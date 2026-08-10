@@ -48083,6 +48083,215 @@ rule pick
         }
     }
 
+    /// gen0 must WRITE a text value that reaches an output position, never
+    /// itoa its packed (start, len) span.
+    ///
+    /// The sixth member of the "pointer-ish value reaching a printer that only
+    /// knows how to itoa" family, after the Result payload (#151), the record
+    /// arena index (#152) and the streamed text field (#153). Measured on main:
+    ///
+    ///   examples/read_config.verbose::load_config   (`out = read(config)`)
+    ///     verbosec  `CFGDATA`             rc 0
+    ///     gen0      `2305840045686259719` rc 0   = 0x1ffffd4e_00000007,
+    ///                                              len 7 == len("CFGDATA")
+    ///
+    /// THE DETECTION LESSON, and the reason this test pins the DIRECT form
+    /// specifically: the family was declared closed twice and was wrong twice,
+    /// both times because ONE position was tested and the rest assumed to
+    /// follow. `concat("[", read(r), "]")` — the obvious probe — WORKS, and has
+    /// worked the whole time, because a concat is texty and the streaming walk
+    /// already owned a correct `span_is_read` arm. It is the bare form, where
+    /// the read IS the whole output, that never reached that walk. A test
+    /// written around the concat form would be a false green.
+    ///
+    /// Three distinct positions, three distinct causes, all pinned here:
+    ///   (a) `read_config::load_config` — a direct `read()` as the entire
+    ///       output. Cause: `ast_is_texty`'s AstCall arm listed `span_is_fetch`
+    ///       but not `span_is_read`, so the rule was classified NON-texty and
+    ///       value-lowered. Fixed in the classifier; `x86_stream_node` already
+    ///       had the dereference-and-write.
+    ///   (b) `sep_roster::sep_line` — `read()` as an argument of a text fold's
+    ///       body concat. Cause: `x86_fold_arg` / `fold_size_arg` tested only
+    ///       `ast_field_is_text`, so a read fell to the number-itoa branch.
+    ///       Fixed by widening both to `ast_span_text`, which already existed
+    ///       (written for `bin_text_mode`) and already covered read.
+    ///       Its argv is COUNT-PREFIXED: `Workforce` is one collection field,
+    ///       so `2 Ada 100 Bo 200` is two Employee{name, salary} elements. An
+    ///       earlier probe of this file used the wrong arity, verbosec printed
+    ///       nothing, and the divergence was misattributed.
+    ///   (c) a bare text FIELD as the entire output (`out = i.s`), which no
+    ///       corpus file has — found by enumerating positions, not by the
+    ///       corpus differential. Cause: neither classifier arm can see that a
+    ///       field is text-typed (TextyState carries no concept table), so this
+    ///       one is fixed at the trampoline via `entry_rule_textspan`, gating
+    ///       on the DECLARED output type exactly as `entry_rule_bool` does.
+    ///
+    /// Each case asserts an explicit ANTI-assertion first — that the output is
+    /// not a large decimal whose high 32 bits look like a region offset — so a
+    /// future regression NAMES the defect instead of showing a diff.
+    ///
+    /// Verified to FAIL pre-change on all three.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~20 s) + needs `ulimit -s unlimited`; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_emits_a_direct_read_text_output() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_drd_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // The resource fixtures. PR #155's lesson: without these BOTH binaries
+        // fail closed on the missing file and the harness records a match that
+        // proves nothing about the path it meant to exercise.
+        fs::write("/tmp/verbose_demo_config.txt", "CFGDATA").unwrap();
+        fs::write("/tmp/verbose_roster_sep.txt", "; ").unwrap();
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_drd_out.elf");
+        let emit = |path: &str, tag: &str| -> std::path::PathBuf {
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), path, out_elf.display()))
+                .status().expect("run gen0");
+            assert!(status.success() && fs::metadata(&out_elf).unwrap().len() > 0,
+                "{path}: gen0 must ACCEPT it — a text value in an output position \
+                 always has a span representation, so there is no refusal half here");
+            let p = std::env::temp_dir().join(format!("verbosec_test_drd_{tag}"));
+            fs::copy(&out_elf, &p).unwrap();
+            let mut pm = fs::metadata(&p).unwrap().permissions();
+            pm.set_mode(0o755);
+            fs::set_permissions(&p, pm).unwrap();
+            p
+        };
+        let reference = |path: &str, rule: &str, tag: &str| -> std::path::PathBuf {
+            let psrc = fs::read_to_string(path).unwrap();
+            let ptok = crate::lexer::Lexer::new(&psrc).tokenize().unwrap();
+            let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+            let p = std::env::temp_dir().join(format!("verbosec_test_drd_{tag}_ref"));
+            compile_native(&pprog, rule, p.to_str().unwrap(), false, false)
+                .expect("verbosec must compile the text-output entry");
+            let mut pm = fs::metadata(&p).unwrap().permissions();
+            pm.set_mode(0o755);
+            fs::set_permissions(&p, pm).unwrap();
+            p
+        };
+        // A packed span rendered as a decimal. The test is a RUN of >= 18
+        // digits, deliberately not a u64 parse: in the sep_roster case the
+        // span's digits abut the preceding salary ("Ada=100" + the span), and
+        // the resulting 22-digit run overflows u64 — a parse-based predicate
+        // silently returns false on exactly the case it exists to catch. None
+        // of the expected outputs here ("CFGDATA", the roster line, "ab",
+        // 10! = 3628800) contains an 18-digit run.
+        let looks_like_a_span = |s: &str| -> bool {
+            s.split(|c: char| !c.is_ascii_digit()).any(|t| t.len() >= 18)
+        };
+
+        // (a) DIRECT read as the whole output. The load-bearing case: the
+        //     concat form below already passed pre-change.
+        let rc_g0 = emit("examples/read_config.verbose", "rc");
+        let rc_vb = reference("examples/read_config.verbose", "load_config", "rc");
+        let got = Command::new(&rc_g0).arg("1").output().unwrap();
+        let want = Command::new(&rc_vb).arg("1").output().unwrap();
+        let got_s = String::from_utf8_lossy(&got.stdout).to_string();
+        assert!(!looks_like_a_span(&got_s),
+            "read_config: gen0 printed a PACKED SPAN as a decimal ({got_s:?}). A \
+             direct `out = read(r)` must be dereferenced through src_base + start \
+             and written, never itoa'd.");
+        assert_eq!(got_s, "CFGDATA\n", "read_config must print the file's contents");
+        assert_eq!(got_s, String::from_utf8_lossy(&want.stdout),
+            "read_config: gen0's stdout must be verbosec's exact bytes");
+        assert_eq!(got.status.code(), want.status.code(), "read_config exit code");
+
+        // (b) read as a fold-body concat argument. Count-prefixed argv.
+        let sr_g0 = emit("examples/sep_roster.verbose", "sr");
+        let sr_vb = reference("examples/sep_roster.verbose", "sep_line", "sr");
+        let argv = ["2", "Ada", "100", "Bo", "200"];
+        let got = Command::new(&sr_g0).args(argv).output().unwrap();
+        let want = Command::new(&sr_vb).args(argv).output().unwrap();
+        let got_s = String::from_utf8_lossy(&got.stdout).to_string();
+        assert!(!looks_like_a_span(&got_s),
+            "sep_roster: gen0 printed a PACKED SPAN as a decimal ({got_s:?}). A \
+             `read()` in a fold body's concat takes the same packed-span write as \
+             a text element field.");
+        assert_eq!(got_s, "roster: Ada=100; Bo=200; \n",
+            "sep_roster must interpolate the separator file's bytes");
+        assert_eq!(got_s, String::from_utf8_lossy(&want.stdout),
+            "sep_roster: gen0's stdout must be verbosec's exact bytes");
+        assert_eq!(got.status.code(), want.status.code(), "sep_roster exit code");
+
+        // (c) a bare text FIELD as the whole output — the entry_rule_textspan
+        //     trampoline. No corpus file has this shape, so it is synthesized.
+        let dir = std::env::temp_dir().join("verbosec_test_drd_probe");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("p.intent"), "1. probe\n").unwrap();
+        let probe = dir.join("p.verbose");
+        fs::write(&probe, r#"@verbose 0.1.0
+
+concept In
+  @intention: "probe input"
+  @source: p.intent:1
+  fields:
+    s : text
+    n : number [0, 100]
+
+rule probe
+  @intention: "a bare text field as the entire output"
+  @source: p.intent:1
+  input:
+    i : In
+  output:
+    o : text
+  logic:
+    o = i.s
+  proofs:
+    purity:
+      reads : [i.s]
+      calls : []
+    termination:
+      bound : 1
+"#).unwrap();
+        let pb_g0 = emit(probe.to_str().unwrap(), "pb");
+        let pb_vb = reference(probe.to_str().unwrap(), "probe", "pb");
+        let got = Command::new(&pb_g0).args(["ab", "5"]).output().unwrap();
+        let want = Command::new(&pb_vb).args(["ab", "5"]).output().unwrap();
+        let got_s = String::from_utf8_lossy(&got.stdout).to_string();
+        assert!(!looks_like_a_span(&got_s),
+            "bare text field output: gen0 printed a PACKED SPAN as a decimal \
+             ({got_s:?}). An entry declared `output: text` whose body value-lowers \
+             must take the span-write trampoline, not the 101-byte itoa one.");
+        assert_eq!(got_s, "ab\n", "a bare text field must print its bytes");
+        assert_eq!(got_s, String::from_utf8_lossy(&want.stdout),
+            "bare text field: gen0's stdout must be verbosec's exact bytes");
+        assert_eq!(got.status.code(), want.status.code(), "bare text field exit code");
+
+        // Guard: a NUMBER entry still itoa's. entry_rule_textspan sits
+        // immediately before the 101-byte fallback in BOTH cascades, so a
+        // predicate that widened by one type code would swallow this.
+        let ft_g0 = emit("examples/factorial.verbose", "ft");
+        let ft_vb = reference("examples/factorial.verbose", "fact", "ft");
+        for a in ["0", "5", "10"] {
+            let g = Command::new(&ft_g0).arg(a).output().unwrap();
+            let v = Command::new(&ft_vb).arg(a).output().unwrap();
+            assert_eq!((g.stdout, g.status.code()), (v.stdout, v.status.code()),
+                "factorial {a}: a NUMBER entry must keep the itoa trampoline");
+        }
+
+        for p in [&gen0, &out_elf, &rc_g0, &rc_vb, &sr_g0, &sr_vb,
+                  &pb_g0, &pb_vb, &ft_g0, &ft_vb] {
+            let _ = fs::remove_file(p);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// THE COMPOSITE DEMO (2026-07): examples/expense_audit.verbose — a
     /// production-shaped program (record collection + reductions + a text-fold
     /// report + a Result validator + match_result composition, FULL

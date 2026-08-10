@@ -24180,6 +24180,22 @@ rule arms_texty_shallow
 -- iff that rule's result is SHALLOW-texty (find_rule's sentinel result is
 -- AstErr, so an unknown callee is 0). The three span primitives short-circuit:
 -- byte_at / length are numbers; substring stays a packed span (value path).
+--
+-- `read(<resource>)` is TEXTY, and its absence here was a silent wrong answer
+-- (fixed 2026-08-10). A direct `out = read(cfg)` was classified 0, so the rule
+-- took the VALUE path: its proc returned the packed (start, len) span in rax
+-- and the 101-byte NUMBER trampoline itoa'd it — `read_config.verbose` printed
+-- 2305840045686259719 (= 0x1ffffd4e_00000007, len 7 = len("CFGDATA")) at rc 0
+-- where verbosec prints CFGDATA. `fetch` was already listed and `read` is its
+-- exact sibling (both produce a runtime-populated span in a resource slot), so
+-- the one-line asymmetry WAS the bug. x86_stream_node's span_is_read arm — the
+-- correct dereference-and-write — already existed and was simply never reached
+-- from this position; the concat form (`concat("[", read(r), "]")`) worked the
+-- whole time, which is exactly why the direct form was assumed to work too.
+-- NOTE the depth bound is unchanged: ast_texty_shallow (what this walk applies
+-- to a CALLEE's body) still says 0 for read, same as it does for fetch, so a
+-- rule that merely CALLS a direct-read rule stays non-texty and traps cleanly
+-- at x86_node's callee_is_texty guard rather than answering wrongly.
 rule ast_is_texty
   @intention: "1 if a subtree is text-shaped with one level of call transitivity, 0 otherwise"
   @source: vexprparse.intent:69
@@ -24199,7 +24215,7 @@ rule ast_is_texty
       AstNeg(inner) => 0
       AstNot(inner) => 0
       AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_fetch(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le32(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_length(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_substring(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else ast_texty_shallow(PrintState { node: block_result(rd_body(find_rule(FindRuleState { rules: ts.prog, src: ts.src, q_start: callee_start, q_len: callee_len }))), src: ts.src })
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_fetch(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_read(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le32(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_length(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_substring(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else ast_texty_shallow(PrintState { node: block_result(rd_body(find_rule(FindRuleState { rules: ts.prog, src: ts.src, q_start: callee_start, q_len: callee_len }))), src: ts.src })
       AstIf(cond, thn, els) => if ast_is_texty(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_is_texty(TextyState { node: els, src: ts.src, prog: ts.prog })
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => arms_is_texty(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
@@ -24232,7 +24248,7 @@ rule ast_is_texty
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
-      calls : [span_is_concat, span_is_fetch, span_is_le32, span_is_le64, span_is_byte_at, span_is_length, span_is_substring, ast_texty_shallow, block_result, rd_body, find_rule, ast_is_texty, arms_is_texty]
+      calls : [span_is_concat, span_is_fetch, span_is_read, span_is_le32, span_is_le64, span_is_byte_at, span_is_length, span_is_substring, ast_texty_shallow, block_result, rd_body, find_rule, ast_is_texty, arms_is_texty]
     termination:
       bound : 8000
 
@@ -25272,6 +25288,70 @@ rule entry_rule_bool
   logic:
     out = match pg.rules:
       RCons(head, tail) => if rd_out_ty(head) == 1 then 1 else 0
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pg.rules]
+      calls : [rd_out_ty]
+    termination:
+      bound : 8000
+
+
+-- ============ TEXT-SPAN ENTRY (2026-08-10) ============
+-- The direct-read slice's SIBLING, found by enumerating positions rather than
+-- by a corpus differential — no `examples/` file has this shape, which is
+-- exactly why three previous sweeps missed it.
+--
+-- An entry whose declared output is `text` but whose body is NOT texty returns
+-- a packed (start, len) SPAN in rax, and until this branch existed no
+-- entry_rule_* claimed it: it fell to the 101-byte NUMBER trampoline and got
+-- itoa'd. Measured on `out = i.s` (a bare text field as the whole output) with
+-- argv "ab": gen0 printed 2287825939234553858 = 0x1fbffd92_00000002 — len 2 ==
+-- len("ab") — at rc 0, where verbosec prints `ab`. The same class as the
+-- Result payload (PR #151), the record arena index (#152) and the streamed
+-- text field (#153): a pointer-ish value reaching a printer that only itoa's.
+--
+-- WHY A TRAMPOLINE AND NOT THE CLASSIFIER. The read() half of this slice is
+-- fixed in ast_is_texty, which routes the rule to the streaming proc. That
+-- road is CLOSED for a bare text field: deciding "is this field text-typed"
+-- needs the params + concept table, and TextyState carries only (node, src,
+-- prog). Widening it would ripple through callee_is_texty / rule_is_texty /
+-- prog_any_texty into blob_end_off's size chain — and worse, callee_is_texty
+-- resolves a DIFFERENT rule than the caller, so "which params" stops having
+-- one answer. Gating on the DECLARED output type instead needs no context at
+-- all, which is precisely the entry_rule_bool precedent.
+--
+-- PLACEMENT, same blast-radius argument as entry_rule_bool: the branch sits
+-- LAST in both cascades — after entry_rule_bool, immediately before the 101
+-- fallback — in blob_end_off AND in elf_program_src, in the same order. Only a
+-- program that reaches the number trampoline today can move, and among those
+-- only one whose output is literally declared `text`. A texty text rule was
+-- already claimed by entry_rule_texty several branches earlier, so this sees
+-- only the value-lowered remainder.
+--
+-- SIZE 80 = call 5 + body 75, and the body is the Result trampoline's fd-1
+-- Ok block COPIED VERBATIM (mov edx,eax ; shr rax,32 ; movabs rsi,src_base ;
+-- add rsi,rax ; write(1) ; push '\n' ; write(1) ; exit(0)). Fourth slice in
+-- this family running to the same conclusion: the emitter already existed.
+--
+-- NO BLOB FORCING, and that is a real difference from the record entry, which
+-- had to OR itself into prog_needs_itoa. The bytes a span here points at live
+-- in the argv MAP_FIXED region (a text field) or a resource buffer (a read),
+-- never in the source blob — and x86_argv_marshal pre-biases by
+-- (0x20000000 - src_base), so `src_base + start` resolves without the blob
+-- being present. A LITERAL body, the one shape that would need the blob, is
+-- AstStr and therefore texty, so entry_rule_texty claims it first and it never
+-- reaches here.
+rule entry_rule_textspan
+  @intention: "1 if the entry rule's declared output type is text but its body value-lowers to a packed span"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => if rd_out_ty(head) == 2 then 1 else 0
       RNil => 0
   proofs:
     purity:
@@ -28268,8 +28348,9 @@ rule bin_text_mode
 
 
 -- fold_size_arg: the EXACT byte count x86_fold_arg emits for ONE fold-body
--- rest arg. A string literal is the 33-byte AstStr stream write; a TEXT element
--- field (e.g. `e.name`) is code_size_node + 36 (the packed-span write: pop rax,
+-- rest arg. A string literal is the 33-byte AstStr stream write; any PACKED
+-- SPAN (ast_span_text: text element field, read, substring, text param) is
+-- code_size_node + 36 (the packed-span write: pop rax,
 -- extract start/len, write src_base + start for len bytes — no itoa, no r9
 -- clobber); any OTHER shallow-texty shape is out of the fold-arg subset (1-byte
 -- int3 — nested concat / bytes / texty ifs have no streamed-in-loop lowering yet);
@@ -28283,19 +28364,21 @@ rule fold_size_arg
   output:
     out : number
   logic:
-    out = if ast_is_str(bg.node) == 1 then 33 else if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then code_size_node(bg) + 36 else if ast_texty_shallow(PrintState { node: bg.node, src: bg.src }) == 1 then 1 else code_size_node(bg) + 10
+    out = if ast_is_str(bg.node) == 1 then 33 else if ast_span_text(bg) == 1 then code_size_node(bg) + 36 else if ast_texty_shallow(PrintState { node: bg.node, src: bg.src }) == 1 then 1 else code_size_node(bg) + 10
   proofs:
     purity:
-      reads : [bg, bg.node, bg.src, bg.params, bg.lets, bg.concepts]
-      calls : [ast_is_str, ast_field_is_text, ast_texty_shallow, code_size_node]
+      reads : [bg, bg.node, bg.src]
+      calls : [ast_is_str, ast_span_text, ast_texty_shallow, code_size_node]
     termination:
       bound : 8000
 
 
 -- x86_fold_arg: stream ONE fold-body rest arg inside the text-fold loop. A
 -- string literal reuses x86_stream_node's AstStr write verbatim (33 B; the
--- syscall clobbers only rcx/r11 — r8/r9 both safe). A TEXT element field (e.g.
--- `e.name`) is <value ops> (x86_node leaves the packed span on the stack) ;
+-- syscall clobbers only rcx/r11 — r8/r9 both safe). Any PACKED SPAN — the
+-- predicate is ast_span_text, so a text element field (`e.name`), a
+-- `read(<resource>)`, a `substring(...)` or a text param all qualify — is
+-- <value ops> (x86_node leaves the packed span on the stack) ;
 -- pop rax ; mov edx, eax (len) ; shr rax, 32 (start) ; movabs rsi, src_base ;
 -- add rsi, rax (rsi = src_base + start = region_base + text_off, the copied
 -- bytes) ; write(1, rsi, len) — 36 B, the text-param write shape; no itoa, no
@@ -28316,11 +28399,11 @@ rule x86_fold_arg
   output:
     out : bytes
   logic:
-    out = if ast_is_str(bg.node) == 1 then x86_stream_node(bg) else if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if ast_texty_shallow(PrintState { node: bg.node, src: bg.src }) == 1 then b"\xcc" else concat(x86_node(bg), b"\x58\x41\x51\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 94)), b"\x41\x59")
+    out = if ast_is_str(bg.node) == 1 then x86_stream_node(bg) else if ast_span_text(bg) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if ast_texty_shallow(PrintState { node: bg.node, src: bg.src }) == 1 then b"\xcc" else concat(x86_node(bg), b"\x58\x41\x51\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 94)), b"\x41\x59")
   proofs:
     purity:
-      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [ast_is_str, ast_field_is_text, ast_texty_shallow, x86_stream_node, x86_node, code_size_node, blob_end_off]
+      reads : [bg, bg.node, bg.src, bg.off, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
+      calls : [ast_is_str, ast_span_text, ast_texty_shallow, x86_stream_node, x86_node, code_size_node, blob_end_off]
     termination:
       bound : 8000
 
@@ -28995,11 +29078,11 @@ rule blob_end_off
     -- orders it identically. Last placement is what bounds the blast radius to
     -- programs that reach the number trampoline today; a size/emit disagreement
     -- here is the p_filesz desync every banner in this file warns about.
-    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if has_svc == 1 then service_tramp_size(ServiceTrampSizeState { svcs: pg.svcs, prog: pg.prog, src: pg.src }) else (if reaction_list_len(pg.rxs) > 0 then reaction_tramp_size(RxSizeState { rxs: pg.rxs, src: pg.src }) else (if entry_rule_result(pg) == 1 then (if entry_result_ok_texty(pg) == 1 then 189 else 210) else if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_collection(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else if entry_rule_record(pg) == 1 then entry_record_tramp_size(pg) else if entry_rule_bool(pg) == 1 then 83 else 101))) + (if prog_needs_itoa(pg) == 1 then 86 else 0) + msize + resource_marshal_size(RMarshSizeState { rem: pg.ress, src: pg.src, prog: pg.prog }) + connection_marshal_size(CMarshSizeState { rem: pg.conns, src: pg.src, prog: pg.prog }) + ps_total(pg.sizes)
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if has_svc == 1 then service_tramp_size(ServiceTrampSizeState { svcs: pg.svcs, prog: pg.prog, src: pg.src }) else (if reaction_list_len(pg.rxs) > 0 then reaction_tramp_size(RxSizeState { rxs: pg.rxs, src: pg.src }) else (if entry_rule_result(pg) == 1 then (if entry_result_ok_texty(pg) == 1 then 189 else 210) else if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_collection(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else if entry_rule_record(pg) == 1 then entry_record_tramp_size(pg) else if entry_rule_bool(pg) == 1 then 83 else if entry_rule_textspan(pg) == 1 then 80 else 101))) + (if prog_needs_itoa(pg) == 1 then 86 else 0) + msize + resource_marshal_size(RMarshSizeState { rem: pg.ress, src: pg.src, prog: pg.prog }) + connection_marshal_size(CMarshSizeState { rem: pg.conns, src: pg.src, prog: pg.prog }) + ps_total(pg.sizes)
   proofs:
     purity:
       reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes, pg.ress, pg.conns, pg.prog, pg.rxs, pg.svcs]
-      calls : [program_uses_arena, reaction_list_len, reaction_tramp_size, service_list_len, service_tramp_size, entry_rule_result, entry_result_ok_texty, entry_rule_texty, entry_rule_bytes, entry_rule_collection, entry_rule_record, entry_record_tramp_size, entry_rule_bool, prog_needs_itoa, ps_total, resource_marshal_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, entry_uses_stdin, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len, connection_marshal_size]
+      calls : [program_uses_arena, reaction_list_len, reaction_tramp_size, service_list_len, service_tramp_size, entry_rule_result, entry_result_ok_texty, entry_rule_texty, entry_rule_bytes, entry_rule_collection, entry_rule_record, entry_record_tramp_size, entry_rule_bool, entry_rule_textspan, prog_needs_itoa, ps_total, resource_marshal_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, entry_uses_stdin, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len, connection_marshal_size]
     termination:
       bound : 8000
 
@@ -32204,6 +32287,11 @@ rule elf_program_src
     -- writes instead of itoa-ing the integer. Sits LAST, immediately before the
     -- number fallback, mirroring blob_end_off's 79 branch exactly.
     let entrybool = entry_rule_bool(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
+    -- Text-span entry (2026-08-10): declared `output: text` that did NOT reach
+    -- entry_rule_texty, so the proc value-lowers to a packed span in rax. Must
+    -- sit LAST, immediately before the 101 fallback, in the SAME order as
+    -- blob_end_off's cascade — a split there desyncs p_filesz and src_base.
+    let entrytextspan = entry_rule_textspan(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     -- Effects tier slice 1: resource path bytes are SPANS into the embedded
     -- source, but blob inclusion is gated on uses_text, which does not see
     -- read( — so program-uses-resources ORs into the gate BY CONSTRUCTION (the
@@ -32226,11 +32314,11 @@ rule elf_program_src
     -- trampoline REPLACES the entry_rule_* trampoline cascade (the trigger IS the
     -- head/entry proc, gated + open/write/close instead of itoa+print).
     let has_reaction = if reaction_list_len(rxs) > 0 then 1 else 0
-    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else if entryrec == 1 then concat(b"\xe8", le32(62 + entryrjfs + (if anytx == 1 then 86 else 0)), b"\x50", x86_json_record(JsonRecState { fields: entryrfields, esize: 8 * (max_payload_fields(concepts) + 1), off: 0 - (61 + entryrjfs + (if anytx == 1 then 86 else 0)), src: s.source, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns }), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrybool == 1 then concat(b"\xe8", le32(78 + (if anytx == 1 then 86 else 0)), b"\x31\xdb\x48\x85\xc0\x74\x14\x48\xb8\x74\x72\x75\x65\x0a\x00\x00\x00\x50\x48\xc7\xc2\x05\x00\x00\x00\xeb\x14\x48\xb8\x66\x61\x6c\x73\x65\x0a\x00\x00\x50\x48\xc7\xc2\x06\x00\x00\x00\xb3\x01\x48\x89\xe6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x89\xdf\x0f\x05") else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else if entryrec == 1 then concat(b"\xe8", le32(62 + entryrjfs + (if anytx == 1 then 86 else 0)), b"\x50", x86_json_record(JsonRecState { fields: entryrfields, esize: 8 * (max_payload_fields(concepts) + 1), off: 0 - (61 + entryrjfs + (if anytx == 1 then 86 else 0)), src: s.source, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns }), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrybool == 1 then concat(b"\xe8", le32(78 + (if anytx == 1 then 86 else 0)), b"\x31\xdb\x48\x85\xc0\x74\x14\x48\xb8\x74\x72\x75\x65\x0a\x00\x00\x00\x50\x48\xc7\xc2\x05\x00\x00\x00\xeb\x14\x48\xb8\x66\x61\x6c\x73\x65\x0a\x00\x00\x50\x48\xc7\xc2\x06\x00\x00\x00\xb3\x01\x48\x89\xe6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x89\xdf\x0f\x05") else if entrytextspan == 1 then concat(b"\xe8", le32(75 + (if anytx == 1 then 86 else 0)), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext]
     termination:
       bound : 256
 
