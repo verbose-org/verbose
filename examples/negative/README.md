@@ -45,14 +45,52 @@ them too — which requires programs that are not in `examples/`, because
   because a fixture that measures a gap in the other direction is still a
   measurement.
 
+## One defect can have several SHAPES, and a fixture only holds the one it tests
+
+The sharpest thing this corpus has produced so far is a lesson about itself.
+
+`purity_reads_missing` scored **PASS** in the first sweep, so the "missing"
+direction of the purity check read as covered. It was not. That fixture declares
+`reads: []`, and the empty declaration was the *only* shape gen0 caught. A
+**partial** under-declaration went through clean:
+
+```
+declares reads: []     , logic reads i.amount      -> gen0 rc=1, 0 bytes  (refused)
+declares reads: [t.a]  , logic reads t.a + t.b     -> gen0 rc=0, 720 bytes (ACCEPTED)
+```
+
+`verbosec` refuses both. gen0's reads list stored each entry's **root ident**
+only, so `[t.a]` put `t` in the list and every `t.<field>` access matched it —
+one declared entry blessed every field of the input. Declaring most reads and
+omitting one is exactly what a concealed read looks like, and the declared
+`reads:` set *is* the audit surface, so the check was close to cosmetic while
+reading as green. (Fixed 2026-08-11; the mechanism is in the `NameList` banner in
+`examples/vexprparse.verbose`.)
+
+This is the second time in this arc that a check looked green because the probe
+landed on the working half of the input space — the first was text `==`, where a
+stuck-`false` equality is right on every non-matching pair. So:
+
+- **A fixture that passes for the wrong reason is worse than a missing one.** A
+  missing fixture leaves a visible hole; a fixture passing vacuously retires the
+  question.
+- **When a check has more than one failure shape, fixture EACH one.** Do not let
+  the cheapest shape stand in for the family. `purity_reads_missing` and
+  `purity_reads_missing_partial` are both kept, and both `calls` shapes too —
+  even though calls was measured correct all along, because "calls was fine" is
+  a measurement, not a property.
+
 ## Adding a fixture
 
 1. Make it as small as possible and isolate exactly one defect.
 2. Point `@source` at `negative.intent`.
 3. Confirm `verbosec` refuses it, and for the reason you intended:
    `cargo run --release -- examples/negative/<name>.verbose`
-4. Run the sweep. It will fail, naming your fixture.
-5. Triage it: if gen0 genuinely cannot perform the check today, add the name to
+4. **Ask what OTHER shapes the same defect has** (empty vs partial, matching vs
+   non-matching, present vs absent) and add a fixture per shape. See the section
+   above for what skipping this costs.
+5. Run the sweep. It will fail, naming your fixture.
+6. Triage it: if gen0 genuinely cannot perform the check today, add the name to
    `KNOWN_GAPS` **and** record the structural cause in the test's doc comment.
    If gen0 *should* catch it, you have found a bug — fix that instead.
 
@@ -61,7 +99,7 @@ them too — which requires programs that are not in `examples/`, because
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 21 fixtures.** They were chosen from CLAUDE.md's known-gaps table plus
+- **Only 23 fixtures.** They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has
   many more refusal paths (resources, connections, services, reactions,
@@ -70,8 +108,19 @@ Stated plainly, because "the negative corpus is green" must not be read as
 - **One defect per fixture, in isolation.** Nothing measures how gen0 behaves
   when two violations co-occur, or when a violation sits inside a construct
   gen0 parses differently (a service handler, a reaction, a `concept_group`).
-- **No refusal-MESSAGE comparison.** The sweep compares exit status only. gen0
-  refusing for an unrelated reason would score as a PASS.
+  Note this is about co-OCCURRENCE; a single defect's several SHAPES do now get
+  a fixture each, for the reason the section above gives.
+- **No refusal-MESSAGE comparison, and there is nothing to compare against.**
+  The sweep compares exit status only, so gen0 refusing for an unrelated reason
+  scores as a PASS. This is not a shortcut that could be tightened cheaply:
+  **gen0 emits no diagnostic at all** — a refusal is a bare `exit 1` with zero
+  bytes written, and nothing on stderr either. Attributing a refusal therefore
+  needs a different instrument, and the one that works is a **corrected twin**:
+  compile the minimally-fixed program too and require ACCEPT, so the only thing
+  that differs between the two verdicts is the violation under test.
+  `two_generation_gen0_detects_partial_purity_underdeclaration` does that for
+  every purity shape it pins. It is per-fixture work, which is why the sweep
+  itself does not do it for all 23.
 - **Effects and services are absent.** Those refusal surfaces are exercised by
   the effect-position matrix in CLAUDE.md, over real TCP and real files, not
   here.

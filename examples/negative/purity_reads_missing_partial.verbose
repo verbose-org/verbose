@@ -1,0 +1,40 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the logic reads BOTH t.a and t.b; `reads:` declares only t.a.
+--
+-- The PARTIAL sibling of purity_reads_missing, which declares `reads: []`. The
+-- two are not the same test. gen0 caught the empty one and accepted this one
+-- (rc 0, 720 bytes) until 2026-08-11, because its reads list stored only each
+-- entry's ROOT ident: `[t.a]` put `t` in the list, and every `t.<field>` read
+-- then matched it. A partial under-declaration — declare most reads, omit one —
+-- is the realistic shape of a concealed read, and it is the shape this fixture
+-- exists to hold.
+--
+-- verbosec: `declared reads do not match logic; missing: [t.b]`.
+concept T
+  @intention: "Two numbers"
+  @source: negative.intent:1
+
+  fields:
+    a : number [0, 1000]
+    b : number [0, 1000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    t : T
+
+  output:
+    total : number
+
+  logic:
+    total = t.a + t.b
+
+  proofs:
+    purity:
+      reads   : [t.a]
+      calls   : []
+    termination:
+      bound : 2
