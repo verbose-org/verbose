@@ -875,16 +875,30 @@ concept_group VExpr [max_depth: 4096, max_nodes: 8000000]
     variants:
       MkPF of (fields : FieldList, next : TokenList)
 
-  -- Records-arc brick R5: a parsed reads/calls entry list — a cons-list of NAME
-  -- spans (each `reads`/`calls` list entry's HEAD identifier span). A reads entry
-  -- like `s.source` captures the span of its head ident `s` (head-ident-only, the
-  -- simpler choice the task permits — it is enough to COUNT entries and identify the
-  -- root binder; the `.field` suffix is skipped by skip_path and not stored). Same
-  -- cons-list family as FieldList (NmCons carries one entry's span + the rest, NmNil
-  -- ends the list). Lives in the group because Proofs (also in the group) carries a
-  -- NameList, and the same arena machinery / structural-recursion proof apply.
+  -- Records-arc brick R5: a parsed reads/calls entry list — a cons-list of ENTRY
+  -- spans. `(start, len)` is the WHOLE entry as written: for `s.source` it is the
+  -- 8 bytes `s.source`, not the 1 byte `s`.
+  --
+  -- It stored the HEAD IDENT ONLY until 2026-08-11, and that was a HOLE, not a
+  -- simplification. `name_in_namelist` byte-compares an entry span against a query
+  -- span, so a head-ident-only list answered the question "is the input mentioned
+  -- ANYWHERE in reads:" instead of "is THIS path declared". `reads: [t.a]` therefore
+  -- satisfied a body reading `t.a + t.b`: gen0 accepted at rc 0 where verbosec
+  -- reports `missing: [t.b]`. Only the degenerate `reads: []` was caught, which is
+  -- exactly the shape the negative fixture happened to test — so the check scored
+  -- as PASS while a PARTIAL under-declaration, the realistic shape of a concealed
+  -- read, went through clean. The declared set IS the audit surface; a check that
+  -- only catches the empty case is close to cosmetic.
+  --
+  -- A `calls:` entry is a bare rule name, so for calls the whole entry and the head
+  -- ident coincide and nothing about that check moved.
+  --
+  -- Same cons-list family as FieldList (NmCons carries one entry's span + the rest,
+  -- NmNil ends the list). Lives in the group because Proofs (also in the group)
+  -- carries a NameList, and the same arena machinery / structural-recursion proof
+  -- apply.
   concept NameList
-    @intention: "Cons-list of a purity reads/calls list (each entry's head-ident span)"
+    @intention: "Cons-list of a purity reads/calls list (each entry's WHOLE span, path included)"
     @source: vexprparse.intent:30
     variants:
       NmCons of (start : number, len : number, rest : NameList)
@@ -10949,24 +10963,27 @@ rule skip_to_newline
 --
 -- A `reads`/`calls` list is `[ entry , entry , ... ]` where each entry is an ident-
 -- path `ident (.ident)*` (e.g. `s.source`). parse_name_list captures each entry's
--- HEAD-IDENT span (the simpler choice the task allows — enough to COUNT entries and
--- name the root binder; skip_path skips the `.field` suffix). The proofs sub-blocks
+-- WHOLE span, head ident through last `.field` (path_end supplies the end offset),
+-- because the purity check byte-compares that span against the path the body
+-- actually reads — see the NameList banner for what head-ident-only cost. The
+-- proofs sub-blocks
 -- (purity / reads / calls / termination / bound / structural|decreasing|increasing)
 -- are reached POSITIONALLY (fixed token offsets + skip_seps), so the only new span
 -- helpers are the optional-block detectors (input/output) and the termination-kind
 -- keyword detectors (structural/decreasing/increasing).
 -- ============================================================================
 
--- A name-cons continuation: the head entry's span plus the parsed REST of the list.
--- names_cons conses the head onto the rest's NameList, threading the rest's end cell.
--- Mirrors FieldConsState exactly, keeping the recursive parse_name_list call lazily
--- inside the entry branch (a let would force it eagerly).
+-- A name-cons continuation: the head entry's WHOLE span (head ident through the last
+-- `.field`) plus the parsed REST of the list. names_cons conses the head onto the
+-- rest's NameList, threading the rest's end cell. Mirrors FieldConsState exactly,
+-- keeping the recursive parse_name_list call lazily inside the entry branch (a let
+-- would force it eagerly).
 concept NameConsState
-  @intention: "Head name-list entry span + the parsed rest of the name list"
+  @intention: "Head name-list entry's whole span + the parsed rest of the name list"
   @source: vexprparse.intent:30
   fields:
-    head_start : number [0, 4000000]
-    head_len : number [0, 4000000]
+    entry_start : number [0, 4000000]
+    entry_len : number [0, 4000000]
     rest : ParsedNames
 
 
@@ -10980,10 +10997,10 @@ rule names_cons
   logic:
     let rest_list = pn_names(nc.rest)
     let rest_next = pn_next(nc.rest)
-    out = ParsedNames::MkNames { names: NameList::NmCons { start: nc.head_start, len: nc.head_len, rest: rest_list }, next: rest_next }
+    out = ParsedNames::MkNames { names: NameList::NmCons { start: nc.entry_start, len: nc.entry_len, rest: rest_list }, next: rest_next }
   proofs:
     purity:
-      reads : [nc.head_start, nc.head_len, nc.rest]
+      reads : [nc.entry_start, nc.entry_len, nc.rest]
       calls : [pn_names, pn_next]
     termination:
       bound : 16
@@ -11014,15 +11031,47 @@ rule skip_path
       bound : 512
 
 
+-- path_end: skip_path's byte-offset twin. Same walk (ident then any `.ident` pairs),
+-- but instead of the cell AFTER the path it returns the byte offset ONE PAST the last
+-- ident — so `path_end - head_start` is the entry's whole length as written, `s.source`
+-- included. That length is what parse_name_list stores in each NmCons, and what makes
+-- the purity reads check a comparison of PATHS rather than of root binders (see the
+-- NameList banner). Forward-index recursion, same shape and bound as skip_path.
+rule path_end
+  @intention: "Byte offset one past the last ident of an ident-path entry (ident then any .field pairs)"
+  @source: vexprparse.intent:30
+  input:
+    st : ParseState
+  output:
+    out : number
+  logic:
+    let id_end = peek_start(st.cell) + peek_len(st.cell)
+    let after_id = advance(Advance { lst: st.cell, k: 1 })
+    let isdot = if peek_op_code(after_id) == 12 then 1 else 0
+    out = if isdot == 1 then path_end(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) else id_end
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_start, peek_len, peek_op_code, path_end, advance]
+    termination:
+      bound : 512
+
+
 -- parse_name_list (records-arc brick R5): parse the body of a bracketed `[ a, b.c,
 -- ... ]` list into a NameList, starting at the cell of the FIRST entry token (right
 -- after the `[`). If that token is an Ident (kind 100) it is an entry head — capture
--- its span, skip the rest of the entry (skip_path), then if the separator is `,` (op
+-- the entry's WHOLE span (head start, path_end minus head start, so `b.c` is 3 bytes
+-- not 1), skip the rest of the entry (skip_path), then if the separator is `,` (op
 -- 11) advance past it and recurse on the next entry; a `]` (op 26) or any non-ident
 -- ends the list (NmNil) and threads the closing-`]` cell as `next`. The recursive
 -- call is LAZY (inside names_cons, exactly like parse_fields' FCons tail). Forward
 -- token scan; bound + the mandatory recursion breadcrumb (the backstop is the finite
 -- token list, bounded by max_nodes). Empty list `[]` lands on `]` immediately => NmNil.
+--
+-- skip_path and path_end walk the SAME token shape and must stay in step: one supplies
+-- the cell the list continues from, the other the byte offset the entry ends at. They
+-- are separate rules because the cons-list has no way back to the previous cell, so
+-- the end offset cannot be recovered from skip_path's result.
 rule parse_name_list
   @intention: "Parse a bracketed reads/calls list into a NameList + its end cell (one NmCons per entry)"
   @source: vexprparse.intent:30
@@ -11034,15 +11083,15 @@ rule parse_name_list
     let knd = peek_kind(st.cell)
     let is_entry = if knd == 100 then 1 else 0
     let name_start = peek_start(st.cell)
-    let name_len = peek_len(st.cell)
+    let entry_end = path_end(ParseState { cell: st.cell })
     let after_path = skip_path(ParseState { cell: st.cell })
     let nextop = peek_op_code(after_path)
     let rest_cell = if nextop == 11 then advance(Advance { lst: after_path, k: 1 }) else after_path
-    out = if is_entry == 1 then names_cons(NameConsState { head_start: name_start, head_len: name_len, rest: parse_name_list(ParseState { cell: rest_cell }) }) else ParsedNames::MkNames { names: NameList::NmNil, next: st.cell }
+    out = if is_entry == 1 then names_cons(NameConsState { entry_start: name_start, entry_len: entry_end - name_start, rest: parse_name_list(ParseState { cell: rest_cell }) }) else ParsedNames::MkNames { names: NameList::NmNil, next: st.cell }
   proofs:
     purity:
       reads : [st.cell]
-      calls : [peek_kind, peek_start, peek_len, skip_path, peek_op_code, names_cons, parse_name_list, advance]
+      calls : [peek_kind, peek_start, path_end, skip_path, peek_op_code, names_cons, parse_name_list, advance]
     termination:
       bound : 512
 
@@ -12831,6 +12880,104 @@ rule ast_var_len
       calls : []
     termination:
       bound : 64
+
+
+-- ast_path_head_start / ast_path_head_len: the ROOT identifier of a field-access
+-- chain. `ast_var_*` answer only for a BARE AstVar; these descend through any number
+-- of AstField wrappers, so `t.a` and `t.a.b` both report the span of `t`. 0 for any
+-- shape that is not a var-rooted path (a call, a literal, an operator node) — the
+-- caller reads a 0 length as "not a path" and falls back to its recursive walk.
+--
+-- Written for the purity reads check, which needs the WHOLE path `head_start ..
+-- last_field_end` to compare against a declared `reads:` entry. The end offset needs
+-- no walk (the outermost AstField already carries the last segment's span); only the
+-- start does, which is why there is no ast_path_end rule.
+rule ast_path_head_start
+  @intention: "The root identifier's span start of a var-rooted field-access path, 0 for any other shape"
+  @source: vexprparse.intent:30
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => start
+      AstField(base, fstart, flen) => ast_path_head_start(base)
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : [ast_path_head_start]
+    termination:
+      bound : 4000
+      structural : n
+
+
+rule ast_path_head_len
+  @intention: "The root identifier's span length of a var-rooted field-access path, 0 for any other shape"
+  @source: vexprparse.intent:30
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => len
+      AstField(base, fstart, flen) => ast_path_head_len(base)
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : [ast_path_head_len]
+    termination:
+      bound : 4000
+      structural : n
 
 
 -- ast_field_base / ast_field_fstart / ast_field_flen (self-hosting-service-slice-2):
@@ -19261,22 +19408,43 @@ rule argtype_check
 --     (rule_named == 1) but is NOT in the rule's declared `calls:` list. Primitives
 --     (length / byte_at / concat / ...) don't resolve to a defined rule, so they are
 --     naturally exempt; self-recursion resolves, so it MUST be declared.
---   * undeclared_reads — every AstVar whose head-ident is the rule's INPUT name (the
---     first `input:` field), is NOT a local (let / param / match binder), and is NOT
---     in the declared `reads:` list. A read `s.source` reaches its head-ident `s`
---     through AstField(AstVar(s), ...) -> AstVar(s), so descending the field base is
---     exactly the head-ident test; declared `[s]` (head-ident spans, R5's storage)
---     admits `s.anything`.
+--   * undeclared_reads — every read PATH rooted at the rule's INPUT name (the first
+--     `input:` field) whose root is NOT a local (let / param / match binder) and
+--     whose WHOLE path is not in the declared `reads:` list. `s.source` is checked
+--     as `s.source`.
+--
+-- READ THE PARAGRAPH BELOW BEFORE TOUCHING EITHER CHECK. Until 2026-08-11 the reads
+-- half compared HEAD IDENTS: R5 stored only an entry's root span, and the AstField
+-- arm descended to the root before querying, so the question asked was "is the input
+-- mentioned anywhere in reads:" and one declared entry admitted `s.anything`. The
+-- banner here described that as the design. It was a hole: `reads: [t.a]` with a body
+-- reading `t.a + t.b` was accepted at rc 0 where verbosec reports `missing: [t.b]`,
+-- and a PARTIAL under-declaration — declare most reads, omit one — is precisely the
+-- shape a concealed read has. Only `reads: []` was caught.
+--
+-- The lesson is about the MEASUREMENT, not the code. The negative fixture for this
+-- row tested the empty declaration, the sweep scored PASS, and the row read as
+-- checked for as long as nobody wrote the partial case. That is the same failure the
+-- text-`==` defect had (correct on half the input space, with the probe landing on
+-- the working half). A fixture that passes for the wrong reason is worse than a
+-- missing one, so both shapes now have their own fixture.
+--
+-- The calls half never had the defect and did not move: a `calls:` entry is a bare
+-- rule name, so its whole span and its root ident are the same bytes.
+--
 -- Both reuse R6a's body-walk shape (Ast / args / vfields / arms recursion, match
 -- binders scoped in per arm via binds_with_binders) and the single new membership
 -- helper name_in_namelist (the NameList analogue of name_bound).
 -- ============================================================================
 
 -- name_in_namelist's probe: the purity NameList to search + the source text + the
--- query name's HEAD-ident span. The NameList analogue of NameBoundState (which
--- searches a Binding) / RuleNamedState (which searches a RuleList).
+-- QUERY span. The query is whatever the caller is asking about, and the entries are
+-- whole entries, so the two are compared like for like: the reads check passes a full
+-- path (`t.a`), the calls check and the resource/connection checks pass a bare name.
+-- The NameList analogue of NameBoundState (which searches a Binding) / RuleNamedState
+-- (which searches a RuleList).
 concept NameInListState
-  @intention: "A purity reads/calls name-list to search + the source text + the query name's head-ident span"
+  @intention: "A purity reads/calls name-list to search + the source text + the query span"
   @source: vexprparse.intent:30
   fields:
     names : NameList
@@ -19285,15 +19453,19 @@ concept NameInListState
     q_len : number [0, 4000000]
 
 
--- name_in_namelist: 1 iff the query span byte-equals some entry's head-ident span in
--- the NameList, 0 otherwise. Walks the NmCons cons-list; at each entry it checks the
+-- name_in_namelist: 1 iff the query span byte-equals some entry's span in the
+-- NameList, 0 otherwise. Walks the NmCons cons-list; at each entry it checks the
 -- entry's LENGTH equals the query length AND the bytes match (name_eq); on a match it
 -- returns 1, else recurses into `rest`. NmNil (end) returns 0 (not declared). Exact
 -- mirror of name_bound / rule_named, reading a NameList entry's (start, len) span
 -- instead of a binding / rule name. Recurses over the NmCons tail (a field of the
 -- packed input, not the input), so bound + the native recursion breadcrumb.
+--
+-- Unchanged by the 2026-08-11 path fix, and that is the point of the fix's shape: the
+-- comparison was always the right one, it was being fed a root ident on both sides.
+-- Widening what parse_name_list STORES and what the AstField arm ASKS was enough.
 rule name_in_namelist
-  @intention: "1 if a name span matches some entry's head-ident in a purity name-list, 0 otherwise"
+  @intention: "1 if a span matches some entry's span in a purity name-list, 0 otherwise"
   @source: vexprparse.intent:30
   input:
     st : NameInListState
@@ -19640,11 +19812,13 @@ rule count_undecl_read_args
       bound : 4000
 
 
--- count_undecl_read_ast: walk an Ast and count each AstVar that is an UNDECLARED
--- input read: its span byte-equals the input name (in_start, in_len), it is NOT a
--- local (name_bound over the scope == 0), and its head-ident is NOT in the declared
--- `reads:` list (name_in_namelist == 0). AstField descends into its base (reaching
--- the head-ident AstVar), so `s.source` is checked at its `s`. AstCall walks its
+-- count_undecl_read_ast: walk an Ast and count each UNDECLARED input read. Two shapes
+-- are reads: a bare AstVar whose span byte-equals the input name (in_start, in_len),
+-- and an AstField chain ROOTED at that name. In both cases it is a violation when the
+-- root is not a local (name_bound over the scope == 0) and the WHOLE path is not in
+-- the declared `reads:` list (name_in_namelist == 0) — `s.source` is checked as the
+-- 8-byte path `s.source`, not as its root `s`; see the AstField arm for why that
+-- distinction is the whole check rather than a detail. AstCall walks its
 -- args; a callee name is not a variable. AstMatch walks the scrutinee then each arm
 -- body with the scope EXTENDED by that arm's binders (count_undecl_read_arms).
 -- a.node is a FIELD of the packed input, so bound + the native recursion breadcrumb.
@@ -19662,7 +19836,23 @@ rule count_undecl_read_ast
       AstNeg(inner) => count_undecl_read_ast(UndeclReadState { node: inner, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstNot(inner) => count_undecl_read_ast(UndeclReadState { node: inner, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstVar(start, len) => if len == a.in_len and (name_eq(NameEqState { src: a.src, a_start: a.in_start, b_start: start, len: len, off: 0 }) == 1 and (name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 and name_in_namelist(NameInListState { names: a.reads, src: a.src, q_start: start, q_len: len }) == 0)) then 1 else 0
-      AstField(base, fstart, flen) => count_undecl_read_ast(UndeclReadState { node: base, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      -- A field access is checked HERE, as a WHOLE PATH, and does NOT recurse into
+      -- its base when that base is rooted at the input. Descending instead (what
+      -- this arm did until 2026-08-11) reduced every `t.<anything>` to the query
+      -- `t`, so one declared entry blessed every field of the input: `reads: [t.a]`
+      -- accepted a body reading `t.a + t.b`. The query span now runs from the path's
+      -- ROOT (ast_path_head_start, which descends any depth of AstField) to one past
+      -- the LAST segment (fstart + flen — the outermost node already carries it),
+      -- and is compared against the whole entry spans parse_name_list now stores.
+      --
+      -- The head-is-the-input guard is what makes not-recursing safe: a path rooted
+      -- at a local (a let, a match binder, a lambda item) or at something that is not
+      -- a var at all (head_len 0) takes the else branch and the old walk runs
+      -- unchanged. A shadowed input name is name_bound, so it takes the else branch
+      -- too and the AstVar arm agrees it is not a read. Deeper paths (`t.a.b`) are
+      -- checked once, at the outermost node, exactly as verbosec's expr_to_path
+      -- inserts one multi-segment path and does not also insert its prefixes.
+      AstField(base, fstart, flen) => if ast_path_head_len(base) > 0 and (ast_path_head_len(base) == a.in_len and (name_eq(NameEqState { src: a.src, a_start: a.in_start, b_start: ast_path_head_start(base), len: a.in_len, off: 0 }) == 1 and name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: ast_path_head_start(base), q_len: a.in_len }) == 0)) then (if name_in_namelist(NameInListState { names: a.reads, src: a.src, q_start: ast_path_head_start(base), q_len: fstart + flen - ast_path_head_start(base) }) == 0 then 1 else 0) else count_undecl_read_ast(UndeclReadState { node: base, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       -- Effects tier slice 1: a `read(<resource>)` call site is an INPUT READ in
       -- the purity sense — the resource name MUST appear in the rule's declared
       -- `reads:` list (verbosec parity: the auditor greps `reads:` and finds
@@ -19693,7 +19883,7 @@ rule count_undecl_read_ast
   proofs:
     purity:
       reads : [a.node, a.binds, a.reads, a.in_start, a.in_len, a.src]
-      calls : [count_undecl_read_ast, count_undecl_read_args, name_eq, name_bound, name_in_namelist, count_undecl_read_vfields, count_undecl_read_arms, span_is_read, ast_var_start, ast_var_len, arg_first, span_is_fetch]
+      calls : [count_undecl_read_ast, count_undecl_read_args, name_eq, name_bound, name_in_namelist, count_undecl_read_vfields, count_undecl_read_arms, span_is_read, ast_var_start, ast_var_len, ast_path_head_start, ast_path_head_len, arg_first, span_is_fetch]
     termination:
       bound : 4000
 

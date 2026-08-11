@@ -43912,19 +43912,28 @@ rule two
         };
 
         // Bridge repro: input:-block go with recursion + full proofs — was 0 / SIGTRAP.
-        let go = "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [go]\n    termination:\n      bound : 8\nrule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else s.n + go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        //
+        // These three fixtures declared `reads : [s]` while their bodies read
+        // `s.n` / `s.pos` / `s.source`, and gen0 accepted that until 2026-08-11
+        // because its reads check compared ROOT IDENTS. verbosec refuses the
+        // shape outright — `missing: [s.n], extra: [s]` — so the fixtures were
+        // never valid Verbose; they were valid only against the hole. Corrected
+        // to the real paths when the hole closed. Nothing about the bridge this
+        // test exists to pin is affected: the purity proof is not an input to
+        // rule_params_of, to eval, or to the emitter.
+        let go = "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [go]\n    termination:\n      bound : 8\nrule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else s.n + go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
         assert_eq!(run_driver(&em, go), 15, "bridge: input:-block go must eval to 15 (was 0)");
         assert_eq!(run_compiled(go, "go"), 15, "bridge: input:-block go must compile and print 15 (was SIGTRAP)");
 
         // MILESTONE: word_length written EXACTLY as the self-source writes it.
-        let wl = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule main\n  logic:\n    out = word_length(ScanState { source: \"hello world\", pos: 0 })\n  proofs:\n    purity:\n      reads : []\n      calls : [word_length]\n    termination:\n      bound : 8\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
+        let wl = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule main\n  logic:\n    out = word_length(ScanState { source: \"hello world\", pos: 0 })\n  proofs:\n    purity:\n      reads : []\n      calls : [word_length]\n    termination:\n      bound : 8\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s.source, s.pos]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
         assert_eq!(run_driver(&em, wl), 5, "milestone: real-shape word_length must eval to 5");
         assert_eq!(run_compiled(wl, "wl"), 5, "milestone: real-shape word_length must compile and print 5");
         // The real-shape rule passes the self-hosted proof surfaces clean. V3:
         // the driver mains above carry full proofs now (the gated emitter refuses
         // undeclared calls); wl_only pins the word_length rule's own proofs in
         // isolation.
-        let wl_only = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
+        let wl_only = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s.source, s.pos]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
         assert_eq!(run_driver(&pur, wl_only), 0, "milestone: word_length's purity proof verifies (0 errors)");
         assert_eq!(run_driver(&term, wl_only), 0, "milestone: word_length's increasing proof verifies (0 errors)");
 
@@ -46774,7 +46783,11 @@ rule pick
     ///
     /// First measured 2026-08-10 on ba2b6ff: 21 fixtures, **5 PASS, 15 KNOWN
     /// GAP, 1 INVERSE**. Two of the 15 were closed in the same commit that
-    /// added this test (see `KNOWN_GAPS` group 1), leaving 7 / 13 / 1. The 13
+    /// added this test (see `KNOWN_GAPS` group 1), leaving 7 / 13 / 1. The two
+    /// `*_missing_partial` fixtures added 2026-08-11 make it **23 fixtures,
+    /// 9 PASS, 13 GAP, 1 INVERSE** — the gap set itself did not move, because
+    /// the defect those two exposed was in gen0's reads check, not in its
+    /// coverage of a declaration it never looks at. The 13
     /// are not thirteen surprises — they are three STRUCTURAL causes wearing
     /// thirteen faces, and reading them that way is the point of the sweep:
     ///
@@ -46802,6 +46815,24 @@ rule pick
     ///      is 3 fixtures — and the missing/extra asymmetry is the sharpest
     ///      single finding here, because "gen0 checks purity" reads as true
     ///      right up until you feed it an EXTRA declared read.
+    ///
+    /// THAT THIRD ENTRY WAS ITSELF TOO GENEROUS, AND CATCHING IT IS THE MOST
+    /// USEFUL THING THIS SWEEP HAS DONE. `purity_reads_missing` scored PASS,
+    /// so the MISSING direction read as covered. It was not: the fixture
+    /// declares `reads: []`, and the empty declaration was the only shape gen0
+    /// caught. A PARTIAL under-declaration (`reads: [t.a]` against a body
+    /// reading `t.a + t.b`) was accepted at rc 0 — see
+    /// `two_generation_gen0_detects_partial_purity_underdeclaration` for the
+    /// measurement, the root cause and the fix. **A fixture that passes for the
+    /// wrong reason is worse than a missing one**, because it retires the
+    /// question. Both shapes now have their own fixture (`*_missing` and
+    /// `*_missing_partial`, for reads and for calls), which is the general
+    /// remedy: when a check has more than one failure shape, fixture EACH one —
+    /// do not let the cheapest shape stand in for the family.
+    ///
+    /// The calls half was measured at the same time and was already correct, so
+    /// the asymmetry named above is between MISSING and EXTRA, not between
+    /// reads and calls.
     ///
     /// The 14th, `input_type_unsupported`, is its own thing: verbosec refuses
     /// it at NATIVE rather than at verify, and gen0 mirrors none of verbosec's
@@ -46963,6 +46994,214 @@ rule pick
         let _ = fs::remove_file(&gen0);
         let _ = fs::remove_file(&out_elf);
         let _ = fs::remove_file(std::env::temp_dir().join("verbosec_test_negative_vc.elf"));
+    }
+
+    /// gen0 must refuse a PARTIAL purity under-declaration, not only an empty one.
+    ///
+    /// `purity_reads_missing` reported PASS in the first negative-corpus
+    /// measurement, and that PASS was false. It declares `reads: []`, and
+    /// `reads: []` was the ONLY shape gen0 caught. Measured on 36eccbe:
+    ///
+    /// ```text
+    ///   declares reads: []     , logic reads i.amount    -> gen0 rc=1, 0 bytes
+    ///   declares reads: [t.a]  , logic reads t.a + t.b   -> gen0 rc=0, 720 bytes
+    /// ```
+    ///
+    /// verbosec refuses both (`missing: [i.amount]` / `missing: [t.b]`). gen0's
+    /// reads list stored each entry's ROOT ident only — `[t.a]` put `t` in the
+    /// list — and the walk reduced every `t.<field>` access to the same root
+    /// before querying, so the check answered "is the input mentioned in reads:"
+    /// rather than "is THIS path declared". One declared entry blessed every
+    /// field of the input.
+    ///
+    /// **A partial under-declaration — declare most reads, omit one — is the
+    /// realistic shape of a concealed read**, and the declared `reads:` set IS
+    /// the audit surface: it is what an auditor greps to find every rule that
+    /// touches a field, a resource or the clock. A check that only fires on the
+    /// empty declaration is close to cosmetic.
+    ///
+    /// This is the second time in this arc that a check looked green because the
+    /// probe landed on the working half of the input space (text `==` was the
+    /// first: a stuck-`false` equality is right on every non-matching pair). The
+    /// procedural lesson outlives the fix — **a fixture that passes for the wrong
+    /// reason is worse than a missing one** — so both shapes are pinned here and
+    /// both have their own committed fixture.
+    ///
+    /// THE CORRECTED TWINS ARE NOT PADDING. gen0 refuses with a bare exit 1 and
+    /// zero bytes — no diagnostic, nothing to match a reason against — so a
+    /// refusal alone cannot be attributed to the defect under test. Compiling the
+    /// MINIMALLY corrected program and requiring ACCEPT is what makes the
+    /// attribution: the only thing that changed is the entry that was missing.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_detects_partial_purity_underdeclaration() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_purity_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // Probes live in their own directory with an intent file, so verbosec's
+        // @source existence check resolves and cannot mask the purity verdict.
+        let dir = std::env::temp_dir().join("verbosec_test_purity_probes");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("p.intent"), "title\n1. one\n2. two\n3. three\n4. four\n").unwrap();
+
+        // A one-concept two-field program whose body reads BOTH fields.
+        let reads_probe = |declared: &str| -> String {
+            format!(
+                "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: p.intent:1\n\n  \
+                 fields:\n    a : number [0, 1000]\n    b : number [0, 1000]\n\n\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:2\n\n  input:\n    t : T\n\n  \
+                 output:\n    total : number\n\n  logic:\n    total = t.a + t.b\n\n  \
+                 proofs:\n    purity:\n      reads   : [{declared}]\n      calls   : []\n    \
+                 termination:\n      bound : 2\n"
+            )
+        };
+        // Two helpers, and a gate that calls BOTH.
+        let calls_probe = |declared: &str| -> String {
+            let helper = |n: &str, k: &str, line: &str| {
+                format!(
+                    "rule {n}\n  @intention: \"h\"\n  @source: p.intent:{line}\n\n  input:\n    t : T\n\n  \
+                     output:\n    out : number\n\n  logic:\n    out = t.a + {k}\n\n  \
+                     proofs:\n    purity:\n      reads   : [t.a]\n      calls   : []\n    \
+                     termination:\n      bound : 2\n\n"
+                )
+            };
+            format!(
+                "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: p.intent:1\n\n  \
+                 fields:\n    a : number [0, 1000]\n\n{}{}\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:4\n\n  input:\n    t : T\n\n  \
+                 output:\n    total : number\n\n  logic:\n    total = h1(t) + h2(t)\n\n  \
+                 proofs:\n    purity:\n      reads   : [t]\n      calls   : [{declared}]\n    \
+                 termination:\n      bound : 6\n",
+                helper("h1", "1", "2"), helper("h2", "2", "3")
+            )
+        };
+
+        // gen0's verdict on a source: true == ACCEPTED (exit 0 with bytes written).
+        let out_elf = std::env::temp_dir().join("verbosec_test_purity_out.elf");
+        let gen0_accepts = |label: &str, text: &str| -> bool {
+            let p = dir.join(format!("{label}.verbose"));
+            fs::write(&p, text).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), p.display(), out_elf.display()))
+                .status().expect("run gen0 over a purity probe");
+            let bytes = fs::metadata(&out_elf).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(status.success(), bytes > 0,
+                "{label}: gen0 must either accept AND emit, or refuse AND emit \
+                 nothing — a half-written ELF at exit 1 is the arena-exhaustion \
+                 signature, not a verdict (see CLAUDE.md on max_nodes)");
+            status.success()
+        };
+        // verbosec's verdict over the same text, verify stage only.
+        let verbosec_accepts = |text: &str| -> bool {
+            let toks = crate::lexer::Lexer::new(text).tokenize().unwrap();
+            let prog = crate::parser::Parser::new(toks).parse_program().unwrap();
+            crate::verifier::verify_program(&prog, &dir).is_empty()
+        };
+
+        // ---- reads. The three shapes, in the order that makes a failure legible.
+        let empty = reads_probe("");
+        let partial = reads_probe("t.a");
+        let complete = reads_probe("t.a, t.b");
+        assert!(!verbosec_accepts(&empty) && !verbosec_accepts(&partial)
+                && verbosec_accepts(&complete),
+            "the reads probes must be (refused, refused, accepted) under VERBOSEC \
+             before they can measure anything about gen0");
+
+        assert!(!gen0_accepts("reads_empty", &empty),
+            "reads: [] with a body reading t.a and t.b must be REFUSED. This is \
+             the degenerate shape gen0 always caught; if it regressed, the whole \
+             reads check is gone, not just the path comparison.");
+        assert!(!gen0_accepts("reads_partial", &partial),
+            "THE DEFECT THIS TEST EXISTS FOR: reads: [t.a] with a body reading \
+             t.a AND t.b must be REFUSED (verbosec: `missing: [t.b]`). Accepting \
+             it means the reads list is back to storing ROOT IDENTS, so one \
+             declared entry blesses every field of the input and a concealed read \
+             passes clean. Check parse_name_list (it must store the WHOLE entry \
+             span via path_end) and count_undecl_read_ast's AstField arm (it must \
+             query the whole path, not descend to the root).");
+        assert!(gen0_accepts("reads_complete", &complete),
+            "reads: [t.a, t.b] is CORRECT and must be ACCEPTED. This is what makes \
+             the refusal above attributable: gen0 gives no diagnostic, so without a \
+             corrected twin a refusal for any unrelated reason would score as a pass.");
+
+        // Order is irrelevant — a purity proof is a SET, and verbosec compares sets.
+        assert!(gen0_accepts("reads_reordered", &reads_probe("t.b, t.a")),
+            "declaration ORDER must not matter; verbosec compares HashSets");
+        // Length is compared before bytes, so a longer/shorter neighbour must not
+        // match. Guards against the fix degenerating into a prefix test.
+        assert!(!gen0_accepts("reads_prefix", &reads_probe("t.a, t.bb")),
+            "`t.bb` must NOT satisfy a read of `t.b` — a prefix match here would \
+             re-open the same hole one byte narrower");
+
+        // ---- calls. Measured at the same time and found ALREADY CORRECT: a
+        // `calls:` entry is a bare rule name, so whole-entry and root-ident spans
+        // coincide and the storage bug could not reach it. Pinned so that "calls
+        // was fine" stays a measurement rather than an assumption.
+        let c_empty = calls_probe("");
+        let c_partial = calls_probe("h1");
+        let c_complete = calls_probe("h1, h2");
+        assert!(!verbosec_accepts(&c_empty) && !verbosec_accepts(&c_partial)
+                && verbosec_accepts(&c_complete),
+            "the calls probes must be (refused, refused, accepted) under VERBOSEC");
+        assert!(!gen0_accepts("calls_empty", &c_empty), "calls: [] must be REFUSED");
+        assert!(!gen0_accepts("calls_partial", &c_partial),
+            "calls: [h1] with a body calling h1 AND h2 must be REFUSED \
+             (verbosec: `missing: [h2]`)");
+        assert!(gen0_accepts("calls_complete", &c_complete),
+            "calls: [h1, h2] is CORRECT and must be ACCEPTED — the attribution twin");
+
+        // ---- the EXTRA direction is still a documented GAP, and stays pinned so
+        // that closing it forces the docs and KNOWN_GAPS to move with it. Over-
+        // declaring conceals nothing, which is why it is lower priority; it is
+        // not harmless, because the declared set is the audit surface.
+        let over = reads_probe("t.a, t.b, t.zzz");
+        assert!(!verbosec_accepts(&over),
+            "verbosec must refuse an over-declared reads list (`extra: [t.zzz]`)");
+        assert!(gen0_accepts("reads_extra", &over),
+            "EXPECTED GAP, not a pass: gen0 does not check the EXTRA direction. \
+             If this now refuses, the gap closed — delete purity_reads_extra from \
+             the negative sweep's KNOWN_GAPS, update CLAUDE.md's purity row, and \
+             flip this assertion.");
+
+        // ---- the committed fixtures, so the pin and the corpus cannot drift.
+        for f in ["purity_reads_missing", "purity_reads_missing_partial",
+                  "purity_calls_missing", "purity_calls_missing_partial"] {
+            let text = fs::read_to_string(format!("examples/negative/{f}.verbose")).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < 'examples/negative/{f}.verbose' > '{}' 2>/dev/null",
+                gen0.display(), out_elf.display()))
+                .status().expect("run gen0 over a committed fixture");
+            assert!(!status.success(),
+                "examples/negative/{f}.verbose must be REFUSED by gen0");
+            assert!(!crate::verifier::verify_program(
+                    &crate::parser::Parser::new(
+                        crate::lexer::Lexer::new(&text).tokenize().unwrap())
+                        .parse_program().unwrap(),
+                    std::path::Path::new("examples/negative")).is_empty(),
+                "examples/negative/{f}.verbose must be REFUSED by verbosec too — \
+                 a fixture both compilers accept measures nothing");
+        }
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// gen0's attribute-name / `@layer`-value closed-set check (`attr_errors`).

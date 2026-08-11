@@ -1,0 +1,81 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the logic calls BOTH h1 and h2; `calls:` declares only h1.
+--
+-- The PARTIAL sibling of purity_calls_missing, which declares `calls: []`. Its
+-- reads twin was a live hole (see purity_reads_missing_partial); this one was
+-- measured at the same time and gen0 already refused it, because a `calls:`
+-- entry is a bare rule name — whole entry and root ident are the same bytes, so
+-- the root-ident-only storage that broke reads was lossless here.
+--
+-- It is kept as a fixture anyway: "calls was fine" is a measurement, not a
+-- property, and nothing else in the suite would notice if the two checks ever
+-- drifted apart again.
+--
+-- verbosec: `declared calls do not match logic; missing: [h2]`.
+concept T
+  @intention: "One number"
+  @source: negative.intent:1
+
+  fields:
+    a : number [0, 1000]
+
+rule h1
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    t : T
+
+  output:
+    out : number
+
+  logic:
+    out = t.a + 1
+
+  proofs:
+    purity:
+      reads   : [t.a]
+      calls   : []
+    termination:
+      bound : 2
+
+rule h2
+  @intention: "doc"
+  @source: negative.intent:3
+
+  input:
+    t : T
+
+  output:
+    out : number
+
+  logic:
+    out = t.a + 2
+
+  proofs:
+    purity:
+      reads   : [t.a]
+      calls   : []
+    termination:
+      bound : 2
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:4
+
+  input:
+    t : T
+
+  output:
+    total : number
+
+  logic:
+    total = h1(t) + h2(t)
+
+  proofs:
+    purity:
+      reads   : [t]
+      calls   : [h1]
+    termination:
+      bound : 6
