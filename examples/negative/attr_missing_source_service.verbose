@@ -1,0 +1,60 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the service declares no @source.
+
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 1000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+rule svc_handler
+  @intention: "Return a constant HTTP 200 for every request"
+  @source: negative.intent:3
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service svc
+  @intention: "doc"
+
+  listen:
+    protocol    : http_1_0
+    port        : 18999
+    max_request : 4096
+
+  handler: svc_handler

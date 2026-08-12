@@ -80,6 +80,42 @@ stuck-`false` equality is right on every non-matching pair. So:
   even though calls was measured correct all along, because "calls was fine" is
   a measurement, not a property.
 
+## And a fixture set can SAMPLE a matrix while reading as if it enumerated one
+
+The lesson above is about a fixture that passes for the wrong reason. There is a
+third failure mode, found 2026-08-12, and it is about fixtures nobody wrote.
+
+`@intention` / `@source` presence had **three** fixtures — `rule` × 2 and
+`concept` × 1 — out of a possible **fourteen**. Verbose has seven declaration
+kinds (`rule`, `concept`, `concept_group`, `reaction`, `service`, `resource`,
+`connection`), each requiring both attributes. So "gen0 does not check presence"
+had been *measured* on two kinds and *assumed* for the other five, and "verbosec
+requires both attributes here" had never been checked per-kind at all.
+
+Nothing in the sweep's output hints at this. Three names sitting in `KNOWN_GAPS`
+look exactly like a closed question — the missing cells are invisible precisely
+because a fixture that does not exist produces no row.
+
+- **When a check ranges over a finite set of contexts, enumerate the set and
+  fixture every cell.** Do not generalise from the cell you happened to write
+  first. This is the same discipline the text-position matrix in `CLAUDE.md`
+  applies to output positions.
+- **Derive the reference behaviour per cell from the source**, rather than
+  assuming the kind you tested speaks for the rest. Here it came from the seven
+  `.ok_or_else(|| self.error("... missing @intention" / "@source"))` pairs in
+  `src/parser.rs`, then a probe per kind to confirm the read.
+
+Enumerating turned up **no surprise** — all seven kinds require both attributes,
+unconditionally, with no exemption and no conditional. That is still a result:
+it was not known before it was measured, and it is what licensed making the
+check exact rather than conservative.
+
+The matrix now has all 14 cells plus a 15th, `attr_missing_source_nested_concept`,
+for the shape where a `concept` inside a `concept_group` lacks an attribute while
+the enclosing group carries both. That one is not a duplicate of the plain
+`concept` cell: it is what makes `concept_group`'s nesting load-bearing, and a
+walk that segmented on top-level declarations only would score it clean.
+
 ## Adding a fixture
 
 1. Make it as small as possible and isolate exactly one defect.

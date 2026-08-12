@@ -20971,6 +20971,83 @@ fn build_elf(code: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Give every declaration in a gen0 PROBE its two mandatory attributes.
+    ///
+    /// Context (attribute-presence slice, 2026-08-12). gen0 now enforces
+    /// mandatory `@intention` / `@source` on every declaration, exactly as
+    /// verbosec always has. The inline probes throughout these tests predate
+    /// that check and were written in gen0's "header-less" dialect — no
+    /// `@verbose` line, no attributes — because gen0 checked neither. They were
+    /// therefore invalid Verbose in two independent ways, and 55 tests were
+    /// resting on the gap. **That the whole probe corpus had drifted into the
+    /// permissive dialect is itself the finding**; the check is not being
+    /// relaxed to accommodate it.
+    ///
+    /// This is applied at the gen0 invocation sites rather than by editing ~100
+    /// dense string literals, and it is safe to apply BLINDLY because it is
+    /// IDEMPOTENT: a declaration that already carries an attribute is left
+    /// exactly as it is, so a verbatim `examples/*.verbose` passed through this
+    /// is unchanged byte-for-byte, and only a probe (or a prepended driver
+    /// `rule main`) actually gains lines. It cannot mask a defect either — the
+    /// attributes it adds are pure traceability, so a probe that is invalid for
+    /// any OTHER reason (bad purity, a short termination bound, an undefined
+    /// callee) stays exactly as invalid, which is what keeps the verify-gate
+    /// and refusal tests meaningful.
+    ///
+    /// A declaration header is `<keyword> <space(s)> <identifier>` — the same
+    /// shape gen0's own `decl_header_at` recognises, so this helper and the rule
+    /// under test agree on where a declaration starts.
+    fn with_probe_attrs(src: impl AsRef<str>) -> String {
+        let src: &str = src.as_ref();
+        const KW: &[&str] = &["concept_group", "concept", "rule", "reaction",
+                              "service", "resource", "connection"];
+        let header_indent = |line: &str| -> Option<usize> {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            let s = line.trim_start_matches(' ');
+            for kw in KW {
+                if let Some(rest) = s.strip_prefix(kw) {
+                    if rest.starts_with(' ')
+                        && rest.trim_start_matches(' ').chars().next()
+                            .map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false) {
+                        return Some(indent);
+                    }
+                }
+            }
+            None
+        };
+        let lines: Vec<&str> = src.lines().collect();
+        let hdrs: Vec<(usize, usize)> = lines.iter().enumerate()
+            .filter_map(|(i, l)| header_indent(l).map(|ind| (i, ind))).collect();
+        if hdrs.is_empty() {
+            return src.to_string();
+        }
+        let mut out: Vec<String> = Vec::with_capacity(lines.len() + hdrs.len() * 2);
+        let mut next = 0usize;
+        for (n, &(i, ind)) in hdrs.iter().enumerate() {
+            for l in &lines[next..=i] {
+                out.push((*l).to_string());
+            }
+            let end = hdrs.get(n + 1).map(|&(j, _)| j).unwrap_or(lines.len());
+            let body = lines[i + 1..end].join("\n");
+            let pad = " ".repeat(ind + 2);
+            if !body.contains("@intention") {
+                out.push(format!("{pad}@intention: \"probe\""));
+            }
+            if !body.contains("@source") {
+                out.push(format!("{pad}@source: probe.intent:1"));
+            }
+            next = i + 1;
+        }
+        for l in &lines[next..] {
+            out.push((*l).to_string());
+        }
+        let mut s = out.join("\n");
+        if src.ends_with('\n') {
+            s.push('\n');
+        }
+        s
+    }
+
     #[test]
     fn emit_open_append_embeds_path_and_syscall() {
         // Smoke test: emit_open_append produces non-empty bytes including the
@@ -21395,7 +21472,7 @@ rule le64_neg
         for &(expr, expected) in cases {
             // 1. emit machine code via the recursive streaming-bytes emitter.
             let mc = Command::new(&x86)
-                .args([expr, "0"])
+                .args([with_probe_attrs(expr).as_str(), "0"])
                 .output()
                 .expect("spawn x86_expr_src");
             assert!(
@@ -21425,7 +21502,7 @@ rule le64_neg
             // 3. cross-check against eval_expr (the interpreter-parity native
             //    evaluator of the SAME parse) and the hand value.
             let ev = Command::new(&eval)
-                .args([expr, "0"])
+                .args([with_probe_attrs(expr).as_str(), "0"])
                 .output()
                 .expect("spawn eval_expr");
             assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
@@ -21497,7 +21574,7 @@ rule le64_neg
         for &(expr, expected) in cases {
             // 1. emit machine code via the recursive streaming-bytes emitter.
             let mc = Command::new(&x86)
-                .args([expr, "0"])
+                .args([with_probe_attrs(expr).as_str(), "0"])
                 .output()
                 .expect("spawn x86_expr_src");
             assert!(
@@ -21527,7 +21604,7 @@ rule le64_neg
             // 3. cross-check against eval_expr (interpreter-parity native
             //    evaluator of the SAME parse) and the hand value.
             let ev = Command::new(&eval)
-                .args([expr, "0"])
+                .args([with_probe_attrs(expr).as_str(), "0"])
                 .output()
                 .expect("spawn eval_expr");
             assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
@@ -21607,7 +21684,7 @@ rule le64_neg
         for &(prog_src, expected) in cases {
             // 1. emit the program blob via the recursive streaming-bytes emitter.
             let mc = Command::new(&x86)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn x86_program_src");
             assert!(
@@ -21637,7 +21714,7 @@ rule le64_neg
             // 3. cross-check against eval_main (the interpreter-parity native
             //    evaluator of the SAME program) and the hand value.
             let ev = Command::new(&em)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn eval_main");
             assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
@@ -21700,7 +21777,7 @@ rule le64_neg
 
         for &(prog_src, expected) in cases {
             let ev = Command::new(&em)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn eval_main");
             assert!(
@@ -21773,7 +21850,7 @@ rule le64_neg
             assert_eq!(oracle(prog_src), *expected, "slice-1 oracle disagreement for {:?}", prog_src);
 
             // Emit the ELF via the self-hosted emitter.
-            let mc = Command::new(&elf).args([*prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(*prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
             let elf_bytes = mc.stdout;
@@ -21849,7 +21926,7 @@ rule le64_neg
             .expect("verbosec must compile `validate` natively");
 
         // Emit the ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
-        let mc = Command::new(&elf).args([prog_src, "0"]).output()
+        let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
             .expect("spawn elf_program_src");
         assert!(mc.status.success(), "elf_program_src must exit 0; got {:?}", mc.status);
         let elf_bytes = mc.stdout;
@@ -21949,7 +22026,7 @@ rule le64_neg
 
         // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
             let bytes = mc.stdout;
@@ -22065,7 +22142,7 @@ rule le64_neg
 
         // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
             let bytes = mc.stdout;
@@ -22183,7 +22260,7 @@ rule le64_neg
 
         // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
             let bytes = mc.stdout;
@@ -22322,7 +22399,7 @@ rule le64_neg
 
         // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
             let bytes = mc.stdout;
@@ -22454,7 +22531,7 @@ rule le64_neg
         let prog_self_let = "concept W\n  fields:\n    xs : collection(number)\nrule scaled\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    let k = 2\n    r = map(w.xs, x => x * k)";
 
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
             let bytes = mc.stdout;
@@ -22582,7 +22659,7 @@ rule le64_neg
         let self_map_src = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept Tagged\n  fields:\n    v : number\n    p : number\nconcept W\n  fields:\n    orders : collection(Order)\nrule tag\n  input:\n    w : W\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.orders, o => Tagged { v: o.amount * 2, p: o.priority })";
 
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?} (self-verify gate)", tag, mc.status);
             let bytes = mc.stdout;
@@ -22712,7 +22789,7 @@ rule le64_neg
         let self_two_src = "concept Person\n  fields:\n    first : text\n    last : text\nconcept Crowd\n  fields:\n    people : collection(Person)\nrule names_line\n  input:\n    c : Crowd\n  output:\n    r : text\n  logic:\n    r = fold(c.people, \"names: \", acc, p => concat(acc, p.first, \" \", p.last, \"; \"))";
 
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?} (self-verify gate)", tag, mc.status);
             let bytes = mc.stdout;
@@ -22894,7 +22971,7 @@ rule le64_neg
         let prog_mism_txt = "concept W\n  fields:\n    xs : collection(number)\nrule mism2\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.xs, 0, acc, x => acc + x)";
 
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
             let bytes = mc.stdout;
@@ -23075,7 +23152,7 @@ rule le64_neg
 
         // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
             let bytes = mc.stdout;
@@ -23182,7 +23259,7 @@ rule le64_neg
 
         // Emit a target ELF via gen0 (argv[1] = header-less source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(),
                 "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
@@ -23318,7 +23395,7 @@ rule le64_neg
             "@verbose 0.1.0\n\nresource cfg\n  @intention: \"c\"\n  @source: e.intent:1\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\n\nconcept Src\n  @intention: \"s\"\n  @source: e.intent:1\n  fields:\n    data : text [..4194304]\n\nrule main\n  @intention: \"m\"\n  @source: e.intent:1\n  input:\n    s : Src\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
             fpath);
 
-        let mc = Command::new(&elf).args([self_src.as_str(), "0"]).output()
+        let mc = Command::new(&elf).args([with_probe_attrs(self_src).as_str(), "0"]).output()
             .expect("spawn elf_program_src");
         assert!(mc.status.success(), "gen0 must emit the stdin-channel target; got {:?}", mc.status);
         assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted stdin target not ELF");
@@ -23393,7 +23470,7 @@ rule le64_neg
 
         // Resource-free, argv entry, texty body -> the argv marshal runs.
         let prog = "concept T\n  fields:\n    go : number\nrule main\n  input:\n    t : T\n  output:\n    out : text\n  logic:\n    out = concat(\"go=\", \"x\")\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8";
-        let mc = Command::new(&elf).args([prog, "0"]).output().expect("spawn gen0");
+        let mc = Command::new(&elf).args([with_probe_attrs(prog).as_str(), "0"]).output().expect("spawn gen0");
         assert!(mc.status.success(), "gen0 must emit the resource-free texty program");
         let bytes = mc.stdout;
         // The argv marshal's mmap length: mov esi, imm32 = BE followed by the
@@ -23434,10 +23511,10 @@ rule le64_neg
             .expect("count_purity_errors must compile natively");
 
         let run_gate = |prog: &str| -> std::process::Output {
-            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+            Command::new(&gate).args([with_probe_attrs(prog).as_str(), "0"]).output().expect("spawn gate")
         };
         let purity_count = |prog: &str| -> i64 {
-            let o = Command::new(&purity).args([prog, "0"]).output().expect("spawn purity");
+            let o = Command::new(&purity).args([with_probe_attrs(prog).as_str(), "0"]).output().expect("spawn purity");
             assert!(o.status.success(), "count_purity_errors must run");
             String::from_utf8_lossy(&o.stdout).trim().parse::<i64>()
                 .unwrap_or_else(|_| panic!("purity count not an int: {:?}", o.stdout))
@@ -23509,7 +23586,7 @@ rule le64_neg
             lpath);
 
         // Emit the self reaction ELF via gen0.
-        let mc = Command::new(&elf).args([self_src.as_str(), "0"]).output()
+        let mc = Command::new(&elf).args([with_probe_attrs(self_src).as_str(), "0"]).output()
             .expect("spawn elf_program_src");
         assert!(mc.status.success(), "gen0 must emit the reaction target; got {:?}", mc.status);
         assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted reaction not ELF");
@@ -23590,7 +23667,7 @@ rule le64_neg
             let prog_src = format!(
                 "concept P\n  fields:\n    v : number [0, 150]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 18\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\nreaction r\n  trigger: fire\n  effects:\n    append_file \"{}\" \"a{}b\"",
                 lpath, escaped);
-            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output().expect("spawn gen0");
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output().expect("spawn gen0");
             assert!(mc.status.success(), "gen0 must emit for escape {:?}; got {:?}", escaped, mc.status);
             let bin = std::env::temp_dir().join("verbosec_test_eff_s2_esc_bin");
             fs::write(&bin, &mc.stdout).unwrap();
@@ -23637,7 +23714,7 @@ rule le64_neg
             .expect("elf_program_src must compile natively");
 
         let run_gate = |prog: &str| -> std::process::Output {
-            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+            Command::new(&gate).args([with_probe_attrs(prog).as_str(), "0"]).output().expect("spawn gate")
         };
         let refuses = |prog: &str, why: &str| {
             let o = run_gate(prog);
@@ -23723,7 +23800,7 @@ rule le64_neg
             let self_src = format!(
                 "{}reaction audit_suspicious\n  trigger: is_suspicious\n  effects:\n    append_file \"{}\" {}",
                 head, lpath, content);
-            let mc = Command::new(&elf).args([self_src.as_str(), "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(self_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "gen0 must emit the {} reaction; got {:?}", tag, mc.status);
             assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46],
@@ -23822,7 +23899,7 @@ rule le64_neg
             .expect("elf_program_src must compile natively");
 
         let run_gate = |prog: &str| -> std::process::Output {
-            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+            Command::new(&gate).args([with_probe_attrs(prog).as_str(), "0"]).output().expect("spawn gate")
         };
         let refuses = |prog: &str, why: &str| {
             let o = run_gate(prog);
@@ -23896,7 +23973,7 @@ rule le64_neg
             format!("@verbose 0.1.0\n\nconnection upstream\n  @intention: \"u\"\n  @source: invoices.intent:1\n  host: \"127.0.0.1\"\n  port: {}\n  max_response: 1024\n  on_connect_error: abort\n\nconcept Tick\n  @intention: \"t\"\n  @source: invoices.intent:1\n  fields:\n    nonce : number [0, 1000000]\n\nrule check_health\n  @intention: \"c\"\n  @source: invoices.intent:1\n  input:\n    t : Tick\n  output:\n    {}\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : [upstream]\n      calls : []\n    termination:\n      bound : 4", port, output, logic)
         };
         let emit_self = |hdrless: &str, tag: &str| -> std::path::PathBuf {
-            let mc = Command::new(&elf).args([hdrless, "0"]).output().expect("spawn gen0");
+            let mc = Command::new(&elf).args([with_probe_attrs(hdrless).as_str(), "0"]).output().expect("spawn gen0");
             assert!(mc.status.success() && mc.stdout.len() >= 4 && &mc.stdout[0..4] == b"\x7fELF",
                 "gen0 must emit an ELF for {}; got {:?} stderr={:?}", tag, mc.status, String::from_utf8_lossy(&mc.stderr));
             let out = std::env::temp_dir().join(format!("verbosec_test_eff_s3_{}_self", tag));
@@ -24001,10 +24078,10 @@ rule le64_neg
             .expect("count_purity_errors must compile natively");
 
         let run_gate = |prog: &str| -> std::process::Output {
-            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+            Command::new(&gate).args([with_probe_attrs(prog).as_str(), "0"]).output().expect("spawn gate")
         };
         let purity_count = |prog: &str| -> i64 {
-            let o = Command::new(&purity).args([prog, "0"]).output().expect("spawn purity");
+            let o = Command::new(&purity).args([with_probe_attrs(prog).as_str(), "0"]).output().expect("spawn purity");
             assert!(o.status.success(), "count_purity_errors must run");
             String::from_utf8_lossy(&o.stdout).trim().parse::<i64>()
                 .unwrap_or_else(|_| panic!("purity count not an int: {:?}", o.stdout))
@@ -24122,7 +24199,7 @@ rule le64_neg
         );
 
         // Emit the server ELF via gen0 (one-shot: gen0 emits + exits).
-        let gen = Command::new(&elf).args([source.as_str(), "0"]).output()
+        let gen = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output()
             .expect("spawn gen0");
         assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
             "gen0 must emit a service ELF; got {:?} stderr={:?}",
@@ -24207,7 +24284,7 @@ rule le64_neg
                 "rule echo_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse {{ status: 200, body: req.{f} }}\n  proofs:\n    purity:\n      reads : [req.{f}]\n      calls : []\n    termination:\n      bound : 1\nservice echo_server\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: echo_handler",
                 f = field, p = port
             );
-            let gen = Command::new(&elf).args([source.as_str(), "0"]).output()
+            let gen = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output()
                 .expect("spawn gen0");
             assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
                 "gen0 must emit an S2 service ELF ({field}); got {:?} stderr={:?}",
@@ -24311,7 +24388,7 @@ rule le64_neg
                 "rule route\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = if req.{f} == \"{v}\" then HttpResponse {{ status: {sa}, body: \"{ba}\" }} else HttpResponse {{ status: {sb}, body: \"{bb}\" }}\n  proofs:\n    purity:\n      reads : [req.{f}]\n      calls : []\n    termination:\n      bound : 8\nservice router_srv\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: route",
                 f = field, v = val, sa = sa, ba = ba, sb = sb, bb = bb, p = port
             );
-            let gen = Command::new(&elf).args([source.as_str(), "0"]).output()
+            let gen = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output()
                 .expect("spawn gen0");
             assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
                 "gen0 must emit an S3 router ELF ({field}); got {:?} stderr={:?}",
@@ -24421,7 +24498,7 @@ rule le64_neg
                 "rule concat_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse {{ status: 200, body: {b} }}\n  proofs:\n    purity:\n      reads : {r}\n      calls : []\n    termination:\n      bound : 8\nservice concat_server\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: concat_handler",
                 b = body, r = reads, p = port
             );
-            let gen = Command::new(&elf).args([source.as_str(), "0"]).output()
+            let gen = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output()
                 .expect("spawn gen0");
             assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
                 "gen0 must emit an S4 concat-body ELF ({tag}); got {:?} stderr={:?}",
@@ -24703,12 +24780,12 @@ rule le64_neg
         // the hash is reproducible; the server is never spawned for this check.
         // ---------------------------------------------------------------------
         let nolog_src = "rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: \"Hello from Verbose over HTTP!\" }\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nservice hello_server\n  listen:\n    protocol : http_1_0\n    port : 18991\n    max_request : 4096\n  handler: hello_handler";
-        let nolog = Command::new(&elf).args([nolog_src, "0"]).output().expect("spawn gen0");
+        let nolog = Command::new(&elf).args([with_probe_attrs(nolog_src).as_str(), "0"]).output().expect("spawn gen0");
         assert!(nolog.status.success(), "gen0 must emit the no-log service; got {:?}", nolog.status);
-        assert_eq!(nolog.stdout.len(), 931, "no-log service ELF size drifted");
+        assert_eq!(nolog.stdout.len(), 1027, "no-log service ELF size drifted");
         assert_eq!(
             sha256_hex(&nolog.stdout),
-            "ff8f967405f490dd22318f019d500ac1fe104d93ba46de21eead3418ea1566e8",
+            "e41d17e315944207dc12efe3a1e594c90f76a2f72f8d0a2b7bc07f41e42129d4",
             "a service WITHOUT a log block must emit BYTE-IDENTICALLY to pre-S5a gen0 \
              (logsz is 0 by construction when no log block is declared)"
         );
@@ -24735,7 +24812,7 @@ rule le64_neg
                 "rule h5a\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {lg}\n  proofs:\n    purity:\n      reads : {rd}\n      calls : []\n    termination:\n      bound : {bd}\nservice s5a\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: h5a{lb}",
                 lg = logic, rd = reads, bd = bound, p = port, lb = logblock
             );
-            let gen = Command::new(&elf).args([source.as_str(), "0"]).output().expect("spawn gen0");
+            let gen = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn gen0");
             assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
                 "gen0 must emit the S5a server ({tag}); got {:?} stderr={:?}",
                 gen.status, String::from_utf8_lossy(&gen.stderr));
@@ -24953,7 +25030,7 @@ rule le64_neg
             .expect("elf_program_src must compile natively");
 
         let emit = |source: &str| -> std::process::Output {
-            Command::new(&elf).args([source, "0"]).output().expect("spawn gen0")
+            Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn gen0")
         };
 
         // A fixed-port, fixed-log-path service source. `param` is the handler's INPUT
@@ -24976,10 +25053,10 @@ rule le64_neg
         let nolog_hello = "rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: \"Hello from Verbose over HTTP!\" }\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nservice hello_server\n  listen:\n    protocol : http_1_0\n    port : 18991\n    max_request : 4096\n  handler: hello_handler";
         let h = emit(nolog_hello);
         assert!(h.status.success(), "gen0 must emit the no-log hello service");
-        assert_eq!(h.stdout.len(), 931, "no-log service ELF size drifted");
+        assert_eq!(h.stdout.len(), 1027, "no-log service ELF size drifted");
         assert_eq!(
             sha256_hex(&h.stdout),
-            "ff8f967405f490dd22318f019d500ac1fe104d93ba46de21eead3418ea1566e8",
+            "e41d17e315944207dc12efe3a1e594c90f76a2f72f8d0a2b7bc07f41e42129d4",
             "a service WITHOUT a log block must STILL emit byte-identically \
              (the S5a pin, NR:24283, must survive S5b's de-baking of S2's two \
               hardcoded je targets — le32(399) reproduces \\x8f\\x01\\x00\\x00 exactly)"
@@ -25001,9 +25078,14 @@ rule le64_neg
         // pre-S5a value and must NEVER move (the whole log term is gated on
         // svc_log_present); the static-log column is re-pinned per slice that changes
         // the emitted block — 5b.5 is such a slice.
+        // RE-BASELINED 2026-08-12 — same reason and same shape as the table in
+        // `self_hosted_service_concurrency_forked`: `with_probe_attrs` adds the two
+        // now-mandatory attributes to each of this probe's 2 declarations (+96 B of
+        // SOURCE), so every row moved by exactly +96 or exactly 0. The 0 row is the
+        // shape whose ELF embeds no source blob. The emitter is untouched.
         let pins: [(usize, &str, usize, &str); 4] = [
-            (847,  "d561c6ff84133a80065cdee16aa069ff671c9be858029043fe7f3cdcd87bf350",
-             1025, "8398da38d096f3aa6470f9ce94cd64c3e7d0a1a1c3976655041972fa389aac53"),
+            (943,  "df0770af321996236635c5c8be662691112d86ec14b830d1bc11b88699c0df96",
+             1121, "85990be98540cd48ba125d8a5e6a8e98f87e7dfb273d534f02d3e3469fcc63bc"),
             (880,  "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e",
              1006, "6e52e040bd828b21c8dc5548234df4d7c7ced1cafeb51d5a731d46551327a9c2"),
             // s3 re-pinned +53 by the text-equality slice (2026-08-08): its handler
@@ -25012,10 +25094,10 @@ rule le64_neg
             // but it is present and it grew). 65 B for the packed-span byte compare
             // in place of the 12 B integer compare. s1/s2/s4 have no `==` and are
             // byte-identical, which is what localises the change to this one shape.
-            (1333, "a7fbcbc17588fdc5b43fbe3c3b40d95bbb847a8ce5d582a223781b0ff32dcbb3",
-             1507, "e4b72a8815b3e5b92721a454d0ffd97e2632f7099205ff1ee120a13f3e61e812"),
-            (1274, "89b6b2752bc9f8665feee9f8ef43e39677d71400292ee0a99cf243e9a3584fa5",
-             1448, "8be9c89ed63ababd8a8c5c84735e774557e014a5955088ef0ed583acef1381c0"),
+            (1429, "56ef93131eab5cd1cb838cc7637d9da5d3261fdf3d4f7b6089e3b31dea6832f6",
+             1603, "42976d7d993955d3787a3a17d8a63608fa3e12bf43886d9618465dac8d0afb32"),
+            (1370, "9cd598fff90d51cfd87524569dbe88b20ae8f2b11d53e5b544448df2c0593946",
+             1544, "932456e179b64f1a6f4c282401e52dd5f9692015947f803bb7349959aeea8871"),
         ];
         // STATIC-LOG columns re-pinned by SLICE 5d (2026-08-10), which moved a static
         // log block from the pre-read slot to the post-parse one so a dropped request
@@ -25375,7 +25457,7 @@ rule le64_neg
         compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
             .expect("elf_program_src must compile natively");
         let emit = |source: &str| -> std::process::Output {
-            Command::new(&elf).args([source, "0"]).output().expect("spawn gen0")
+            Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn gen0")
         };
 
         // The four body shapes, so the +34 is checked on every branch AND on both log
@@ -25748,7 +25830,7 @@ rule le64_neg
         compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
             .expect("elf_program_src must compile natively");
         let emit = |source: &str| -> std::process::Output {
-            Command::new(&elf).args([source, "0"]).output().expect("spawn gen0")
+            Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn gen0")
         };
 
         // The service-source template. Kept character-for-character stable because the
@@ -25853,9 +25935,18 @@ rule le64_neg
         let static_log = "\n  log:\n    append_file \"/tmp/vx_ref.log\" \"hit\\n\"";
         let field_log = "\n  log:\n    append_file \"/tmp/vx_ref.log\" concat(req.method, \" \", req.path, \"\\n\")";
         // (shape, log variant, size, pre-S8 sha256)
+        // RE-BASELINED 2026-08-12 by the attribute-presence slice, and the SHAPE of
+        // the move is the proof that the EMITTER did not change. gen0 now requires
+        // `@intention` / `@source` on every declaration, so `with_probe_attrs` adds
+        // both to this test's probes: 48 B per declaration x 2 declarations (the
+        // handler rule + the service) = 96 B of extra SOURCE. Every row here moved
+        // by EXACTLY +96 or by EXACTLY 0 — nothing in between, and no row changed
+        // bytes while keeping its size. The zeros are the s2 rows, whose emitted
+        // ELF does not embed the source blob at all, so a longer source cannot
+        // reach them. A genuine emitter change could not produce that pattern.
         let pins: [(&str, &str, usize, &str); 11] = [
-            ("s1", "", 847, "c20fc86f413cb1c49054e040a33c17a4ec5e77daed47f5a031d446378f906724"),
-            ("s1", "static", 1021, "324ba08d390cdf08d6b1896e3fc1dc16fbd2f350e207d417423bc779cd1352fa"),
+            ("s1", "", 943, "eb81cac4f4d7e759c518c76f32eea1a5306acffcf779060fa779513836469871"),
+            ("s1", "static", 1117, "1496da8aec889b0be4bf07cf8d9b21e3de0d15ca2c1b71e670ee72b54b86c6d0"),
             ("s2", "", 880, "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e"),
             ("s2", "static", 1006, "6e52e040bd828b21c8dc5548234df4d7c7ced1cafeb51d5a731d46551327a9c2"),
             ("s2", "field", 1092, "f90d706fa496a725c0c530b020e83a0b3addfce986c17326f6c46ea253a60b64"),
@@ -25872,12 +25963,12 @@ rule le64_neg
             // only the two parse-fail je rel32s moved. `s1/static` is byte-identical
             // (the constant-response branch has no parse and so no post-parse slot),
             // as are all four no-log rows and both `field` rows.
-            ("s3", "", 1329, "428fd712cdba0ee8557fae9153d65df3c397fc79d934497e07f37e1c264f0df7"),
-            ("s3", "static", 1503, "dfcbb68ff02b38093bf5123872daecc946e2e674cbbc5e2277beb01b96e458e5"),
-            ("s3", "field", 1621, "87799a2ca23dfe34eee240015955f64cfaaf1649cb6b2eb17026c419d5e6d065"),
-            ("s4", "", 1270, "e02614cca202fc60bf1c673b6937069be4f66207fa6c85bbc7389532312d4e03"),
-            ("s4", "static", 1444, "8fe2d3cc8cc476c2bf0497dad52afd08ec39ec8e3ceaa23d68131727d47a2a5f"),
-            ("s4", "field", 1562, "9291eef4fe9d6555759fb667a5c316a3bdb47346c60c05a40de557a754e36969"),
+            ("s3", "", 1425, "f15fad310e38d42b7f3c488025aacd7a61db7d32908c906091299b7ce46004a9"),
+            ("s3", "static", 1599, "be6bad2bab7f2f21d7f8aad8045da155bf2a0169314828dc3ef96c2299265a32"),
+            ("s3", "field", 1717, "8ee06503ef611d412ba4f1c674bae821cc97f544169d03bed527a13bb54b0934"),
+            ("s4", "", 1366, "629bf06e1fddd1ea76f3475d280197341fdeea658d6048e12fb37c2cb56a902e"),
+            ("s4", "static", 1540, "68a6bc01a4b4008bb6a253dc138e93bdae3463cf5c82ea9ed1ebf1b5df1c5f93"),
+            ("s4", "field", 1658, "63de8ba68c995e8cfc175b6ebcc7abf01bcb5a7a1d4bf190cad169eeec0f1401"),
         ];
         let logblock = |v: &str| -> &str {
             match v { "static" => static_log, "field" => field_log, _ => "" }
@@ -26260,7 +26351,7 @@ rule le64_neg
             .expect("elf_program_src must compile natively");
 
         let run = |prog: &str| -> std::process::Output {
-            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+            Command::new(&gate).args([with_probe_attrs(prog).as_str(), "0"]).output().expect("spawn gate")
         };
         let refuse = |prog: &str, why: &str| {
             let o = run(prog);
@@ -26635,7 +26726,7 @@ rule le64_neg
 
         for &(expr, expected) in cases {
             let mc = Command::new(&x86)
-                .args([expr, "0"])
+                .args([with_probe_attrs(expr).as_str(), "0"])
                 .output()
                 .expect("spawn x86_expr_src");
             assert!(mc.status.success(), "x86_expr_src must exit 0 for {:?}", expr);
@@ -26654,7 +26745,7 @@ rule le64_neg
             };
 
             let ev = Command::new(&eval)
-                .args([expr, "0"])
+                .args([with_probe_attrs(expr).as_str(), "0"])
                 .output()
                 .expect("spawn eval_expr");
             assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
@@ -26703,7 +26794,7 @@ rule le64_neg
 
         for &(prog_src, expected) in prog_cases {
             let mc = Command::new(&xp)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn x86_program_src");
             assert!(mc.status.success(), "x86_program_src must exit 0 for {:?}", prog_src);
@@ -26722,7 +26813,7 @@ rule le64_neg
             };
 
             let ev = Command::new(&em)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn eval_main");
             assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
@@ -26778,7 +26869,7 @@ rule le64_neg
 
         for &(prog_src, expected) in cases {
             let mc = Command::new(&x86)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn x86_program_src");
             assert!(mc.status.success(), "x86_program_src must exit 0 for {:?}", prog_src);
@@ -26797,7 +26888,7 @@ rule le64_neg
             };
 
             let ev = Command::new(&em)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn eval_main");
             assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
@@ -26863,7 +26954,7 @@ rule le64_neg
         for &(prog_src, expected) in cases {
             // 1. emit the program blob via the recursive streaming-bytes emitter.
             let mc = Command::new(&x86)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn x86_program_src");
             assert!(
@@ -26889,7 +26980,7 @@ rule le64_neg
             // 3. cross-check against eval_main (interpreter-parity native
             //    evaluator of the SAME program) and the hand value.
             let ev = Command::new(&em)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn eval_main");
             assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
@@ -26961,7 +27052,7 @@ rule le64_neg
         for (i, &(prog_src, expected)) in cases.iter().enumerate() {
             // 1. emit the ELF bytes via the recursive streaming-bytes emitter.
             let mc = Command::new(&elf)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn elf_program_src");
             assert!(
@@ -27006,7 +27097,7 @@ rule le64_neg
 
             // cross-check against eval_main (interpreter-parity native evaluator).
             let ev = Command::new(&em)
-                .args([prog_src, "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn eval_main");
             assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
@@ -27076,7 +27167,7 @@ rule le64_neg
         // sums of the precomputed ProcSizeList.
         let prog_src = "rule main\n  logic:\n    out = double(add(3, 4))\n  proofs:\n    purity:\n      reads : []\n      calls : [double, add]\n    termination:\n      bound : 8\nrule add(x, y)\n  logic:\n    out = x + y\n  proofs:\n    purity:\n      reads : [x, y]\n      calls : []\n    termination:\n      bound : 8\nrule double(x)\n  logic:\n    out = x * 2\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8";
 
-        let mc = Command::new(&elf).args([prog_src, "0"]).output().expect("spawn emitter");
+        let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output().expect("spawn emitter");
         assert!(mc.status.success(), "elf_program_src must exit 0; got {:?}", mc.status);
         let elf_bytes = mc.stdout;
         assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitter output must be an ELF");
@@ -27151,7 +27242,7 @@ rule le64_neg
 
         for (i, (prog_src, expected, uses_var)) in cases.iter().enumerate() {
             let mc = Command::new(&elf)
-                .args([prog_src.as_str(), "0"])
+                .args([with_probe_attrs(prog_src).as_str(), "0"])
                 .output()
                 .expect("spawn elf_program_src");
             assert!(
@@ -27278,7 +27369,7 @@ rule le64_neg
                 "R6c oracle disagreement for {:?}", prog_src
             );
 
-            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
             let elf_bytes = mc.stdout;
@@ -27392,7 +27483,7 @@ rule le64_neg
             // Cross-check the interpreter oracle agrees with the expected value.
             assert_eq!(oracle(prog_src), *expected, "slice-2 oracle disagreement for {:?}", prog_src);
 
-            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
             let elf_bytes = mc.stdout;
@@ -27502,7 +27593,7 @@ rule le64_neg
             // Cross-check the interpreter oracle agrees with the expected value.
             assert_eq!(oracle(prog_src), *expected, "oracle disagreement for {:?}", prog_src);
 
-            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
             let elf_bytes = mc.stdout;
@@ -43341,7 +43432,12 @@ rule two
         for (i, (prog_src, expected)) in cases.iter().enumerate() {
             assert_eq!(oracle(prog_src), *expected, "oracle disagreement for {:?}", prog_src);
 
-            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+            // Attribute ONCE and reuse: the embedding assertion below looks for
+            // this exact text inside the emitted blob, so it has to be the text
+            // that was actually compiled, not the pre-attribute original.
+            let prog_src = with_probe_attrs(prog_src);
+            let prog_src = prog_src.as_str();
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
                 .expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
             let elf_bytes = mc.stdout;
@@ -43373,7 +43469,7 @@ rule two
         // Text-free gate: no embedding, p_filesz covers exactly the whole file
         // (the appended-source extension never fires without program_uses_text).
         let text_free = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\n  proofs:\n    purity:\n      reads : []\n      calls : [get_a]\n    termination:\n      bound : 8\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b\n  proofs:\n    purity:\n      reads : [s.a, s.b]\n      calls : []\n    termination:\n      bound : 8";
-        let mc = Command::new(&elf).args([text_free, "0"]).output().expect("spawn elf_program_src");
+        let mc = Command::new(&elf).args([with_probe_attrs(text_free).as_str(), "0"]).output().expect("spawn elf_program_src");
         assert!(mc.status.success(), "elf_program_src must exit 0 for the text-free program");
         let tf_bytes = mc.stdout;
         let p_filesz = u64::from_le_bytes(tf_bytes[96..104].try_into().unwrap());
@@ -43406,7 +43502,7 @@ rule two
         compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
             .expect("elf_program_src must compile natively");
 
-        let mc = Command::new(&elf).args([prog_src, "0"]).output().expect("spawn gen0");
+        let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output().expect("spawn gen0");
         assert!(mc.status.success(), "gen0 must exit 0 emitting {:?}", prog_src);
         assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "gen0 must emit an ELF");
 
@@ -43476,7 +43572,7 @@ rule two
         let em = std::env::temp_dir().join("verbosec_test_failclosed_eval_main");
         compile_native(&program, "eval_main", em.to_str().unwrap(), false, false).unwrap();
         let r = std::process::Command::new(&em)
-            .args(["rule main\n  logic:\n    out = byte_at(\"abc\", 99)", "0"])
+            .args([with_probe_attrs("rule main\n  logic:\n    out = byte_at(\"abc\", 99)").as_str(), "0"])
             .output().expect("spawn eval_main");
         assert!(r.status.success(), "the INTERPRETER must not abort on OOB");
         assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "0",
@@ -43894,7 +43990,7 @@ rule two
                 .unwrap_or_else(|_| panic!("driver {:?} produced non-number for {:?}: {:?}", bin, source, r.stdout))
         };
         let run_compiled = |source: &str, tag: &str| -> i64 {
-            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf_program_src");
+            let mc = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {} ({:?})", tag, mc.status);
             let out_path = std::env::temp_dir().join(format!("verbosec_test_bridge_a_out_{}", tag));
             fs::write(&out_path, &mc.stdout).expect("write a.out");
@@ -44006,7 +44102,7 @@ rule two
         );
         assert_eq!(run(&em, &driven), 5, "verbatim scan_word: interprets to 5");
 
-        let mc = Command::new(&elf).args([driven.as_str(), "0"]).output().expect("spawn elf gen");
+        let mc = Command::new(&elf).args([with_probe_attrs(driven).as_str(), "0"]).output().expect("spawn elf gen");
         assert!(mc.status.success(), "elf_program_src must exit 0 on the verbatim file");
         let out_path = std::env::temp_dir().join("verbosec_test_verbatim_a_out");
         fs::write(&out_path, &mc.stdout).expect("write a.out");
@@ -44070,7 +44166,7 @@ rule two
                 .unwrap_or_else(|_| panic!("{:?} produced non-number: {:?}", bin, r.stdout))
         };
         let run_compiled = |source: &str, tag: &str| -> i64 {
-            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf gen");
+            let mc = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn elf gen");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {}", tag);
             let out_path = std::env::temp_dir().join(format!("verbosec_test_vfam_a_out_{}", tag));
             fs::write(&out_path, &mc.stdout).expect("write a.out");
@@ -44191,7 +44287,7 @@ rule two
                 .unwrap_or_else(|_| panic!("{:?} produced non-number: {:?}", bin, r.stdout))
         };
         let run_compiled = |source: &str, tag: &str| -> i64 {
-            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf gen");
+            let mc = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn elf gen");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {} (pre-fix: 2^40 hang)", tag);
             let out_path = std::env::temp_dir().join(format!("verbosec_test_selffrag_{}", tag));
             fs::write(&out_path, &mc.stdout).expect("write a.out");
@@ -44366,6 +44462,11 @@ rule two
         let elf = std::env::temp_dir().join("verbosec_argv_elf_program_src");
         compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
             .expect("elf_program_src must compile natively");
+        // Companion for sources too large for a single argv slot — see the
+        // channel-by-size note in `emit_then_run` below.
+        let elf_raw = std::env::temp_dir().join("verbosec_argv_elf_program_src_raw");
+        compile_native_stdin_raw(&program, "elf_program_src", elf_raw.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
 
         // Real oracles: verbosec's OWN native word_length and count_rules.
         let sw_src = fs::read_to_string("examples/scan_word.verbose").unwrap();
@@ -44391,7 +44492,23 @@ rule two
         let emit_then_run = |source: &str, a1: &str, a2: &str, tag: &str, via_stdin: bool|
                 -> (String, std::process::ExitStatus) {
             use std::io::Write;
-            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn emitter");
+            // Channel by SIZE, not by preference: once every declaration carries
+            // its two mandatory attributes (gen0 enforces them as of 2026-08-12)
+            // the count_rules fragment measures 136678 B, past Linux's 131072
+            // MAX_ARG_STRLEN. Big sources are piped into a stdin-raw emitter;
+            // everything else keeps the argv path this test exists to exercise.
+            let attributed = with_probe_attrs(source);
+            let mc = if attributed.len() < 120 * 1024 {
+                Command::new(&elf).args([attributed.as_str(), "0"]).output().expect("spawn emitter")
+            } else {
+                let mut child = Command::new(&elf_raw).arg("0")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn().expect("spawn emitter (stdin-raw)");
+                child.stdin.take().unwrap()
+                    .write_all(attributed.as_bytes()).expect("write source");
+                child.wait_with_output().expect("wait emitter")
+            };
             assert!(mc.status.success(), "elf_program_src must exit 0 for {}", tag);
             assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
             let p = std::env::temp_dir().join(format!("verbosec_argv_out_{}", tag));
@@ -44513,7 +44630,7 @@ rule two
 
         // (3) argc guard: the scanner ELF with NO argv exits 1, no stdout.
         {
-            let mc = Command::new(&elf).args([sw_src.as_str(), "0"]).output().unwrap();
+            let mc = Command::new(&elf).args([with_probe_attrs(sw_src).as_str(), "0"]).output().unwrap();
             let p = std::env::temp_dir().join("verbosec_argv_out_guard");
             fs::write(&p, &mc.stdout).unwrap();
             let mut perms = fs::metadata(&p).unwrap().permissions();
@@ -44539,7 +44656,7 @@ rule two
             0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x48, 0x31,
             0xff, 0x0f, 0x05,
         ];
-        let mc = Command::new(&elf).args([fact, "0"]).output().unwrap();
+        let mc = Command::new(&elf).args([with_probe_attrs(fact).as_str(), "0"]).output().unwrap();
         assert_eq!(&mc.stdout[120..221], &NUMBER_TRAMPOLINE[..],
             "input-free fact ELF must keep the original 101-byte number trampoline at offset 120");
 
@@ -44650,8 +44767,23 @@ rule two
         assert!(frag.len() < 128 * 1024,
             "count_rules fragment must fit under the 128 KB single-arg limit; got {}", frag.len());
 
-        // Emit the count_rules ELF (fragment via argv — the fragment is small).
-        let mc = Command::new(&elf).args([frag.as_str(), "0"]).output().expect("spawn emitter");
+        // Emit the count_rules ELF. The fragment used to go through argv, and no
+        // longer fits: once every declaration carries its two mandatory
+        // attributes (gen0 enforces them as of 2026-08-12) it measures
+        // 121754 -> 136678 B against Linux's 131072 MAX_ARG_STRLEN. So this one
+        // emit is piped into a stdin-raw-built emitter; the small probes below
+        // still go through argv, which is what this test is about.
+        let elf_raw = std::env::temp_dir().join("verbosec_stdin_elf_program_src_raw");
+        compile_native_stdin_raw(&program, "elf_program_src", elf_raw.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mc = {
+            let mut child = Command::new(&elf_raw).arg("0")
+                .stdin(Stdio::piped()).stdout(Stdio::piped())
+                .spawn().expect("spawn emitter (stdin-raw)");
+            child.stdin.take().unwrap()
+                .write_all(with_probe_attrs(frag).as_bytes()).expect("write fragment");
+            child.wait_with_output().expect("wait emitter")
+        };
         assert!(mc.status.success(), "elf_program_src must exit 0 for the count_rules fragment");
         assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitter output must be an ELF");
         let cr_elf = std::env::temp_dir().join("verbosec_stdin_count_rules");
@@ -44709,7 +44841,7 @@ rule two
             0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x48, 0x31,
             0xff, 0x0f, 0x05,
         ];
-        let fm = Command::new(&elf).args([fact, "0"]).output().unwrap();
+        let fm = Command::new(&elf).args([with_probe_attrs(fact).as_str(), "0"]).output().unwrap();
         assert_eq!(&fm.stdout[120..221], &NUMBER_TRAMPOLINE[..],
             "input-free fact ELF must keep the original 101-byte number trampoline at offset 120");
 
@@ -44832,7 +44964,11 @@ rule two
         // Emit the checker ELF via elf_program_src. Pre-fix: the emitter exits 1
         // partway through, so `mc.status.success()` fails right here.
         let frag_p = std::env::temp_dir().join("verbosec_srcblob_frag.verbose");
-        fs::write(&frag_p, &frag).expect("write fragment");
+        // `strip` above drops @attr lines along with comments and blanks, so the
+        // fragment arrives with no @intention / @source at all. gen0 requires
+        // both on every declaration as of 2026-08-12, so they go back on here —
+        // the same treatment every other probe in this file gets.
+        fs::write(&frag_p, with_probe_attrs(&frag)).expect("write fragment");
         let out_p = std::env::temp_dir().join("verbosec_srcblob_out.elf");
         let status = Command::new("sh")
             .arg("-c")
@@ -44947,7 +45083,7 @@ rule two
 
         // Emit the ELF for `source`, run it, return (stdout bytes, status).
         let emit_and_run = |source: &str, tag: &str| -> (Vec<u8>, std::process::ExitStatus, Vec<u8>) {
-            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf_program_src");
+            let mc = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {}; got {:?}", tag, mc.status);
             let elf_bytes = mc.stdout;
             assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
@@ -45003,7 +45139,7 @@ rule two
             "out = print_expr(build_chain(Seed { n: 3 }))",
             "out = length(print_expr(build_chain(Seed { n: 3 })))",
         );
-        let mc = Command::new(&elf).args([refusal.as_str(), "0"]).output().expect("spawn elf_program_src");
+        let mc = Command::new(&elf).args([with_probe_attrs(&refusal).as_str(), "0"]).output().expect("spawn elf_program_src");
         assert!(
             !mc.status.success(),
             "a texty callee in value position must be REFUSED at verify time \
@@ -45014,7 +45150,7 @@ rule two
             "a refusing gen0 must write ZERO bytes, not a partial ELF ({} bytes)",
             mc.stdout.len()
         );
-        let ev = Command::new(&em).args([refusal.as_str(), "0"]).output().expect("spawn eval_main");
+        let ev = Command::new(&em).args([with_probe_attrs(&refusal).as_str(), "0"]).output().expect("spawn eval_main");
         assert!(ev.status.success(), "eval_main must exit 0 for the refusal program");
         assert_eq!(
             String::from_utf8_lossy(&ev.stdout).trim(), "7",
@@ -45069,7 +45205,7 @@ rule two
 
         // Emit the ELF for `source` via the self-hosted emitter, run it, return raw stdout.
         let emit_and_run = |source: &str, tag: &str| -> Vec<u8> {
-            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf_program_src");
+            let mc = Command::new(&elf).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn elf_program_src");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {}; got {:?}", tag, mc.status);
             let elf_bytes = mc.stdout;
             assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
@@ -45170,7 +45306,7 @@ rule two
 
         // Emit an ELF for `prog_src` via the self-hosted emitter, run it, return trimmed stdout.
         let emit_and_run = |prog_src: &str, tag: &str| -> String {
-            let mc = Command::new(&elf).args([prog_src, "0"]).output().expect("spawn emitter");
+            let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output().expect("spawn emitter");
             assert!(mc.status.success(), "emitter must exit 0 for {}; got {:?}", tag, mc.status);
             assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
             let out_path = std::env::temp_dir().join(format!("verbosec_test_b4b_maxmin_out_{}", tag));
@@ -45279,7 +45415,7 @@ rule two
                 .stdout(Stdio::piped())
                 .spawn()
                 .expect("spawn emitter");
-            child.stdin.take().unwrap().write_all(p.as_bytes()).unwrap();
+            child.stdin.take().unwrap().write_all(with_probe_attrs(p).as_bytes()).unwrap();
             let o = child.wait_with_output().unwrap();
             assert!(o.status.success(), "emitter must exit 0 compiling P");
             o.stdout
@@ -45599,7 +45735,7 @@ rule two
         let tmp = std::env::temp_dir();
         let write = |name: &str, body: &str| -> String {
             let p = tmp.join(name);
-            fs::write(&p, body).unwrap();
+            fs::write(&p, with_probe_attrs(body)).unwrap();
             p.to_str().unwrap().to_string()
         };
 
@@ -45698,7 +45834,7 @@ rule two
         // Returns (exit_code, emitted_byte_count).
         let emit = |name: &str, body: &str| -> (i32, usize) {
             let p = tmp.join(name);
-            fs::write(&p, body).unwrap();
+            fs::write(&p, with_probe_attrs(body)).unwrap();
             let out = Command::new("sh")
                 .arg("-c")
                 .arg(format!("ulimit -s unlimited; '{}' 0 < '{}'", bin.display(), p.display()))
@@ -46204,7 +46340,7 @@ rule pick
         // Run gen1 on a probe program; return (exit_code, stdout_bytes).
         let probe = |program_src: &str, tag: &str| -> (i32, Vec<u8>) {
             let p = std::env::temp_dir().join(format!("verbosec_test_v3_probe_{}.verbose", tag));
-            fs::write(&p, program_src).unwrap();
+            fs::write(&p, with_probe_attrs(program_src)).unwrap();
             let out_p = std::env::temp_dir().join(format!("verbosec_test_v3_probe_{}.out", tag));
             let status = Command::new("sh")
                 .arg("-c")
@@ -46501,11 +46637,37 @@ rule pick
             ("rule main\n  logic:\n    out = max(min(100, 42), 7)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\n", "42"), // max/min
             ("concept Outer\n  fields:\n    inner : Inner\nconcept Inner\n  fields:\n    z : number\nrule main\n  logic:\n    let o = Outer { inner: Inner { z: 88 } }\n    out = o.inner.z\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\n", "88"), // chained field
         ];
+        // V4 (attribute-presence slice, 2026-08-12): gen0 now enforces MANDATORY
+        // @intention / @source on every declaration, exactly as verbosec always
+        // has. These probes predate that check and carried no attributes at all,
+        // so they began failing the verify gate — correctly. They are written in
+        // gen0's dialect and were never verbosec-valid anyway (no `@verbose`
+        // header: verbosec refuses them at line 1 for that alone), so the two
+        // mandatory lines are inserted here rather than bloating eight already
+        // dense literals. What these probes measure is gen0's EMITTER over
+        // distinct construct classes; the attributes are scaffolding to get past
+        // its VERIFIER, not part of the measurement. Inserting them uniformly
+        // also means a probe added later cannot forget them.
+        let with_attrs = |p: &str| -> String {
+            let mut out = String::new();
+            for line in p.lines() {
+                out.push_str(line);
+                out.push('\n');
+                let ind = line.len() - line.trim_start_matches(' ').len();
+                let s = line.trim_start_matches(' ');
+                if ["concept_group ", "concept ", "rule "].iter().any(|k| s.starts_with(k)) {
+                    let pad = " ".repeat(ind + 2);
+                    out.push_str(&format!(
+                        "{pad}@intention: \"probe\"\n{pad}@source: p.intent:1\n"));
+                }
+            }
+            out
+        };
         let cp = std::env::temp_dir().join("verbosec_test_2gen_corpus.verbose");
         let c0 = std::env::temp_dir().join("verbosec_test_2gen_c0.elf");
         let c1 = std::env::temp_dir().join("verbosec_test_2gen_c1.elf");
         for (src_p, expect) in corpus {
-            fs::write(&cp, src_p).unwrap();
+            fs::write(&cp, with_attrs(src_p)).unwrap();
             let e0 = emit_prog(&gen0, &cp, &c0);
             let e1 = emit_prog(&gen1, &cp, &c1);
             assert_eq!(e0, e1,
@@ -46784,22 +46946,28 @@ rule pick
     /// First measured 2026-08-10 on ba2b6ff: 21 fixtures, **5 PASS, 15 KNOWN
     /// GAP, 1 INVERSE**. Two of the 15 were closed in the same commit that
     /// added this test (see `KNOWN_GAPS` group 1), leaving 7 / 13 / 1. The two
-    /// `*_missing_partial` fixtures added 2026-08-11 make it **23 fixtures,
-    /// 9 PASS, 13 GAP, 1 INVERSE** — the gap set itself did not move, because
+    /// `*_missing_partial` fixtures added 2026-08-11 make it 23 fixtures,
+    /// 9 PASS, 13 GAP, 1 INVERSE — the gap set itself did not move, because
     /// the defect those two exposed was in gen0's reads check, not in its
-    /// coverage of a declaration it never looks at. The 13
-    /// are not thirteen surprises — they are three STRUCTURAL causes wearing
-    /// thirteen faces, and reading them that way is the point of the sweep:
+    /// coverage of a declaration it never looks at. The **twelve** fixtures
+    /// added 2026-08-12 complete the `@intention` / `@source` PRESENCE matrix
+    /// (all SEVEN declaration kinds × both attributes, plus the NESTED-concept
+    /// shape; only rule and concept had one before), and `attr_pres_errors`
+    /// closes all fifteen at once:
+    /// **35 fixtures, 24 PASS, 10 GAP, 1 INVERSE**. The 10 are not ten
+    /// surprises — they are three STRUCTURAL causes wearing ten faces, and
+    /// reading them that way is the point of the sweep:
     ///
     ///   1. **gen0's tokenizer discards attribute lines entirely.**
     ///      `tokenize_indent`'s `isattr` (`c0b == 64`) folds an `@`-leading
     ///      line into `isblank`, so `@intention` / `@source` / `@layer` never
     ///      reach the parser at all. Nothing downstream can check what the
-    ///      token stream does not contain — which is why the two checks that
-    ///      COULD be closed cheaply were closed on the RAW SOURCE instead
-    ///      (`attr_errors`), and why the rest cannot: presence has to know
-    ///      which declaration an attribute belongs to, and stratification
-    ///      needs the call graph. 5 fixtures remain.
+    ///      token stream does not contain — which is why every check that CAN
+    ///      be closed is closed on the RAW SOURCE instead (`attr_errors` for
+    ///      the closed-set NAME, `attr_pres_errors` for PRESENCE). Only
+    ///      stratification is left, and it is the one that a source walk
+    ///      structurally cannot do: it needs the call graph AND the layer
+    ///      value attached to each rule. 2 fixtures remain.
     ///   2. **gen0 SKIPS the `hints:` block structurally.**
     ///      `parse_rule_decl_pos` consumes it with `skip_indented_block` so
     ///      the program is not truncated (PR #141/#142), but consuming is not
@@ -46834,11 +47002,36 @@ rule pick
     /// the asymmetry named above is between MISSING and EXTRA, not between
     /// reads and calls.
     ///
-    /// The 14th, `input_type_unsupported`, is its own thing: verbosec refuses
+    /// The 10th, `input_type_unsupported`, is its own thing: verbosec refuses
     /// it at NATIVE rather than at verify, and gen0 mirrors none of verbosec's
     /// emit-time refusal surface. It is the same class as `recursive_text_eval`
     /// in CLAUDE.md's gaps table (accept-what-verbosec-refuses), reproduced
     /// here in a fixture small enough to reason about.
+    ///
+    /// THE PRESENCE MATRIX IS COMPLETE, AND COMPLETING IT WAS THE POINT.
+    /// Before 2026-08-12 only `rule` and `concept` had a presence fixture — 3
+    /// of a possible 14 — so "gen0 does not check presence" was measured on 2
+    /// of 7 declaration kinds and ASSUMED for the other 5. That is the same
+    /// generalise-from-one-position mistake the text-position matrix in
+    /// CLAUDE.md exists to prevent. The matrix is now enumerated rather than
+    /// sampled: **every one of the seven kinds requires BOTH attributes,
+    /// unconditionally** (derived from the seven `.ok_or_else(...missing
+    /// @intention/@source)` pairs in `src/parser.rs`, then confirmed by
+    /// probing each kind), and all fourteen cells have a fixture — plus a
+    /// fifteenth for the NESTED-concept shape, where the enclosing group
+    /// carries both attributes and only the concept inside it does not. That
+    /// one is not a duplicate of the plain `concept` cell: it is the shape that
+    /// makes `concept_group`'s nesting load-bearing, and a walk that segmented
+    /// on top-level declarations only would score it clean.
+    ///
+    /// NOTE THE STRICTNESS DIRECTION INVERTS between the two attribute checks,
+    /// which is why one may be sloppy and the other may not. The NAME check
+    /// (`attr_errors`) uses the UNION of valid names across kinds — weaker than
+    /// verbosec, and safe, because it can only ever MISS a violation. For
+    /// PRESENCE, being over-strict would REJECT VALID PROGRAMS, so
+    /// `attr_pres_errors` has to be exact; it is validated by the fact that all
+    /// 151 files in `examples/` still compile and 99 of the 100 accepted
+    /// binaries are byte-identical (the 100th is `vexprparse` itself).
     ///
     /// THE INVERSE ROW IS NOT DECORATION. `bad_arity` calls a one-input rule
     /// with two arguments; **verbosec ACCEPTS it** (it has no arity check on
@@ -46858,16 +47051,16 @@ rule pick
         // prints the full diff either way. Grouped by the structural cause
         // named in the doc comment above.
         const KNOWN_GAPS: &[&str] = &[
-            // (1) attribute lines are lexed away as blank — 5 of the original 7.
+            // (1) attribute lines are lexed away as blank — 2 of the original 7.
             //     `attr_unknown_on_rule` and `layer_unknown_name` were CLOSED by
-            //     gen0's `attr_errors` source-line walk (see the `span_is_hints`
-            //     neighbourhood in examples/vexprparse.verbose). The five left
-            //     are not closed-set checks: three need to associate an
-            //     attribute with the declaration it belongs to (presence), and
-            //     two need the call graph (stratification).
-            "attr_missing_intention_rule",
-            "attr_missing_source_concept",
-            "attr_missing_source_rule",
+            //     gen0's `attr_errors` source-line walk; the fourteen
+            //     `attr_missing_*` PRESENCE fixtures were CLOSED by its sibling
+            //     `attr_pres_errors` (both in the `span_is_hints` neighbourhood
+            //     in examples/vexprparse.verbose). The two left need the CALL
+            //     GRAPH plus the layer value ATTACHED to each rule, i.e.
+            //     retaining attributes through the parse rather than
+            //     re-scanning the source — the one thing a source-line walk
+            //     structurally cannot do.
             "layer_calls_unlayered",
             "layer_violation",
             // (2) the `hints:` block is skipped, not checked — 4
@@ -47202,6 +47395,203 @@ rule pick
         let _ = fs::remove_file(&gen0);
         let _ = fs::remove_file(&out_elf);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// gen0 must enforce MANDATORY `@intention` / `@source` on every declaration.
+    ///
+    /// Design priority #4 is Traceability — "intention → IR → binary always
+    /// navigable" — and until 2026-08-12 gen0 emitted a working binary for a
+    /// rule with no `@intention` at all. Measured on 1bf5ec6, all three
+    /// fixtures that existed: `verbosec` reports `rule 'gate' missing
+    /// @intention` / `missing @source` / `concept 'Invoice' missing @source`,
+    /// and gen0 returned **rc 0 with a 567-byte ELF** for each. A binary whose
+    /// blocks trace back to nothing is precisely what the language exists to
+    /// make impossible.
+    ///
+    /// THE MATRIX IS DERIVED, NOT ASSUMED — and deriving it is half the slice.
+    /// Only `rule` and `concept` had a fixture, so the other five declaration
+    /// kinds were never measured. Reading `src/parser.rs` shows all SEVEN end
+    /// their parse with the same pair of
+    /// `.ok_or_else(|| self.error("... missing @intention" / "@source"))`
+    /// calls — concept_group 225/228, concept 310/312, rule 579/581, reaction
+    /// 1745/1746, service 1999/2000, resource 2139/2140, connection 2294/2295 —
+    /// with **no kind-specific exemption and no conditional**. Each was then
+    /// probed to confirm the read. All fourteen cells now have a fixture, plus
+    /// a fifteenth for the nested-concept shape.
+    ///
+    /// STRICTNESS DIRECTION IS THE OPPOSITE OF THE NAME CHECK, which is why
+    /// this one had to be exact. `attr_errors` (names) uses the UNION of valid
+    /// names across kinds — deliberately weaker than verbosec, and safe,
+    /// because it can only ever MISS a violation. For PRESENCE, being
+    /// over-strict REJECTS VALID PROGRAMS, so a conservative approximation is
+    /// the dangerous direction. Hence the false-positive guard below, and hence
+    /// the corpus evidence: all 151 examples still compile, and 99 of the 100
+    /// accepted binaries are byte-identical (the 100th is `vexprparse` itself).
+    ///
+    /// THE CORRECTED TWINS ARE THE INSTRUMENT, not padding. gen0 refuses with a
+    /// bare exit 1, zero bytes and an empty stderr, so a refusal on its own
+    /// cannot be attributed to the defect under test. Re-inserting the ONE
+    /// missing attribute and requiring ACCEPT is what makes the attribution.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_enforces_mandatory_intention_and_source() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_attrpres_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let ndir = std::path::Path::new("examples/negative");
+        let out_elf = std::env::temp_dir().join("verbosec_test_attrpres_out.elf");
+
+        // gen0's verdict on a source text. true == ACCEPTED (exit 0 AND bytes).
+        let gen0_accepts = |label: &str, text: &str| -> bool {
+            let p = std::env::temp_dir().join(format!("verbosec_attrpres_{label}.verbose"));
+            fs::write(&p, text).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), p.display(), out_elf.display()))
+                .status().expect("run gen0 over an attribute probe");
+            let bytes = fs::metadata(&out_elf).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(status.success(), bytes > 0,
+                "{label}: gen0 must either accept AND emit, or refuse AND emit \
+                 nothing — a half-written ELF at exit 1 is the arena-exhaustion \
+                 signature, not a verdict (see CLAUDE.md on max_nodes)");
+            let _ = fs::remove_file(&p);
+            status.success()
+        };
+        // verbosec's verdict over the same text. Attributes are checked at PARSE,
+        // so a missing one never reaches the verifier — both stages count.
+        let verbosec_accepts = |text: &str| -> bool {
+            let toks = match crate::lexer::Lexer::new(text).tokenize() {
+                Ok(t) => t, Err(_) => return false };
+            let prog = match crate::parser::Parser::new(toks).parse_program() {
+                Ok(p) => p, Err(_) => return false };
+            crate::verifier::verify_program(&prog, ndir).is_empty()
+        };
+
+        // A declaration header is `<keyword> <space(s)> <identifier>` — the same
+        // shape gen0's `decl_header_at` recognises, so the twin builder and the
+        // rule under test cannot disagree about where a declaration starts.
+        const KW: &[&str] = &["concept_group", "concept", "rule", "reaction",
+                              "service", "resource", "connection"];
+        let header_indent = |line: &str| -> Option<usize> {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            let s = line.trim_start_matches(' ');
+            for kw in KW {
+                if let Some(rest) = s.strip_prefix(kw) {
+                    if rest.starts_with(' ')
+                        && rest.trim_start_matches(' ').chars().next()
+                            .map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false) {
+                        return Some(indent);
+                    }
+                }
+            }
+            None
+        };
+        // Re-insert the ONE missing attribute, at the declaration that lacks it.
+        let corrected = |text: &str, missing: &str| -> String {
+            let lines: Vec<&str> = text.lines().collect();
+            let hdrs: Vec<(usize, usize)> = lines.iter().enumerate()
+                .filter_map(|(i, l)| header_indent(l).map(|ind| (i, ind))).collect();
+            for (n, &(i, ind)) in hdrs.iter().enumerate() {
+                let end = hdrs.get(n + 1).map(|&(j, _)| j).unwrap_or(lines.len());
+                if !lines[i + 1..end].join("\n").contains(&format!("@{missing}")) {
+                    let pad = " ".repeat(ind + 2);
+                    let add = if missing == "intention" {
+                        format!("{pad}@intention: \"doc\"")
+                    } else {
+                        format!("{pad}@source: negative.intent:3")
+                    };
+                    let mut out: Vec<String> =
+                        lines[..=i].iter().map(|s| s.to_string()).collect();
+                    out.push(add);
+                    out.extend(lines[i + 1..].iter().map(|s| s.to_string()));
+                    return out.join("\n") + "\n";
+                }
+            }
+            panic!("no declaration in this fixture is missing @{missing}");
+        };
+
+        // ---- every committed presence fixture, with its corrected twin.
+        let mut fixtures: Vec<String> = fs::read_dir(ndir).unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .filter(|n| n.starts_with("attr_missing_") && n.ends_with(".verbose"))
+            .map(|n| n.trim_end_matches(".verbose").to_string())
+            .collect();
+        fixtures.sort();
+        assert_eq!(fixtures.len(), 15,
+            "the PRESENCE matrix is 7 declaration kinds x 2 mandatory attributes, \
+             plus the nested-concept shape = 15 fixtures. Got {}: {:?}. If a kind \
+             was added to the language, add its two fixtures; if one was deleted \
+             here, the matrix is being sampled again instead of enumerated.",
+            fixtures.len(), fixtures);
+
+        for name in &fixtures {
+            let missing = if name.contains("_intention_") { "intention" } else { "source" };
+            let text = fs::read_to_string(ndir.join(format!("{name}.verbose"))).unwrap();
+
+            assert!(!verbosec_accepts(&text),
+                "{name}: verbosec must REFUSE this — a fixture both compilers \
+                 accept measures nothing");
+            assert!(!gen0_accepts(name, &text),
+                "THE DEFECT THIS TEST EXISTS FOR: {name} declares no @{missing} \
+                 and gen0 ACCEPTED it. Before 2026-08-12 this emitted a 567-byte \
+                 binary at rc 0 for a rule that traces back to no intention line \
+                 at all, which breaks design priority #4 (Traceability). Check \
+                 `attr_pres_errors` in examples/vexprparse.verbose and that it is \
+                 still summed into BOTH verrs gates (verify_errors and \
+                 elf_program_src).");
+
+            let twin = corrected(&text, missing);
+            assert!(verbosec_accepts(&twin),
+                "{name}: the corrected twin must be ACCEPTED by verbosec, or the \
+                 fixture is not isolating the missing @{missing}");
+            assert!(gen0_accepts(&format!("{name}_twin"), &twin),
+                "{name}: the corrected twin must be ACCEPTED by gen0. This is what \
+                 makes the refusal above attributable — gen0 emits no diagnostic, \
+                 so without the twin a refusal for ANY unrelated reason would score \
+                 as a pass. If only the twin fails, `attr_pres_errors` is \
+                 over-strict and is now rejecting valid programs.");
+        }
+
+        // ---- FALSE-POSITIVE GUARD. Over-strictness is the dangerous direction
+        // here, and the shape that would trip a naive header test is a line
+        // that BEGINS with a declaration keyword without being a declaration:
+        // a concept field named `service`, and an output field named `rule`,
+        // which puts `rule = ...` at the head of a logic line. verbosec accepts
+        // this program; so must gen0.
+        let keyword_names = "@verbose 0.1.0\n\n\
+            concept T\n  @intention: \"fields named after declaration keywords\"\n  \
+            @source: negative.intent:1\n\n  fields:\n    service  : number [0, 100]\n    \
+            resource : number [0, 100]\n\n\
+            rule gate\n  @intention: \"an output field named after a declaration keyword\"\n  \
+            @source: negative.intent:2\n\n  input:\n    t : T\n\n  output:\n    rule : bool\n\n  \
+            logic:\n    rule = t.service > t.resource\n\n  \
+            proofs:\n    purity:\n      reads   : [t.service, t.resource]\n      calls   : []\n    \
+            termination:\n      bound : 1\n";
+        assert!(verbosec_accepts(keyword_names),
+            "the false-positive probe must be VALID Verbose, or it guards nothing");
+        assert!(gen0_accepts("keyword_names", keyword_names),
+            "FALSE POSITIVE: gen0 refused a program whose only peculiarity is a \
+             field named `service`/`resource` and an output field named `rule` \
+             (so the logic line reads `rule = ...`). `decl_header_at` must require \
+             keyword + space(s) + IDENTIFIER; `rule =` is not a declaration. \
+             Rejecting valid programs is the failure mode this check must not have.");
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
     }
 
     /// gen0's attribute-name / `@layer`-value closed-set check (`attr_errors`).
@@ -48965,7 +49355,7 @@ rule probe
 
         // gen0 emit: source on argv[1], pos on argv[2]. Returns None on refusal.
         let g0 = |tag: &str, source: &str| -> Option<std::path::PathBuf> {
-            let o = Command::new(&gen0).args([source, "0"]).output().expect("spawn gen0");
+            let o = Command::new(&gen0).args([with_probe_attrs(source).as_str(), "0"]).output().expect("spawn gen0");
             if !o.status.success() || o.stdout.is_empty() {
                 return None;
             }
