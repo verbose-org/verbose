@@ -1,0 +1,37 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the resource declares no @source.
+
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 1000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+resource probe
+  @intention: "doc"
+
+  path: "/tmp/verbose_negative_probe.txt"
+  max:  4096
+  on_read_error: abort

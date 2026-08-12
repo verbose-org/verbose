@@ -1,0 +1,43 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the concept NESTED inside the concept_group declares no @source.
+-- Distinct SHAPE from attr_missing_source_concept: the enclosing group carries
+-- both attributes, so a walk that only looked at the group would score this
+-- clean. This is the shape that makes concept_group's nesting load-bearing.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 1000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+concept_group G [max_depth: 4, max_nodes: 16]
+  @intention: "doc"
+  @source: negative.intent:3
+
+  concept Node
+    @intention: "A node is a leaf or a branch"
+
+    variants:
+      Leaf of (v: number)
+      Branch of (next: Node)
