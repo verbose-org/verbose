@@ -1859,6 +1859,11 @@ fn verify_rule(
         }
     }
 
+    // Arity of every rule-call site. `facts.calls` only carries callee NAMES
+    // (it feeds the purity proof), so the arity check needs its own walk over
+    // the logic — see `check_call_arity`.
+    check_call_arity(rule, errors);
+
     check_purity(rule, &facts, errors);
     check_termination(rule, concepts, group_concept_owner, errors);
 
@@ -3105,6 +3110,156 @@ fn walk_for_match_result_callees(
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
+    }
+}
+
+/// Every rule-call site in an expression tree, as `(callee_name, arg_count)`.
+///
+/// WHY A SEPARATE WALK rather than an extra out-param on `collect_expr_facts`:
+/// that function filters reads by lambda scope and merges sub-scopes through
+/// fresh `HashSet`s, none of which an arity check cares about — a call is a
+/// call wherever it sits. This walk therefore has no scoping logic at all,
+/// just "recurse into every sub-expression".
+///
+/// The match has NO catch-all arm on purpose: adding an `Expr` variant that
+/// can hold a sub-expression must fail to compile here rather than silently
+/// hide call sites from the arity check.
+///
+/// Every `Expr::Call` in the AST is a RULE call. The parser intercepts all 36
+/// `PRIMITIVE_CALL_NAMES` in call position before the generic `Expr::Call`
+/// fallback (see `parse_primary`), and record/variant construction have their
+/// own nodes (`Expr::Record` / `Expr::VariantConstruct`), so no primitive and
+/// no constructor can reach this collector.
+fn collect_call_sites(expr: &Expr, out: &mut Vec<(String, usize)>) {
+    match expr {
+        Expr::Call(name, args) => {
+            out.push((name.clone(), args.len()));
+            for a in args {
+                collect_call_sites(a, out);
+            }
+        }
+        // Leaves — nothing to recurse into.
+        Expr::Number(_)
+        | Expr::Text(_)
+        | Expr::Bytes(_)
+        | Expr::Ident(_)
+        | Expr::Read(_)
+        | Expr::NowUnix => {}
+        // One sub-expression.
+        Expr::Field(inner, _)
+        | Expr::Not(inner)
+        | Expr::Neg(inner)
+        | Expr::Ok(inner)
+        | Expr::Err(inner)
+        | Expr::JsonEscape(inner)
+        | Expr::ParseInt(inner)
+        | Expr::Length(inner)
+        | Expr::Abs(inner)
+        | Expr::Le32(inner)
+        | Expr::Le64(inner)
+        | Expr::BitNot(inner)
+        | Expr::ArenaScope(inner)
+        | Expr::AbortIf(inner)
+        | Expr::Fetch(_, inner) => collect_call_sites(inner, out),
+        // Two sub-expressions.
+        Expr::Binary(_, l, r)
+        | Expr::StartsWith(l, r)
+        | Expr::EndsWith(l, r)
+        | Expr::Contains(l, r)
+        | Expr::ByteAt(l, r)
+        | Expr::Min(l, r)
+        | Expr::Max(l, r)
+        | Expr::BitAnd(l, r)
+        | Expr::BitOr(l, r)
+        | Expr::BitXor(l, r)
+        | Expr::Shl(l, r)
+        | Expr::Shr(l, r) => {
+            collect_call_sites(l, out);
+            collect_call_sites(r, out);
+        }
+        // Three sub-expressions.
+        Expr::If(a, b, c) | Expr::Substring(a, b, c) => {
+            collect_call_sites(a, out);
+            collect_call_sites(b, out);
+            collect_call_sites(c, out);
+        }
+        // Lambda-bearing forms: the binder names are irrelevant here.
+        Expr::Quantifier(_, coll, _, body) | Expr::Map(coll, _, body) | Expr::Filter(coll, _, body) => {
+            collect_call_sites(coll, out);
+            collect_call_sites(body, out);
+        }
+        Expr::Fold(coll, initial, _, _, body) => {
+            collect_call_sites(coll, out);
+            collect_call_sites(initial, out);
+            collect_call_sites(body, out);
+        }
+        Expr::FoldBytes(text, initial, _, _, _, body) => {
+            collect_call_sites(text, out);
+            collect_call_sites(initial, out);
+            collect_call_sites(body, out);
+        }
+        Expr::MatchResult(target, _, ok_body, _, err_body) => {
+            collect_call_sites(target, out);
+            collect_call_sites(ok_body, out);
+            collect_call_sites(err_body, out);
+        }
+        // Field lists.
+        Expr::Record(_, fields) | Expr::VariantConstruct(_, _, fields) => {
+            for (_, e) in fields {
+                collect_call_sites(e, out);
+            }
+        }
+        Expr::Concat(args) => {
+            for a in args {
+                collect_call_sites(a, out);
+            }
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            collect_call_sites(scrutinee, out);
+            for arm in arms {
+                collect_call_sites(&arm.body, out);
+            }
+        }
+    }
+}
+
+/// A rule call must pass EXACTLY ONE argument.
+///
+/// DERIVED, not assumed. `Parser::parse_rule` makes the `input:` block
+/// mandatory and `parse_binding_block` yields exactly one `(name, type)` pair,
+/// so a rule structurally has exactly one input — there is no zero-input or
+/// multi-input rule to call. The optional `context:` block does NOT change
+/// this: a context is bound at the top-level invocation (read once from
+/// argv/stdin by the emitter), never at a call site — `eval_rule_with_value`
+/// inserts only `rule.input_name` into the callee's environment, and no call
+/// syntax exists for supplying a context.
+///
+/// Both executors already enforce it — the interpreter with
+/// `rule call expects 1 argument, got N` and the native emitter with
+/// `native call requires exactly 1 argument`. Until this check landed the
+/// VERIFIER did not, so `verbosec <file>` printed "all proofs check out" for a
+/// program that neither `--run` nor `--native` would accept. That is not a
+/// safety hole (it fails closed both ways) but it is a truthfulness hole in
+/// the one component whose whole job is to be trustworthy.
+fn check_call_arity(rule: &Rule, errors: &mut Vec<VerifyError>) {
+    let mut sites: Vec<(String, usize)> = Vec::new();
+    for (_, expr) in &rule.logic.bindings {
+        collect_call_sites(expr, &mut sites);
+    }
+    collect_call_sites(&rule.logic.value, &mut sites);
+
+    for (callee, argc) in sites {
+        if argc != 1 {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / calls", rule.name),
+                message: format!(
+                    "calls rule '{}' with {} argument{}; a rule call takes exactly 1 (a rule has exactly one 'input')",
+                    callee,
+                    argc,
+                    if argc == 1 { "" } else { "s" }
+                ),
+            });
+        }
     }
 }
 
@@ -4852,6 +5007,250 @@ rule bad
                 && e.message.contains("bool")
                 && e.message.contains("number")),
             "expected a bool/number mismatch error at the top level, got {:#?}",
+            errs
+        );
+    }
+
+    /// A wrong-arity rule call is refused AT VERIFY TIME, not only at
+    /// emit/run time.
+    ///
+    /// THE DEFECT THIS PINS was a TRUTHFULNESS hole, not a safety one. Before
+    /// this check, `helper(i, i)` on a one-input rule produced:
+    ///
+    /// ```text
+    ///   verbosec <file>            -> "verified: ...; all proofs check out"  (rc 0)
+    ///   verbosec <file> --native   -> "native call requires exactly 1 argument"
+    ///   verbosec <file> --run      -> "rule call expects 1 argument, got 2"
+    /// ```
+    ///
+    /// So it failed closed in practice — no bad binary, no wrong answer — but
+    /// the VERIFIER blessed a program its own emitter and interpreter both
+    /// refuse. "The verifier is the durable artifact" is the project's central
+    /// claim, and a reference that disagrees with itself is a counterexample
+    /// to it. Same class as the bool exit-code inconsistency (PR #156).
+    ///
+    /// The CORRECT-ARITY TWIN is the half that makes the refusal attributable:
+    /// the two programs differ in exactly one token, so a clean verdict on the
+    /// twin proves the error came from the arity and not from some unrelated
+    /// defect in the fixture. Without it this test would still pass against a
+    /// verifier that rejected the program for the wrong reason.
+    #[test]
+    fn wrong_arity_rule_call_rejected_at_verify_time() {
+        // `{CALL}` is the only thing that differs between the two programs.
+        let program = |call: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: invoices.intent:1
+  fields:
+    amount : number [0, 1000000]
+
+rule helper
+  @intention: "doc"
+  @source: invoices.intent:1
+  input:
+    i : Invoice
+  output:
+    ok : bool
+  logic:
+    ok = i.amount > 1000
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+rule caller
+  @intention: "doc"
+  @source: invoices.intent:1
+  input:
+    i : Invoice
+  output:
+    ok : bool
+  logic:
+    ok = {call}
+  proofs:
+    purity:
+      reads   : [i]
+      calls   : [helper]
+    termination:
+      bound : 3
+"#
+            )
+        };
+
+        // Two arguments where the callee declares one input.
+        let errs = verify_str(&program("helper(i, i)"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("caller")
+                && e.context.contains("calls")
+                && e.message.contains("helper")
+                && e.message.contains("2 arguments")
+                && e.message.contains("exactly 1")),
+            "expected a wrong-arity refusal naming the caller, the callee, and \
+             expected-vs-actual; got {:#?}",
+            errs
+        );
+
+        // Zero arguments is the same defect from the other side. The parser
+        // accepts `helper()`, so nothing but this check stands between it and
+        // a "proofs check out" verdict.
+        let errs = verify_str(&program("helper()"));
+        assert!(
+            errs.iter().any(|e| e.message.contains("helper")
+                && e.message.contains("0 arguments")
+                && e.message.contains("exactly 1")),
+            "expected a zero-argument call to be refused too; got {:#?}",
+            errs
+        );
+
+        // THE TWIN: correct arity, otherwise byte-identical. Must verify clean.
+        let errs = verify_str(&program("helper(i)"));
+        assert!(
+            errs.is_empty(),
+            "the correct-arity twin must verify clean, or the refusal above is \
+             not attributable to the arity; got {:#?}",
+            errs
+        );
+    }
+
+    /// A wrong-arity call is refused wherever it SITS, not only at the top of
+    /// the logic — the walk has no catch-all arm, so a nested position must
+    /// not be able to hide one.
+    ///
+    /// The three positions probed here are the ones a scoping-aware walk is
+    /// most likely to drop: inside a lambda body (`count`'s predicate), inside
+    /// a `let` RHS (which is collected separately from `logic.value`), and
+    /// inside a `concat` argument list.
+    #[test]
+    fn wrong_arity_rule_call_rejected_in_nested_positions() {
+        let with_logic = |lets: &str, value: &str, out_ty: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept Line
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number [0, 1000]
+
+concept Batch
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    lines : collection(Line)
+
+rule helper
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    l : Line
+  output:
+    ok : bool
+  logic:
+    ok = l.amount > 10
+  proofs:
+    purity:
+      reads   : [l.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+rule caller
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    b : Batch
+  output:
+    r : {out_ty}
+  logic:
+{lets}    r = {value}
+  proofs:
+    purity:
+      reads   : [b.lines]
+      calls   : [helper]
+    termination:
+      bound : 5
+"#
+            )
+        };
+
+        let nested = [
+            // Inside a quantifier/aggregation lambda body.
+            ("lambda body", with_logic("", "count(b.lines, e => helper(e, e))", "number")),
+            // Inside a `let` RHS — collected from logic.bindings, not logic.value.
+            (
+                "let RHS",
+                with_logic(
+                    "    let n = count(b.lines, e => helper(e, e))\n",
+                    "n",
+                    "number",
+                ),
+            ),
+            // Inside a concat argument list.
+            (
+                "concat arg",
+                with_logic("", "concat(\"n=\", count(b.lines, e => helper(e, e)))", "text"),
+            ),
+        ];
+
+        for (position, src) in nested {
+            let errs = verify_str(&src);
+            assert!(
+                errs.iter().any(|e| e.message.contains("helper")
+                    && e.message.contains("2 arguments")),
+                "a wrong-arity call in the {position} position escaped the arity \
+                 check; got {errs:#?}",
+            );
+        }
+    }
+
+    /// The arity check must NOT fire on built-in primitives.
+    ///
+    /// Primitives legitimately take 0, 1, 2 or 3 arguments (`now_unix()`,
+    /// `length(t)`, `min(a, b)`, `substring(t, a, b)`), so an arity check that
+    /// saw them would reject essentially every non-trivial program. It does
+    /// not see them because the parser resolves all 36 `PRIMITIVE_CALL_NAMES`
+    /// in call position BEFORE the generic `Expr::Call` fallback — this test
+    /// pins that reasoning to observable behaviour, so that the day a
+    /// primitive stops being intercepted, this fails rather than the corpus.
+    #[test]
+    fn arity_check_does_not_fire_on_primitives() {
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number [0, 1000]
+    name   : text [..64]
+
+rule uses_primitives
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    r : number
+  logic:
+    let a = min(t.amount, 100)
+    let b = length(substring(t.name, 0, 2))
+    r = a + b + abs(0 - t.amount)
+  proofs:
+    purity:
+      reads   : [t.amount, t.name]
+      calls   : []
+    termination:
+      bound : 8
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.is_empty(),
+            "the arity check fired on a built-in primitive (0/1/2/3-arg forms \
+             are all legal for primitives); got {:#?}",
             errs
         );
     }
