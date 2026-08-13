@@ -46953,8 +46953,11 @@ rule pick
     /// added 2026-08-12 complete the `@intention` / `@source` PRESENCE matrix
     /// (all SEVEN declaration kinds × both attributes, plus the NESTED-concept
     /// shape; only rule and concept had one before), and `attr_pres_errors`
-    /// closes all fifteen at once:
-    /// **35 fixtures, 24 PASS, 10 GAP, 1 INVERSE**. The 10 are not ten
+    /// closes all fifteen at once: 35 fixtures, 24 PASS, 10 GAP, 1 INVERSE.
+    /// The INVERSE row closed 2026-08-13 when verbosec grew the rule-call
+    /// arity check it had never had, so the set is now EMPTY and the standing
+    /// measurement is
+    /// **35 fixtures, 25 PASS, 10 GAP, 0 INVERSE**. The 10 are not ten
     /// surprises — they are three STRUCTURAL causes wearing ten faces, and
     /// reading them that way is the point of the sweep:
     ///
@@ -47033,11 +47036,17 @@ rule pick
     /// 151 files in `examples/` still compile and 99 of the 100 accepted
     /// binaries are byte-identical (the 100th is `vexprparse` itself).
     ///
-    /// THE INVERSE ROW IS NOT DECORATION. `bad_arity` calls a one-input rule
-    /// with two arguments; **verbosec ACCEPTS it** (it has no arity check on
-    /// rule calls at all) while gen0 REFUSES via `badarity_rule`. It is
-    /// asserted explicitly so that the day verbosec grows the check, this test
-    /// says so instead of quietly reclassifying the row as a PASS.
+    /// THE INVERSE SET IS NOW EMPTY, AND IT EARNED ITS KEEP ON THE WAY OUT.
+    /// `bad_arity` calls a one-input rule with two arguments. From 2026-08-10
+    /// to 2026-08-13 **verbosec ACCEPTED it** — it had no arity check on rule
+    /// calls at all — while gen0 REFUSED via `badarity_rule`. Asserting that
+    /// explicitly, instead of letting it sit unremarked in some bucket, is
+    /// what kept the discrepancy visible until it was fixed; the row is now a
+    /// PASS because verbosec's verifier grew `check_call_arity`. The `INVERSE`
+    /// constant stays (empty) rather than being deleted: it is the tripwire
+    /// for the NEXT time gen0 out-strictens the reference, which is a state
+    /// that always needs a deliberate verdict — a program verbosec blesses
+    /// but the self-hosted compiler will not build.
     #[test]
     #[ignore = "builds gen0 from the full self-source then runs it over the negative corpus; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
@@ -47077,7 +47086,9 @@ rule pick
         ];
 
         // verbosec ACCEPTS these; gen0 refuses. The reverse direction.
-        const INVERSE: &[&str] = &["bad_arity"];
+        // EMPTY since 2026-08-13: `bad_arity` was the only entry and it moved
+        // to `mirrored` when verbosec's verifier grew `check_call_arity`.
+        const INVERSE: &[&str] = &[];
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

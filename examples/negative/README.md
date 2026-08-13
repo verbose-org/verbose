@@ -40,10 +40,16 @@ them too — which requires programs that are not in `examples/`, because
 - Fixtures are **not** picked up by the corpus-acceptance sweep: that sweep
   reads `examples/` non-recursively and filters on the `.verbose` extension, so
   a subdirectory is excluded. `EXPECTED_TOTAL` stays 151.
-- One fixture, `bad_arity.verbose`, is an **inverse** case: `verbosec` accepts
-  it and gen0 refuses it. It is kept (and asserted) rather than deleted,
-  because a fixture that measures a gap in the other direction is still a
-  measurement.
+- The sweep's `INVERSE` set — fixtures `verbosec` ACCEPTS and gen0 refuses — is
+  currently **empty**, and the constant is kept as a tripwire rather than
+  deleted. Its one occupant, `bad_arity.verbose`, was an inverse case from
+  2026-08-10 until 2026-08-13: `verbosec` had no rule-call arity check at all,
+  so `helper(i, i)` on a one-input rule verified clean while gen0 refused it.
+  Keeping it asserted — instead of filing it away in some bucket — is what kept
+  it visible until `check_call_arity` landed in `src/verifier.rs`; the fixture
+  is now a PASS (both compilers refuse). **A fixture that measures a gap in the
+  other direction is still a measurement**, and the empty set is what will
+  catch the next one.
 
 ## One defect can have several SHAPES, and a fixture only holds the one it tests
 
@@ -135,7 +141,7 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 23 fixtures.** They were chosen from CLAUDE.md's known-gaps table plus
+- **Only 35 fixtures.** They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has
   many more refusal paths (resources, connections, services, reactions,
@@ -155,8 +161,10 @@ Stated plainly, because "the negative corpus is green" must not be read as
   compile the minimally-fixed program too and require ACCEPT, so the only thing
   that differs between the two verdicts is the violation under test.
   `two_generation_gen0_detects_partial_purity_underdeclaration` does that for
-  every purity shape it pins. It is per-fixture work, which is why the sweep
-  itself does not do it for all 23.
+  every purity shape it pins, and
+  `wrong_arity_rule_call_rejected_at_verify_time` (`src/verifier.rs`) does it
+  for the arity check. It is per-fixture work, which is why the sweep itself
+  does not do it for all 35.
 - **Effects and services are absent.** Those refusal surfaces are exercised by
   the effect-position matrix in CLAUDE.md, over real TCP and real files, not
   here.
