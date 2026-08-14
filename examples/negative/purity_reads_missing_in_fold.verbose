@@ -1,0 +1,55 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the `sum` body reads b.threshold; `reads:` declares only b.orders.
+--
+-- The POSITION sibling of purity_reads_missing_partial. That one holds the
+-- realistic SHAPE of a concealed read (declare most, omit one); this one holds
+-- the realistic PLACE — inside a collection operation, which is where
+-- non-trivial work lives. Until 2026-08-14 gen0's purity walks returned a flat
+-- 0 for twelve node families (AstOk, AstResErr, AstMatchResult, and the nine
+-- collection nodes AstSum / AstCount / AstFold / AstAll / AstAny / AstMap /
+-- AstFilter / AstMinFold / AstMaxFold), so this program was ACCEPTED at rc 0,
+-- 854 bytes. Two directions of the same check were already implemented and
+-- correct; they simply never looked here.
+--
+-- Note what this fixture does NOT do: it holds ONE of the twelve. The other
+-- eleven are enumerated with corrected twins in
+-- `two_generation_gen0_purity_walk_descends_into_collection_and_result_nodes`
+-- (src/native.rs), because the sweep compares exit status only and cannot
+-- attribute a refusal, while that test can.
+--
+-- verbosec: `declared reads do not match logic; missing: [b.threshold]`.
+concept Order
+  @intention: "One order"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000]
+
+concept Batch
+  @intention: "A batch of orders plus a threshold"
+  @source: negative.intent:1
+
+  fields:
+    orders    : collection(Order)
+    threshold : number [0, 1000]
+
+rule total_above
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    b : Batch
+
+  output:
+    total : number
+
+  logic:
+    total = sum(b.orders, o => if o.amount > b.threshold then o.amount else 0)
+
+  proofs:
+    purity:
+      reads   : [b.orders]
+      calls   : []
+    termination:
+      bound : 400

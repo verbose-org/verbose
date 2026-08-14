@@ -16935,6 +16935,48 @@ rule binds_with_binders
       bound : 512
 
 
+-- binds_with_one's input: a binding scope + ONE name span to add to it.
+concept BindsWithOneState
+  @intention: "A binding scope plus one lambda-binder name span to extend it with"
+  @source: vexprparse.intent:32
+  fields:
+    binds : Binding
+    start : number
+    len : number
+
+
+-- binds_with_one: extend a binding scope with a SINGLE binder name. The singleton
+-- sibling of binds_with_binders (which takes a match arm's whole BinderList), for
+-- the lambda / accumulator / Ok-Err binders the collection and Result node families
+-- introduce — `sum(xs, e => ...)` binds one name, `fold(xs, i, acc, e => ...)` binds
+-- two (applied twice, nested), `match_result(r, v => ..., e => ...)` binds one per
+-- arm. Same DUMMY value (AstNum 0) as binds_with_binders: name_bound only ever reads
+-- the (start, len) identity, never the value. Non-recursive — one cons cell.
+--
+-- WHY THIS EXISTS AT ALL: verbosec's collect_expr_facts collects a lambda body's
+-- reads into a FRESH set and then drops every path whose root is the binder, so
+-- `sum(w.items, e => e.v)` reads `w.items` and NOT `e.v`. gen0 gets the same effect
+-- from the other side — the binder is already IN scope when the body is walked, so
+-- count_undecl_read_ast's name_bound guard rejects it before the reads-list query.
+-- Getting this wrong is a FALSE POSITIVE (a valid program refused), not a missed
+-- violation, which is why the scoping is threaded rather than approximated.
+rule binds_with_one
+  @intention: "Extend a binding scope with one binder name span"
+  @source: vexprparse.intent:32
+  input:
+    bw : BindsWithOneState
+  output:
+    out : Binding
+  logic:
+    out = Binding::BCons { name_start: bw.start, name_len: bw.len, value: Ast::AstNum { value: 0 }, rest: bw.binds }
+  proofs:
+    purity:
+      reads : [bw.binds, bw.start, bw.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- R6a: count_undef_vfields — sum count_undef_ast over every field VALUE of a
 -- variant construct's VFieldList. The field NAMEs are record-field labels, not
 -- variables, so only the `val` Ast of each VFCons is walked. The scope `binds` is
@@ -20081,19 +20123,29 @@ rule count_undecl_call_ast
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => count_undecl_call_vfields(UndeclCallVFieldsState { fields: fields, rules: a.rules, calls: a.calls, src: a.src })
       AstMatch(scrut, arms) => count_undecl_call_ast(UndeclCallState { node: scrut, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_arms(UndeclCallArmsState { arms: arms, rules: a.rules, calls: a.calls, src: a.src })
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => 0
-      AstResErr(inner) => 0
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
-      AstSum(coll, item_start, item_len, body) => 0
-      AstCount(coll, item_start, item_len, body) => 0
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
-      AstAll(coll, item_start, item_len, body) => 0
-      AstAny(coll, item_start, item_len, body) => 0
-      AstMap(coll, item_start, item_len, body) => 0
-      AstFilter(coll, item_start, item_len, body) => 0
-      AstMinFold(coll, item_start, item_len, body) => 0
-      AstMaxFold(coll, item_start, item_len, body) => 0
+      -- Result + collection families. These twelve were a flat `0` ("Result tier
+      -- slice 1 stub") until 2026-08-14, which meant a call performed inside a
+      -- `sum` / `fold` / `map` / `Ok(...)` body was INVISIBLE to the declared-calls
+      -- check — and those are exactly the places non-trivial work lives. Same walk
+      -- shape as count_badcall_ast, which PR #150 taught to descend into the same
+      -- twelve for the undefined-callee lint; the two must stay node-for-node
+      -- identical in WHICH children they visit, or the two lints disagree about
+      -- what the body contains. No scope threading here: a `calls:` entry is a bare
+      -- rule name, and a lambda binder can never shadow one (a binder is a value,
+      -- a callee is a rule) — that asymmetry with the reads walk is why this arm
+      -- set is the short one.
+      AstOk(inner) => count_undecl_call_ast(UndeclCallState { node: inner, rules: a.rules, calls: a.calls, src: a.src })
+      AstResErr(inner) => count_undecl_call_ast(UndeclCallState { node: inner, rules: a.rules, calls: a.calls, src: a.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => count_undecl_call_ast(UndeclCallState { node: scrut, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: ok_body, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: err_body, rules: a.rules, calls: a.calls, src: a.src })
+      AstSum(coll, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
+      AstCount(coll, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: init, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
+      AstAll(coll, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
+      AstAny(coll, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
+      AstMap(coll, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
+      AstFilter(coll, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
+      AstMinFold(coll, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
+      AstMaxFold(coll, item_start, item_len, body) => count_undecl_call_ast(UndeclCallState { node: coll, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src })
   proofs:
     purity:
       reads : [a.node, a.rules, a.calls, a.src]
@@ -20355,23 +20407,45 @@ rule count_undecl_read_ast
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => count_undecl_read_vfields(UndeclReadVFieldsState { fields: fields, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstMatch(scrut, arms) => count_undecl_read_ast(UndeclReadState { node: scrut, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_arms(UndeclReadArmsState { arms: arms, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => 0
-      AstResErr(inner) => 0
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
-      AstSum(coll, item_start, item_len, body) => 0
-      AstCount(coll, item_start, item_len, body) => 0
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
-      AstAll(coll, item_start, item_len, body) => 0
-      AstAny(coll, item_start, item_len, body) => 0
-      AstMap(coll, item_start, item_len, body) => 0
-      AstFilter(coll, item_start, item_len, body) => 0
-      AstMinFold(coll, item_start, item_len, body) => 0
-      AstMaxFold(coll, item_start, item_len, body) => 0
+      -- Result + collection families. These twelve were a flat `0` ("Result tier
+      -- slice 1 stub") until 2026-08-14, and that hole sat exactly where non-trivial
+      -- work lives: `out = sum(w.items, e => e.v + w.secret)` with `reads: [w.items]`
+      -- was ACCEPTED at rc 0, 854 bytes, where verbosec reports `missing: [w.secret]`.
+      -- The declared reads set IS the audit surface, so a read the walk cannot see is
+      -- a read nobody can grep for.
+      --
+      -- BINDER SCOPE IS THE WHOLE DIFFICULTY, and it runs the OPPOSITE way to the
+      -- under-declaration risk: descending without scoping the lambda binder would
+      -- report `e.v` as an undeclared read of the input and REFUSE valid programs.
+      -- verbosec (collect_expr_facts) walks each lambda body into a FRESH fact set
+      -- and drops every path rooted at the binder; gen0 gets the same answer by
+      -- pushing the binder into `binds` BEFORE walking the body, so the AstVar /
+      -- AstField arms' existing name_bound guard rejects it first. Mirrored per
+      -- family exactly as verbosec scopes it: the collection expression and a fold's
+      -- `init` are walked in the OUTER scope (they are evaluated before any element
+      -- exists), the body under the binder; `fold` binds acc AND item (two nested
+      -- conses); `match_result` binds ok_var over ok_body and err_var over err_body,
+      -- with the scrutinee outer. Ok / Err are pure pass-throughs and bind nothing.
+      -- Nesting needs no extra machinery: an inner fold conses its own binder onto
+      -- the scope the outer one already extended, and a binder that SHADOWS the
+      -- input name is handled by the same guard (name_bound wins, so it is not a
+      -- read) — which is verbosec's behaviour too.
+      AstOk(inner) => count_undecl_read_ast(UndeclReadState { node: inner, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstResErr(inner) => count_undecl_read_ast(UndeclReadState { node: inner, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => count_undecl_read_ast(UndeclReadState { node: scrut, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: ok_body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: ok_bstart, len: ok_blen }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: err_body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: err_bstart, len: err_blen }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstSum(coll, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstCount(coll, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: init, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), start: acc_start, len: acc_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstAll(coll, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstAny(coll, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstMap(coll, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstFilter(coll, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstMinFold(coll, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstMaxFold(coll, item_start, item_len, body) => count_undecl_read_ast(UndeclReadState { node: coll, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_one(BindsWithOneState { binds: a.binds, start: item_start, len: item_len }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
   proofs:
     purity:
       reads : [a.node, a.binds, a.reads, a.in_start, a.in_len, a.src]
-      calls : [count_undecl_read_ast, count_undecl_read_args, name_eq, name_bound, name_in_namelist, count_undecl_read_vfields, count_undecl_read_arms, span_is_read, ast_var_start, ast_var_len, ast_path_head_start, ast_path_head_len, arg_first, span_is_fetch]
+      calls : [count_undecl_read_ast, count_undecl_read_args, name_eq, name_bound, name_in_namelist, count_undecl_read_vfields, count_undecl_read_arms, span_is_read, ast_var_start, ast_var_len, ast_path_head_start, ast_path_head_len, arg_first, span_is_fetch, binds_with_one]
     termination:
       bound : 4000
 
@@ -20523,164 +20597,48 @@ rule undeclared_reads
 -- its EXTRA direction inherits that for free, so both halves are now the same
 -- three-line shape. There is no calls-specific machinery here at all.
 --
--- THE GUARD IS THE LOAD-BEARING PART. Both walks return a flat 0 for twelve node
--- families (AstOk / AstResErr / AstMatchResult / AstSum / AstCount / AstFold /
--- AstAll / AstAny / AstMap / AstFilter / AstMinFold / AstMaxFold — the "Result
--- tier slice 1 stub" arms). For the MISSING direction that blindness is
--- fail-open: a read inside `sum(...)` is not flagged. For the EXTRA direction
--- the SAME blindness inverts to fail-CLOSED — the read is invisible, so a
--- correctly declared entry looks unperformed and gen0 would refuse a program
--- verbosec accepts. That is the one direction this arc must never move in, so
--- ast_has_opaque walks the body first and purity_errors skips BOTH extra checks
--- for any rule containing one of the twelve. Coarse (a whole rule loses the
--- check for one `map`) and deliberately so: it can only ever MISS a violation.
+-- THE OPACITY GUARD IS GONE, BECAUSE WHAT IT GUARDED IS GONE (2026-08-14).
+-- Until that date both walks returned a flat 0 for twelve node families (AstOk /
+-- AstResErr / AstMatchResult / AstSum / AstCount / AstFold / AstAll / AstAny /
+-- AstMap / AstFilter / AstMinFold / AstMaxFold — the "Result tier slice 1 stub"
+-- arms), and `ast_has_opaque` + its four list walks existed to make BOTH extra
+-- checks stand down for any rule containing one of them. The reasoning was
+-- sound and is worth keeping on the record: for the MISSING direction that
+-- blindness is fail-OPEN (a read inside `sum(...)` is simply not flagged), and
+-- for the EXTRA direction the SAME blindness inverts to fail-CLOSED (the site is
+-- invisible, so a CORRECTLY declared entry looks unperformed and gen0 refuses a
+-- program verbosec accepts) — the one direction this arc must never move in.
 --
--- NOT GUARDED, because it cannot be reached: verbosec also counts `now_unix()`
--- as a read of the synthetic name `now`, which this walk does not know. A
--- program using it is already refused by gen0 several checks earlier —
--- `now_unix` is not in span_is_primitive, so count_badcall_ast reports it as an
--- undefined callee — and all four `examples/` files declaring `reads: [now]`
--- (order_intake, recent_event, recent_event_abs, sliding_count) are refused for
--- exactly that reason. An arm here would be dead code, i.e. the same false
--- explicitation this check exists to catch. It becomes live the day gen0 learns
--- the primitive, and the `now` read must be added to ast_has_opaque then.
+-- The twelve are now WALKED, by both directions, with lambda / accumulator /
+-- Ok-Err binder scoping (see the arm block in count_undecl_read_ast). So the
+-- opaque set is EMPTY, `ast_has_opaque` would be a rule that structurally
+-- returns 0 for every input, and the guard would suppress nothing. Keeping a
+-- constant-0 predicate and a `if opaque == 0 then ... else 0` around it is
+-- exactly the FALSE EXPLICITATION this project forbids by name — a declaration
+-- that looks like a mechanism and checks nothing — so the five rules were
+-- deleted rather than emptied. Validated empirically before removal, not just
+-- argued: corpus acceptance stays 100/151 with the guard gone, which is the
+-- statement that no valid program lost its extra check to a walk that still
+-- cannot see something.
+--
+-- WHAT WOULD BRING IT BACK, stated so a future slice recognizes the moment: any
+-- new AST node family whose children the purity walks do NOT descend into.
+-- Re-adding a family to one of these walks is cheap; re-adding it WITHOUT a
+-- guard is what turns the EXTRA check into a false-positive machine. The one
+-- near-miss on the horizon is `now_unix()`, which verbosec counts as a read of
+-- the synthetic name `now` and this walk does not know. It cannot be reached
+-- today — `now_unix` is not in span_is_primitive, so count_badcall_ast reports
+-- it as an undefined callee, and all four `examples/` files declaring
+-- `reads: [now]` (order_intake, recent_event, recent_event_abs, sliding_count)
+-- are refused for exactly that reason. The day gen0 learns the primitive, `now`
+-- becomes a performed read the walk cannot see, and the EXTRA direction needs a
+-- guard for it (or, better, an arm that recognizes it).
+--
+-- The OTHER guard survives untouched: extra_reads still stands down when
+-- `in_len == 0` (a rule with no `input:` block — gen0's parens dialect). That
+-- one is a different hole, in the input-name matcher rather than in the node
+-- walk, and nothing here closes it. Its banner is on extra_reads.
 -- ============================================================================
-
--- ast_has_opaque: >0 iff the AST contains a node family the purity walks do not
--- descend into. Bare `Ast` input (same shape as ast_path_head_start), so no state
--- concept is needed; the four sub-list walks below mirror the four list types an
--- Ast can hang children off. Every arm either recurses or returns 0, except the
--- twelve stub families which return 1 — the whole point of the rule.
-rule ast_has_opaque
-  @intention: "1 if an AST contains a node family the purity reads/calls walks do not descend into, 0 otherwise"
-  @source: vexprparse.intent:30
-  input:
-    n : Ast
-  output:
-    out : number
-  logic:
-    out = match n:
-      AstNum(value) => 0
-      AstBin(op, lhs, rhs) => ast_has_opaque(lhs) + ast_has_opaque(rhs)
-      AstNeg(inner) => ast_has_opaque(inner)
-      AstNot(inner) => ast_has_opaque(inner)
-      AstVar(start, len) => 0
-      AstField(base, fstart, flen) => ast_has_opaque(base)
-      AstCall(callee_start, callee_len, args) => args_have_opaque(args)
-      AstIf(cond, thn, els) => ast_has_opaque(cond) + ast_has_opaque(thn) + ast_has_opaque(els)
-      AstBool(value) => 0
-      AstStr(start, len) => 0
-      AstBytes(start, len) => 0
-      AstErr => 0
-      AstVariant(cstart, clen, vstart, vlen, fields) => vfields_have_opaque(fields)
-      AstMatch(scrut, arms) => ast_has_opaque(scrut) + arms_have_opaque(arms)
-      AstOk(inner) => 1
-      AstResErr(inner) => 1
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
-      AstSum(coll, item_start, item_len, body) => 1
-      AstCount(coll, item_start, item_len, body) => 1
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
-      AstAll(coll, item_start, item_len, body) => 1
-      AstAny(coll, item_start, item_len, body) => 1
-      AstMap(coll, item_start, item_len, body) => 1
-      AstFilter(coll, item_start, item_len, body) => 1
-      AstMinFold(coll, item_start, item_len, body) => 1
-      AstMaxFold(coll, item_start, item_len, body) => 1
-  proofs:
-    purity:
-      reads : [n]
-      calls : [ast_has_opaque, args_have_opaque, vfields_have_opaque, arms_have_opaque]
-    termination:
-      bound : 4000
-      structural : n
-
-
--- args_have_opaque: ast_has_opaque summed over a call's argument list.
-rule args_have_opaque
-  @intention: "1 or more if any call argument contains an opaque node family, 0 otherwise"
-  @source: vexprparse.intent:30
-  input:
-    a : ArgList
-  output:
-    out : number
-  logic:
-    out = match a:
-      ArgCons(head, tail) => ast_has_opaque(head) + args_have_opaque(tail)
-      ArgNil => 0
-  proofs:
-    purity:
-      reads : [a]
-      calls : [ast_has_opaque, args_have_opaque]
-    termination:
-      bound : 4000
-      structural : a
-
-
--- vfields_have_opaque: ast_has_opaque summed over a variant construct's field values.
-rule vfields_have_opaque
-  @intention: "1 or more if any variant-construct field value contains an opaque node family, 0 otherwise"
-  @source: vexprparse.intent:30
-  input:
-    f : VFieldList
-  output:
-    out : number
-  logic:
-    out = match f:
-      VFCons(name_start, name_len, val, rest) => ast_has_opaque(val) + vfields_have_opaque(rest)
-      VFNil => 0
-  proofs:
-    purity:
-      reads : [f]
-      calls : [ast_has_opaque, vfields_have_opaque]
-    termination:
-      bound : 4000
-      structural : f
-
-
--- arms_have_opaque: ast_has_opaque summed over every match arm BODY. Binders are
--- irrelevant here (this asks about node SHAPES, not about names), so unlike
--- count_undecl_read_arms there is no scope to extend.
-rule arms_have_opaque
-  @intention: "1 or more if any match arm body contains an opaque node family, 0 otherwise"
-  @source: vexprparse.intent:30
-  input:
-    m : ArmList
-  output:
-    out : number
-  logic:
-    out = match m:
-      ArmCons(vstart, vlen, binders, body, rest) => ast_has_opaque(body) + arms_have_opaque(rest)
-      ArmNil => 0
-  proofs:
-    purity:
-      reads : [m]
-      calls : [ast_has_opaque, arms_have_opaque]
-    termination:
-      bound : 4000
-      structural : m
-
-
--- binds_have_opaque: ast_has_opaque summed over every binding's RHS. The other
--- half of a rule body (the result expression is walked directly).
-rule binds_have_opaque
-  @intention: "1 or more if any let binding's RHS contains an opaque node family, 0 otherwise"
-  @source: vexprparse.intent:30
-  input:
-    b : Binding
-  output:
-    out : number
-  logic:
-    out = match b:
-      BCons(name_start, name_len, value, rest) => ast_has_opaque(value) + binds_have_opaque(rest)
-      BNil => 0
-  proofs:
-    purity:
-      reads : [b]
-      calls : [ast_has_opaque, binds_have_opaque]
-    termination:
-      bound : 4000
-      structural : b
-
 
 -- count_extra_reads's input: the declared entries still to check + everything one
 -- read-walk needs (the let bindings to iterate, the full local scope, the result
@@ -20865,18 +20823,18 @@ concept PurityRuleState
 -- as `missing: [...]` / `extra: [...]`). 0 = the rule's declared purity proof
 -- matches its body exactly.
 --
--- THE OPACITY GUARD IS THE LOAD-BEARING LINE, and it is why the two directions
--- are NOT symmetric here. Both walks return a flat 0 for twelve node families
--- (the "Result tier slice 1 stub" arms — see the banner above extra_reads). For
--- the UNDER direction that blindness is fail-OPEN: a read inside `sum(...)` is
--- simply not flagged, and a missed violation is the safe outcome. For the OVER
--- direction the SAME blindness inverts to fail-CLOSED: the performed site is
--- invisible, so a CORRECTLY declared entry looks unperformed and gen0 would
--- refuse a program verbosec accepts — the one direction this whole arc must
--- never move in. So the guard walks the rule's binds + result first, and BOTH
--- extra checks are skipped for any rule containing one of the twelve. Coarse by
--- construction (a single `map` anywhere in the body costs the rule its extra
--- check) and deliberately so: it can only ever MISS an over-declaration.
+-- THE TWO DIRECTIONS ARE NOW SYMMETRIC, which they were not until 2026-08-14.
+-- Until then both walks returned a flat 0 for twelve node families (the "Result
+-- tier slice 1 stub" arms), so this rule computed an `opaque` flag first and
+-- skipped BOTH extra checks for any rule containing one of them. The twelve are
+-- now walked with binder scoping, the opaque set is empty, and the flag and its
+-- five rules are deleted — see the banner above extra_reads for the full
+-- argument and for what would bring the guard back.
+--
+-- ONE ASYMMETRY SURVIVES and it lives on extra_reads, not here: a rule with no
+-- `input:` block (gen0's parens dialect) has no input name to match, so the
+-- read walk sees zero sites and every declared entry would look unperformed.
+-- extra_reads suppresses itself on `in_len == 0` for exactly that reason.
 --
 -- The arena_scope is not decoration either. extra_reads re-runs the whole read
 -- walk once per declared entry, so a rule with six `reads:` entries costs six
@@ -20895,14 +20853,12 @@ rule purity_errors
   output:
     out : number
   logic:
-    let body = rd_body(pr.rd)
-    let opaque = binds_have_opaque(block_binds(body)) + ast_has_opaque(block_result(body))
     let under = undeclared_calls(UndeclCallRuleState { rd: pr.rd, rules: pr.prog, src: pr.src }) + undeclared_reads(UndeclReadRuleState { rd: pr.rd, src: pr.src })
-    out = under + (if opaque == 0 then arena_scope(extra_reads(UndeclReadRuleState { rd: pr.rd, src: pr.src }) + extra_calls(UndeclCallRuleState { rd: pr.rd, rules: pr.prog, src: pr.src })) else 0)
+    out = under + arena_scope(extra_reads(UndeclReadRuleState { rd: pr.rd, src: pr.src }) + extra_calls(UndeclCallRuleState { rd: pr.rd, rules: pr.prog, src: pr.src }))
   proofs:
     purity:
       reads : [pr.rd, pr.prog, pr.src]
-      calls : [rd_body, block_binds, block_result, binds_have_opaque, ast_has_opaque, undeclared_calls, undeclared_reads, extra_reads, extra_calls]
+      calls : [undeclared_calls, undeclared_reads, extra_reads, extra_calls]
     termination:
       bound : 64
 

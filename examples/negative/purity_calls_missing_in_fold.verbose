@@ -1,0 +1,69 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the `sum` body calls `weight`; `calls:` declares nothing.
+--
+-- The `calls` twin of purity_reads_missing_in_fold, kept separate for the
+-- reason the README gives: "calls was fine" is a measurement, not a property.
+-- Here it was NOT fine — the two walks stub the same twelve node families, so a
+-- CALL performed inside a collection body was as invisible as a read. Measured
+-- on a014fd0: rc 0, 853 bytes.
+--
+-- A concealed call is worse than a concealed read in one specific way: the
+-- `calls:` graph is what @layer stratification and the whole callee-resolution
+-- story are built on, so a call the walk cannot see is a call no downstream
+-- analysis can see either.
+--
+-- verbosec: `declared calls do not match logic; missing: [weight]`.
+concept Order
+  @intention: "One order"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000]
+
+concept Batch
+  @intention: "A batch of orders"
+  @source: negative.intent:1
+
+  fields:
+    orders : collection(Order)
+
+rule weight
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    o : Order
+
+  output:
+    w : number
+
+  logic:
+    w = o.amount * 2
+
+  proofs:
+    purity:
+      reads   : [o.amount]
+      calls   : []
+    termination:
+      bound : 2
+
+rule weighted_total
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    b : Batch
+
+  output:
+    total : number
+
+  logic:
+    total = sum(b.orders, o => weight(o))
+
+  proofs:
+    purity:
+      reads   : [b.orders]
+      calls   : []
+    termination:
+      bound : 400
