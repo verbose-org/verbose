@@ -20732,6 +20732,25 @@ rule count_extra_reads
 -- three or the directions would be checking different things), computes `total`
 -- with an EMPTY declared list, then folds count_extra_reads over the declared
 -- entries. 0 = every declared read is actually performed.
+--
+-- THE `in_len == 0` GUARD IS THE SECOND BLINDNESS ARM, and it is the same
+-- argument as purity_errors' opacity guard applied to a different structural
+-- hole. count_undecl_read_ast recognizes a read ONLY when the path's root
+-- byte-equals the rule's INPUT NAME — the first field of its `input:` block. A
+-- rule declared in gen0's parens dialect (`rule f(x)`) has NO input block, so
+-- `rd_input` is an empty FieldList, `in_len` is 0, and the walk can see ZERO
+-- reads no matter what the body does. Every declared entry would then look
+-- unperformed and gen0 would refuse a program over a proof that is correct
+-- under verbosec's model (there, a parens param is not a let binding, so
+-- `reads: [x]` for `out = x * 10` is exactly right). gen0 instead treats a
+-- param as a LOCAL — param_to_binding puts it in `scope` — so the two models
+-- genuinely disagree about the parens dialect, and the disagreement is
+-- invisible in the MISSING direction (gen0 sees fewer sites, fails OPEN) and
+-- fatal in the EXTRA one (gen0 sees fewer sites, fails CLOSED). Suppressing is
+-- the only reading that keeps the invariant this whole check is built on: it
+-- may MISS an over-declaration, it may never INVENT one. Measured: the R2
+-- fixed-point corpus' call-chain program (`rule f(x)` / `rule g(y)` declaring
+-- `reads : [x]` / `reads : [y]`) is the shape that found this.
 rule extra_reads
   @intention: "Number of `reads:` entries a rule declares but never performs (0 if clean)"
   @source: vexprparse.intent:30
@@ -20750,7 +20769,7 @@ rule extra_reads
     let in_start = fl_head_start(infl)
     let in_len = fl_head_len(infl)
     let total = count_undecl_read_binds(UndeclReadBindsState { iter: binds, scope: scope, reads: NameList::NmNil, in_start: in_start, in_len: in_len, src: ur.src }) + count_undecl_read_ast(UndeclReadState { node: result, binds: scope, reads: NameList::NmNil, in_start: in_start, in_len: in_len, src: ur.src })
-    out = count_extra_reads(ExtraReadState { entries: declared, binds: binds, scope: scope, result: result, total: total, in_start: in_start, in_len: in_len, src: ur.src })
+    out = if in_len == 0 then 0 else count_extra_reads(ExtraReadState { entries: declared, binds: binds, scope: scope, result: result, total: total, in_start: in_start, in_len: in_len, src: ur.src })
   proofs:
     purity:
       reads : [ur.rd, ur.src]
@@ -20837,24 +20856,55 @@ concept PurityRuleState
     src : text [..256]
 
 
--- purity_errors: the total purity-proof violations for ONE rule — undeclared_calls
--- (defined-rule calls not in `calls:`) plus undeclared_reads (input fields not in
--- `reads:`). 0 = the rule's declared purity proof matches its body.
+-- purity_errors: the total purity-proof violations for ONE rule, in BOTH
+-- directions. UNDER-declaration is undeclared_calls (defined-rule calls not in
+-- `calls:`) plus undeclared_reads (input reads not in `reads:`); OVER-declaration
+-- is extra_calls plus extra_reads (declared entries the body never performs).
+-- Together they make the declared set EQUAL to the performed set, which is what
+-- verbosec checks (`declared_reads != facts.reads` is a set inequality, reported
+-- as `missing: [...]` / `extra: [...]`). 0 = the rule's declared purity proof
+-- matches its body exactly.
+--
+-- THE OPACITY GUARD IS THE LOAD-BEARING LINE, and it is why the two directions
+-- are NOT symmetric here. Both walks return a flat 0 for twelve node families
+-- (the "Result tier slice 1 stub" arms — see the banner above extra_reads). For
+-- the UNDER direction that blindness is fail-OPEN: a read inside `sum(...)` is
+-- simply not flagged, and a missed violation is the safe outcome. For the OVER
+-- direction the SAME blindness inverts to fail-CLOSED: the performed site is
+-- invisible, so a CORRECTLY declared entry looks unperformed and gen0 would
+-- refuse a program verbosec accepts — the one direction this whole arc must
+-- never move in. So the guard walks the rule's binds + result first, and BOTH
+-- extra checks are skipped for any rule containing one of the twelve. Coarse by
+-- construction (a single `map` anywhere in the body costs the rule its extra
+-- check) and deliberately so: it can only ever MISS an over-declaration.
+--
+-- The arena_scope is not decoration either. extra_reads re-runs the whole read
+-- walk once per declared entry, so a rule with six `reads:` entries costs six
+-- extra walks, and every walk-state record is an arena node in a gen0-EMITTED
+-- compiler (verbosec's own emit stack-passes plain concepts, gen1's x86_node
+-- arena-allocates them). purity_list folds this over ~930 rules inside verrs'
+-- single outer arena_scope, so without a per-rule reclaim boundary the peak
+-- would grow by that multiple across the whole program. Scoping it here caps
+-- the extra check at one rule's worth. The value is a number, so nothing
+-- survives the bump-pointer restore.
 rule purity_errors
-  @intention: "Total purity-proof violations (undeclared calls + undeclared reads) for one rule"
+  @intention: "Total purity-proof violations (undeclared and over-declared calls and reads) for one rule"
   @source: vexprparse.intent:30
   input:
     pr : PurityRuleState
   output:
     out : number
   logic:
-    out = undeclared_calls(UndeclCallRuleState { rd: pr.rd, rules: pr.prog, src: pr.src }) + undeclared_reads(UndeclReadRuleState { rd: pr.rd, src: pr.src })
+    let body = rd_body(pr.rd)
+    let opaque = binds_have_opaque(block_binds(body)) + ast_has_opaque(block_result(body))
+    let under = undeclared_calls(UndeclCallRuleState { rd: pr.rd, rules: pr.prog, src: pr.src }) + undeclared_reads(UndeclReadRuleState { rd: pr.rd, src: pr.src })
+    out = under + (if opaque == 0 then arena_scope(extra_reads(UndeclReadRuleState { rd: pr.rd, src: pr.src }) + extra_calls(UndeclCallRuleState { rd: pr.rd, rules: pr.prog, src: pr.src })) else 0)
   proofs:
     purity:
       reads : [pr.rd, pr.prog, pr.src]
-      calls : [undeclared_calls, undeclared_reads]
+      calls : [rd_body, block_binds, block_result, binds_have_opaque, ast_has_opaque, undeclared_calls, undeclared_reads, extra_reads, extra_calls]
     termination:
-      bound : 16
+      bound : 64
 
 
 -- purity_list's input: the rule list being ITERATED + the FULL program rule list

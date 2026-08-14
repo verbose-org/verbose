@@ -46957,9 +46957,11 @@ rule pick
     /// The INVERSE row closed 2026-08-13 when verbosec grew the rule-call
     /// arity check it had never had, so the set went EMPTY. Three of the four
     /// `hints:` fixtures closed 2026-08-14 (`hint_errors`, a TOKEN walk — see
-    /// group 2 below), so the standing measurement is
-    /// **35 fixtures, 28 PASS, 7 GAP, 0 INVERSE**. The 7 are not seven
-    /// surprises — they are three STRUCTURAL causes wearing seven faces, and
+    /// group 2 below), and the two `purity_*_extra` fixtures closed the same
+    /// day (`extra_reads` / `extra_calls` — group 3), so the standing
+    /// measurement is
+    /// **35 fixtures, 30 PASS, 5 GAP, 0 INVERSE**. The 5 are not five
+    /// surprises — they are three STRUCTURAL causes wearing five faces, and
     /// reading them that way is the point of the sweep:
     ///
     ///   1. **gen0's tokenizer discards attribute lines entirely.**
@@ -46990,13 +46992,20 @@ rule pick
     ///      ("the two `overflow` ones need interval arithmetic"), and that
     ///      mis-scoping is exactly what kept the cheap half — two integer
     ///      literals and a `>` — open for a slice longer than it had to be.
-    ///   3. **gen0's purity/termination analyses are one-directional or
-    ///      absent.** `purity_list` catches a DECLARED set that is MISSING an
-    ///      entry the logic performs, and does NOT catch a declared entry the
-    ///      logic never performs; `term_list` does not count operations. That
-    ///      is 3 fixtures — and the missing/extra asymmetry is the sharpest
-    ///      single finding here, because "gen0 checks purity" reads as true
-    ///      right up until you feed it an EXTRA declared read.
+    ///   3. **gen0's purity/termination analyses were one-directional or
+    ///      absent.** That was 3 fixtures; **2 closed 2026-08-14** and 1
+    ///      remains. `purity_list` caught a declared set MISSING an entry the
+    ///      logic performs and did NOT catch a declared entry the logic never
+    ///      performs — the sharpest single finding this sweep produced, because
+    ///      "gen0 checks purity" read as true right up until you fed it an
+    ///      EXTRA declared read. `extra_reads` / `extra_calls` close it by
+    ///      REUSING the existing walk rather than writing a second one:
+    ///      `sites(NmNil)` is every performed site, `sites([q])` is every site
+    ///      except those matching `q`, so `q` is extra exactly when the two are
+    ///      equal. One walk per declared entry, same comparison, same path
+    ///      semantics, same scoping — which is what keeps the two directions
+    ///      from ever disagreeing about what "the same read" means.
+    ///      `term_list` still does not count operations: 1 fixture left.
     ///
     /// THAT THIRD ENTRY WAS ITSELF TOO GENEROUS, AND CATCHING IT IS THE MOST
     /// USEFUL THING THIS SWEEP HAS DONE. `purity_reads_missing` scored PASS,
@@ -47016,7 +47025,7 @@ rule pick
     /// the asymmetry named above is between MISSING and EXTRA, not between
     /// reads and calls.
     ///
-    /// The 7th, `input_type_unsupported`, is its own thing: verbosec refuses
+    /// The 5th, `input_type_unsupported`, is its own thing: verbosec refuses
     /// it at NATIVE rather than at verify, and gen0 mirrors none of verbosec's
     /// emit-time refusal surface. It is the same class as `recursive_text_eval`
     /// in CLAUDE.md's gaps table (accept-what-verbosec-refuses), reproduced
@@ -47092,9 +47101,14 @@ rule pick
             //     computed range, i.e. interval arithmetic over the logic —
             //     the same machinery `termination_bound_short` is waiting on.
             "hint_overflow_bad",
-            // (3) purity / termination analyses one-directional or absent — 3
-            "purity_calls_extra",
-            "purity_reads_extra",
+            // (3) purity / termination analyses one-directional or absent — was
+            //     3, now 1. `purity_reads_extra` and `purity_calls_extra` were
+            //     CLOSED 2026-08-14: `purity_errors` now adds `extra_reads` +
+            //     `extra_calls`, so the declared set must EQUAL the performed
+            //     set rather than merely contain it. `termination_bound_short`
+            //     is left and is a different animal — it needs an operation
+            //     counter over the parsed logic, the same absent machinery
+            //     `hint_overflow_bad` is waiting on.
             "termination_bound_short",
             // (4) native-emit refusal surface not mirrored — 1
             "input_type_unsupported",
@@ -47385,18 +47399,24 @@ rule pick
         assert!(gen0_accepts("calls_complete", &c_complete),
             "calls: [h1, h2] is CORRECT and must be ACCEPTED — the attribution twin");
 
-        // ---- the EXTRA direction is still a documented GAP, and stays pinned so
-        // that closing it forces the docs and KNOWN_GAPS to move with it. Over-
-        // declaring conceals nothing, which is why it is lower priority; it is
-        // not harmless, because the declared set is the audit surface.
+        // ---- the EXTRA direction. This assertion was written as an EXPECTED-GAP
+        // marker ("gen0 does not check the EXTRA direction… if this now refuses,
+        // the gap closed") and it CLOSED on 2026-08-14 — so it is flipped here,
+        // and the full both-directions pin lives in
+        // `two_generation_gen0_rejects_purity_over_declaration` next door. Kept in
+        // this test rather than moved, because a purity check that catches MISSING
+        // and stops catching EXTRA is the exact regression this file already
+        // learned to distrust: half a set comparison reads as green.
         let over = reads_probe("t.a, t.b, t.zzz");
         assert!(!verbosec_accepts(&over),
             "verbosec must refuse an over-declared reads list (`extra: [t.zzz]`)");
-        assert!(gen0_accepts("reads_extra", &over),
-            "EXPECTED GAP, not a pass: gen0 does not check the EXTRA direction. \
-             If this now refuses, the gap closed — delete purity_reads_extra from \
-             the negative sweep's KNOWN_GAPS, update CLAUDE.md's purity row, and \
-             flip this assertion.");
+        assert!(!gen0_accepts("reads_extra", &over),
+            "reads: [t.a, t.b, t.zzz] over a body reading only t.a and t.b must be \
+             REFUSED (verbosec: `extra: [t.zzz]`). Accepting it means the declared \
+             set is back to being a SUPERSET of the performed set — the audit \
+             surface then over-states what the rule touches, which is false \
+             explicitation. See extra_reads / count_extra_reads in \
+             examples/vexprparse.verbose and the opacity guard in purity_errors.");
 
         // ---- the committed fixtures, so the pin and the corpus cannot drift.
         for f in ["purity_reads_missing", "purity_reads_missing_partial",
@@ -47416,6 +47436,301 @@ rule pick
                     std::path::Path::new("examples/negative")).is_empty(),
                 "examples/negative/{f}.verbose must be REFUSED by verbosec too — \
                  a fixture both compilers accept measures nothing");
+        }
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// gen0 must refuse a purity proof that declares MORE than the logic performs.
+    ///
+    /// The other half of the check pinned next door. `purity_list` caught a
+    /// declared set that was MISSING an entry (PR #161 made that genuine rather
+    /// than degenerate); it did not catch a declared entry the logic never
+    /// performs. Measured on 8c7b4f8:
+    ///
+    /// ```text
+    ///   examples/negative/purity_reads_extra.verbose   gen0 rc=0, 567 B
+    ///   examples/negative/purity_calls_extra.verbose   gen0 rc=0, 625 B
+    /// ```
+    ///
+    /// verbosec refuses both — `check_purity` compares `declared != facts` as a
+    /// SET, and reports the difference in each direction (`missing: [...]` /
+    /// `extra: [...]`). Half of a set comparison is not a set comparison: with
+    /// only the missing direction, the declared set is a SUPERSET of the
+    /// performed set, so a rule may claim to read a field, a resource or the
+    /// clock that it never touches and no tool disagrees. **The declared
+    /// `reads:` set IS the audit surface** — it is what an auditor greps to find
+    /// every rule that touches something — and a declaration nothing checks is
+    /// exactly the "false explicitation" this project forbids by name.
+    ///
+    /// THE OPACITY GUARD IS THE PART THAT NEEDS PINNING, not the refusal. gen0's
+    /// two purity walks return a flat 0 for twelve node families (`AstOk`,
+    /// `AstResErr`, `AstMatchResult`, and the nine collection nodes — the
+    /// "Result tier slice 1 stub" arms, the same twelve PR #150 found
+    /// `count_badcall_ast` stubbing). For the MISSING direction that blindness
+    /// is fail-OPEN. For the EXTRA direction the SAME blindness inverts to
+    /// fail-CLOSED: the performed site is invisible, so a CORRECTLY declared
+    /// entry looks unperformed and gen0 would refuse a program verbosec
+    /// accepts. `ast_has_opaque` walks the body first and `purity_errors` skips
+    /// BOTH extra checks for any rule containing one of the twelve.
+    ///
+    /// Measured with the guard REMOVED (one-line edit, `if opaque == 0` forced
+    /// true), the idiomatic `out = sum(w.items, e => e.v)` with the CORRECT
+    /// `reads: [w.items]` is REFUSED at rc 1 with zero bytes — a valid program
+    /// rejected. That is why `guard_correct` below is an assertion and not a
+    /// comment: without it, a later "simplification" that drops the guard would
+    /// pass every other test in this file and start rejecting valid programs.
+    /// `guard_over` is its twin and records the guard's COST honestly: an
+    /// over-declaration inside a guarded rule is still undetected.
+    ///
+    /// A SECOND blindness arm exists and was found by measurement, not design:
+    /// `extra_reads` also suppresses itself when the rule has no `input:` block
+    /// (`in_len == 0`). gen0's read walk recognizes a read only when the path
+    /// root byte-equals the INPUT NAME, so a parens-dialect rule (`rule f(x)`)
+    /// gives it nothing to match and every declared entry looks unperformed.
+    /// `guard_parens_param` pins it. Nothing in `examples/` has that shape —
+    /// verbosec's parser makes `input:` mandatory — so only the R2 fixed-point
+    /// corpus reached it, and it reached it as a bare "emitter must exit 0"
+    /// with no cause named. Same invariant as the opacity guard: MISS an
+    /// over-declaration, never INVENT one.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_rejects_purity_over_declaration() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_overdecl_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let dir = std::env::temp_dir().join("verbosec_test_overdecl_probes");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("p.intent"), "title\n1. one\n2. two\n3. three\n4. four\n5. five\n").unwrap();
+
+        // THREE fields, body reads only two. The spurious entry can therefore
+        // name a REAL field of the concept — the realistic shape of the mistake
+        // (a `reads:` line left behind when the logic that used it was edited
+        // out), not the degenerate "name that does not exist anywhere".
+        let reads_probe = |declared: &str| -> String {
+            format!(
+                "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: p.intent:1\n\n  \
+                 fields:\n    a : number [0, 1000]\n    b : number [0, 1000]\n    c : number [0, 1000]\n\n\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:2\n\n  input:\n    t : T\n\n  \
+                 output:\n    total : number\n\n  logic:\n    total = t.a + t.b\n\n  \
+                 proofs:\n    purity:\n      reads   : [{declared}]\n      calls   : []\n    \
+                 termination:\n      bound : 2\n"
+            )
+        };
+        // THREE defined helpers, gate calls only two. Same shape: the spurious
+        // `calls:` entry names a rule that genuinely exists.
+        let calls_probe = |declared: &str| -> String {
+            let helper = |n: &str, k: &str, line: &str| {
+                format!(
+                    "rule {n}\n  @intention: \"h\"\n  @source: p.intent:{line}\n\n  input:\n    t : T\n\n  \
+                     output:\n    out : number\n\n  logic:\n    out = t.a + {k}\n\n  \
+                     proofs:\n    purity:\n      reads   : [t.a]\n      calls   : []\n    \
+                     termination:\n      bound : 2\n\n"
+                )
+            };
+            format!(
+                "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: p.intent:1\n\n  \
+                 fields:\n    a : number [0, 1000]\n\n{}{}{}\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:5\n\n  input:\n    t : T\n\n  \
+                 output:\n    total : number\n\n  logic:\n    total = h1(t) + h2(t)\n\n  \
+                 proofs:\n    purity:\n      reads   : [t]\n      calls   : [{declared}]\n    \
+                 termination:\n      bound : 6\n",
+                helper("h1", "1", "2"), helper("h2", "2", "3"), helper("h3", "3", "4")
+            )
+        };
+        // An OPAQUE body: `sum(...)` is one of the twelve node families both
+        // purity walks stub to 0, so the only performed read (`w.items`, the
+        // collection expression) is invisible to gen0.
+        let opaque_probe = |declared: &str| -> String {
+            format!(
+                "@verbose 0.1.0\n\nconcept Item\n  @intention: \"i\"\n  @source: p.intent:1\n\n  \
+                 fields:\n    v : number [0, 1000]\n\n\
+                 concept W\n  @intention: \"w\"\n  @source: p.intent:2\n\n  \
+                 fields:\n    items : collection(Item)\n    tag : number [0, 1000]\n\n\
+                 rule total\n  @intention: \"s\"\n  @source: p.intent:3\n\n  input:\n    w : W\n\n  \
+                 output:\n    out : number\n\n  logic:\n    out = sum(w.items, e => e.v)\n\n  \
+                 proofs:\n    purity:\n      reads   : [{declared}]\n      calls   : []\n    \
+                 termination:\n      bound : 100\n"
+            )
+        };
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_overdecl_out.elf");
+        let gen0_accepts = |label: &str, text: &str| -> bool {
+            let p = dir.join(format!("{label}.verbose"));
+            fs::write(&p, text).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), p.display(), out_elf.display()))
+                .status().expect("run gen0 over an over-declaration probe");
+            let bytes = fs::metadata(&out_elf).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(status.success(), bytes > 0,
+                "{label}: gen0 must either accept AND emit, or refuse AND emit \
+                 nothing — a half-written ELF at exit 1 is the arena-exhaustion \
+                 signature, not a verdict (see CLAUDE.md on max_nodes)");
+            status.success()
+        };
+        let verbosec_accepts = |text: &str| -> bool {
+            let toks = crate::lexer::Lexer::new(text).tokenize().unwrap();
+            let prog = crate::parser::Parser::new(toks).parse_program().unwrap();
+            crate::verifier::verify_program(&prog, &dir).is_empty()
+        };
+
+        // ---- reads. The corrected twin FIRST, so a blanket refusal (gen0 broken
+        // for some unrelated reason) fails here rather than scoring as a pass.
+        let exact = reads_probe("t.a, t.b");
+        assert!(verbosec_accepts(&exact), "the corrected reads twin must verify");
+        assert!(gen0_accepts("reads_exact", &exact),
+            "reads: [t.a, t.b] is EXACTLY what the body reads and must be ACCEPTED. \
+             gen0 emits no diagnostic, so this twin is what makes every refusal \
+             below attributable to the over-declaration rather than to anything else.");
+
+        for (label, declared) in [
+            ("reads_over_last",  "t.a, t.b, t.c"),
+            ("reads_over_first", "t.c, t.a, t.b"),
+            ("reads_over_mid",   "t.a, t.c, t.b"),
+        ] {
+            let text = reads_probe(declared);
+            assert!(!verbosec_accepts(&text),
+                "{label}: verbosec must refuse `reads: [{declared}]` (`extra: [t.c]`)");
+            assert!(!gen0_accepts(label, &text),
+                "{label}: `reads: [{declared}]` over a body reading only t.a and t.b \
+                 must be REFUSED. All three positions are asserted because \
+                 count_extra_reads RECURSES over the declared list — a bug that \
+                 only checked the head, or only the tail, would pass one of these \
+                 and fail another.");
+        }
+
+        // ---- calls. Same shape, and the reason it needs its own assertions
+        // rather than being assumed to follow: `calls` was already correct when
+        // `reads` was broken in PR #161, so the two have drifted before.
+        let c_exact = calls_probe("h1, h2");
+        assert!(verbosec_accepts(&c_exact), "the corrected calls twin must verify");
+        assert!(gen0_accepts("calls_exact", &c_exact),
+            "calls: [h1, h2] is EXACTLY what the body calls and must be ACCEPTED");
+
+        let c_over = calls_probe("h1, h2, h3");
+        assert!(!verbosec_accepts(&c_over),
+            "verbosec must refuse `calls: [h1, h2, h3]` (`extra: [h3]`)");
+        assert!(!gen0_accepts("calls_over", &c_over),
+            "`calls: [h1, h2, h3]` where h3 is DEFINED but never called must be \
+             REFUSED. Naming a real rule is the realistic shape — a stale entry \
+             left behind by an edit — and it is the shape that needs the callee to \
+             be resolved, not merely absent from the body's text.");
+
+        // A declared callee that resolves to NO rule is also `extra` to verbosec
+        // (its actual call set cannot contain a name the body never calls,
+        // resolvable or not). gen0 agrees for a different reason worth recording:
+        // count_undecl_call_ast only ever counts callees that RESOLVE, so
+        // excluding an unresolvable name removes nothing from the total.
+        let c_ghost = calls_probe("h1, h2, nosuchrule");
+        assert!(!verbosec_accepts(&c_ghost),
+            "verbosec must refuse `calls: [..., nosuchrule]` (`extra: [nosuchrule]`)");
+        assert!(!gen0_accepts("calls_ghost", &c_ghost),
+            "an unresolvable declared callee must be REFUSED as extra");
+
+        // ---- THE OPACITY GUARD. Both halves, because they are one decision.
+        let g_correct = opaque_probe("w.items");
+        assert!(verbosec_accepts(&g_correct),
+            "`reads: [w.items]` for `sum(w.items, e => e.v)` is CORRECT under \
+             verbosec — the collection expression is a read, the lambda body's \
+             `e.v` is not");
+        assert!(gen0_accepts("guard_correct", &g_correct),
+            "THE FALSE-POSITIVE GUARD. gen0's purity walks stub `sum(...)` (and \
+             eleven sibling node families) to 0, so the ONLY performed read here \
+             is invisible to them and the correct declaration looks unperformed. \
+             ast_has_opaque must detect the stubbed family and purity_errors must \
+             skip BOTH extra checks for the rule. Measured with the guard removed: \
+             this exact program is refused at rc 1 with zero bytes — a valid \
+             program rejected, the one direction this arc must never move in.");
+
+        // The SECOND blindness arm, found by the R2 fixed-point corpus rather
+        // than by design: a rule in gen0's parens dialect (`rule f(x)`) has no
+        // `input:` block, so `in_len` is 0 and the read walk — which recognizes
+        // a read only when the path root byte-equals the INPUT NAME — can see
+        // no read at all. `reads: [x]` is correct under verbosec's model (a
+        // parens param is not a let binding) and would be flagged extra by a
+        // walk that cannot see it. Not reachable from `examples/` (verbosec's
+        // parser makes `input:` mandatory, so the dialect is gen0-only), which
+        // is exactly why only the fixed-point corpus caught it.
+        let parens = "@verbose 0.1.0\n\nrule main\n  @intention: \"m\"\n  @source: p.intent:1\n  \
+                      logic:\n    out = f(4)\n  proofs:\n    purity:\n      reads : []\n      \
+                      calls : [f]\n    termination:\n      bound : 8\n\n\
+                      rule f(x)\n  @intention: \"f\"\n  @source: p.intent:2\n  \
+                      logic:\n    out = x * 10\n  proofs:\n    purity:\n      reads : [x]\n      \
+                      calls : []\n    termination:\n      bound : 8\n";
+        assert!(gen0_accepts("guard_parens_param", parens),
+            "THE SECOND FALSE-POSITIVE GUARD (`in_len == 0` in extra_reads). A \
+             parens-dialect rule has no `input:` block, so gen0's read walk has \
+             no input name to match and sees ZERO reads — every declared entry \
+             then looks unperformed. Refusing here would invent a violation over \
+             a proof that is correct under verbosec's model. This shape is the \
+             R2 fixed-point corpus' call-chain program; if this regresses, \
+             two_generation_bootstrap_fixed_point fails too, but it fails with a \
+             bare 'emitter must exit 0' that names no cause.");
+
+        let g_over = opaque_probe("w.items, w.tag");
+        assert!(!verbosec_accepts(&g_over),
+            "verbosec refuses `reads: [w.items, w.tag]` here (`extra: [w.tag]`)");
+        assert!(gen0_accepts("guard_over", &g_over),
+            "THE GUARD'S COST, pinned deliberately: an over-declaration inside a \
+             rule containing one of the twelve opaque families is UNDETECTED, \
+             because the guard is per-RULE, not per-node. That is the safe \
+             direction (miss a violation, never invent one) and it is documented \
+             in CLAUDE.md's purity row. If this ever starts refusing, the guard \
+             got finer-grained — good, but confirm guard_correct still passes \
+             and move the documentation with it.");
+
+        // ---- the committed fixtures, so the pin and the negative corpus cannot
+        // drift apart. Each is paired with its MINIMALLY corrected twin.
+        for (f, bad, good) in [
+            ("purity_reads_extra", "reads   : [i.amount, i.tier]", "reads   : [i.amount]"),
+            ("purity_calls_extra", "calls   : [helper]",           "calls   : []"),
+        ] {
+            let text = fs::read_to_string(format!("examples/negative/{f}.verbose")).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < 'examples/negative/{f}.verbose' > '{}' 2>/dev/null",
+                gen0.display(), out_elf.display()))
+                .status().expect("run gen0 over a committed fixture");
+            assert!(!status.success(),
+                "examples/negative/{f}.verbose must be REFUSED by gen0");
+            assert!(!crate::verifier::verify_program(
+                    &crate::parser::Parser::new(
+                        crate::lexer::Lexer::new(&text).tokenize().unwrap())
+                        .parse_program().unwrap(),
+                    std::path::Path::new("examples/negative")).is_empty(),
+                "examples/negative/{f}.verbose must be REFUSED by verbosec too");
+            assert_eq!(text.matches(bad).count(), 1,
+                "{f}: the fixture's over-declared line moved; update this twin");
+            let fixed = text.replace(bad, good);
+            // Verified against examples/negative (not the probe dir) so the
+            // fixture's own `@source: negative.intent:N` still resolves.
+            assert!(crate::verifier::verify_program(
+                    &crate::parser::Parser::new(
+                        crate::lexer::Lexer::new(&fixed).tokenize().unwrap())
+                        .parse_program().unwrap(),
+                    std::path::Path::new("examples/negative")).is_empty(),
+                "{f}: the corrected twin must verify under verbosec");
+            assert!(gen0_accepts(&format!("{f}_fixed"), &fixed),
+                "{f}: the corrected twin must be ACCEPTED by gen0 — without it the \
+                 refusal above is not attributable to the over-declaration");
         }
 
         let _ = fs::remove_file(&gen0);
