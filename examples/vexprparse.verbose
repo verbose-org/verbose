@@ -8924,31 +8924,34 @@ rule span_is_proofs
 -- an unrecognized top-level item and truncate the whole program at).
 --
 -- ==================== SKIPPING IS NOT VERIFYING ====================
--- This predicate exists so the block can be SKIPPED. gen0 therefore does NOT
--- verify anything a `hints:` block declares. verbosec (src/verifier.rs +
--- src/parser.rs) performs at least these checks that gen0 does not:
---   * `overflow : [min, max]` — the declared bounds are MECHANICALLY CHECKED
---     against the rule's logic by interval arithmetic (src/verifier.rs, the
---     `hints.overflow` context). A rule whose arithmetic can leave the declared
---     range is REJECTED by verbosec; so is `min > max`. gen0 accepts both.
---   * `vectorizable` / `parallel` / `cache_result` — the justification string
---     is MANDATORY and must be non-empty; verbosec's parser rejects the bare
---     keyword form (src/parser.rs). gen0 accepts a bare hint.
---   * the hint NAME is a CLOSED SET (vectorizable, parallel, cache_result,
---     overflow) — verbosec rejects anything else, per the project's
---     closed-attributes rule. gen0 accepts an arbitrary name.
--- So after this slice gen0 will accept a rule whose `overflow:` bound verbosec
--- would refuse. That is a real, KNOWN divergence between the two compilers, and
--- it is accepted deliberately here because the alternative it replaces is
--- worse: before this slice the same files were SILENTLY TRUNCATED (a rule
--- carrying `hints:` ended the program walk, and every rule after it vanished
--- from the emitted binary with exit 0 and no diagnostic). A documented
--- verification gap is auditable; a silent truncation is not.
--- Verifying hint contents in gen0 is a SEPARATE LATER SLICE (it needs interval
--- arithmetic over the parsed logic, which the self-hosted verifier does not yet
--- have). Until it lands, `hints:` joins `@layer` on the list of declarations
--- gen0 parses past without checking — see CLAUDE.md, "self-hosted compiler:
--- known verification gaps".
+-- This predicate exists so the block can be SKIPPED, and for one slice that was
+-- ALL that happened to a `hints:` block: consumed, never checked. THREE of the
+-- four divergences that opened here are now CLOSED by `hint_errors` and its
+-- helpers (search this file for "HINTS-BLOCK CHECKS") — the hint NAME against
+-- the closed set {vectorizable, parallel, cache_result, overflow}, the
+-- MANDATORY non-empty justification on the three trust-based hints, and an
+-- INVERTED `overflow : [min, max]` interval. That walk runs on the TOKEN
+-- stream, not on the raw source, precisely because — unlike an attribute line —
+-- every token of a `hints:` block reaches the parser, which is how this
+-- predicate finds the header in the first place.
+--
+-- ONE divergence remains, named rather than generalised: verbosec also checks
+-- that the declared `overflow` interval CONTAINS the rule's computed range
+-- (`computed range [0, 2000000] exceeds declared [0, 2]`), by interval
+-- arithmetic over the logic — machinery gen0's verifier does not have. It stays
+-- as the negative-corpus fixture `hint_overflow_bad` and as a row in CLAUDE.md,
+-- "self-hosted compiler: known verification gaps".
+--
+-- The two `overflow` checks are NOT one gap, and reading them as one is what
+-- kept the cheap half open for a slice: `min > max` needs two integer literals
+-- and a comparison; `[0, 2]` vs a computed `[0, 2000000]` needs an abstract
+-- interpreter. Different machinery, different cost, different slice.
+--
+-- Why the SKIP itself was still worth shipping alone, before any of the
+-- checking: what it replaced was worse than a documented gap. Before it, a rule
+-- carrying `hints:` ENDED the program walk, and every rule after it vanished
+-- from the emitted binary at exit 0 with no diagnostic (showcase emitted 1 rule
+-- of 6). A verification gap is auditable; a silent truncation is not.
 -- ===================================================================
 rule span_is_hints
   @intention: "1 if an Ident span spells exactly \"hints\", 0 otherwise"
@@ -10507,8 +10510,12 @@ rule pr_next
 -- Both halves are pinned by the STRAY case in
 -- `self_hosted_parses_all_rules_past_a_trailing_hints_block` (src/native.rs).
 --
--- KNOWN VERIFICATION GAP: consuming the block is not checking it. See the
--- banner on span_is_hints for exactly which verbosec checks gen0 forgoes.
+-- CONSUMING THE BLOCK IS NOT CHECKING IT. This rule only makes the cursor land
+-- past the block; the CHECKING is a separate token walk (`hint_errors`, a verrs
+-- contribution — search for "HINTS-BLOCK CHECKS"). Deliberately separate: the
+-- skip must stay byte-identical for a program with no `hints:` block, and the
+-- checks have to reach a stray block this walk never visits. See the banner on
+-- span_is_hints for the one verbosec check gen0 still forgoes.
 rule parse_rule_decl_pos
   @intention: "Parse a `rule NAME` + `logic:` block starting at ps.pos into a RuleDecl + end index"
   @source: vexprparse.intent:31
@@ -10738,6 +10745,303 @@ rule toplevel_junk
     purity:
       reads : [ps.cell, ps.src]
       calls : [skip_seps_dedent, peek_start, peek_len, peek_kind, span_is_rule, span_is_concept, span_is_concept_group, span_is_resource, span_is_reaction, span_is_connection, span_is_service, parse_rule_decl_pos, pr_next, skip_indented_block, toplevel_junk]
+    termination:
+      bound : 512
+
+
+-- ==================== HINTS-BLOCK CHECKS (three of four) ====================
+-- The `hints:` block was CONSUMED but never CHECKED: `parse_rule_decl_pos`
+-- skip_indented_block's past it so the program is not truncated (see the
+-- span_is_hints banner), and nothing looked inside. Three of the four checks
+-- verbosec performs there are closed here; the fourth is named below and left
+-- open with its reason.
+--
+-- WHY THIS IS A TOKEN WALK AND NOT A SOURCE WALK -- the opposite call from
+-- `attr_errors` / `attr_pres_errors`, and for a reason that is measurable
+-- rather than stylistic. Those two walk the RAW SOURCE because the tokenizer
+-- DISCARDS attribute lines (`tokenize_indent`'s `isattr` folds a line whose
+-- first non-space byte is `@` into `isblank`), so there is literally nothing in
+-- the token stream to check. A `hints:` block is different: every one of its
+-- tokens is in the stream -- that is exactly how `span_is_hints` finds the
+-- header in order to skip the block. So the information is already tokenized,
+-- already length-delimited, and already free of comments and indentation
+-- noise, and re-deriving it from bytes would be strictly more work and
+-- strictly less precise.
+--
+-- THE LEGAL NAME SET IS DERIVED FROM verbosec, not remembered:
+-- `Parser::parse_hints_block` (src/parser.rs) matches `overflow` as the bracket
+-- form and then dispatches the string form over exactly `vectorizable`,
+-- `parallel`, `cache_result`, with every other name falling to
+-- `unknown hint '{}' (allowed: vectorizable, parallel, cache_result, overflow)`.
+-- Four names, closed -- the same closed-attributes discipline `attr_name_ok`
+-- applies to `@`-attributes, applied to hints.
+--
+-- WHAT IS CHECKED, and why each one matters more than its size suggests:
+--   1. NAME in the closed set. A hint is the ONE construct in the language that
+--      is supposed to be semantically inert (CLAUDE.md: "a hint must never
+--      change observable behaviour"), which is precisely why a MISSPELLED hint
+--      is dangerous: `vectorisable` / `paralell` reads as a declared, verified
+--      optimization and is in fact nothing at all. Silence is the worst
+--      possible response.
+--   2. JUSTIFICATION present and non-empty for the three trust-based hints.
+--      The justification IS the hint's audit surface -- absence of the hint
+--      means "not claimed", so presence must always carry the reason. verbosec
+--      rejects the bare keyword form at parse time; so does this now. "Non-
+--      empty" is `peek_str_len > 2` because a Str token's `len` spans BOTH
+--      quotes, so `""` measures exactly 2. verbosec additionally rejects an
+--      all-whitespace justification (`reason.trim()`); this does not, which is
+--      the SAFE direction -- it can miss a violation, never invent one.
+--   3. `overflow : [min, max]` with min > max. A pure SHAPE check on two
+--      literals: an inverted interval is empty, so no arithmetic can ever land
+--      inside it. Nothing is inferred and no logic is walked.
+--
+-- WHAT IS NOT CHECKED, deliberately: whether the declared `overflow` interval
+-- CONTAINS the rule's computed range. That is interval arithmetic over the
+-- parsed logic -- a real arc, not a slice, and the same missing machinery the
+-- `termination.bound` row needs. It stays in CLAUDE.md's gaps table and in the
+-- negative corpus as `hint_overflow_bad`. Note the two `overflow` fixtures are
+-- NOT one gap: `min > max` needs two integers and a comparison,
+-- `[0, 2]` vs `[0, 2000000]` needs the abstract interpreter. An earlier note in
+-- this file lumped them together, and that mis-scoping is what kept the cheap
+-- half open.
+--
+-- SHAPE MISMATCH IS SILENCE, NOT AN ERROR. Every check fires only on a fully
+-- recognised shape: an unknown name is one error and its justification is then
+-- not judged; an `overflow` whose brackets/comma/numerals do not parse yields
+-- zero errors rather than a guess. verbosec refuses those at parse time, so
+-- gen0 stays the weaker of the two -- again the safe direction. The one place
+-- precision is mandatory is the BLOCK ANCHOR, because an over-eager anchor
+-- would reject valid programs: a block is recognised only as the four-token
+-- run `Ident("hints") ':' Newline Indent`. A concept field named `hints` is
+-- `hints : <type>` with no Newline after the colon, so it cannot be mistaken
+-- for a block header, and a stray top-level `hints:` is already refused by
+-- `toplevel_junk` (checking it too is harmless).
+--
+-- MEASURED: over all 151 files in examples/ this reports ZERO -- the seven
+-- files that carry hints use only `vectorizable`, `parallel` and `overflow`,
+-- all with well-formed justifications and non-inverted intervals -- and over
+-- examples/negative/ exactly one error on each of `hint_unknown_name`,
+-- `hint_bare_no_justification`, `hint_overflow_inverted`, and zero on
+-- `hint_overflow_bad` and the other 31 fixtures.
+-- ===========================================================================
+
+
+rule span_is_vectorizable
+  @intention: "1 if an Ident span spells exactly \"vectorizable\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 12 and (byte_at(sc.src, sc.start) == 118 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 99 and (byte_at(sc.src, sc.start + 3) == 116 and (byte_at(sc.src, sc.start + 4) == 111 and (byte_at(sc.src, sc.start + 5) == 114 and (byte_at(sc.src, sc.start + 6) == 105 and (byte_at(sc.src, sc.start + 7) == 122 and (byte_at(sc.src, sc.start + 8) == 97 and (byte_at(sc.src, sc.start + 9) == 98 and (byte_at(sc.src, sc.start + 10) == 108 and (byte_at(sc.src, sc.start + 11) == 101)))))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 192
+
+
+rule span_is_parallel
+  @intention: "1 if an Ident span spells exactly \"parallel\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 8 and (byte_at(sc.src, sc.start) == 112 and (byte_at(sc.src, sc.start + 1) == 97 and (byte_at(sc.src, sc.start + 2) == 114 and (byte_at(sc.src, sc.start + 3) == 97 and (byte_at(sc.src, sc.start + 4) == 108 and (byte_at(sc.src, sc.start + 5) == 108 and (byte_at(sc.src, sc.start + 6) == 101 and (byte_at(sc.src, sc.start + 7) == 108)))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 128
+
+
+rule span_is_cache_result
+  @intention: "1 if an Ident span spells exactly \"cache_result\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 12 and (byte_at(sc.src, sc.start) == 99 and (byte_at(sc.src, sc.start + 1) == 97 and (byte_at(sc.src, sc.start + 2) == 99 and (byte_at(sc.src, sc.start + 3) == 104 and (byte_at(sc.src, sc.start + 4) == 101 and (byte_at(sc.src, sc.start + 5) == 95 and (byte_at(sc.src, sc.start + 6) == 114 and (byte_at(sc.src, sc.start + 7) == 101 and (byte_at(sc.src, sc.start + 8) == 115 and (byte_at(sc.src, sc.start + 9) == 117 and (byte_at(sc.src, sc.start + 10) == 108 and (byte_at(sc.src, sc.start + 11) == 116)))))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 192
+
+
+rule span_is_overflow
+  @intention: "1 if an Ident span spells exactly \"overflow\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 8 and (byte_at(sc.src, sc.start) == 111 and (byte_at(sc.src, sc.start + 1) == 118 and (byte_at(sc.src, sc.start + 2) == 101 and (byte_at(sc.src, sc.start + 3) == 114 and (byte_at(sc.src, sc.start + 4) == 102 and (byte_at(sc.src, sc.start + 5) == 108 and (byte_at(sc.src, sc.start + 6) == 111 and (byte_at(sc.src, sc.start + 7) == 119)))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 128
+
+
+-- The closed set itself. Mirrors `span_is_decl_kw`'s shape: a chained if/else
+-- so each recognizer is evaluated at most once. `overflow` is included here
+-- even though `hint_entry_error` tests it separately, so that "is this a legal
+-- hint name" has exactly ONE answer in the file and the two cannot drift.
+rule span_is_hint_name
+  @intention: "1 if an Ident span spells one of the four legal hint names (vectorizable, parallel, cache_result, overflow)"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if span_is_vectorizable(sc) == 1 then 1 else if span_is_parallel(sc) == 1 then 1 else if span_is_cache_result(sc) == 1 then 1 else span_is_overflow(sc)
+  proofs:
+    purity:
+      reads : [sc]
+      calls : [span_is_vectorizable, span_is_parallel, span_is_cache_result, span_is_overflow]
+    termination:
+      bound : 64
+
+
+-- hint_skip_line: from the first token of a hint entry, the cell at which the
+-- NEXT entry begins. Walks forward to the entry's terminating Newline and
+-- returns the cell just past it; a Dedent, an Indent or Eof reached first is
+-- returned UNADVANCED so the caller's own dispatch decides what it means.
+-- Called only from an Ident cell, so the first step always advances -- which is
+-- what makes the caller's loop terminate.
+rule hint_skip_line
+  @intention: "The token cell at which the next hints-block entry begins"
+  @source: vexprparse.intent:63
+  input:
+    st : ParseState
+  output:
+    out : TokenList
+  logic:
+    let knd = peek_kind(st.cell)
+    let nxt = advance(Advance { lst: st.cell, k: 1 })
+    out = if knd == 0 then st.cell else if knd == 800 then st.cell else if knd == 700 then st.cell else if knd == 600 then nxt else hint_skip_line(ParseState { cell: nxt })
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_kind, advance, hint_skip_line]
+    termination:
+      bound : 256
+
+
+-- hint_entry_error: the verdict for ONE `<name> : <value>` entry, with ps.cell
+-- on the name. Sums three independent charges (an entry can only realistically
+-- earn one, but summing avoids any ordering assumption):
+--   * unknown name  -> 1
+--   * a known trust-based hint with no `:`, a non-string value, or the empty
+--     string `""` -> 1
+--   * `overflow : [min, max]` fully recognised with min > max -> 1
+-- Every guard is conservative: a shape that does not parse charges nothing.
+-- `ps.cell` is reused as the inert fallback cell for the unrecognised branches
+-- (it is an Ident, so `peek_op_code` and `peek_is_num` both read 0 on it) --
+-- deliberately, rather than `TokenList::Nil`, which would allocate an arena
+-- node per call for no reason.
+rule hint_entry_error
+  @intention: "Number of verbosec-refused defects in one hints-block entry (unknown name, missing/empty justification, inverted overflow interval)"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let nstart = peek_start(ps.cell)
+    let nlen = peek_len(ps.cell)
+    let is_ov = span_is_overflow(SpanCheck { src: ps.src, start: nstart, len: nlen })
+    let known = span_is_hint_name(SpanCheck { src: ps.src, start: nstart, len: nlen })
+    let n1 = advance(Advance { lst: ps.cell, k: 1 })
+    let has_colon = if peek_op_code(n1) == 10 then 1 else 0
+    let n2 = advance(Advance { lst: n1, k: 1 })
+    let just_bad = if known == 0 then 0 else if is_ov == 1 then 0 else if has_colon == 0 then 1 else if peek_is_str(n2) == 0 then 1 else if peek_str_len(n2) <= 2 then 1 else 0
+    let has_lb = if is_ov == 1 and (has_colon == 1 and peek_op_code(n2) == 25) then 1 else 0
+    let m1raw = if has_lb == 1 then advance(Advance { lst: n2, k: 1 }) else ps.cell
+    let m1neg = if peek_op_code(m1raw) == 14 then 1 else 0
+    let m1cell = if m1neg == 1 then advance(Advance { lst: m1raw, k: 1 }) else m1raw
+    let minv = if m1neg == 1 then 0 - peek_value(m1cell) else peek_value(m1cell)
+    let c1 = advance(Advance { lst: m1cell, k: 1 })
+    let has_comma = if peek_op_code(c1) == 11 then 1 else 0
+    let m2raw = if has_comma == 1 then advance(Advance { lst: c1, k: 1 }) else ps.cell
+    let m2neg = if peek_op_code(m2raw) == 14 then 1 else 0
+    let m2cell = if m2neg == 1 then advance(Advance { lst: m2raw, k: 1 }) else m2raw
+    let maxv = if m2neg == 1 then 0 - peek_value(m2cell) else peek_value(m2cell)
+    let both_num = if peek_is_num(m1cell) == 1 and peek_is_num(m2cell) == 1 then 1 else 0
+    let ovf_bad = if has_lb == 1 and (has_comma == 1 and (both_num == 1 and minv > maxv)) then 1 else 0
+    out = (if known == 0 then 1 else 0) + (just_bad + ovf_bad)
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [peek_start, peek_len, span_is_overflow, span_is_hint_name, advance, peek_op_code, peek_is_str, peek_str_len, peek_value, peek_is_num]
+    termination:
+      bound : 256
+
+
+-- hint_block_errors: sum the verdicts of every entry in one `hints:` block,
+-- with ps.cell on the block's FIRST entry token (just past the Indent). Stops
+-- at the Dedent that closes the block, at Eof, or at any token that is not an
+-- Ident -- stopping rather than charging, because a shape this walk does not
+-- recognise is verbosec's to refuse, not gen0's to guess at.
+rule hint_block_errors
+  @intention: "Number of verbosec-refused defects across all entries of one hints: block"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(ps.cell)
+    let isid = peek_is_ident(ps.cell)
+    let nxt = advance(Advance { lst: ps.cell, k: 1 })
+    out = if knd == 0 then 0 else if knd == 800 then 0 else if knd == 600 or knd == 700 then hint_block_errors(ProgramState { cell: nxt, src: ps.src }) else if isid == 0 then 0 else hint_entry_error(ps) + hint_block_errors(ProgramState { cell: hint_skip_line(ParseState { cell: ps.cell }), src: ps.src })
+  proofs:
+    purity:
+      reads : [ps, ps.cell, ps.src]
+      calls : [peek_kind, peek_is_ident, advance, hint_block_errors, hint_entry_error, hint_skip_line]
+    termination:
+      bound : 512
+
+
+-- hint_errors: the verrs contribution. One linear pass over the WHOLE token
+-- list, charging every `hints:` block it finds. The anchor is the four-token
+-- run `Ident("hints") ':' Newline Indent` (kinds 100 / 400+10 / 600 / 700) --
+-- see the banner above for why that shape cannot false-positive on a field
+-- named `hints`.
+-- Termination: bound-only plus the mandatory recursion breadcrumb. The cursor
+-- advances by exactly one cons cell per step and the base case is the Eof token
+-- (`peek_kind == 0`, which `head_tok` also yields for Nil), so the backstop is
+-- the finite token list -- the same argument `tokenize` itself carries.
+rule hint_errors
+  @intention: "Number of hints-block defects verbosec refuses (unknown hint name, missing/empty justification, inverted overflow interval) across the whole program"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(ps.cell)
+    let nxt = advance(Advance { lst: ps.cell, k: 1 })
+    let is_h = span_is_hints(SpanCheck { src: ps.src, start: peek_start(ps.cell), len: peek_len(ps.cell) })
+    let opened = if is_h == 0 then 0 else if peek_op_code(nxt) == 10 and (peek_kind(advance(Advance { lst: nxt, k: 1 })) == 600 and peek_kind(advance(Advance { lst: nxt, k: 2 })) == 700) then 1 else 0
+    let here = if opened == 1 then hint_block_errors(ProgramState { cell: advance(Advance { lst: nxt, k: 3 }), src: ps.src }) else 0
+    out = if knd == 0 then 0 else here + hint_errors(ProgramState { cell: nxt, src: ps.src })
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [peek_kind, advance, span_is_hints, peek_start, peek_len, peek_op_code, hint_block_errors, hint_errors]
     termination:
       bound : 512
 
@@ -21660,11 +21964,11 @@ rule verify_errors
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors]
+      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors]
     termination:
       bound : 256
 
@@ -32917,7 +33221,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -32989,7 +33293,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors, hint_errors]
     termination:
       bound : 256
 

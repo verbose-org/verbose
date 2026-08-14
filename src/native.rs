@@ -46955,10 +46955,11 @@ rule pick
     /// shape; only rule and concept had one before), and `attr_pres_errors`
     /// closes all fifteen at once: 35 fixtures, 24 PASS, 10 GAP, 1 INVERSE.
     /// The INVERSE row closed 2026-08-13 when verbosec grew the rule-call
-    /// arity check it had never had, so the set is now EMPTY and the standing
-    /// measurement is
-    /// **35 fixtures, 25 PASS, 10 GAP, 0 INVERSE**. The 10 are not ten
-    /// surprises — they are three STRUCTURAL causes wearing ten faces, and
+    /// arity check it had never had, so the set went EMPTY. Three of the four
+    /// `hints:` fixtures closed 2026-08-14 (`hint_errors`, a TOKEN walk — see
+    /// group 2 below), so the standing measurement is
+    /// **35 fixtures, 28 PASS, 7 GAP, 0 INVERSE**. The 7 are not seven
+    /// surprises — they are three STRUCTURAL causes wearing seven faces, and
     /// reading them that way is the point of the sweep:
     ///
     ///   1. **gen0's tokenizer discards attribute lines entirely.**
@@ -46971,14 +46972,24 @@ rule pick
     ///      stratification is left, and it is the one that a source walk
     ///      structurally cannot do: it needs the call graph AND the layer
     ///      value attached to each rule. 2 fixtures remain.
-    ///   2. **gen0 SKIPS the `hints:` block structurally.**
+    ///   2. **gen0 SKIPPED the `hints:` block structurally** —
     ///      `parse_rule_decl_pos` consumes it with `skip_indented_block` so
     ///      the program is not truncated (PR #141/#142), but consuming is not
-    ///      checking. That is 4 fixtures. Two of them (`hint_unknown_name`,
-    ///      `hint_bare_no_justification`) are closed-set/shape checks that a
-    ///      later slice can do by walking the block's tokens; the two
-    ///      `overflow` ones need interval arithmetic over the parsed logic,
-    ///      which is a real arc, not a slice.
+    ///      checking. That was 4 fixtures; 3 closed 2026-08-14 and **1
+    ///      remains**. What made three of them cheap is that a `hints:` block,
+    ///      unlike an attribute line, is FULLY PRESENT in the token stream —
+    ///      that is how `span_is_hints` finds the header in order to skip it —
+    ///      so `hint_errors` walks tokens rather than raw source and gets the
+    ///      closed-set NAME, the mandatory non-empty JUSTIFICATION and an
+    ///      INVERTED `overflow` interval for the cost of one linear pass.
+    ///      `hint_overflow_bad` is left, and it is genuinely a different
+    ///      animal: checking that the declared interval CONTAINS the rule's
+    ///      computed range needs interval arithmetic over the logic, the same
+    ///      absent machinery `termination_bound_short` needs. **The two
+    ///      `overflow` fixtures were previously described here as one gap**
+    ///      ("the two `overflow` ones need interval arithmetic"), and that
+    ///      mis-scoping is exactly what kept the cheap half — two integer
+    ///      literals and a `>` — open for a slice longer than it had to be.
     ///   3. **gen0's purity/termination analyses are one-directional or
     ///      absent.** `purity_list` catches a DECLARED set that is MISSING an
     ///      entry the logic performs, and does NOT catch a declared entry the
@@ -47005,7 +47016,7 @@ rule pick
     /// the asymmetry named above is between MISSING and EXTRA, not between
     /// reads and calls.
     ///
-    /// The 10th, `input_type_unsupported`, is its own thing: verbosec refuses
+    /// The 7th, `input_type_unsupported`, is its own thing: verbosec refuses
     /// it at NATIVE rather than at verify, and gen0 mirrors none of verbosec's
     /// emit-time refusal surface. It is the same class as `recursive_text_eval`
     /// in CLAUDE.md's gaps table (accept-what-verbosec-refuses), reproduced
@@ -47072,11 +47083,15 @@ rule pick
             //     structurally cannot do.
             "layer_calls_unlayered",
             "layer_violation",
-            // (2) the `hints:` block is skipped, not checked — 4
-            "hint_bare_no_justification",
+            // (2) the `hints:` block — 1 of the original 4. `hint_unknown_name`,
+            //     `hint_bare_no_justification` and `hint_overflow_inverted`
+            //     were CLOSED by gen0's `hint_errors` token walk (see
+            //     "HINTS-BLOCK CHECKS" in examples/vexprparse.verbose). This
+            //     one is NOT the same shape as its `_inverted` sibling: it
+            //     needs the declared interval checked AGAINST the rule's
+            //     computed range, i.e. interval arithmetic over the logic —
+            //     the same machinery `termination_bound_short` is waiting on.
             "hint_overflow_bad",
-            "hint_overflow_inverted",
-            "hint_unknown_name",
             // (3) purity / termination analyses one-directional or absent — 3
             "purity_calls_extra",
             "purity_reads_extra",
@@ -47728,6 +47743,233 @@ rule pick
                 if vc_ok { "accepts" } else { "refuses" }
             );
         }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// gen0's `hints:` block checks — closed-set NAME, mandatory non-empty
+    /// JUSTIFICATION, inverted `overflow` interval (`hint_errors`).
+    ///
+    /// WHY THIS MATTERS MORE THAN A THREE-ROW GAP-TABLE DELTA. `hints:` is the
+    /// one construct in the language that is SUPPOSED to be semantically inert
+    /// — CLAUDE.md's rule is that a hint changes speed, code size and
+    /// instruction selection, never stdout, never the exit code, never which
+    /// inputs are accepted (PR #156 exists because a `vectorizable` hint was
+    /// found silently changing an exit code). A compiler that accepts an
+    /// UNKNOWN hint name therefore fails in the quietest possible way: the
+    /// author writes `vectorisable` or `paralell`, believes an optimization is
+    /// declared and mechanically verified, and nothing anywhere disagrees.
+    /// That is the closed-attributes rule — "unknown `@attributes` are
+    /// rejected, not silently ignored" — applied to hints, and it is why the
+    /// `typo_*` cases below are in the corpus rather than just the obviously
+    /// bogus `unrollable`.
+    ///
+    /// THREE PROPERTIES THIS ASSERTS THAT THE NEGATIVE SWEEP CANNOT:
+    ///
+    ///   (a) **THE ACCEPTING ARM.** The negative corpus only ever feeds
+    ///       invalid programs, so a check that refuses EVERYTHING scores a
+    ///       perfect sweep. `cache_result` is the concrete danger here and the
+    ///       exact analogue of `@layer: interface` in the attribute test
+    ///       above: it is a legal hint name that appears in **no file in
+    ///       examples/**, so a one-byte typo in `span_is_cache_result` would
+    ///       pass the corpus sweep, the fixed point AND the negative sweep,
+    ///       and surface only the day someone wrote a valid `cache_result`.
+    ///
+    ///   (b) **THE REALISTIC SHAPE, not the degenerate one.** Twice in this
+    ///       arc a check read as green because the probe landed on the working
+    ///       half of the input space (text `==` was stuck-false and therefore
+    ///       right on every non-matching pair; `purity_reads_missing` only
+    ///       ever tested `reads: []`). The degenerate hints shape is a rule
+    ///       with exactly ONE hint, which is all four `examples/negative/`
+    ///       fixtures are. So the `multi_second_*` cases put the bad entry
+    ///       SECOND, after a good one — the only shape that exercises the
+    ///       entry loop rather than just its first iteration.
+    ///
+    ///   (c) **THE CORRECTED TWIN**, since gen0 emits no diagnostic at all (a
+    ///       refusal is a bare exit 1, zero bytes on stdout, nothing on
+    ///       stderr). Every refusing case has an accepting sibling that
+    ///       differs only in the violation, so the refusal is attributable to
+    ///       the defect and not to some unrelated thing about the fixture.
+    ///
+    /// Every verdict is asserted AGAINST VERBOSEC rather than a hardcoded rc —
+    /// the property is agreement, not a magic number — and the fixture's own
+    /// validity is asserted first, so a mis-written case fails as a fixture
+    /// bug instead of being read as a compiler finding.
+    ///
+    /// THE ONE DELIBERATE DISAGREEMENT is `overflow_too_narrow`
+    /// (`overflow : [0, 2]` on a rule whose computed range is `[-500, 500]`).
+    /// verbosec refuses it by interval arithmetic; gen0 accepts it and is
+    /// asserted to accept it. Naming the surviving gap in the test — rather
+    /// than omitting the case — is what stops it being quietly forgotten, and
+    /// it is also the discriminator that proves the three closed checks are
+    /// not just "gen0 refuses anything with a hints block".
+    ///
+    /// Verified to FAIL pre-change: against a gen0 built from the parent
+    /// commit all 7 refusing cases came back rc 0.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_verifies_hint_names_justifications_and_overflow_shape() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let tmp = std::env::temp_dir().join("verbosec_test_hintchecks");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Without this the `@source` existence check fires first and every
+        // case "refuses" for a reason unrelated to its hints block.
+        fs::write(tmp.join("hints.intent"), "line one\nline two\nline three\n").unwrap();
+
+        let gen0 = tmp.join("gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // The carrier rule is `total = i.amount - 500` over `amount` in
+        // [0, 1000], so its computed range is [-500, 500]. Chosen because it
+        // makes NEGATIVE overflow bounds expressible: `[-500, 500]` is a valid
+        // declaration here and `[500, -500]` is the inverted twin, which is
+        // what exercises the `-` (op 14) handling in the numeral read. A
+        // bool-output carrier could not test that at all.
+        //
+        // (case name, hints-block entry lines, must verbosec accept it?)
+        let cases: &[(&str, &[&str], bool)] = &[
+            // ---- ACCEPTING arm: the half the negative corpus cannot cover.
+            ("no_hints", &[], true),
+            ("ok_vectorizable", &["vectorizable : \"scalar arithmetic, no cross-element dependency\""], true),
+            ("ok_parallel", &["parallel : \"each record is independent\""], true),
+            // Zero coverage anywhere in examples/ — see (a) in the doc comment.
+            ("ok_cache_result", &["cache_result : \"pure function of one bounded field\""], true),
+            ("ok_overflow", &["overflow : [-500, 500]"], true),
+            ("ok_overflow_wider", &["overflow : [-1000, 1000]"], true),
+            ("ok_multi", &["vectorizable : \"scalar arithmetic\"", "overflow : [-500, 500]"], true),
+            // ---- REFUSING arm: one violation each, corrected twin above.
+            ("unknown_name", &["unrollable : \"because I said so\""], false),
+            // The motivating case: a PLAUSIBLE typo of a real hint name.
+            ("typo_vectorisable", &["vectorisable : \"s where z belongs\""], false),
+            ("bare_hint", &["vectorizable"], false),
+            ("empty_justification", &["vectorizable : \"\""], false),
+            ("overflow_inverted", &["overflow : [500, -500]"], false),
+            // ---- REFUSING arm, REALISTIC shape: the bad entry is SECOND.
+            ("multi_second_unknown", &["vectorizable : \"scalar arithmetic\"", "paralell : \"typo\"", "overflow : [-500, 500]"], false),
+            ("multi_second_inverted", &["vectorizable : \"scalar arithmetic\"", "overflow : [500, -500]"], false),
+            ("multi_second_bare", &["vectorizable : \"scalar arithmetic\"", "parallel"], false),
+        ];
+
+        let build = |entries: &[&str]| -> String {
+            let block = if entries.is_empty() {
+                String::new()
+            } else {
+                let mut b = String::from("\n  hints:\n");
+                for e in entries {
+                    b.push_str("    ");
+                    b.push_str(e);
+                    b.push('\n');
+                }
+                b
+            };
+            format!(
+                "@verbose 0.1.0\n\n\
+                 concept Invoice\n  @intention: \"doc\"\n  @source: hints.intent:1\n\n\
+                 \x20 fields:\n    amount : number [0, 1000]\n\n\n\
+                 rule shifted\n  @intention: \"doc\"\n  @source: hints.intent:2\n\n\
+                 \x20 input:\n    i : Invoice\n\n\
+                 \x20 output:\n    total : number\n\n\
+                 \x20 logic:\n    total = i.amount - 500\n\n\
+                 \x20 proofs:\n    purity:\n      reads   : [i.amount]\n      calls   : []\n\
+                 \x20   termination:\n      bound : 1\n{block}"
+            )
+        };
+
+        let run_gen0 = |name: &str, prog_src: &str| -> bool {
+            let path = tmp.join(format!("{name}.verbose"));
+            fs::write(&path, prog_src).unwrap();
+            let out = tmp.join(format!("{name}.elf"));
+            let _ = fs::remove_file(&out);
+            Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                    gen0.display(), path.display(), out.display()
+                ))
+                .status()
+                .expect("run gen0")
+                .success()
+        };
+
+        for (name, entries, vc_accepts) in cases {
+            let prog_src = build(entries);
+
+            // verbosec's verdict over lex -> parse -> verify. The hint checks
+            // live on BOTH sides of that split (name / justification are parse
+            // errors, inverted bounds is a verify error), which is precisely
+            // why the verdict is taken from the pipeline and not from a
+            // hardcoded expectation per case.
+            let vc_ok = (|| {
+                let t = match crate::lexer::Lexer::new(&prog_src).tokenize() { Ok(t) => t, Err(_) => return false };
+                let p = match crate::parser::Parser::new(t).parse_program() { Ok(p) => p, Err(_) => return false };
+                crate::verifier::verify_program(&p, &tmp).is_empty()
+            })();
+            assert_eq!(
+                vc_ok, *vc_accepts,
+                "case '{name}': the FIXTURE is wrong, not the compiler — verbosec \
+                 {} it while the case says it should be {}. Fix the fixture before \
+                 reading anything into gen0's answer.",
+                if vc_ok { "accepts" } else { "refuses" },
+                if *vc_accepts { "accepted" } else { "refused" }
+            );
+
+            let gen0_ok = run_gen0(name, &prog_src);
+            assert_eq!(
+                gen0_ok, vc_ok,
+                "case '{name}' ({entries:?}): gen0 {} it, verbosec {} it.\n\
+                 \n\
+                 gen0 ACCEPTED what verbosec refuses -> `hint_errors` regressed, \
+                 or the block ANCHOR stopped matching. The anchor is the \
+                 four-token run Ident(\"hints\") ':' Newline Indent; if the \
+                 tokenizer's kind codes moved (600 Newline / 700 Indent / \
+                 800 Dedent), every block becomes invisible and this whole \
+                 check silently does nothing.\n\
+                 gen0 REFUSED what verbosec accepts -> a FALSE POSITIVE, the \
+                 failure mode this check must not have. Check the byte values \
+                 in the span_is_* predicate for that hint name, and remember \
+                 `cache_result` has no coverage anywhere in examples/.",
+                if gen0_ok { "accepted" } else { "refused" },
+                if vc_ok { "accepts" } else { "refuses" }
+            );
+        }
+
+        // THE SURVIVING GAP, asserted rather than omitted. `[0, 2]` against a
+        // computed range of [-500, 500] needs interval arithmetic over the
+        // logic; gen0 has none, so it accepts. This case is also the
+        // discriminator that the three closed checks are real: a gen0 that
+        // simply refused every program carrying a `hints:` block would pass
+        // every refusing case above and fail here.
+        let narrow = build(&["overflow : [0, 2]"]);
+        let vc_narrow = (|| {
+            let t = match crate::lexer::Lexer::new(&narrow).tokenize() { Ok(t) => t, Err(_) => return false };
+            let p = match crate::parser::Parser::new(t).parse_program() { Ok(p) => p, Err(_) => return false };
+            crate::verifier::verify_program(&p, &tmp).is_empty()
+        })();
+        assert!(!vc_narrow, "fixture bug: verbosec must refuse overflow [0, 2] on a rule whose range is [-500, 500]");
+        assert!(
+            run_gen0("overflow_too_narrow", &narrow),
+            "gen0 REFUSED `overflow : [0, 2]`. That is the interval-arithmetic \
+             gap (`hint_overflow_bad`), which gen0 is documented NOT to check — \
+             so either a check has become over-broad (it must fire on min > max \
+             only, never on a well-ordered interval), or the gap genuinely \
+             closed, in which case delete `hint_overflow_bad` from the negative \
+             sweep's KNOWN_GAPS, update CLAUDE.md's gaps table and flip this \
+             assertion in the same commit."
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
