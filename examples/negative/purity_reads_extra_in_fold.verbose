@@ -1,0 +1,54 @@
+@verbose 0.1.0
+
+-- NEGATIVE: `reads:` declares b.threshold, which the rule never reads.
+--
+-- The OVER-declaration cell of the same matrix, and it needed a fixture of its
+-- own because it was suppressed by a DIFFERENT mechanism than its sibling. When
+-- the EXTRA direction landed (2026-08-14, `extra_reads` / `extra_calls`) it came
+-- with an explicit opacity guard: `ast_has_opaque` walked the body first and
+-- purity_errors skipped both extra checks for any rule containing one of the
+-- twelve stubbed node families. That guard was correct AT THE TIME — with the
+-- walk blind inside `sum(...)`, a CORRECTLY declared read looks unperformed, so
+-- without the guard gen0 would have refused valid programs. It cost exactly
+-- this: an over-declaration in any rule containing a collection operation went
+-- undetected (measured on a014fd0: rc 0, 1003 bytes).
+--
+-- Teaching the walk to descend is what retires the guard, so the two fixtures
+-- close on the same change but for opposite reasons — one because the walk now
+-- SEES the site, one because the walk no longer needs to be MUTED.
+--
+-- verbosec: `declared reads do not match logic; extra: [b.threshold]`.
+concept Order
+  @intention: "One order"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000]
+
+concept Batch
+  @intention: "A batch of orders plus an unused threshold"
+  @source: negative.intent:1
+
+  fields:
+    orders    : collection(Order)
+    threshold : number [0, 1000]
+
+rule plain_total
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    b : Batch
+
+  output:
+    total : number
+
+  logic:
+    total = sum(b.orders, o => o.amount)
+
+  proofs:
+    purity:
+      reads   : [b.orders, b.threshold]
+      calls   : []
+    termination:
+      bound : 400

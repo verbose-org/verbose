@@ -115,22 +115,32 @@ so `q` is extra exactly when the two are equal. One walk per declared entry, sam
 comparison, same path semantics, same scoping — which is what keeps the two
 directions from ever disagreeing about what "the same read" means.
 
-**Two guards suppress the new check, and both are deliberate.** gen0's purity
-walks return a flat `0` for twelve node families (`AstOk`, `AstResErr`,
-`AstMatchResult`, and the nine collection nodes `AstSum` / `AstCount` /
-`AstFold` / `AstAll` / `AstAny` / `AstMap` / `AstFilter` / `AstMinFold` /
-`AstMaxFold`), and `extra_reads` also stands down for a rule with no `input:`
-block. In both cases the walk can see FEWER performed sites than `verbosec`
-does, and the same blindness that is fail-OPEN for the missing direction inverts
-to fail-CLOSED for this one: a correctly declared entry looks unperformed, and
-gen0 would refuse a program `verbosec` accepts.
+**Two guards suppressed the new check, and one of them lasted a day.** gen0's
+purity walks returned a flat `0` for twelve node families (`AstOk`,
+`AstResErr`, `AstMatchResult`, and the nine collection nodes `AstSum` /
+`AstCount` / `AstFold` / `AstAll` / `AstAny` / `AstMap` / `AstFilter` /
+`AstMinFold` / `AstMaxFold`), and `extra_reads` also stands down for a rule with
+no `input:` block. In both cases the walk can see FEWER performed sites than
+`verbosec` does, and the same blindness that is fail-OPEN for the missing
+direction inverts to fail-CLOSED for this one: a correctly declared entry looks
+unperformed, and gen0 would refuse a program `verbosec` accepts.
+
+The twelve-family guard is **gone** — the walks were taught to descend, with
+lambda / accumulator / `Ok`-`Err` binder scoping, so the opaque set is empty and
+`ast_has_opaque` was deleted rather than left returning a constant `0`. The
+`input:`-block guard survives: it is a hole in the input-name matcher, not in
+the node walk. See the section on POSITION further down.
 
 - **When you add the reverse of an existing one-directional check, re-audit
   every place the walk is incomplete.** Incompleteness that was harmless in one
-  direction is a false positive in the other. Both guards here are per-RULE, so
-  the cost is stated plainly: an over-declaration in a rule containing any one
-  of the twelve families is still undetected. Miss a violation, never invent
-  one.
+  direction is a false positive in the other.
+- **State the cost of a guard as an ASSERTION, not a comment.** The over-
+  declaration that the twelve-family guard let through was pinned as a
+  deliberate `gen0_accepts` in
+  `two_generation_gen0_rejects_purity_over_declaration`. When the guard was
+  retired the next day, that assertion FAILED and named the change; had it been
+  a comment, the improvement would have landed with nothing recording that
+  anything moved.
 - The `input:`-block guard was NOT found by design — nothing in `examples/` has
   the shape (`verbosec`'s parser makes `input:` mandatory, so gen0's parens
   dialect `rule f(x)` is gen0-only). The R2 fixed-point corpus in
@@ -172,6 +182,42 @@ arc.
   and it decays.** This one deferred the cheap half for a slice. It is the third
   time in this arc a stale framing cost more than the code (the INDENT/DEDENT
   comment, the attribute-PRESENCE "genuinely ambiguous" note, this).
+
+## A fixture set organised by DECLARATION cannot see a defect of POSITION
+
+Every fixture in this directory before 2026-08-14 isolated a **declaration**
+`gen0` fails to check: an attribute, a hint, a purity list, a termination bound.
+That is a natural organising axis — it is how CLAUDE.md's gaps table is laid
+out, and how you would enumerate `src/parser.rs`. It also has a blind spot, and
+`purity_reads_missing_in_fold` is what fell into it.
+
+```
+declares reads: [w.items] , logic  sum(w.items, e => e.v + w.secret)  -> gen0 rc=0, 854 B
+declares calls: []        , logic  sum(w.items, e => dbl(e))          -> gen0 rc=0, 853 B
+```
+
+`verbosec` refuses both. Nothing about the DECLARATION is unchecked here — both
+purity directions were implemented, and both were correct. The walks simply
+returned a flat `0` for twelve AST node families (`AstOk`, `AstResErr`,
+`AstMatchResult`, and the nine collection nodes), so a read or a call performed
+inside a `sum` / `fold` / `map` / `Ok(...)` body was in a part of the tree the
+check never visited. **The right check, in the wrong half of the tree.**
+
+A corpus with one row per declaration has no cell for that, so completing the
+declaration matrix — which the section above rightly insists on — would never
+have surfaced it. The three `*_in_fold` fixtures are the first here to vary
+POSITION while holding the declaration constant.
+
+- **Ask where a check RUNS, not only what it checks.** Two axes, not one: which
+  declaration, and which syntactic position the violation sits in.
+- **Reach for the sibling walk.** `count_badcall_ast` (the undefined-callee
+  lint) had the identical twelve-arm stub and PR #150 fixed it there; the purity
+  pair was left behind for four days. When one walk over the AST is found
+  incomplete, the others over the same AST are the first place to look.
+- The full twelve-family enumeration lives in
+  `two_generation_gen0_purity_walk_descends_into_collection_and_result_nodes`
+  rather than here, on purpose: the sweep compares exit status only, and a
+  corrected twin per family is what makes each refusal attributable.
 
 ## And a fixture set can SAMPLE a matrix while reading as if it enumerated one
 
@@ -228,13 +274,16 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 35 fixtures**, currently measuring **30 PASS / 5 GAP / 0 INVERSE**.
+- **Only 38 fixtures**, currently measuring **33 PASS / 5 GAP / 0 INVERSE**.
   They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has
   many more refusal paths (resources, connections, services, reactions,
   `concept_group` bounds, `Result` arm typing, layer/effect composition) with
-  no fixture here at all.
+  no fixture here at all. One is known and named without a fixture: gen0 does
+  not require a `proofs:` block at all, which `verbosec` refuses at parse time.
+  It is closable in its own slice, and rule 6 below is why it is not parked in
+  `KNOWN_GAPS` in the meantime.
 - **One defect per fixture, in isolation.** Nothing measures how gen0 behaves
   when two violations co-occur, or when a violation sits inside a construct
   gen0 parses differently (a service handler, a reaction, a `concept_group`).

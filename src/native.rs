@@ -22021,8 +22021,8 @@ rule le64_neg
             .expect("verbosec must compile `tally` natively");
 
         // Self-hosted, header-less targets: scalar collection(number), body `x`.
-        let prog_self_total = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = sum(w.xs, x => x)";
-        let prog_self_tally = "concept W\n  fields:\n    xs : collection(number)\nrule tally\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = count(w.xs, x => x > 3)";
+        let prog_self_total = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = sum(w.xs, x => x)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
+        let prog_self_tally = "concept W\n  fields:\n    xs : collection(number)\nrule tally\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = count(w.xs, x => x > 3)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
 
         // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
@@ -22137,8 +22137,8 @@ rule le64_neg
 
         // Self-hosted, header-less targets: scalar collection(number), body over `x`
         // and the source-named `acc`.
-        let prog_self_total = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, 100, acc, x => acc + x)";
-        let prog_self_shifty = "concept W\n  fields:\n    xs : collection(number)\nrule shifty\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, 0, acc, x => acc * 2 + x)";
+        let prog_self_total = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, 100, acc, x => acc + x)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
+        let prog_self_shifty = "concept W\n  fields:\n    xs : collection(number)\nrule shifty\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, 0, acc, x => acc * 2 + x)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
 
         // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
@@ -22255,8 +22255,8 @@ rule le64_neg
             .expect("verbosec must compile `anygt` natively");
 
         // Self-hosted, header-less targets: scalar collection(number), body over `x`.
-        let prog_self_allgt = "concept W\n  fields:\n    xs : collection(number)\nrule allgt\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if all(w.xs, x => x > 3) then 1 else 0";
-        let prog_self_anygt = "concept W\n  fields:\n    xs : collection(number)\nrule anygt\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if any(w.xs, x => x > 100) then 1 else 0";
+        let prog_self_allgt = "concept W\n  fields:\n    xs : collection(number)\nrule allgt\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if all(w.xs, x => x > 3) then 1 else 0\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
+        let prog_self_anygt = "concept W\n  fields:\n    xs : collection(number)\nrule anygt\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if any(w.xs, x => x > 100) then 1 else 0\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
 
         // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
@@ -22391,7 +22391,7 @@ rule le64_neg
         .iter()
         .map(|(name, logic)| {
             format!(
-                "{}rule {}\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    {}",
+                "{}rule {}\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400",
                 concepts, name, logic
             )
         })
@@ -22455,7 +22455,7 @@ rule le64_neg
         // Scalar-element regression: a collection(number) reduction through the
         // SAME build still takes the untouched single-atoi path and computes
         // correctly (the record-element guard resolves `number` to no concept).
-        let scalar_src = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = sum(w.xs, x => x)";
+        let scalar_src = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = sum(w.xs, x => x)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
         let scalar = emit_self(scalar_src, "scalar_total");
         assert_eq!(run(&scalar, &["4", "10", "20", "30", "40"]), "100\n");
         assert_eq!(run(&scalar, &["0"]), "0\n");
@@ -22524,11 +22524,11 @@ rule le64_neg
             .expect("verbosec must compile `big_ones` natively (slice 4a)");
 
         // Self-hosted, header-less targets — the SAME rule bodies.
-        let prog_self_map = "concept W\n  fields:\n    xs : collection(number)\nrule doubled\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    r = map(w.xs, x => x * 2)";
-        let prog_self_filter = "concept W\n  fields:\n    xs : collection(number)\nrule big_ones\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    r = filter(w.xs, x => x > 10)";
+        let prog_self_map = "concept W\n  fields:\n    xs : collection(number)\nrule doubled\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    r = map(w.xs, x => x * 2)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
+        let prog_self_filter = "concept W\n  fields:\n    xs : collection(number)\nrule big_ones\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    r = filter(w.xs, x => x > 10)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
         // A let binding BEFORE the map: storesize != 0 shifts the AstMap node's
         // blob offset, so the itoa call-site rel32 must thread bg.off correctly.
-        let prog_self_let = "concept W\n  fields:\n    xs : collection(number)\nrule scaled\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    let k = 2\n    r = map(w.xs, x => x * k)";
+        let prog_self_let = "concept W\n  fields:\n    xs : collection(number)\nrule scaled\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    let k = 2\n    r = map(w.xs, x => x * k)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
 
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
             let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
@@ -22655,8 +22655,8 @@ rule le64_neg
             .expect("verbosec must compile record `tag` (map) natively");
 
         // Self-hosted, header-less targets — the SAME concepts + rule bodies.
-        let self_filter_src = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept W\n  fields:\n    orders : collection(Order)\nrule keep\n  input:\n    w : W\n  output:\n    r : collection(Order)\n  logic:\n    r = filter(w.orders, o => o.amount > 100)";
-        let self_map_src = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept Tagged\n  fields:\n    v : number\n    p : number\nconcept W\n  fields:\n    orders : collection(Order)\nrule tag\n  input:\n    w : W\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.orders, o => Tagged { v: o.amount * 2, p: o.priority })";
+        let self_filter_src = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept W\n  fields:\n    orders : collection(Order)\nrule keep\n  input:\n    w : W\n  output:\n    r : collection(Order)\n  logic:\n    r = filter(w.orders, o => o.amount > 100)\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400";
+        let self_map_src = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept Tagged\n  fields:\n    v : number\n    p : number\nconcept W\n  fields:\n    orders : collection(Order)\nrule tag\n  input:\n    w : W\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.orders, o => Tagged { v: o.amount * 2, p: o.priority })\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400";
 
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
             let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
@@ -22783,10 +22783,10 @@ rule le64_neg
         let vref_two = compile_ref(vsrc_two, "names_line", "two");
 
         // Self-hosted, header-less targets — the SAME concepts + rule bodies.
-        let self_roster_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule roster_line\n  input:\n    w : Workforce\n  output:\n    line : text\n  logic:\n    line = fold(w.employees, \"roster: \", acc, e => concat(acc, e.name, \"=\", e.salary, \"; \"))";
-        let self_jfilter_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule keep\n  input:\n    w : Workforce\n  output:\n    r : collection(Employee)\n  logic:\n    r = filter(w.employees, e => e.salary > 100)";
-        let self_jmap_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Tagged\n  fields:\n    who : text\n    pay : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule relabel\n  input:\n    w : Workforce\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.employees, e => Tagged { who: e.name, pay: e.salary * 2 })";
-        let self_two_src = "concept Person\n  fields:\n    first : text\n    last : text\nconcept Crowd\n  fields:\n    people : collection(Person)\nrule names_line\n  input:\n    c : Crowd\n  output:\n    r : text\n  logic:\n    r = fold(c.people, \"names: \", acc, p => concat(acc, p.first, \" \", p.last, \"; \"))";
+        let self_roster_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule roster_line\n  input:\n    w : Workforce\n  output:\n    line : text\n  logic:\n    line = fold(w.employees, \"roster: \", acc, e => concat(acc, e.name, \"=\", e.salary, \"; \"))\n  proofs:\n    purity:\n      reads : [w.employees]\n      calls : []\n    termination:\n      bound : 400";
+        let self_jfilter_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule keep\n  input:\n    w : Workforce\n  output:\n    r : collection(Employee)\n  logic:\n    r = filter(w.employees, e => e.salary > 100)\n  proofs:\n    purity:\n      reads : [w.employees]\n      calls : []\n    termination:\n      bound : 400";
+        let self_jmap_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Tagged\n  fields:\n    who : text\n    pay : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule relabel\n  input:\n    w : Workforce\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.employees, e => Tagged { who: e.name, pay: e.salary * 2 })\n  proofs:\n    purity:\n      reads : [w.employees]\n      calls : []\n    termination:\n      bound : 400";
+        let self_two_src = "concept Person\n  fields:\n    first : text\n    last : text\nconcept Crowd\n  fields:\n    people : collection(Person)\nrule names_line\n  input:\n    c : Crowd\n  output:\n    r : text\n  logic:\n    r = fold(c.people, \"names: \", acc, p => concat(acc, p.first, \" \", p.last, \"; \"))\n  proofs:\n    purity:\n      reads : [c.people]\n      calls : []\n    termination:\n      bound : 400";
 
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
             let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
@@ -22954,21 +22954,21 @@ rule le64_neg
 
         // Self-hosted, header-less targets — the SAME rule bodies.
         let rec_concepts = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept W\n  fields:\n    orders : collection(Order)\n";
-        let prog_rec = format!("{}rule amounts_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"amts:\", acc, o => concat(acc, \" \", o.amount))", rec_concepts);
-        let prog_multi = format!("{}rule detail_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"orders:\", acc, o => concat(acc, \" [\", o.amount, \"x\", o.priority, \"]\"))", rec_concepts);
-        let prog_scaled = format!("{}rule scaled_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"x2:\", acc, o => concat(acc, \" \", o.amount * 2))", rec_concepts);
+        let prog_rec = format!("{}rule amounts_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"amts:\", acc, o => concat(acc, \" \", o.amount))\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400", rec_concepts);
+        let prog_multi = format!("{}rule detail_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"orders:\", acc, o => concat(acc, \" [\", o.amount, \"x\", o.priority, \"]\"))\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400", rec_concepts);
+        let prog_scaled = format!("{}rule scaled_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"x2:\", acc, o => concat(acc, \" \", o.amount * 2))\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400", rec_concepts);
         // A let binding BEFORE the fold: storesize != 0 shifts the AstFold
         // node's blob offset, so every per-arg itoa call-site rel32 must
         // thread bg.off correctly.
-        let prog_let = format!("{}rule let_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    let k = 3\n    r = fold(w.orders, \"x3:\", acc, o => concat(acc, \" \", o.amount * k))", rec_concepts);
+        let prog_let = format!("{}rule let_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    let k = 3\n    r = fold(w.orders, \"x3:\", acc, o => concat(acc, \" \", o.amount * k))\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400", rec_concepts);
         // Scalar-element text fold — NO verbosec oracle (Phase 5b refuses
         // scalar-element input collections); hand-pinned expected bytes.
-        let prog_scalar = "concept W\n  fields:\n    xs : collection(number)\nrule vals_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.xs, \"vals:\", acc, x => concat(acc, \" \", x))";
+        let prog_scalar = "concept W\n  fields:\n    xs : collection(number)\nrule vals_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.xs, \"vals:\", acc, x => concat(acc, \" \", x))\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
         // Non-append-only: acc referenced in the rest args -> whole-fold int3.
-        let prog_bad = format!("{}rule bad_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"amts:\", acc, o => concat(acc, \" \", acc))", rec_concepts);
+        let prog_bad = format!("{}rule bad_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"amts:\", acc, o => concat(acc, \" \", acc))\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400", rec_concepts);
         // Declared-type/body-shape mismatches -> int3 proc body.
-        let prog_mism_num = "concept W\n  fields:\n    xs : collection(number)\nrule mism\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, \"vals:\", acc, x => concat(acc, \" \", x))";
-        let prog_mism_txt = "concept W\n  fields:\n    xs : collection(number)\nrule mism2\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.xs, 0, acc, x => acc + x)";
+        let prog_mism_num = "concept W\n  fields:\n    xs : collection(number)\nrule mism\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, \"vals:\", acc, x => concat(acc, \" \", x))\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
+        let prog_mism_txt = "concept W\n  fields:\n    xs : collection(number)\nrule mism2\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.xs, 0, acc, x => acc + x)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
 
         let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
             let mc = Command::new(&elf).args([with_probe_attrs(prog_src).as_str(), "0"]).output()
@@ -23144,7 +23144,7 @@ rule le64_neg
         .iter()
         .map(|(name, logic)| {
             format!(
-                "{}rule {}\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    {}",
+                "{}rule {}\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 400",
                 concepts, name, logic
             )
         })
@@ -23201,8 +23201,8 @@ rule le64_neg
         // Scalar-element case: a `collection(number)` reduction (NO verbosec native
         // oracle — verbosec refuses collection(number); hand-pinned) takes the
         // untouched single-atoi loop and computes correctly, incl. the sentinels.
-        let scalar_min = "concept W\n  fields:\n    xs : collection(number)\nrule mn\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = min(w.xs, x => x)";
-        let scalar_max = "concept W\n  fields:\n    xs : collection(number)\nrule mx\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = max(w.xs, x => x)";
+        let scalar_min = "concept W\n  fields:\n    xs : collection(number)\nrule mn\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = min(w.xs, x => x)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
+        let scalar_max = "concept W\n  fields:\n    xs : collection(number)\nrule mx\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = max(w.xs, x => x)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 400";
         let smn = emit_self(scalar_min, "scalar_min");
         let smx = emit_self(scalar_max, "scalar_max");
         assert_eq!(run(&smn, &["3", "50", "10", "30"]), "10\n");
@@ -46958,9 +46958,13 @@ rule pick
     /// arity check it had never had, so the set went EMPTY. Three of the four
     /// `hints:` fixtures closed 2026-08-14 (`hint_errors`, a TOKEN walk — see
     /// group 2 below), and the two `purity_*_extra` fixtures closed the same
-    /// day (`extra_reads` / `extra_calls` — group 3), so the standing
-    /// measurement is
-    /// **35 fixtures, 30 PASS, 5 GAP, 0 INVERSE**. The 5 are not five
+    /// day (`extra_reads` / `extra_calls` — group 3). The **three** fixtures
+    /// added 2026-08-14 measure a POSITION rather than a declaration —
+    /// `purity_reads_missing_in_fold`, `purity_calls_missing_in_fold`,
+    /// `purity_reads_extra_in_fold` — and all three land as PASS in the same
+    /// commit, because the purity walks now descend into the twelve node
+    /// families they stubbed. So the standing measurement is
+    /// **38 fixtures, 33 PASS, 5 GAP, 0 INVERSE**. The 5 are not five
     /// surprises — they are three STRUCTURAL causes wearing five faces, and
     /// reading them that way is the point of the sweep:
     ///
@@ -47465,25 +47469,31 @@ rule pick
     /// every rule that touches something — and a declaration nothing checks is
     /// exactly the "false explicitation" this project forbids by name.
     ///
-    /// THE OPACITY GUARD IS THE PART THAT NEEDS PINNING, not the refusal. gen0's
-    /// two purity walks return a flat 0 for twelve node families (`AstOk`,
-    /// `AstResErr`, `AstMatchResult`, and the nine collection nodes — the
-    /// "Result tier slice 1 stub" arms, the same twelve PR #150 found
-    /// `count_badcall_ast` stubbing). For the MISSING direction that blindness
-    /// is fail-OPEN. For the EXTRA direction the SAME blindness inverts to
-    /// fail-CLOSED: the performed site is invisible, so a CORRECTLY declared
-    /// entry looks unperformed and gen0 would refuse a program verbosec
-    /// accepts. `ast_has_opaque` walks the body first and `purity_errors` skips
-    /// BOTH extra checks for any rule containing one of the twelve.
+    /// THE OPACITY GUARD THIS TEST WAS WRITTEN AROUND IS GONE (2026-08-14), and
+    /// the two `guard_*` assertions survive it with their verdicts swapped.
+    /// When the EXTRA direction landed, gen0's two purity walks returned a flat
+    /// 0 for twelve node families (`AstOk`, `AstResErr`, `AstMatchResult`, and
+    /// the nine collection nodes — the "Result tier slice 1 stub" arms, the same
+    /// twelve PR #150 found `count_badcall_ast` stubbing). For the MISSING
+    /// direction that blindness was fail-OPEN; for the EXTRA direction the SAME
+    /// blindness inverted to fail-CLOSED, so `ast_has_opaque` muted both extra
+    /// checks for any rule containing one of the twelve. Measured with that
+    /// guard forcibly removed, the idiomatic `out = sum(w.items, e => e.v)` with
+    /// the CORRECT `reads: [w.items]` was refused at rc 1 with zero bytes.
     ///
-    /// Measured with the guard REMOVED (one-line edit, `if opaque == 0` forced
-    /// true), the idiomatic `out = sum(w.items, e => e.v)` with the CORRECT
-    /// `reads: [w.items]` is REFUSED at rc 1 with zero bytes — a valid program
-    /// rejected. That is why `guard_correct` below is an assertion and not a
-    /// comment: without it, a later "simplification" that drops the guard would
-    /// pass every other test in this file and start rejecting valid programs.
-    /// `guard_over` is its twin and records the guard's COST honestly: an
-    /// over-declaration inside a guarded rule is still undetected.
+    /// The walks now DESCEND into all twelve, with lambda / accumulator / Ok-Err
+    /// binder scoping, so the opaque set is empty and the guard is deleted. The
+    /// two assertions therefore stop measuring a guard and start measuring the
+    /// WALK, one from each side: `guard_correct` is the binder-scope negative (a
+    /// correct declaration inside a `sum` must still be ACCEPTED — descending
+    /// without scoping `e` would refuse it), and `guard_over` is the cell that
+    /// flipped (a spurious entry inside a `sum` is now CAUGHT).
+    ///
+    /// **That flip is the reason the cost was worth asserting rather than
+    /// merely commenting.** `guard_over` was deliberately written as
+    /// `gen0_accepts` to record what the guard cost; when the cost became
+    /// payable, a named test failed and said so, instead of the improvement
+    /// landing silently with no record that anything had changed.
     ///
     /// A SECOND blindness arm exists and was found by measurement, not design:
     /// `extra_reads` also suppresses itself when the rule has no `input:` block
@@ -47645,20 +47655,31 @@ rule pick
         assert!(!gen0_accepts("calls_ghost", &c_ghost),
             "an unresolvable declared callee must be REFUSED as extra");
 
-        // ---- THE OPACITY GUARD. Both halves, because they are one decision.
+        // ---- THE COLLECTION-BODY CELL. Both halves, because they are one
+        // decision — and the decision INVERTED on 2026-08-14, when the purity
+        // walks were taught to descend into the twelve node families they
+        // stubbed. Before that, `ast_has_opaque` muted both extra checks for
+        // any rule containing one of the twelve, so `guard_correct` passed
+        // BECAUSE the check was off and `guard_over` documented the cost.
+        // Now the walk SEES `w.items`, so `guard_correct` passes for the right
+        // reason and `guard_over` is caught. Keeping both assertions with the
+        // verdicts swapped is the point: the pair reads as a before/after of
+        // the same probe, and it is what would catch a regression in either
+        // direction (a walk that stops descending, or one that mis-scopes the
+        // binder and starts flagging `e.v`).
         let g_correct = opaque_probe("w.items");
         assert!(verbosec_accepts(&g_correct),
             "`reads: [w.items]` for `sum(w.items, e => e.v)` is CORRECT under \
              verbosec — the collection expression is a read, the lambda body's \
              `e.v` is not");
         assert!(gen0_accepts("guard_correct", &g_correct),
-            "THE FALSE-POSITIVE GUARD. gen0's purity walks stub `sum(...)` (and \
-             eleven sibling node families) to 0, so the ONLY performed read here \
-             is invisible to them and the correct declaration looks unperformed. \
-             ast_has_opaque must detect the stubbed family and purity_errors must \
-             skip BOTH extra checks for the rule. Measured with the guard removed: \
-             this exact program is refused at rc 1 with zero bytes — a valid \
-             program rejected, the one direction this arc must never move in.");
+            "THE BINDER-SCOPE NEGATIVE. gen0's read walk now DESCENDS into \
+             `sum(...)`, so it must also push the lambda binder `e` into scope \
+             before walking the body — otherwise `e.v` reads as an undeclared \
+             read of the input and this valid program is refused. Descending \
+             without scoping is a FALSE POSITIVE, the one direction this arc \
+             must never move in; the walk mirrors verbosec's collect_expr_facts, \
+             which drops every inner path rooted at the binder.");
 
         // The SECOND blindness arm, found by the R2 fixed-point corpus rather
         // than by design: a rule in gen0's parens dialect (`rule f(x)`) has no
@@ -47688,14 +47709,19 @@ rule pick
         let g_over = opaque_probe("w.items, w.tag");
         assert!(!verbosec_accepts(&g_over),
             "verbosec refuses `reads: [w.items, w.tag]` here (`extra: [w.tag]`)");
-        assert!(gen0_accepts("guard_over", &g_over),
-            "THE GUARD'S COST, pinned deliberately: an over-declaration inside a \
-             rule containing one of the twelve opaque families is UNDETECTED, \
-             because the guard is per-RULE, not per-node. That is the safe \
-             direction (miss a violation, never invent one) and it is documented \
-             in CLAUDE.md's purity row. If this ever starts refusing, the guard \
-             got finer-grained — good, but confirm guard_correct still passes \
-             and move the documentation with it.");
+        assert!(!gen0_accepts("guard_over", &g_over),
+            "THE GUARD'S COST, NOW PAID OFF. This assertion was `gen0_accepts` \
+             until 2026-08-14, pinning what the opacity guard cost: an \
+             over-declaration inside a rule containing any of the twelve node \
+             families went undetected, because the guard was per-RULE, not \
+             per-node. Teaching the walks to descend removed the guard's reason \
+             to exist, so the cell flips to a refusal. NOTE WHAT THAT MEANS FOR \
+             THIS TEST: the two `guard_*` assertions no longer measure a guard \
+             at all — they measure the WALK, one from each side (a correct \
+             declaration inside a `sum` must pass, a spurious one must not). \
+             That is a strictly stronger pair, and it is why the deliberately \
+             asserted cost was worth writing down rather than leaving implicit: \
+             the day it became payable, a test named it.");
 
         // ---- the committed fixtures, so the pin and the negative corpus cannot
         // drift apart. Each is paired with its MINIMALLY corrected twin.
@@ -47731,6 +47757,287 @@ rule pick
             assert!(gen0_accepts(&format!("{f}_fixed"), &fixed),
                 "{f}: the corrected twin must be ACCEPTED by gen0 — without it the \
                  refusal above is not attributable to the over-declaration");
+        }
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// gen0's purity walks must SEE inside collection and `Result` nodes.
+    ///
+    /// Both walks — `count_undecl_read_ast` and `count_undecl_call_ast` —
+    /// returned a flat `0` for twelve node families until 2026-08-14: `AstOk`,
+    /// `AstResErr`, `AstMatchResult`, and the nine collection nodes `AstSum` /
+    /// `AstCount` / `AstFold` / `AstAll` / `AstAny` / `AstMap` / `AstFilter` /
+    /// `AstMinFold` / `AstMaxFold`, all labelled "Result tier slice 1 stub".
+    /// PR #150 had already found and fixed the identical stub in
+    /// `count_badcall_ast` (the undefined-callee lint); the purity pair was left
+    /// behind, so a read or a call performed inside a `sum` / `fold` / `map` /
+    /// `Ok(...)` body was invisible to the proof check. Measured on a014fd0:
+    ///
+    /// ```text
+    ///   out = sum(w.items, e => e.v + w.secret)  reads: [w.items]  -> rc 0, 854 B
+    ///   out = sum(w.items, e => dbl(e))          calls: []         -> rc 0, 853 B
+    /// ```
+    ///
+    /// verbosec reports `missing: [w.secret]` and `missing: [dbl]`. **The
+    /// declared `reads:` set IS the audit surface** — it is what someone greps
+    /// to find every rule touching a resource, the clock, or a field — and this
+    /// hole sat exactly where non-trivial work lives, so the set was reliable
+    /// only for rules that do nothing interesting.
+    ///
+    /// EVERY ONE OF THE TWELVE GETS ITS OWN CASE, with a corrected twin, and
+    /// that is deliberate rather than thorough-for-its-own-sake. They are twelve
+    /// separate match arms that can drift independently: eleven correct arms and
+    /// one left at `0` reads exactly like twelve correct arms from any test that
+    /// samples the family. It is the same discipline the `@intention`/`@source`
+    /// PRESENCE matrix needed (2026-08-12, where five of seven declaration kinds
+    /// had never been measured) and the same one the negative corpus' own README
+    /// states: when a check ranges over a finite set of contexts, enumerate the
+    /// set. The committed fixtures hold three representative cells; the full
+    /// enumeration lives here because the sweep compares exit status only and
+    /// cannot attribute a refusal, whereas a corrected twin can.
+    ///
+    /// BINDER SCOPE IS THE OTHER HALF, and it fails in the opposite direction.
+    /// Descending into `sum(w.items, e => e.v)` without pushing `e` into scope
+    /// would report `e.v` as an undeclared read of `w` and REFUSE A VALID
+    /// PROGRAM. verbosec (`collect_expr_facts`) walks each lambda body into a
+    /// fresh fact set and drops every path rooted at the binder; gen0 conses the
+    /// binder onto `binds` before walking the body, so its existing `name_bound`
+    /// guard rejects the path first. The `scope_*` cases pin one shape each of
+    /// what that has to get right: a plain lambda, a `fold`'s TWO binders,
+    /// `match_result`'s per-arm binders, a NESTED lambda (inner binder consed
+    /// onto the outer's extended scope), and a binder that SHADOWS the input
+    /// name. Without them a later change could start reporting binders as
+    /// undeclared reads and every assertion above would still pass.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_purity_walk_descends_into_collection_and_result_nodes() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_opaquewalk_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let dir = std::env::temp_dir().join("verbosec_test_opaquewalk_probes");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("p.intent"), "title\n1. one\n2. two\n3. three\n").unwrap();
+
+        // A three-field input so the omitted read can name a REAL field — the
+        // realistic shape of a concealed read, not "a name that exists nowhere".
+        // The rule under test is NOT the entry rule: gen0's purity check folds
+        // over every rule, and keeping the entry trivial stops an unrelated
+        // emit-side refusal (e.g. entry_freshtext) from masquerading as a
+        // purity verdict.
+        const HEAD: &str = "@verbose 0.1.0\n\n\
+            concept Item\n  @intention: \"i\"\n  @source: p.intent:1\n  \
+            fields:\n    v : number [0, 100]\n\n\
+            concept W\n  @intention: \"w\"\n  @source: p.intent:1\n  \
+            fields:\n    items : collection(Item)\n    secret : number [0, 100]\n    flag : number [0, 1]\n\n\
+            rule main\n  @intention: \"m\"\n  @source: p.intent:1\n  \
+            input:\n    w : W\n  output:\n    out : number\n  \
+            logic:\n    out = w.flag\n  proofs:\n    purity:\n      reads : [w.flag]\n      \
+            calls : []\n    termination:\n      bound : 10\n\n";
+        // A callee for the `calls`-side cases and for match_result's scrutinee.
+        const DBL: &str = "rule dbl\n  @intention: \"d\"\n  @source: p.intent:2\n  \
+            input:\n    i : Item\n  output:\n    out : number\n  \
+            logic:\n    out = i.v * 2\n  proofs:\n    purity:\n      reads : [i.v]\n      \
+            calls : []\n    termination:\n      bound : 10\n\n";
+        const VAL: &str = "rule val\n  @intention: \"v\"\n  @source: p.intent:2\n  \
+            input:\n    w : W\n  output:\n    out : Result(number, text)\n  \
+            logic:\n    out = if w.flag > 0 then Ok(1) else Err(\"nope\")\n  \
+            proofs:\n    purity:\n      reads : [w.flag]\n      calls : []\n    \
+            termination:\n      bound : 10\n\n";
+
+        let probe = |extra: &str, body: &str, ty: &str, reads: &str, calls: &str| -> String {
+            format!("{HEAD}{extra}rule probe\n  @intention: \"p\"\n  @source: p.intent:3\n  \
+                 input:\n    w : W\n  output:\n    out : {ty}\n  \
+                 logic:\n    out = {body}\n  proofs:\n    purity:\n      reads : [{reads}]\n      \
+                 calls : [{calls}]\n    termination:\n      bound : 400\n")
+        };
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_opaquewalk_out.elf");
+        let gen0_accepts = |label: &str, text: &str| -> bool {
+            let p = dir.join(format!("{label}.verbose"));
+            fs::write(&p, text).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), p.display(), out_elf.display()))
+                .status().expect("run gen0 over a purity-walk probe");
+            let bytes = fs::metadata(&out_elf).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(status.success(), bytes > 0,
+                "{label}: gen0 must either accept AND emit, or refuse AND emit \
+                 nothing — a half-written ELF at exit 1 is the arena-exhaustion \
+                 signature, not a verdict (see CLAUDE.md on max_nodes)");
+            status.success()
+        };
+        let verbosec_accepts = |text: &str| -> bool {
+            let toks = crate::lexer::Lexer::new(text).tokenize().unwrap();
+            let prog = crate::parser::Parser::new(toks).parse_program().unwrap();
+            crate::verifier::verify_program(&prog, &dir).is_empty()
+        };
+
+        // ---- THE TWELVE, one cell each. `bad` omits the read the body performs;
+        // `good` is the minimal correction. Both are asserted, so a refusal is
+        // attributable to the omission rather than to anything else about the
+        // shape (gen0 emits no diagnostic — a refusal is a bare exit 1).
+        //
+        //  (label, extra decls, body, output type, bad reads, good reads, calls)
+        let reads_cells: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
+            ("sum",     "", "sum(w.items, e => e.v + w.secret)",                "number",
+             "w.items", "w.items, w.secret", ""),
+            ("count",   "", "count(w.items, e => e.v > w.secret)",              "number",
+             "w.items", "w.items, w.secret", ""),
+            ("all",     "", "all(w.items, e => e.v > w.secret)",                "bool",
+             "w.items", "w.items, w.secret", ""),
+            ("any",     "", "any(w.items, e => e.v > w.secret)",                "bool",
+             "w.items", "w.items, w.secret", ""),
+            ("minfold", "", "min(w.items, e => e.v + w.secret)",                "number",
+             "w.items", "w.items, w.secret", ""),
+            ("maxfold", "", "max(w.items, e => e.v + w.secret)",                "number",
+             "w.items", "w.items, w.secret", ""),
+            ("map",     "", "map(w.items, e => e.v + w.secret)",                "collection(number)",
+             "w.items", "w.items, w.secret", ""),
+            ("filter",  "", "filter(w.items, e => e.v > w.secret)",             "collection(Item)",
+             "w.items", "w.items, w.secret", ""),
+            // fold twice: the BODY and the INIT are walked in different scopes
+            // (init in the caller's, body under acc+item), so they are two cells.
+            ("foldbody", "", "fold(w.items, 0, acc, e => acc + e.v + w.secret)", "number",
+             "w.items", "w.items, w.secret", ""),
+            ("foldinit", "", "fold(w.items, w.secret, acc, e => acc + e.v)",     "number",
+             "w.items", "w.items, w.secret", ""),
+            ("ok",      "", "if w.flag > 0 then Ok(w.secret) else Err(\"n\")",   "Result(number, text)",
+             "w.flag", "w.flag, w.secret", ""),
+            ("reserr",  "", "if w.flag > 0 then Ok(1) else Err(concat(\"e\", w.secret))", "Result(number, text)",
+             "w.flag", "w.flag, w.secret", ""),
+            // match_result: scrutinee in the outer scope, each arm under its own
+            // binder. `val(w)` passes the whole input, which verbosec records as
+            // the read `w` — hence the bare `w` in both declarations.
+            ("matchresult", VAL, "match_result(val(w), v => Ok(v + w.secret), e => Err(e))",
+             "Result(number, text)", "w", "w, w.secret", "val"),
+        ];
+        for (label, extra, body, ty, bad, good, calls) in reads_cells {
+            let good_text = probe(extra, body, ty, good, calls);
+            assert!(verbosec_accepts(&good_text),
+                "{label}: the corrected twin must verify under verbosec — if it does \
+                 not, the probe is wrong and the refusal below proves nothing");
+            assert!(gen0_accepts(&format!("{label}_good"), &good_text),
+                "{label}: the corrected twin must be ACCEPTED by gen0");
+
+            let bad_text = probe(extra, body, ty, bad, calls);
+            assert!(!verbosec_accepts(&bad_text),
+                "{label}: verbosec must refuse the under-declared reads");
+            assert!(!gen0_accepts(&format!("{label}_bad"), &bad_text),
+                "{label}: a read performed inside this node family must be VISIBLE \
+                 to gen0's `reads:` check. All twelve families are asserted \
+                 separately because they are twelve independent match arms — one \
+                 left at the old `=> 0` stub reads exactly like twelve correct \
+                 arms to any test that samples the family.");
+        }
+
+        // ---- THE CALLS SIBLING. Its own cells, not assumed to follow from
+        // reads: the two checks have drifted before (PR #161 found `reads`
+        // broken while `calls` was correct), and "calls was fine" is a
+        // measurement, not a property. A concealed CALL is the worse of the two,
+        // because the `calls:` graph is what callee resolution and @layer
+        // stratification are built on.
+        let call_cells: &[(&str, &str, &str, &str)] = &[
+            ("callin_sum", "sum(w.items, e => dbl(e))", "number", "w.items"),
+            ("callin_ok",  "if w.flag > 0 then Ok(dbl(Item { v: w.flag })) else Err(\"n\")",
+             "Result(number, text)", "w.flag"),
+        ];
+        for (label, body, ty, reads) in call_cells {
+            let good_text = probe(DBL, body, ty, reads, "dbl");
+            assert!(verbosec_accepts(&good_text), "{label}: the corrected twin must verify");
+            assert!(gen0_accepts(&format!("{label}_good"), &good_text),
+                "{label}: the corrected twin must be ACCEPTED by gen0");
+
+            let bad_text = good_text.replace("calls : [dbl]", "calls : []");
+            assert_ne!(bad_text, good_text, "{label}: the calls line moved; fix this twin");
+            assert!(!verbosec_accepts(&bad_text),
+                "{label}: verbosec must refuse the undeclared call");
+            assert!(!gen0_accepts(&format!("{label}_bad"), &bad_text),
+                "{label}: a CALL performed inside this node family must be VISIBLE \
+                 to gen0's `calls:` check");
+        }
+
+        // ---- BINDER SCOPE, the false-positive side. Every one of these is a
+        // CORRECT program that must stay accepted; getting the scoping wrong
+        // makes them all refusals, which is strictly worse than the hole this
+        // slice closes.
+        let scope_cells: &[(&str, &str, &str, &str, &str)] = &[
+            ("scope_lambda", "", "sum(w.items, e => e.v * 2)",                        "number", "w.items"),
+            ("scope_fold",   "", "fold(w.items, 0, acc, e => acc + e.v)",             "number", "w.items"),
+            ("scope_nested", "", "sum(w.items, e => count(w.items, f => f.v > e.v))", "number", "w.items"),
+            // A binder that SHADOWS the input name. `w.v` inside the lambda is
+            // the ELEMENT's field, not the input's — name_bound must win over
+            // the input-name match, exactly as verbosec's binder filter does.
+            ("scope_shadow", "", "sum(w.items, w => w.v * 2)",                        "number", "w.items"),
+        ];
+        for (label, extra, body, ty, reads) in scope_cells {
+            let text = probe(extra, body, ty, reads, "");
+            assert!(verbosec_accepts(&text), "{label}: the probe must verify under verbosec");
+            assert!(gen0_accepts(label, &text),
+                "{label}: BINDER SCOPE. This program is CORRECT — the lambda \
+                 binder's fields are not reads of the input — and refusing it \
+                 would be a false positive, the one direction this arc must never \
+                 move in. If this fails, the walk descended into the body without \
+                 pushing the binder into scope first (or `binds_with_one` stopped \
+                 being applied to one of acc / item / ok_var / err_var).");
+        }
+        let mr_scope = probe(VAL, "match_result(val(w), v => Ok(v), e => Err(e))",
+                             "Result(number, text)", "w", "val");
+        assert!(verbosec_accepts(&mr_scope), "scope_matchresult: the probe must verify");
+        assert!(gen0_accepts("scope_matchresult", &mr_scope),
+            "scope_matchresult: BINDER SCOPE for match_result's TWO arm binders. \
+             `v` and `e` are bound per-arm; neither is a read of the input.");
+
+        // ---- the committed fixtures, so the pin and the negative corpus cannot
+        // drift apart. Each is paired with its MINIMALLY corrected twin.
+        for (f, bad, good) in [
+            ("purity_reads_missing_in_fold", "reads   : [b.orders]", "reads   : [b.orders, b.threshold]"),
+            ("purity_calls_missing_in_fold", "calls   : []\n    termination:\n      bound : 400",
+                                             "calls   : [weight]\n    termination:\n      bound : 400"),
+            ("purity_reads_extra_in_fold",   "reads   : [b.orders, b.threshold]", "reads   : [b.orders]"),
+        ] {
+            let text = fs::read_to_string(format!("examples/negative/{f}.verbose")).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < 'examples/negative/{f}.verbose' > '{}' 2>/dev/null",
+                gen0.display(), out_elf.display()))
+                .status().expect("run gen0 over a committed fixture");
+            assert!(!status.success(), "examples/negative/{f}.verbose must be REFUSED by gen0");
+            assert!(!crate::verifier::verify_program(
+                    &crate::parser::Parser::new(
+                        crate::lexer::Lexer::new(&text).tokenize().unwrap())
+                        .parse_program().unwrap(),
+                    std::path::Path::new("examples/negative")).is_empty(),
+                "examples/negative/{f}.verbose must be REFUSED by verbosec too");
+            assert_eq!(text.matches(bad).count(), 1,
+                "{f}: the fixture's declaration line moved; update this twin");
+            let fixed = text.replace(bad, good);
+            assert!(crate::verifier::verify_program(
+                    &crate::parser::Parser::new(
+                        crate::lexer::Lexer::new(&fixed).tokenize().unwrap())
+                        .parse_program().unwrap(),
+                    std::path::Path::new("examples/negative")).is_empty(),
+                "{f}: the corrected twin must verify under verbosec");
+            assert!(gen0_accepts(&format!("{f}_fixed"), &fixed),
+                "{f}: the corrected twin must be ACCEPTED by gen0 — without it the \
+                 refusal above is not attributable to the omitted entry");
         }
 
         let _ = fs::remove_file(&gen0);
