@@ -20490,6 +20490,338 @@ rule undeclared_reads
       bound : 64
 
 
+-- ============================================================================
+-- PURITY, THE OTHER DIRECTION: an EXTRA declared entry (2026-08-14)
+--
+-- The two checks above answer "is every read/call the body performs DECLARED?".
+-- verbosec also answers the reverse — "is every DECLARED read/call performed?" —
+-- and reports it as `extra: [...]`. Over-declaring conceals nothing, so this is
+-- the benign direction, but it is not harmless: the declared `reads:` set IS the
+-- audit surface an auditor greps to find every rule that touches a resource or
+-- the clock, and a declared read that never happens is FALSE EXPLICITATION,
+-- which this project forbids by name. Without it the declared set is only a
+-- SUPERSET of the performed set, which weakens every claim built on it.
+--
+-- THE WALK IS THE ONE ALREADY THERE. No new AST traversal was written for this.
+-- count_undecl_read_* / count_undecl_call_* already answer "how many performed
+-- reads/calls are ABSENT from this NameList", so:
+--
+--   sites(NmNil)     = every performed site                        = TOTAL
+--   sites([q])       = every performed site except those equal to q
+--   TOTAL - sites([q]) = the number of sites matching q
+--
+-- so q is EXTRA exactly when sites([q]) == TOTAL. One walk with the empty list
+-- per rule, plus one walk with a singleton list per declared entry. The
+-- comparison, the path semantics and the scoping all come from the existing
+-- rules unchanged — which is what keeps the two directions from ever disagreeing
+-- about what "the same read" means.
+--
+-- CALLS IS THE EASIER HALF, for the same reason it escaped the 2026-08-11 path
+-- bug: a `calls:` entry is a bare rule name, so the entry span and the query
+-- span (an AstCall's callee span) are the same shape with no path to reconstruct.
+-- Reads had to be taught whole-path storage before its MISSING direction worked;
+-- its EXTRA direction inherits that for free, so both halves are now the same
+-- three-line shape. There is no calls-specific machinery here at all.
+--
+-- THE GUARD IS THE LOAD-BEARING PART. Both walks return a flat 0 for twelve node
+-- families (AstOk / AstResErr / AstMatchResult / AstSum / AstCount / AstFold /
+-- AstAll / AstAny / AstMap / AstFilter / AstMinFold / AstMaxFold — the "Result
+-- tier slice 1 stub" arms). For the MISSING direction that blindness is
+-- fail-open: a read inside `sum(...)` is not flagged. For the EXTRA direction
+-- the SAME blindness inverts to fail-CLOSED — the read is invisible, so a
+-- correctly declared entry looks unperformed and gen0 would refuse a program
+-- verbosec accepts. That is the one direction this arc must never move in, so
+-- ast_has_opaque walks the body first and purity_errors skips BOTH extra checks
+-- for any rule containing one of the twelve. Coarse (a whole rule loses the
+-- check for one `map`) and deliberately so: it can only ever MISS a violation.
+--
+-- NOT GUARDED, because it cannot be reached: verbosec also counts `now_unix()`
+-- as a read of the synthetic name `now`, which this walk does not know. A
+-- program using it is already refused by gen0 several checks earlier —
+-- `now_unix` is not in span_is_primitive, so count_badcall_ast reports it as an
+-- undefined callee — and all four `examples/` files declaring `reads: [now]`
+-- (order_intake, recent_event, recent_event_abs, sliding_count) are refused for
+-- exactly that reason. An arm here would be dead code, i.e. the same false
+-- explicitation this check exists to catch. It becomes live the day gen0 learns
+-- the primitive, and the `now` read must be added to ast_has_opaque then.
+-- ============================================================================
+
+-- ast_has_opaque: >0 iff the AST contains a node family the purity walks do not
+-- descend into. Bare `Ast` input (same shape as ast_path_head_start), so no state
+-- concept is needed; the four sub-list walks below mirror the four list types an
+-- Ast can hang children off. Every arm either recurses or returns 0, except the
+-- twelve stub families which return 1 — the whole point of the rule.
+rule ast_has_opaque
+  @intention: "1 if an AST contains a node family the purity reads/calls walks do not descend into, 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => ast_has_opaque(lhs) + ast_has_opaque(rhs)
+      AstNeg(inner) => ast_has_opaque(inner)
+      AstNot(inner) => ast_has_opaque(inner)
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => ast_has_opaque(base)
+      AstCall(callee_start, callee_len, args) => args_have_opaque(args)
+      AstIf(cond, thn, els) => ast_has_opaque(cond) + ast_has_opaque(thn) + ast_has_opaque(els)
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => vfields_have_opaque(fields)
+      AstMatch(scrut, arms) => ast_has_opaque(scrut) + arms_have_opaque(arms)
+      AstOk(inner) => 1
+      AstResErr(inner) => 1
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
+      AstSum(coll, item_start, item_len, body) => 1
+      AstCount(coll, item_start, item_len, body) => 1
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
+      AstAll(coll, item_start, item_len, body) => 1
+      AstAny(coll, item_start, item_len, body) => 1
+      AstMap(coll, item_start, item_len, body) => 1
+      AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 1
+      AstMaxFold(coll, item_start, item_len, body) => 1
+  proofs:
+    purity:
+      reads : [n]
+      calls : [ast_has_opaque, args_have_opaque, vfields_have_opaque, arms_have_opaque]
+    termination:
+      bound : 4000
+      structural : n
+
+
+-- args_have_opaque: ast_has_opaque summed over a call's argument list.
+rule args_have_opaque
+  @intention: "1 or more if any call argument contains an opaque node family, 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    a : ArgList
+  output:
+    out : number
+  logic:
+    out = match a:
+      ArgCons(head, tail) => ast_has_opaque(head) + args_have_opaque(tail)
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a]
+      calls : [ast_has_opaque, args_have_opaque]
+    termination:
+      bound : 4000
+      structural : a
+
+
+-- vfields_have_opaque: ast_has_opaque summed over a variant construct's field values.
+rule vfields_have_opaque
+  @intention: "1 or more if any variant-construct field value contains an opaque node family, 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    f : VFieldList
+  output:
+    out : number
+  logic:
+    out = match f:
+      VFCons(name_start, name_len, val, rest) => ast_has_opaque(val) + vfields_have_opaque(rest)
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [f]
+      calls : [ast_has_opaque, vfields_have_opaque]
+    termination:
+      bound : 4000
+      structural : f
+
+
+-- arms_have_opaque: ast_has_opaque summed over every match arm BODY. Binders are
+-- irrelevant here (this asks about node SHAPES, not about names), so unlike
+-- count_undecl_read_arms there is no scope to extend.
+rule arms_have_opaque
+  @intention: "1 or more if any match arm body contains an opaque node family, 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    m : ArmList
+  output:
+    out : number
+  logic:
+    out = match m:
+      ArmCons(vstart, vlen, binders, body, rest) => ast_has_opaque(body) + arms_have_opaque(rest)
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [m]
+      calls : [ast_has_opaque, arms_have_opaque]
+    termination:
+      bound : 4000
+      structural : m
+
+
+-- binds_have_opaque: ast_has_opaque summed over every binding's RHS. The other
+-- half of a rule body (the result expression is walked directly).
+rule binds_have_opaque
+  @intention: "1 or more if any let binding's RHS contains an opaque node family, 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    b : Binding
+  output:
+    out : number
+  logic:
+    out = match b:
+      BCons(name_start, name_len, value, rest) => ast_has_opaque(value) + binds_have_opaque(rest)
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b]
+      calls : [ast_has_opaque, binds_have_opaque]
+    termination:
+      bound : 4000
+      structural : b
+
+
+-- count_extra_reads's input: the declared entries still to check + everything one
+-- read-walk needs (the let bindings to iterate, the full local scope, the result
+-- expression, the input-name span, the source) + `total`, the site count computed
+-- ONCE by the caller against an EMPTY declared list. Recursing over `entries`
+-- keeps `total` and the six walk inputs constant.
+concept ExtraReadState
+  @intention: "The declared reads entries left to check + one read-walk's inputs + the total performed-site count"
+  @source: vexprparse.intent:30
+  fields:
+    entries : NameList
+    binds : Binding
+    scope : Binding
+    result : Ast
+    total : number
+    in_start : number
+    in_len : number
+    src : text [..256]
+
+
+-- count_extra_reads: for each declared `reads:` entry, re-run the read walk with a
+-- SINGLETON list holding just that entry. Excluding a performed path lowers the
+-- count; excluding a path the body never reads changes nothing — so
+-- `sites([q]) == total` is exactly "q is never performed", one violation. The
+-- singleton is built inline twice (once per half of the walk) rather than in a let,
+-- because a let cannot live inside a match arm; both allocate the same two arena
+-- nodes and the two lists are compared only by their contents.
+rule count_extra_reads
+  @intention: "Number of declared `reads:` entries the body never actually reads"
+  @source: vexprparse.intent:30
+  input:
+    e : ExtraReadState
+  output:
+    out : number
+  logic:
+    out = match e.entries:
+      NmCons(start, len, rest) => (if count_undecl_read_binds(UndeclReadBindsState { iter: e.binds, scope: e.scope, reads: NameList::NmCons { start: start, len: len, rest: NameList::NmNil }, in_start: e.in_start, in_len: e.in_len, src: e.src }) + count_undecl_read_ast(UndeclReadState { node: e.result, binds: e.scope, reads: NameList::NmCons { start: start, len: len, rest: NameList::NmNil }, in_start: e.in_start, in_len: e.in_len, src: e.src }) == e.total then 1 else 0) + count_extra_reads(ExtraReadState { entries: rest, binds: e.binds, scope: e.scope, result: e.result, total: e.total, in_start: e.in_start, in_len: e.in_len, src: e.src })
+      NmNil => 0
+  proofs:
+    purity:
+      reads : [e.entries, e.binds, e.scope, e.result, e.total, e.in_start, e.in_len, e.src]
+      calls : [count_undecl_read_binds, count_undecl_read_ast, count_extra_reads]
+    termination:
+      bound : 4000
+
+
+-- extra_reads: the over-declared-read count for ONE rule. Builds the same scope,
+-- declared list and input-name span as undeclared_reads (the two must agree on all
+-- three or the directions would be checking different things), computes `total`
+-- with an EMPTY declared list, then folds count_extra_reads over the declared
+-- entries. 0 = every declared read is actually performed.
+rule extra_reads
+  @intention: "Number of `reads:` entries a rule declares but never performs (0 if clean)"
+  @source: vexprparse.intent:30
+  input:
+    ur : UndeclReadRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(ur.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let pbinds = param_to_binding(rd_params(ur.rd))
+    let scope = append_bindings(BindAppendState { a: pbinds, b: binds })
+    let declared = prf_reads(rd_proofs(ur.rd))
+    let infl = rd_input(ur.rd)
+    let in_start = fl_head_start(infl)
+    let in_len = fl_head_len(infl)
+    let total = count_undecl_read_binds(UndeclReadBindsState { iter: binds, scope: scope, reads: NameList::NmNil, in_start: in_start, in_len: in_len, src: ur.src }) + count_undecl_read_ast(UndeclReadState { node: result, binds: scope, reads: NameList::NmNil, in_start: in_start, in_len: in_len, src: ur.src })
+    out = count_extra_reads(ExtraReadState { entries: declared, binds: binds, scope: scope, result: result, total: total, in_start: in_start, in_len: in_len, src: ur.src })
+  proofs:
+    purity:
+      reads : [ur.rd, ur.src]
+      calls : [rd_body, block_binds, block_result, param_to_binding, rd_params, append_bindings, prf_reads, rd_proofs, rd_input, fl_head_start, fl_head_len, count_undecl_read_binds, count_undecl_read_ast, count_extra_reads]
+    termination:
+      bound : 64
+
+
+-- count_extra_calls's input: the mirror of ExtraReadState for the calls half. Two
+-- fewer fields, because a call site needs no scope and no input-name span — the
+-- only thing a callee span is compared against is the program's rule list.
+concept ExtraCallState
+  @intention: "The declared calls entries left to check + one call-walk's inputs + the total performed-call count"
+  @source: vexprparse.intent:30
+  fields:
+    entries : NameList
+    binds : Binding
+    result : Ast
+    rules : RuleList
+    total : number
+    src : text [..256]
+
+
+-- count_extra_calls: the calls twin of count_extra_reads, same subtraction. Note a
+-- declared name that resolves to NO rule also scores as extra — count_undecl_call_ast
+-- only ever counts callees that resolve, so excluding an unresolvable name removes
+-- nothing from the total. verbosec agrees: its actual call set cannot contain a name
+-- the body never calls, resolvable or not.
+rule count_extra_calls
+  @intention: "Number of declared `calls:` entries the body never actually calls"
+  @source: vexprparse.intent:30
+  input:
+    e : ExtraCallState
+  output:
+    out : number
+  logic:
+    out = match e.entries:
+      NmCons(start, len, rest) => (if count_undecl_call_binds(UndeclCallBindsState { binds: e.binds, rules: e.rules, calls: NameList::NmCons { start: start, len: len, rest: NameList::NmNil }, src: e.src }) + count_undecl_call_ast(UndeclCallState { node: e.result, rules: e.rules, calls: NameList::NmCons { start: start, len: len, rest: NameList::NmNil }, src: e.src }) == e.total then 1 else 0) + count_extra_calls(ExtraCallState { entries: rest, binds: e.binds, result: e.result, rules: e.rules, total: e.total, src: e.src })
+      NmNil => 0
+  proofs:
+    purity:
+      reads : [e.entries, e.binds, e.result, e.rules, e.total, e.src]
+      calls : [count_undecl_call_binds, count_undecl_call_ast, count_extra_calls]
+    termination:
+      bound : 4000
+
+
+-- extra_calls: the over-declared-call count for ONE rule. Same shape as extra_reads,
+-- resolving callees against the full program exactly as undeclared_calls does.
+rule extra_calls
+  @intention: "Number of `calls:` entries a rule declares but never makes (0 if clean)"
+  @source: vexprparse.intent:30
+  input:
+    uc : UndeclCallRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(uc.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let declared = prf_calls(rd_proofs(uc.rd))
+    let total = count_undecl_call_binds(UndeclCallBindsState { binds: binds, rules: uc.rules, calls: NameList::NmNil, src: uc.src }) + count_undecl_call_ast(UndeclCallState { node: result, rules: uc.rules, calls: NameList::NmNil, src: uc.src })
+    out = count_extra_calls(ExtraCallState { entries: declared, binds: binds, result: result, rules: uc.rules, total: total, src: uc.src })
+  proofs:
+    purity:
+      reads : [uc.rd, uc.rules, uc.src]
+      calls : [rd_body, block_binds, block_result, prf_calls, rd_proofs, count_undecl_call_binds, count_undecl_call_ast, count_extra_calls]
+    termination:
+      bound : 64
+
+
 -- ---------------------------------------------------------------------------
 -- wiring + gate driver
 -- ---------------------------------------------------------------------------
