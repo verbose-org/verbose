@@ -86,6 +86,41 @@ stuck-`false` equality is right on every non-matching pair. So:
   even though calls was measured correct all along, because "calls was fine" is
   a measurement, not a property.
 
+## Two fixtures that share a keyword are not necessarily one gap
+
+The mirror image of the section above. There the same defect had several shapes
+and one fixture stood in for the family; here two fixtures spelled `overflow`
+and were *described* as one family they did not belong to.
+
+`hint_overflow_inverted` (`overflow : [10, 0]`) and `hint_overflow_bad`
+(`overflow : [0, 2]` on a rule whose real range is `[0, 2000000]`) sat side by
+side in `KNOWN_GAPS`, and the gaps table said of both: *"needs interval
+arithmetic over the parsed logic, which gen0's verifier lacks; a real arc, not a
+slice."* That is true of exactly one of them.
+
+```
+overflow : [10, 0]   ->  min > max: two integer literals and a `>`.
+                         verbosec: verify error, invalid overflow bounds.
+overflow : [0, 2]    ->  declared interval vs COMPUTED range: an abstract
+                         interpreter over the logic.
+                         verbosec: computed range [0, 2000000] exceeds declared [0, 2].
+```
+
+The two verdicts do not even come from the same place, and the messages say so.
+An inverted interval is EMPTY — no arithmetic can land inside it — so refusing
+it needs no notion of what the rule computes. `hint_overflow_inverted` closed
+2026-08-14 in three lines of the same walk that closed the name and
+justification checks; `hint_overflow_bad` is still open and still genuinely an
+arc.
+
+- **Read a gap's cost off the reference's own error message**, not off the
+  keyword the fixture shares with its neighbour. Two fixtures under one heading
+  invite one estimate, and the expensive one sets it.
+- **When a "known gap" note declares something expensive, that note is a claim
+  and it decays.** This one deferred the cheap half for a slice. It is the third
+  time in this arc a stale framing cost more than the code (the INDENT/DEDENT
+  comment, the attribute-PRESENCE "genuinely ambiguous" note, this).
+
 ## And a fixture set can SAMPLE a matrix while reading as if it enumerated one
 
 The lesson above is about a fixture that passes for the wrong reason. There is a
@@ -141,7 +176,8 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 35 fixtures.** They were chosen from CLAUDE.md's known-gaps table plus
+- **Only 35 fixtures**, currently measuring **28 PASS / 7 GAP / 0 INVERSE**.
+  They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has
   many more refusal paths (resources, connections, services, reactions,
@@ -161,7 +197,11 @@ Stated plainly, because "the negative corpus is green" must not be read as
   compile the minimally-fixed program too and require ACCEPT, so the only thing
   that differs between the two verdicts is the violation under test.
   `two_generation_gen0_detects_partial_purity_underdeclaration` does that for
-  every purity shape it pins, and
+  every purity shape it pins,
+  `two_generation_gen0_verifies_hint_names_justifications_and_overflow_shape`
+  for every hints shape (and it carries the surviving `hint_overflow_bad` gap
+  as an explicit ACCEPT assertion, so "gen0 just refuses anything with a
+  `hints:` block" cannot masquerade as three closed checks), and
   `wrong_arity_rule_call_rejected_at_verify_time` (`src/verifier.rs`) does it
   for the arity check. It is per-fixture work, which is why the sweep itself
   does not do it for all 35.
