@@ -88,6 +88,48 @@ Acceptance does not prove that the author's intention was wise, or that the whol
 toolchain is free of bugs; it means the declared, mechanically checked contract
 held for that program.
 
+## The question that started Verbose
+
+> What happens when an AI can produce a native binary directly?
+
+Generating bytes is not the difficult part. The difficult part is deciding whether
+those bytes should be allowed to run. A directly generated binary does not, by
+itself, tell an operator which effects were intended, which resources were
+authorized, which omissions are mistakes, or why a new version gained a capability.
+
+Verbose explores that control layer before direct binary generation becomes
+ordinary. Today, the AI produces a `.verbose` program and the compiler verifies and
+lowers it:
+
+```text
+human intent
+    ↓
+AI-generated Verbose contract
+    ↓
+deterministic verification
+    ↓
+compiler-generated native binary / WASM
+```
+
+In a possible future, an AI may generate the binary itself. The lasting role of
+Verbose would then be the explicit contract against which that binary and its
+claimed capabilities are independently validated:
+
+```text
+approved Verbose contract ───────────────┐
+                                        ↓
+human intent → AI → binary + evidence → independent validator → execution
+```
+
+That future path is a research direction, not a guarantee implemented today. It
+would require a binary validator and evidence strong enough to connect machine code
+back to the approved contract. The architectural principle, however, already
+governs the project:
+
+> **Generation may be probabilistic. Authorization to execute must be deterministic.**
+
+The AI is free to propose. It is never free to authorize itself.
+
 ## How people use it
 
 - **Writing `.verbose` directly** — always valid. Someone who wants the upfront discipline of declaring reads, termination bounds, overflow ranges, and architectural layer can skip the AI entirely. Hand-written and AI-generated `.verbose` files go through the exact same verifier; the compiler treats them identically.
