@@ -86,6 +86,58 @@ stuck-`false` equality is right on every non-matching pair. So:
   even though calls was measured correct all along, because "calls was fine" is
   a measurement, not a property.
 
+## Half a set comparison reads as a set comparison
+
+`purity_reads_extra` and `purity_calls_extra` closed on 2026-08-14, and what
+they were measuring is worth keeping written down, because the shape recurs.
+
+`verbosec`'s `check_purity` compares `declared != facts` as a **set**, and
+reports the difference in each direction. gen0 implemented only one of them: it
+caught a declared set MISSING an entry the logic performs, and not a declared
+entry the logic never performs. Measured on 8c7b4f8:
+
+```
+examples/negative/purity_reads_extra.verbose   gen0 rc=0, 567 B   (verbosec: extra: [i.tier])
+examples/negative/purity_calls_extra.verbose   gen0 rc=0, 625 B   (verbosec: extra: [helper])
+```
+
+With only the missing direction, the declared set is a **superset** of the
+performed set: a rule may claim to read a field, a resource or the clock it
+never touches, and no tool disagrees. Over-declaring conceals nothing — which is
+why it sat at lower priority — but the declared `reads:` set *is* the audit
+surface, and a declaration nothing checks is exactly the *false explicitation*
+the project forbids by name. "gen0 checks purity" was true in one direction and
+read as true in both.
+
+The fix reuses the existing walk rather than adding a second one. `sites(NmNil)`
+is every performed site; `sites([q])` is every site except those matching `q`;
+so `q` is extra exactly when the two are equal. One walk per declared entry, same
+comparison, same path semantics, same scoping — which is what keeps the two
+directions from ever disagreeing about what "the same read" means.
+
+**Two guards suppress the new check, and both are deliberate.** gen0's purity
+walks return a flat `0` for twelve node families (`AstOk`, `AstResErr`,
+`AstMatchResult`, and the nine collection nodes `AstSum` / `AstCount` /
+`AstFold` / `AstAll` / `AstAny` / `AstMap` / `AstFilter` / `AstMinFold` /
+`AstMaxFold`), and `extra_reads` also stands down for a rule with no `input:`
+block. In both cases the walk can see FEWER performed sites than `verbosec`
+does, and the same blindness that is fail-OPEN for the missing direction inverts
+to fail-CLOSED for this one: a correctly declared entry looks unperformed, and
+gen0 would refuse a program `verbosec` accepts.
+
+- **When you add the reverse of an existing one-directional check, re-audit
+  every place the walk is incomplete.** Incompleteness that was harmless in one
+  direction is a false positive in the other. Both guards here are per-RULE, so
+  the cost is stated plainly: an over-declaration in a rule containing any one
+  of the twelve families is still undetected. Miss a violation, never invent
+  one.
+- The `input:`-block guard was NOT found by design — nothing in `examples/` has
+  the shape (`verbosec`'s parser makes `input:` mandatory, so gen0's parens
+  dialect `rule f(x)` is gen0-only). The R2 fixed-point corpus in
+  `two_generation_bootstrap_fixed_point` found it, as a bare "emitter must exit
+  0" naming no cause. **A negative corpus drawn from valid-Verbose shapes cannot
+  see a gen0-dialect-only false positive**; the fixed point can.
+
 ## Two fixtures that share a keyword are not necessarily one gap
 
 The mirror image of the section above. There the same defect had several shapes
@@ -176,7 +228,7 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 35 fixtures**, currently measuring **28 PASS / 7 GAP / 0 INVERSE**.
+- **Only 35 fixtures**, currently measuring **30 PASS / 5 GAP / 0 INVERSE**.
   They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has
@@ -196,8 +248,9 @@ Stated plainly, because "the negative corpus is green" must not be read as
   needs a different instrument, and the one that works is a **corrected twin**:
   compile the minimally-fixed program too and require ACCEPT, so the only thing
   that differs between the two verdicts is the violation under test.
-  `two_generation_gen0_detects_partial_purity_underdeclaration` does that for
-  every purity shape it pins,
+  `two_generation_gen0_detects_partial_purity_underdeclaration` and
+  `two_generation_gen0_rejects_purity_over_declaration` do that for
+  every purity shape they pin,
   `two_generation_gen0_verifies_hint_names_justifications_and_overflow_shape`
   for every hints shape (and it carries the surviving `hint_overflow_bad` gap
   as an explicit ACCEPT assertion, so "gen0 just refuses anything with a
