@@ -21787,6 +21787,184 @@ rule count_term_binds
       bound : 4000
 
 
+-- ============================================================================
+-- TERMINATION.BOUND: the OPERATION COUNT half of the termination proof.
+--
+-- The gaps table recorded this as "needs an operation counter over the parsed
+-- logic — the same missing machinery as the `overflow` row", which reads as an
+-- arc. It is not. verbosec's `count_operations` (src/verifier.rs) is a PLAIN
+-- STRUCTURAL NODE COUNT: every arm is `1 + sum(children)`, the four literal /
+-- identifier leaves are 0, and `Field` passes through without adding. No
+-- interval arithmetic, no dataflow, no scoping — structurally the same walk as
+-- count_undecl_read_ast, minus the binder threading. THIRD gap in this arc
+-- mis-priced as an arc when the reference implementation turned out to be a
+-- plain walk (after hint_overflow_inverted's two-literal shape check and the
+-- attribute-PRESENCE line walk). Read the reference before believing a summary
+-- of it.
+--
+-- WHAT IS COUNTED: exactly `rule.logic.value` — the RESULT expression. NOT the
+-- let bindings. verbosec calls `count_operations(&rule.logic.value)` and stops
+-- there, so counting the binds as well would over-count and REJECT VALID
+-- PROGRAMS. That is the standing hazard of this whole check and it is
+-- asymmetric: under-counting only misses a violation, over-counting refuses a
+-- program verbosec accepts.
+--
+-- THE FOUR ARMS THAT ARE NOT `1 + children`, and why. verbosec's PARSER
+-- DESUGARS sum / count / the fold-forms of min / max into `Expr::Fold` before
+-- the verifier ever sees them, so the nodes the counter walks are not the nodes
+-- the author wrote. gen0 keeps dedicated AST variants (AstSum / AstCount /
+-- AstMinFold / AstMaxFold), so the desugaring's extra nodes have to be added
+-- back by hand:
+--
+--   sum(c, v => b)   -> Fold(c, Number(0), __acc, v, Binary(Add, Ident, b))
+--                       = 1 + c + 0 + (1 + 0 + b)         =>  2 + c + b
+--   count(c, v => p) -> Fold(c, Number(0), __acc, v,
+--                            Binary(Add, Ident, If(p, 1, 0)))
+--                       = 1 + c + 0 + (1 + 0 + (1 + p))   =>  3 + c + p
+--   min(c, v => b)   -> Fold(c, Number(MAX), __acc, v,
+--                            If(Binary(Lt, b, Ident), b, Ident))
+--                       = 1 + c + 0 + (1 + (1 + b) + b)   =>  3 + c + 2*b
+--   max(c, v => b)   -> same shape with Gt                =>  3 + c + 2*b
+--
+-- The `2 * b` is not a typo: verbosec's min/max desugar CLONES the body
+-- expression into both the comparison and the then-branch, so its whole subtree
+-- is counted twice. `fold` itself is NOT desugared and stays 1 + coll + init +
+-- body; `all` / `any` become `Expr::Quantifier`, 1 + coll + pred; `map` /
+-- `filter` keep their own variants, 1 + coll + body.
+--
+-- EVERY PRIMITIVE IS AN AstCall HERE AND NEEDS NO SPECIAL CASE, which is the
+-- reason this walk is short. verbosec resolves `read` / `now_unix` / `concat` /
+-- `substring` / `band` / ... into ~20 distinct Expr variants, but each of them
+-- costs `1 + <its children>`, and gen0's generic AstCall arm computes exactly
+-- that. The three shapes worth checking by hand all agree: `read(cfg)` is an
+-- AstCall with one AstVar arg = 1 + 0 = 1, matching verbosec's CHILDLESS
+-- `Expr::Read` = 1; `fetch(c, req)` is 1 + 0 + req, matching `Expr::Fetch(name,
+-- req)` = 1 + req (the connection name is not an Expr on verbosec's side);
+-- `now_unix()` is 1 + nothing, matching `Expr::NowUnix` = 1.
+--
+-- NO GEN0 COUNTERPART: verbosec's `Expr::FoldBytes` (`fold_bytes(...)`). gen0's
+-- parser has no such keyword, so a program using it fails to parse here and is
+-- refused long before this walk runs (examples/byte_classifier.verbose is
+-- refused by gen0 today for exactly that reason). `Expr::Bool` does not exist on
+-- verbosec's side at all — `true` / `false` parse to `Expr::Ident`, worth 0,
+-- which is what gen0's AstBool arm returns. `-5` is NOT folded to a literal by
+-- either parser: both build a unary-negate node over a literal, worth 1.
+--
+-- AstErr (gen0's parse-error sentinel) has no verbosec counterpart either and
+-- counts 0. A shape gen0 cannot parse therefore UNDER-counts, which is the safe
+-- direction: it can miss a violation, never invent one.
+rule count_ops_ast
+  @intention: "verbosec's count_operations: structural node count of an expression; literals and field access are free"
+  @source: vexprparse.intent:67
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      -- Expr::Field(base, _) => count_operations(base). A field access is a
+      -- PASS-THROUGH, not an operation — the only non-leaf arm worth 0.
+      AstField(base, fstart, flen) => count_ops_ast(base)
+      AstNeg(inner) => 1 + count_ops_ast(inner)
+      AstNot(inner) => 1 + count_ops_ast(inner)
+      AstOk(inner) => 1 + count_ops_ast(inner)
+      AstResErr(inner) => 1 + count_ops_ast(inner)
+      AstBin(op, lhs, rhs) => 1 + count_ops_ast(lhs) + count_ops_ast(rhs)
+      AstIf(cond, thn, els) => 1 + count_ops_ast(cond) + count_ops_ast(thn) + count_ops_ast(els)
+      AstCall(callee_start, callee_len, args) => 1 + count_ops_args(args)
+      AstVariant(cstart, clen, vstart, vlen, fields) => 1 + count_ops_vfields(fields)
+      AstMatch(scrut, arms) => 1 + count_ops_ast(scrut) + count_ops_arms(arms)
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1 + count_ops_ast(scrut) + count_ops_ast(ok_body) + count_ops_ast(err_body)
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1 + count_ops_ast(coll) + count_ops_ast(init) + count_ops_ast(body)
+      AstAll(coll, item_start, item_len, body) => 1 + count_ops_ast(coll) + count_ops_ast(body)
+      AstAny(coll, item_start, item_len, body) => 1 + count_ops_ast(coll) + count_ops_ast(body)
+      AstMap(coll, item_start, item_len, body) => 1 + count_ops_ast(coll) + count_ops_ast(body)
+      AstFilter(coll, item_start, item_len, body) => 1 + count_ops_ast(coll) + count_ops_ast(body)
+      -- The four DESUGARED arms. See the banner above for the derivation; the
+      -- doubled body on min/max mirrors verbosec's body.clone().
+      AstSum(coll, item_start, item_len, body) => 2 + count_ops_ast(coll) + count_ops_ast(body)
+      AstCount(coll, item_start, item_len, body) => 3 + count_ops_ast(coll) + count_ops_ast(body)
+      AstMinFold(coll, item_start, item_len, body) => 3 + count_ops_ast(coll) + 2 * count_ops_ast(body)
+      AstMaxFold(coll, item_start, item_len, body) => 3 + count_ops_ast(coll) + 2 * count_ops_ast(body)
+  proofs:
+    purity:
+      reads : [n]
+      calls : [count_ops_ast, count_ops_args, count_ops_vfields, count_ops_arms]
+    termination:
+      bound : 4000
+
+
+-- count_ops_args: sum count_ops_ast over a call's argument list. The AstCall
+-- node has already paid its own 1, mirroring verbosec's
+-- `1 + args.iter().map(count_operations).sum()`.
+rule count_ops_args
+  @intention: "Structural node count summed over every argument of a call"
+  @source: vexprparse.intent:67
+  input:
+    l : ArgList
+  output:
+    out : number
+  logic:
+    out = match l:
+      ArgCons(head, tail) => count_ops_ast(head) + count_ops_args(tail)
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [l]
+      calls : [count_ops_ast, count_ops_args]
+    termination:
+      bound : 4000
+
+
+-- count_ops_vfields: sum count_ops_ast over a record / variant construction's
+-- field VALUES. Field NAMES cost nothing — verbosec's Record and
+-- VariantConstruct arms both map over `(_, e)`, ignoring the name.
+rule count_ops_vfields
+  @intention: "Structural node count summed over every field value of a record or variant construction"
+  @source: vexprparse.intent:67
+  input:
+    l : VFieldList
+  output:
+    out : number
+  logic:
+    out = match l:
+      VFCons(name_start, name_len, val, rest) => count_ops_ast(val) + count_ops_vfields(rest)
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [l]
+      calls : [count_ops_ast, count_ops_vfields]
+    termination:
+      bound : 4000
+
+
+-- count_ops_arms: sum count_ops_ast over every match arm's BODY. Binders cost
+-- nothing, exactly as verbosec's MatchVariant arm maps over `a.body` alone.
+rule count_ops_arms
+  @intention: "Structural node count summed over every match arm body"
+  @source: vexprparse.intent:67
+  input:
+    l : ArmList
+  output:
+    out : number
+  logic:
+    out = match l:
+      ArmCons(vstart, vlen, binders, body, rest) => count_ops_ast(body) + count_ops_arms(rest)
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [l]
+      calls : [count_ops_ast, count_ops_arms]
+    termination:
+      bound : 4000
+
+
 -- term_errors's input: ONE rule declaration + the source text. Self-recursion is
 -- detected against the rule's OWN name span, so no program RuleList is needed
 -- (termination is a local property, like reads). Same shape as UndeclReadRuleState.
@@ -21807,6 +21985,15 @@ concept TermRuleState
 -- declared field span, and an EMPTY structural binder set (no match encloses
 -- the body's top level). A rule with no self-call passes vacuously (the walk
 -- finds no site to flag).
+--
+-- The BOUND check rides here rather than in its own verrs term, because
+-- term_list already folds this rule over every declaration in the program and
+-- the bound is read off the same Proofs the kind comes from. Note it is
+-- deliberately OUTSIDE the `kind == 0` guard: verbosec's check_termination
+-- compares the declared bound for EVERY rule, whatever its termination kind,
+-- and a bound-only rule is precisely the common case. The comparison direction
+-- mirrors verbosec exactly — `declared < actual` is the error, so an EXACT
+-- bound passes.
 rule term_errors
   @intention: "Total termination-proof violations for one rule (0 if the declared descent holds at every self-call)"
   @source: vexprparse.intent:67
@@ -21828,13 +22015,16 @@ rule term_errors
     let tf_start = prf_term_field_start(prf)
     let tf_len = prf_term_field_len(prf)
     let bad_in_binds = count_term_binds(TermBindsState { binds: binds, rn_start: rn_start, rn_len: rn_len, kind: kind, in_start: in_start, in_len: in_len, tf_start: tf_start, tf_len: tf_len, sbinds: Binding::BNil, src: tr.src })
-    out = if kind == 0 then 0 else bad_in_binds + count_term_ast(TermAstState { node: result, rn_start: rn_start, rn_len: rn_len, kind: kind, in_start: in_start, in_len: in_len, tf_start: tf_start, tf_len: tf_len, sbinds: Binding::BNil, src: tr.src })
+    let declared_bound = prf_term_bound(prf)
+    let actual_ops = count_ops_ast(result)
+    let bad_bound = if declared_bound < actual_ops then 1 else 0
+    out = bad_bound + (if kind == 0 then 0 else bad_in_binds + count_term_ast(TermAstState { node: result, rn_start: rn_start, rn_len: rn_len, kind: kind, in_start: in_start, in_len: in_len, tf_start: tf_start, tf_len: tf_len, sbinds: Binding::BNil, src: tr.src }))
   proofs:
     purity:
       reads : [tr.rd, tr.src]
-      calls : [rd_proofs, prf_term_kind, rd_body, block_binds, block_result, rd_name_start, rd_name_len, rd_input, fl_head_start, fl_head_len, prf_term_field_start, prf_term_field_len, count_term_binds, count_term_ast]
+      calls : [rd_proofs, prf_term_kind, rd_body, block_binds, block_result, rd_name_start, rd_name_len, rd_input, fl_head_start, fl_head_len, prf_term_field_start, prf_term_field_len, count_term_binds, count_term_ast, prf_term_bound, count_ops_ast]
     termination:
-      bound : 64
+      bound : 80
 
 
 concept TermListState

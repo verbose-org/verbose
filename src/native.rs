@@ -47008,9 +47008,11 @@ rule pick
     /// commit, because the purity walks now descend into the twelve node
     /// families they stubbed. The **three** `proofs_missing*` fixtures added
     /// 2026-08-14 likewise land as PASS in the commit that adds them
-    /// (`proofs_errors`, a second TOKEN walk). So the standing measurement is
-    /// **41 fixtures, 36 PASS, 5 GAP, 0 INVERSE**. The 5 are not five
-    /// surprises — they are three STRUCTURAL causes wearing five faces, and
+    /// (`proofs_errors`, a second TOKEN walk). `termination_bound_short` closed
+    /// 2026-08-15 (`count_ops_ast`, a plain structural node walk mirroring
+    /// verbosec's `count_operations` — group 3). So the standing measurement is
+    /// **41 fixtures, 37 PASS, 4 GAP, 0 INVERSE**. The 4 are not four
+    /// surprises — they are three STRUCTURAL causes wearing four faces, and
     /// reading them that way is the point of the sweep:
     ///
     ///   1. **gen0's tokenizer discards attribute lines entirely.**
@@ -47035,15 +47037,21 @@ rule pick
     ///      INVERTED `overflow` interval for the cost of one linear pass.
     ///      `hint_overflow_bad` is left, and it is genuinely a different
     ///      animal: checking that the declared interval CONTAINS the rule's
-    ///      computed range needs interval arithmetic over the logic, the same
-    ///      absent machinery `termination_bound_short` needs. **The two
+    ///      computed range needs interval arithmetic over the logic. **The two
     ///      `overflow` fixtures were previously described here as one gap**
     ///      ("the two `overflow` ones need interval arithmetic"), and that
     ///      mis-scoping is exactly what kept the cheap half — two integer
     ///      literals and a `>` — open for a slice longer than it had to be.
+    ///      The same sentence ALSO claimed `termination_bound_short` needed
+    ///      "the same absent machinery", and that was the THIRD instance of
+    ///      the identical error: `count_operations` turned out to be a plain
+    ///      node count with no interval arithmetic anywhere. This row is now
+    ///      the only fixture in the corpus that genuinely needs abstract
+    ///      interpretation, and it is stated alone so nothing else can be
+    ///      deferred by association with it.
     ///   3. **gen0's purity/termination analyses were one-directional or
-    ///      absent.** That was 3 fixtures; **2 closed 2026-08-14** and 1
-    ///      remains. `purity_list` caught a declared set MISSING an entry the
+    ///      absent.** That was 3 fixtures; 2 closed 2026-08-14 and the last
+    ///      closed 2026-08-15, so **this group is now EMPTY**. `purity_list` caught a declared set MISSING an entry the
     ///      logic performs and did NOT catch a declared entry the logic never
     ///      performs — the sharpest single finding this sweep produced, because
     ///      "gen0 checks purity" read as true right up until you fed it an
@@ -47054,7 +47062,11 @@ rule pick
     ///      equal. One walk per declared entry, same comparison, same path
     ///      semantics, same scoping — which is what keeps the two directions
     ///      from ever disagreeing about what "the same read" means.
-    ///      `term_list` still does not count operations: 1 fixture left.
+    ///      `term_list` then grew the operation count it lacked: `term_errors`
+    ///      compares `prf_term_bound(prf)` against `count_ops_ast(result)`,
+    ///      an arm-for-arm mirror of verbosec's `count_operations`. Recorded
+    ///      here as an arc, delivered as a 4-rule walk — see the
+    ///      TERMINATION.BOUND banner in examples/vexprparse.verbose.
     ///
     /// THAT THIRD ENTRY WAS ITSELF TOO GENEROUS, AND CATCHING IT IS THE MOST
     /// USEFUL THING THIS SWEEP HAS DONE. `purity_reads_missing` scored PASS,
@@ -47163,18 +47175,25 @@ rule pick
             //     "HINTS-BLOCK CHECKS" in examples/vexprparse.verbose). This
             //     one is NOT the same shape as its `_inverted` sibling: it
             //     needs the declared interval checked AGAINST the rule's
-            //     computed range, i.e. interval arithmetic over the logic —
-            //     the same machinery `termination_bound_short` is waiting on.
+            //     computed range, i.e. interval arithmetic over the logic.
+            //
+            //     THIS ROW IS NOW ALONE IN NEEDING THAT, and the correction is
+            //     worth keeping: it used to be grouped with
+            //     `termination_bound_short` as "the same absent machinery",
+            //     and that pairing was WRONG. verbosec's `count_operations` is
+            //     a plain structural node count (every arm `1 + sum(children)`,
+            //     literals 0, `Field` a pass-through) — no interval arithmetic
+            //     anywhere — so the termination row was a walk, not an arc, and
+            //     closed as one. `hint_overflow_bad` genuinely needs abstract
+            //     interpretation over the logic; nothing else here does.
             "hint_overflow_bad",
             // (3) purity / termination analyses one-directional or absent — was
-            //     3, now 1. `purity_reads_extra` and `purity_calls_extra` were
-            //     CLOSED 2026-08-14: `purity_errors` now adds `extra_reads` +
+            //     3, now 0. `purity_reads_extra` and `purity_calls_extra` were
+            //     CLOSED 2026-08-14 (`purity_errors` gained `extra_reads` +
             //     `extra_calls`, so the declared set must EQUAL the performed
-            //     set rather than merely contain it. `termination_bound_short`
-            //     is left and is a different animal — it needs an operation
-            //     counter over the parsed logic, the same absent machinery
-            //     `hint_overflow_bad` is waiting on.
-            "termination_bound_short",
+            //     set); `termination_bound_short` was CLOSED the same week by
+            //     `count_ops_ast` + the `bad_bound` term in `term_errors`.
+            //     This group is empty.
             // (4) native-emit refusal surface not mirrored — 1
             "input_type_unsupported",
         ];
@@ -48336,6 +48355,306 @@ rule pick
         let _ = fs::remove_dir_all(&dir);
     }
 
+
+    /// gen0 must check the declared `termination.bound` against the ACTUAL
+    /// operation count of the rule's result expression.
+    ///
+    /// Measured on fb58216, `examples/negative/termination_bound_short.verbose`:
+    /// verbosec reports `declared bound 1 is less than actual operation count
+    /// 13`, gen0 accepted at **rc 0 with a 771-byte ELF**. The declared bound is
+    /// the only static statement a Verbose program makes about how much work a
+    /// rule does; unchecked, it is decoration, which this project forbids by
+    /// name.
+    ///
+    /// THE CHECK WAS MIS-PRICED AS AN ARC, for the THIRD time in this sequence
+    /// (after `hint_overflow_inverted` and attribute PRESENCE). The gaps table
+    /// said it "needs an operation counter over the parsed logic — the same
+    /// missing machinery as the `overflow` row". Reading the reference instead
+    /// of a summary of it: `count_operations` (`src/verifier.rs`) is a PLAIN
+    /// STRUCTURAL NODE COUNT — every arm `1 + sum(children)`, the four literal /
+    /// identifier leaves 0, `Field` a pass-through — with no interval
+    /// arithmetic, no dataflow and no scoping anywhere in it. Four rules in
+    /// gen0 (`count_ops_ast` plus three list walks), zero emitted bytes.
+    ///
+    /// WHAT THIS TEST ASSERTS, and why it is built the way it is:
+    ///
+    ///   * **The boundary is DERIVED, not hard-coded.** For each probe the test
+    ///     calls `verifier::count_operations` on the parsed rule, then requires
+    ///     gen0 to ACCEPT at `bound == count` and REFUSE at `bound == count-1`.
+    ///     An off-by-one is the single most likely defect here and nothing else
+    ///     in the suite would catch it — a `<=`-vs-`<` slip still refuses the
+    ///     negative fixture and still passes the corpus.
+    ///   * **verbosec is asserted on both sides of every boundary too**, and on
+    ///     the short side its message must name `termination.bound` AND report
+    ///     the same count this test derived. A probe refused for an unrelated
+    ///     reason measures nothing (the lesson from the `proofs_missing*`
+    ///     fixtures, which were refused by the purity walk before the presence
+    ///     check existed).
+    ///   * **Many arm families, not just `Binary`.** `count_operations` has 33
+    ///     independently-driftable match arms; a walk that mirrors thirty of
+    ///     them reads exactly like one that mirrors all of them. The families
+    ///     with a NON-obvious weight are the ones that matter: verbosec's
+    ///     PARSER desugars `sum` / `count` / fold-form `min` / `max` into
+    ///     `Expr::Fold` before the counter ever runs, so gen0's dedicated
+    ///     AstSum / AstCount / AstMinFold / AstMaxFold arms have to add the
+    ///     desugaring's extra nodes back by hand (+2 / +3 / +3 with the body
+    ///     counted TWICE). Fold-form `min` / `max` appear in NO file under
+    ///     `examples/`, so the doubled-body arm is covered here and nowhere
+    ///     else.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~10 s) then compiles ~25 probes; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_verifies_termination_bound_against_operation_count() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_bound_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let dir = std::env::temp_dir().join("verbosec_test_bound_probes");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("p.intent"), "title\n1. one\n2. two\n3. three\n4. four\n").unwrap();
+        // The `read` probe's declared resource. Neither compiler opens it at
+        // COMPILE time, but materialising it keeps the probe honest if this
+        // test ever grows a run step.
+        let _ = fs::write("/tmp/verbose_bound_probe_cfg.txt", "CFGDATA");
+
+        let out_elf = dir.join("out.elf");
+        let gen0_accepts = |label: &str, text: &str| -> bool {
+            let p = dir.join(format!("{label}.verbose"));
+            fs::write(&p, text).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), p.display(), out_elf.display()))
+                .status().expect("run gen0 over a bound probe");
+            let bytes = fs::metadata(&out_elf).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(status.success(), bytes > 0,
+                "{label}: gen0 must either accept AND emit, or refuse AND emit \
+                 nothing — a half-written ELF at exit 1 is the arena-exhaustion \
+                 signature, not a verdict (see CLAUDE.md on max_nodes)");
+            status.success()
+        };
+        // verbosec's verdict, with the diagnostics joined so the SHORT side can
+        // be attributed to the bound rather than to something incidental.
+        let verbosec_verdict = |text: &str| -> Result<(), String> {
+            let toks = match crate::lexer::Lexer::new(text).tokenize() {
+                Ok(t) => t, Err(e) => return Err(format!("lex: {e:?}")) };
+            let prog = match crate::parser::Parser::new(toks).parse_program() {
+                Ok(p) => p, Err(e) => return Err(format!("parse: {e:?}")) };
+            let errs = crate::verifier::verify_program(&prog, &dir);
+            if errs.is_empty() { Ok(()) }
+            else { Err(errs.iter().map(|e| format!("[{}] {}", e.context, e.message))
+                            .collect::<Vec<_>>().join(" | ")) }
+        };
+
+        // Every probe is a whole program carrying `bound : @@B@@` on the rule
+        // under test; `entry` names that rule so its count can be read off the
+        // parsed AST.
+        struct Probe { label: &'static str, entry: &'static str, text: String }
+
+        const INV: &str = "@verbose 0.1.0\n\nconcept Invoice\n  @intention: \"i\"\n  @source: p.intent:1\n\n  fields:\n    amount : number [0, 1000000]\n    tag    : text [..32]\n\n";
+        const BAG: &str = "@verbose 0.1.0\n\nconcept El\n  @intention: \"e\"\n  @source: p.intent:1\n\n  fields:\n    v : number [0, 1000]\n\nconcept Bag\n  @intention: \"b\"\n  @source: p.intent:1\n\n  fields:\n    xs : collection(El)\n\n";
+
+        let scalar = |label: &'static str, out_ty: &str, body: &str, reads: &str| Probe {
+            label, entry: "gate",
+            text: format!("{INV}rule gate\n  @intention: \"g\"\n  @source: p.intent:2\n\n  \
+                input:\n    i : Invoice\n\n  output:\n    out : {out_ty}\n\n  logic:\n    out = {body}\n\n  \
+                proofs:\n    purity:\n      reads   : [{reads}]\n      calls   : []\n\n    \
+                termination:\n      bound : @@B@@\n"),
+        };
+        let coll = |label: &'static str, out_ty: &str, body: &str| Probe {
+            label, entry: "gate",
+            text: format!("{BAG}rule gate\n  @intention: \"g\"\n  @source: p.intent:2\n\n  \
+                input:\n    b : Bag\n\n  output:\n    out : {out_ty}\n\n  logic:\n    out = {body}\n\n  \
+                proofs:\n    purity:\n      reads   : [b.xs]\n      calls   : []\n\n    \
+                termination:\n      bound : @@B@@\n"),
+        };
+
+        let probes: Vec<Probe> = vec![
+            // --- leaves, and the one NON-leaf worth 0 ------------------------
+            scalar("lit",      "number", "42",           ""),
+            scalar("field",    "number", "i.amount",     "i.amount"),
+            scalar("str",      "text",   "\"hello\"",    ""),
+            // --- Binary / Neg / Not / If -------------------------------------
+            scalar("bin",      "number", "i.amount + 2 * 3 - 4",   "i.amount"),
+            scalar("neg",      "number", "0 - i.amount",           "i.amount"),
+            scalar("not",      "bool",   "not (i.amount > 1)",     "i.amount"),
+            scalar("if_chain", "number",
+                   "if i.amount > 1 then i.amount + 1 else if i.amount > 0 then 2 else 3",
+                   "i.amount"),
+            // --- Call. gen0 sees ONE generic AstCall where verbosec has ~20
+            //     distinct Expr variants; each costs 1 + its children, which is
+            //     exactly what the AstCall arm computes. `now_unix()` pins the
+            //     childless case (verbosec's Expr::NowUnix = 1, gen0's AstCall
+            //     with an empty arg list = 1 + 0).
+            scalar("prims",    "number",
+                   "length(i.tag) + min(i.amount, 3) + max(i.amount, 4) + band(i.amount, 7) + bnot(i.amount) + shl(i.amount, 1) + byte_at(i.tag, 0)",
+                   "i.amount, i.tag"),
+            scalar("concat",   "text",   "concat(\"x\", i.tag, \"y\")", "i.tag"),
+            scalar("subst",    "number", "length(substring(i.tag, 0, 1))", "i.tag"),
+            // THE ASYMMETRIC CALL. verbosec's `Expr::Read(name)` is CHILDLESS
+            // and worth 1; gen0 sees `AstCall("read", [AstVar(cfg)])`, worth
+            // 1 + 0 because AstVar is a leaf. The two agree only because the
+            // resource name is not an expression on verbosec's side. `fetch`
+            // and `now_unix` have the same shape; `now_unix` cannot be probed
+            // here because it is outside gen0's 18-name `span_is_primitive`
+            // set, so gen0 refuses it as an undefined callee (the documented
+            // 18-vs-36 asymmetry) — a refusal for an unrelated reason, which
+            // would measure nothing.
+            Probe { label: "read", entry: "gate", text: format!(
+                "{INV}resource cfg\n  @intention: \"c\"\n  @source: p.intent:1\n\n  \
+                 path: \"/tmp/verbose_bound_probe_cfg.txt\"\n  max: 32\n  on_read_error: abort\n\n\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:2\n\n  input:\n    i : Invoice\n\n  \
+                 output:\n    out : text\n\n  logic:\n    out = concat(read(cfg), i.tag, \"!\")\n\n  \
+                 proofs:\n    purity:\n      reads   : [i.tag, cfg]\n      calls   : []\n\n    \
+                 termination:\n      bound : @@B@@\n") },
+            // A rule call: the same generic AstCall arm, with a resolvable
+            // callee rather than a primitive.
+            Probe { label: "call", entry: "gate", text: format!(
+                "{INV}rule helper\n  @intention: \"h\"\n  @source: p.intent:2\n\n  input:\n    i : Invoice\n\n  \
+                 output:\n    out : number\n\n  logic:\n    out = i.amount + 1\n\n  \
+                 proofs:\n    purity:\n      reads   : [i.amount]\n      calls   : []\n\n    termination:\n      bound : 400\n\n\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:3\n\n  input:\n    i : Invoice\n\n  \
+                 output:\n    out : number\n\n  logic:\n    out = helper(i) + helper(i) * 2\n\n  \
+                 proofs:\n    purity:\n      reads   : [i]\n      calls   : [helper]\n\n    \
+                 termination:\n      bound : @@B@@\n") },
+            // --- collection families -----------------------------------------
+            coll("sum",    "number",             "sum(b.xs, e => e.v + 1)"),
+            coll("count",  "number",             "count(b.xs, e => e.v > 1)"),
+            coll("fold",   "number",             "fold(b.xs, 0, acc, e => acc + e.v * 2)"),
+            coll("all",    "bool",               "all(b.xs, e => e.v > 0)"),
+            coll("any",    "bool",               "any(b.xs, e => e.v > 0)"),
+            coll("map",    "collection(number)", "map(b.xs, e => e.v * 3)"),
+            coll("filter", "collection(El)",     "filter(b.xs, e => e.v > 2)"),
+            // THE ARM NO CORPUS FILE EXERCISES. verbosec's parser desugars the
+            // fold form to `Fold(c, MAX, __acc, v, If(Binary(Lt, b, acc), b, acc))`
+            // — the body subtree appears TWICE, so its cost is doubled. A gen0
+            // arm written as the obvious `1 + coll + body` under-counts by
+            // `2 + body`, and neither the corpus nor the negative fixture would
+            // notice.
+            coll("min_fold",      "number", "min(b.xs, e => e.v + 1)"),
+            coll("max_fold",      "number", "max(b.xs, e => e.v * 2 + 3)"),
+            coll("min_fold_deep", "number",
+                 "min(b.xs, e => if e.v > 1 then e.v + e.v * 2 else e.v - 1)"),
+            // --- Record construction (verbosec Expr::Record) ------------------
+            Probe { label: "record", entry: "gate", text: format!(
+                "{INV}concept R\n  @intention: \"r\"\n  @source: p.intent:1\n\n  fields:\n    n : number\n    m : text\n\n\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:2\n\n  input:\n    i : Invoice\n\n  \
+                 output:\n    out : R\n\n  logic:\n    out = R {{ n: i.amount + 1, m: i.tag }}\n\n  \
+                 proofs:\n    purity:\n      reads   : [i.amount, i.tag]\n      calls   : []\n\n    \
+                 termination:\n      bound : @@B@@\n") },
+            // --- Ok / Err / match_result. The entry rule is the SECOND one, so
+            //     this also checks the walk reaches past the first declaration.
+            Probe { label: "match_result", entry: "gate", text: format!(
+                "{INV}rule inner\n  @intention: \"v\"\n  @source: p.intent:2\n\n  input:\n    i : Invoice\n\n  \
+                 output:\n    out : Result(number, text)\n\n  logic:\n    out = if i.amount > 5 then Ok(i.amount * 2) else Err(\"bad\")\n\n  \
+                 proofs:\n    purity:\n      reads   : [i.amount]\n      calls   : []\n\n    termination:\n      bound : 400\n\n\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:3\n\n  input:\n    i : Invoice\n\n  \
+                 output:\n    out : Result(number, text)\n\n  logic:\n    out = match_result(inner(i), v => Ok(v + 1), e => Err(concat(\"[\", i.tag, \"] \", e)))\n\n  \
+                 proofs:\n    purity:\n      reads   : [i, i.tag]\n      calls   : [inner]\n\n    \
+                 termination:\n      bound : @@B@@\n") },
+        ];
+
+        let mut zero_count_probes = 0usize;
+        let mut doubled_arm_seen = false;
+        for pr in &probes {
+            // Parse once with a deliberately huge bound to read the count off
+            // the AST, then rebuild the two variants around it.
+            let big = pr.text.replace("@@B@@", "999999");
+            let toks = crate::lexer::Lexer::new(&big).tokenize()
+                .unwrap_or_else(|e| panic!("{}: probe must lex, got {e:?}", pr.label));
+            let prog = crate::parser::Parser::new(toks).parse_program()
+                .unwrap_or_else(|e| panic!("{}: probe must parse, got {e:?}", pr.label));
+            let rule = prog.items.iter().find_map(|it| match it {
+                crate::ast::Item::Rule(r) if r.name == pr.entry => Some(r),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{}: no rule named {}", pr.label, pr.entry));
+            let n = crate::verifier::count_operations(&rule.logic.value);
+
+            let exact = pr.text.replace("@@B@@", &n.to_string());
+            if let Err(why) = verbosec_verdict(&exact) {
+                panic!("{}: the EXACT-bound probe must verify under verbosec, got {why}. \
+                        A probe refused for an unrelated reason measures nothing.", pr.label);
+            }
+            assert!(gen0_accepts(&format!("{}_exact", pr.label), &exact),
+                "{}: THE BOUNDARY. `bound == count` ({n}) must be ACCEPTED — \
+                 verbosec's test is `declared < actual`, so an EQUAL bound is \
+                 fine. A gen0 check written with `<=` would reject valid \
+                 programs, the one direction this arc must never move in.",
+                pr.label);
+
+            if n == 0 {
+                // A zero-count body (a bare literal, or a bare field access —
+                // `Expr::Field` is a pass-through worth 0) has no `count - 1`
+                // to test. Counted rather than skipped silently: these probes
+                // exist to pin the ZERO weights, not the boundary.
+                zero_count_probes += 1;
+                continue;
+            }
+
+            let short = pr.text.replace("@@B@@", &(n - 1).to_string());
+            let why = verbosec_verdict(&short)
+                .expect_err("verbosec must refuse a bound one below the count");
+            assert!(why.contains("termination.bound") && why.contains("actual operation count"),
+                "{}: verbosec must refuse the short-bound probe FOR THE BOUND, got {why}",
+                pr.label);
+            assert!(why.contains(&format!("count {n}")),
+                "{}: verbosec's reported count must be the one this test derived ({n}); got {why}",
+                pr.label);
+            assert!(!gen0_accepts(&format!("{}_short", pr.label), &short),
+                "{}: THE DEFECT THIS TEST EXISTS FOR. `bound == count - 1` ({}) \
+                 must be REFUSED with zero bytes. verbosec says: {why}",
+                pr.label, n - 1);
+            if pr.label.starts_with("min_fold") || pr.label.starts_with("max_fold") {
+                doubled_arm_seen = true;
+            }
+        }
+        assert_eq!(zero_count_probes, 3,
+            "exactly the `lit`, `str` and `field` probes should have a zero \
+             count — two literal leaves and the `Field` pass-through. If this \
+             moves, a weight changed and the boundary half of some probe \
+             silently stopped running.");
+        assert!(doubled_arm_seen,
+            "the fold-form min/max probes must have reached the count-1 half — \
+             they are the only coverage of the DOUBLED-body arm anywhere in the \
+             repo, since no examples/ file uses min(coll, v => …)");
+
+        // The negative fixture this slice closes, end to end.
+        let short_fixture = fs::read_to_string("examples/negative/termination_bound_short.verbose")
+            .expect("examples/negative/termination_bound_short.verbose must exist");
+        assert!(verbosec_verdict(&short_fixture).is_err(), "the fixture must be invalid");
+        assert!(!gen0_accepts("negative_fixture", &short_fixture),
+            "examples/negative/termination_bound_short.verbose must be REFUSED. \
+             Measured on fb58216: rc 0, 771 bytes.");
+
+        // FALSE-POSITIVE GUARD on real, valid programs. The corpus sweep covers
+        // all 151; naming three here makes a regression legible without it.
+        // `logs` and `report` carry sum / count / fold / all / any bodies, i.e.
+        // exactly the arms whose weight is NOT `1 + children`.
+        for f in ["examples/invoices.verbose", "examples/logs.verbose", "examples/report.verbose"] {
+            let text = fs::read_to_string(f).unwrap();
+            assert!(gen0_accepts(&format!("real_{}", f.replace(['/', '.'], "_")), &text),
+                "{f} is valid Verbose whose every declared bound covers its rule's \
+                 operation count, and MUST still be accepted — an OVER-counting \
+                 arm rejects valid programs, which is strictly worse than the gap \
+                 this check closes");
+        }
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// gen0 must enforce MANDATORY `@intention` / `@source` on every declaration.
     ///
     /// Design priority #4 is Traceability — "intention → IR → binary always
@@ -48991,7 +49310,7 @@ rule probe
       reads : [h.data]
       calls : []
     termination:
-      bound : 1
+      bound : 4
 ";
         let argv_bin = emit("argv", argv_prog);
         let run = |bin: &std::path::Path, args: &[&str], stdin_bytes: &str| -> String {
