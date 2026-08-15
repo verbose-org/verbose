@@ -11046,6 +11046,282 @@ rule hint_errors
       bound : 512
 
 
+-- ================= PROOFS-BLOCK PRESENCE CHECKS (all three) =================
+-- verbosec REFUSES, at PARSE time, a rule with no `proofs:` block, a `proofs:`
+-- block with no `purity:`, and a `proofs:` block with no `termination:` —
+-- `Parser::parse_rule`'s `proofs.ok_or_else(... "rule 'X' missing 'proofs'
+-- block")` plus `parse_proofs_block`'s two `.ok_or_else(... "proofs missing
+-- 'purity'" / "'termination'")`. gen0 checked NONE of the three. This closes
+-- all three.
+--
+-- THE MATRIX IS RULE-ONLY, AND THAT WAS DERIVED RATHER THAN ASSUMED. Verbose
+-- has seven declaration kinds, and the `@intention` / `@source` PRESENCE slice
+-- found all seven requiring both attributes — so the natural expectation here
+-- was another seven-cell matrix. It is not: `parse_proofs_block` has EXACTLY
+-- ONE call site in src/parser.rs (`parse_rule`, line 567), and exactly one
+-- `.ok_or_else` demanding its result (line 588). The other six kinds do not
+-- merely not-require a `proofs:` block, they do not ACCEPT one — probed on all
+-- six, each reports its own closed-set body error (`expected attribute,
+-- 'fields:', or 'variants:' in concept body`, `… 'trigger:', or 'effects:' in
+-- reaction`, and so on). So this walk charges RULES and nothing else, and a
+-- stray `proofs:` on another kind is `toplevel_junk`'s business, not this
+-- rule's.
+--
+-- WHY A TOKEN WALK AND NOT A SOURCE WALK — the same call `hint_errors` makes,
+-- for the same measurable reason, and the OPPOSITE of `attr_errors` /
+-- `attr_pres_errors`. Those two walk the RAW SOURCE because `tokenize_indent`'s
+-- `isattr` folds an `@`-leading line into `isblank`, so an attribute reaches no
+-- parser at all. `proofs:` is the other case entirely: every token of the block
+-- is in the stream — that is precisely how `span_is_proofs` finds the header so
+-- `parse_rule_decl_pos` can `skip_indented_block` past it, and how
+-- `parse_proofs` reads `reads:` / `calls:` / `bound:` out of it. Tokens are
+-- also STRICTLY MORE PRECISE here than bytes: verbosec's parser accepts
+-- `proofs :` and `purity  :` (an Ident then a Colon token, whitespace between
+-- them irrelevant), so a byte-level `"proofs:"` match would REJECT A VALID
+-- PROGRAM — the one direction this arc must never move in. Measured over all
+-- 151 files in examples/ the corpus happens to be uniform (1354 `proofs:`,
+-- 1354 `purity:`, 1354 `termination:`, no spaced variants), but relying on that
+-- would be relying on a convention rather than on the grammar.
+--
+-- HOW PRESENCE IS SCOPED TO ONE RULE. `proofs_errors` walks top-level
+-- declarations the way `toplevel_junk` does — `skip_seps_dedent` to the header,
+-- then `skip_indented_block` over the whole declaration — but it deliberately
+-- does NOT call `parse_rule_decl_pos`. A rule declaration is ONE indented
+-- block (header line at column 0, every sub-block at column 2+), so
+-- `skip_indented_block` from the header already steps over the logic, the
+-- `proofs:` and any `hints:`; re-parsing each of ~925 rules a third time (after
+-- `parse_program` and `toplevel_junk`) would cost arena nodes for nothing.
+-- `seek_proofs` then scans that same block for the header, bounded by the same
+-- depth/seen accounting, so it can never reach into the NEXT rule and score a
+-- missing block as present.
+--
+-- THE ANCHOR IS FOUR TOKENS, `Ident("proofs") ':' Newline Indent`, exactly as
+-- `hint_errors` anchors a hints block. A field named `proofs` is `proofs :
+-- <type>` with no Newline after the colon, so it cannot be mistaken for a block
+-- header. `purity` / `termination` are anchored more loosely (Ident then Colon)
+-- because they are only ever looked for INSIDE an already-anchored proofs
+-- block, where nothing else can spell them.
+--
+-- ORDER IS NOT ASSUMED. `parse_proofs` reaches the sub-blocks POSITIONALLY
+-- (purity first, then termination) because the corpus is written that way, but
+-- verbosec's `parse_proofs_block` is a `while` loop dispatching on whichever
+-- keyword it finds, so `termination:` BEFORE `purity:` is valid Verbose. This
+-- walk therefore SCANS for each keyword rather than indexing to it — a
+-- positional check would refuse a program verbosec accepts.
+--
+-- ONE ERROR, NOT THREE, for a rule with no block at all: purity and termination
+-- are then trivially absent too, and verbosec reports exactly one parse error.
+--
+-- MEASURED before the fix (no-read body `out = 42`, so the purity walk has
+-- nothing to disagree with): all three shapes accepted at rc 0, 548 B. With a
+-- READING body two of the three flipped to rc 1 — but that was the PURITY walk
+-- firing on an empty declared read set, not a presence check, which is why the
+-- fixtures for this row all use a no-read body. After: all three refused at
+-- rc 1 with zero bytes; all 151 examples still compile; gen0's own 925 rules
+-- still verify.
+rule span_is_purity
+  @intention: "1 if an Ident span spells exactly \"purity\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 112 and (byte_at(sc.src, sc.start + 1) == 117 and (byte_at(sc.src, sc.start + 2) == 114 and (byte_at(sc.src, sc.start + 3) == 105 and (byte_at(sc.src, sc.start + 4) == 116 and byte_at(sc.src, sc.start + 5) == 121))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule span_is_termination
+  @intention: "1 if an Ident span spells exactly \"termination\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 11 and (byte_at(sc.src, sc.start) == 116 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 114 and (byte_at(sc.src, sc.start + 3) == 109 and (byte_at(sc.src, sc.start + 4) == 105 and (byte_at(sc.src, sc.start + 5) == 110 and (byte_at(sc.src, sc.start + 6) == 97 and (byte_at(sc.src, sc.start + 7) == 116 and (byte_at(sc.src, sc.start + 8) == 105 and (byte_at(sc.src, sc.start + 9) == 111 and byte_at(sc.src, sc.start + 10) == 110)))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- A token cursor plus the source and the running block depth, for the two
+-- proofs-block scans. `want` selects which sub-block keyword proofs_kw_scan is
+-- looking for (1 = purity, 2 = termination, 0 = do not scan); seek_proofs
+-- ignores it and always passes 0.
+concept ProofsScan
+  @intention: "A token cursor plus source, wanted sub-block keyword, and block depth/seen accounting"
+  @source: vexprparse.intent:63
+  fields:
+    cell : TokenList
+    src : text [..256]
+    want : number [0, 4]
+    depth : number [0, 4000000]
+    seen : number [0, 4000000]
+
+
+-- proofs_anchor_at: 1 iff ps.cell begins the four-token run
+-- `Ident("proofs") ':' Newline Indent` — the block header shape. Called from
+-- BOTH seek_proofs (to stop) and rule_proofs_errors (to judge what it stopped
+-- on), so the two can never disagree about what a proofs block looks like.
+rule proofs_anchor_at
+  @intention: "1 if the cursor begins a `proofs:` block header (Ident, Colon, Newline, Indent), 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let n1 = advance(Advance { lst: ps.cell, k: 1 })
+    let is_p = span_is_proofs(SpanCheck { src: ps.src, start: peek_start(ps.cell), len: peek_len(ps.cell) })
+    out = if is_p == 1 and (peek_op_code(n1) == 10 and (peek_kind(advance(Advance { lst: n1, k: 1 })) == 600 and peek_kind(advance(Advance { lst: n1, k: 2 })) == 700)) then 1 else 0
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [advance, span_is_proofs, peek_start, peek_len, peek_op_code, peek_kind]
+    termination:
+      bound : 64
+
+
+-- seek_proofs: from a cursor at a rule's `rule` keyword, scan forward for the
+-- `proofs:` block header, STOPPING at the Dedent that closes the rule's own
+-- indented block. The depth/seen accounting is skip_indented_block's, verbatim,
+-- which is what bounds the scan to this one declaration — without it the walk
+-- would find the NEXT rule's proofs block and score a missing one as present.
+-- Returns the header cell when found, else the cell just past the rule block
+-- (or the Eof cell); the caller re-applies proofs_anchor_at to tell which.
+-- Forward-index recursion toward the finite token end; bound + the mandatory
+-- recursion breadcrumb, same backstop as skip_indented_block's.
+rule seek_proofs
+  @intention: "The cell at a rule's `proofs:` header, or the cell past the rule block when it has none"
+  @source: vexprparse.intent:63
+  input:
+    bs : ProofsScan
+  output:
+    out : TokenList
+  logic:
+    let knd = peek_kind(bs.cell)
+    let nxt = advance(Advance { lst: bs.cell, k: 1 })
+    let is_indent = if knd == 700 then 1 else 0
+    let is_dedent = if knd == 800 then 1 else 0
+    let ndepth = if is_indent == 1 then bs.depth + 1 else if is_dedent == 1 then bs.depth - 1 else bs.depth
+    let nseen = if is_indent == 1 then 1 else bs.seen
+    let closed = if nseen == 1 then (if ndepth == 0 then 1 else 0) else 0
+    let hit = proofs_anchor_at(ProgramState { cell: bs.cell, src: bs.src })
+    out = if knd == 0 then bs.cell else (if hit == 1 then bs.cell else (if closed == 1 then nxt else seek_proofs(ProofsScan { cell: nxt, src: bs.src, want: 0, depth: ndepth, seen: nseen })))
+  proofs:
+    purity:
+      reads : [bs.cell, bs.src, bs.depth, bs.seen]
+      calls : [peek_kind, advance, proofs_anchor_at, seek_proofs]
+    termination:
+      bound : 4000000
+
+
+-- proofs_kw_scan: 1 iff the sub-block keyword named by ks.want (1 = purity,
+-- 2 = termination) appears, followed by a Colon, inside the proofs block whose
+-- Indent token ks.cell starts at. Same depth/seen bound as seek_proofs, so the
+-- scan cannot leak past the block's closing Dedent. ks.want == 0 answers 1
+-- immediately without scanning: rule_proofs_errors passes it when there is no
+-- block to look in, and discards the answer.
+-- ONE RULE SERVES BOTH KEYWORDS on purpose — the purity and termination checks
+-- must never disagree about scoping, anchoring or bounding, and the only way to
+-- guarantee that is for there to be one walk.
+rule proofs_kw_scan
+  @intention: "1 if the wanted proofs sub-block keyword (purity or termination) appears inside this proofs block"
+  @source: vexprparse.intent:63
+  input:
+    ks : ProofsScan
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(ks.cell)
+    let nxt = advance(Advance { lst: ks.cell, k: 1 })
+    let is_indent = if knd == 700 then 1 else 0
+    let is_dedent = if knd == 800 then 1 else 0
+    let ndepth = if is_indent == 1 then ks.depth + 1 else if is_dedent == 1 then ks.depth - 1 else ks.depth
+    let nseen = if is_indent == 1 then 1 else ks.seen
+    let closed = if nseen == 1 then (if ndepth == 0 then 1 else 0) else 0
+    let sstart = peek_start(ks.cell)
+    let slen = peek_len(ks.cell)
+    let is_pu = span_is_purity(SpanCheck { src: ks.src, start: sstart, len: slen })
+    let is_te = span_is_termination(SpanCheck { src: ks.src, start: sstart, len: slen })
+    let named = if ks.want == 1 then is_pu else is_te
+    let hit = if named == 1 and peek_op_code(nxt) == 10 then 1 else 0
+    out = if ks.want == 0 then 1 else (if knd == 0 then 0 else (if hit == 1 then 1 else (if closed == 1 then 0 else proofs_kw_scan(ProofsScan { cell: nxt, src: ks.src, want: ks.want, depth: ndepth, seen: nseen }))))
+  proofs:
+    purity:
+      reads : [ks.cell, ks.src, ks.want, ks.depth, ks.seen]
+      calls : [peek_kind, advance, peek_start, peek_len, span_is_purity, span_is_termination, peek_op_code, proofs_kw_scan]
+    termination:
+      bound : 4000000
+
+
+-- rule_proofs_errors: the per-rule verdict, with ps.cell at the `rule` keyword.
+-- 1 when the rule has no `proofs:` block at all (purity and termination are
+-- then trivially absent too, and verbosec reports exactly one parse error);
+-- otherwise one error per missing sub-block, so 0, 1 or 2.
+rule rule_proofs_errors
+  @intention: "Number of missing mandatory proofs blocks for one rule declaration (0..2)"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let pc = seek_proofs(ProofsScan { cell: ps.cell, src: ps.src, want: 0, depth: 0, seen: 0 })
+    let found = proofs_anchor_at(ProgramState { cell: pc, src: ps.src })
+    let ind = advance(Advance { lst: pc, k: 3 })
+    let w1 = if found == 1 then 1 else 0
+    let w2 = if found == 1 then 2 else 0
+    let hasp = proofs_kw_scan(ProofsScan { cell: ind, src: ps.src, want: w1, depth: 0, seen: 0 })
+    let hast = proofs_kw_scan(ProofsScan { cell: ind, src: ps.src, want: w2, depth: 0, seen: 0 })
+    out = if found == 0 then 1 else (1 - hasp) + (1 - hast)
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [seek_proofs, proofs_anchor_at, advance, proofs_kw_scan]
+    termination:
+      bound : 64
+
+
+-- proofs_errors: the verrs contribution. Walks top-level declarations the way
+-- toplevel_junk does — skip_seps_dedent to the header, skip_indented_block over
+-- the whole declaration — charging rule_proofs_errors on each one that spells
+-- `rule` and nothing on the other six kinds (which cannot carry a `proofs:`
+-- block at all; see the banner above). skip_indented_block returns its own cell
+-- only at Eof, which the `knd == 0` base case takes first, so the cursor always
+-- advances. Forward recursion toward the finite token end; bound + the
+-- mandatory recursion breadcrumb, same backstop as toplevel_junk's.
+rule proofs_errors
+  @intention: "Number of mandatory proofs / purity / termination blocks missing across every rule in the program"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let hp = skip_seps_dedent(ParseState { cell: ps.cell })
+    let knd = peek_kind(hp)
+    let is_rule = span_is_rule(SpanCheck { src: ps.src, start: peek_start(hp), len: peek_len(hp) })
+    let endp = skip_indented_block(SkipBlockState { cell: hp, depth: 0, seen: 0 })
+    let here = if is_rule == 1 then rule_proofs_errors(ProgramState { cell: hp, src: ps.src }) else 0
+    out = if knd == 0 then 0 else here + proofs_errors(ProgramState { cell: endp, src: ps.src })
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [skip_seps_dedent, peek_kind, span_is_rule, peek_start, peek_len, skip_indented_block, rule_proofs_errors, proofs_errors]
+    termination:
+      bound : 512
+
+
 -- rule_list_len: the number of rule declarations in a parsed program. Structural
 -- recursion on the RuleList tail (Phase C), like count_binds on a Binding list.
 rule rule_list_len
@@ -22302,11 +22578,11 @@ rule verify_errors
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors]
+      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors, proofs_errors]
     termination:
       bound : 256
 
@@ -33559,7 +33835,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -33631,7 +33907,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors, hint_errors]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors]
     termination:
       bound : 256
 
