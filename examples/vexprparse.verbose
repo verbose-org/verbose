@@ -21173,6 +21173,261 @@ rule purity_list
       bound : 4000
 
 
+-- ==================== @layer STRATIFICATION ====================
+-- The sealed-subgraph discipline: a rule that declares a layer may only call
+-- rules that ALSO declare one, and only layers its own is allowed to call.
+-- verbosec's `check_layer_discipline` (src/verifier.rs) is the reference, and
+-- reading it rather than the summary of it is what made this a slice instead
+-- of an arc. It is DIRECT-CALL ONLY -- for each call in the rule's facts,
+-- resolve the callee BY NAME, error if the callee is unlayered, error if
+-- `caller_layer.can_call(callee_layer)` is false. **No transitive closure, no
+-- graph traversal, no fixpoint.** The gaps table called this one "needs the
+-- call graph", which priced it as a reachability analysis; what it actually
+-- needs is one lookup per declared callee.
+--
+-- `Layer::can_call` (src/ast.rs) is three arms, and `layer_call_ok` below
+-- mirrors them one for one rather than collapsing them into the equivalent
+-- `callee <= caller` numeric test -- the encoding happens to be monotone
+-- (domain < application < interface, exactly as ast.rs's own comment says),
+-- but an auditor comparing the two files should see the same three arms, not
+-- a cleverness they have to re-derive.
+--
+-- TWO INPUTS ARE NEEDED, AND BOTH ALREADY EXIST HERE.
+--
+--   (1) rule -> LAYER. Attributes are lexed away (`tokenize_indent`'s `isattr`
+--       folds an `@`-line into `isblank`), so this comes off the RAW SOURCE,
+--       the same channel `attr_errors` / `attr_pres_errors` use and for the
+--       same reason. `decl_layer_at` is `decl_has_intention` with a different
+--       payload: scan forward from the line after a declaration header,
+--       STOP at the next header, and report what was found. The scan's
+--       starting point is free -- a parsed RuleDecl already carries
+--       `rd_name_start`, the byte offset of its own name -- so this is
+--       O(declaration), not O(file), per rule. The value is read with
+--       `attr_value_start` + the `span_is_domain` / `_application` /
+--       `_interface` trio that `attr_errors` introduced for the closed-set
+--       NAME check.
+--
+--   (2) rule -> CALLEES. Taken from the rule's DECLARED `calls:` list, not
+--       from a fresh AST walk. That is sound because purity is now checked in
+--       BOTH directions (missing since 2026-08-11, extra since 2026-08-14,
+--       and the twelve opaque node families walked since the same day): for
+--       any program verbosec ACCEPTS, `check_purity`'s set comparison
+--       guarantees declared == performed, so querying the declared list gives
+--       exactly the set `facts.calls` would. On a program where they DIFFER,
+--       the purity check refuses it anyway, so no accepted program can be
+--       judged against the wrong set. **This is a real dependency and it is
+--       stated so it can be found**: weaken either purity direction and this
+--       check silently weakens with it.
+--
+-- STRICTNESS DIRECTION: exact, like PRESENCE and unlike the attribute NAME
+-- check. Refusing a call that verbosec permits would REJECT A VALID PROGRAM,
+-- so `layer_call_ok` enumerates all nine caller x callee cells plus the
+-- unlayered-callee case rather than approximating. An UNLAYERED CALLER is
+-- unconstrained -- verbosec only enters `check_layer_discipline` under
+-- `if let Some(caller_layer) = rule.layer` -- so `layer_rule_errors` returns 0
+-- before looking at anything else, which is what keeps the ~925 rules in this
+-- file (none of which declares a layer) and the 100 accepted corpus files
+-- untouched.
+--
+-- NOT CLOSED BY THIS: `@layer` on a declaration kind that may not carry one
+-- (verbosec allows it on a rule and refuses it on a concept). That stays under
+-- the attribute NAME row's documented UNION weakness -- gen0 reads a layer off
+-- a rule and never asks whether some other declaration also carries one.
+-- =========================================================================
+
+
+-- decl_layer_at: the layer CODE declared by the declaration whose header line
+-- precedes s.pos -- 1 domain, 2 application, 3 interface, 0 none. Byte-for-byte
+-- the `decl_has_intention` walk (stop at the next header or end-of-source),
+-- differing only in what it reports on a hit. `vstart` / `vlen` are guarded on
+-- `hit` so the eager lets never scan from a position an attribute line does not
+-- own; `code` is computed unconditionally but every span check leads with its
+-- length test, so a (0, 0) span answers 0 without a byte_at.
+rule decl_layer_at
+  @intention: "The @layer code declared before the next declaration header (1 domain, 2 application, 3 interface, 0 none)"
+  @source: vexprparse.intent:63
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let width = line_width(ScanState { source: s.source, pos: s.pos })
+    let cstart = s.pos + width
+    let nls = next_line_start(ScanState { source: s.source, pos: s.pos })
+    let hdr = decl_header_at(ScanState { source: s.source, pos: cstart })
+    let c0 = if cstart >= len then 0 else byte_at(s.source, cstart)
+    let nlen = if c0 == 64 then ident_run(ScanState { source: s.source, pos: cstart + 1 }) else 0
+    let hit = if c0 == 64 then span_is_layer_kw(SpanCheck { src: s.source, start: cstart + 1, len: nlen }) else 0
+    let vstart = if hit == 1 then attr_value_start(ScanState { source: s.source, pos: cstart + 1 + nlen }) else 0
+    let vlen = if hit == 1 then ident_run(ScanState { source: s.source, pos: vstart }) else 0
+    let code = if span_is_domain(SpanCheck { src: s.source, start: vstart, len: vlen }) == 1 then 1 else if span_is_application(SpanCheck { src: s.source, start: vstart, len: vlen }) == 1 then 2 else if span_is_interface(SpanCheck { src: s.source, start: vstart, len: vlen }) == 1 then 3 else 0
+    out = if s.pos >= len then 0 else if hdr == 1 then 0 else if hit == 1 then code else decl_layer_at(ScanState { source: s.source, pos: nls })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [line_width, next_line_start, decl_header_at, ident_run, span_is_layer_kw, attr_value_start, span_is_domain, span_is_application, span_is_interface, decl_layer_at]
+    termination:
+      bound : 65535
+
+
+-- RuleLayerState: a parsed rule declaration + the source text it was parsed
+-- from. The rule carries its own name's byte offset, which is the only anchor
+-- the source scan needs.
+concept RuleLayerState
+  @intention: "A parsed rule declaration + the source text, for reading its @layer off the raw source"
+  @source: vexprparse.intent:63
+  fields:
+    rd : RuleDecl
+    src : text [..256]
+
+
+-- rule_layer: the declared @layer code of ONE parsed rule, 0 if it declares
+-- none. `rd_name_start` gives the offset of the rule's NAME, which sits on the
+-- header line, so the attribute scan starts at the following line -- exactly
+-- where `attr_pres_errors` starts its own `decl_has_intention` scan.
+rule rule_layer
+  @intention: "The declared @layer code of a parsed rule (0 if it declares no layer)"
+  @source: vexprparse.intent:63
+  input:
+    rl : RuleLayerState
+  output:
+    out : number
+  logic:
+    let nls = next_line_start(ScanState { source: rl.src, pos: rd_name_start(rl.rd) })
+    out = decl_layer_at(ScanState { source: rl.src, pos: nls })
+  proofs:
+    purity:
+      reads : [rl.rd, rl.src]
+      calls : [next_line_start, rd_name_start, decl_layer_at]
+    termination:
+      bound : 64
+
+
+-- LayerPair: a caller layer code and a callee layer code, both in 0..3.
+concept LayerPair
+  @intention: "A caller layer code and a callee layer code (0 none, 1 domain, 2 application, 3 interface)"
+  @source: vexprparse.intent:63
+  fields:
+    caller : number [0, 3]
+    callee : number [0, 3]
+
+
+-- layer_call_ok: 1 iff a rule at `caller` may call a rule at `callee`. Mirrors
+-- BOTH refusal arms of verbosec's `check_layer_discipline`: the `None` arm
+-- (callee declares no layer -- a layered rule may only call layered rules, so
+-- this is refused for EVERY caller including interface, which is the one cell
+-- a bare `can_call` port would get wrong), then the three `Layer::can_call`
+-- arms. Enumerated cell by cell rather than written as `callee <= caller`, so
+-- the correspondence with src/ast.rs is readable rather than derived.
+rule layer_call_ok
+  @intention: "1 if a rule at the caller layer may call a rule at the callee layer, 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    lp : LayerPair
+  output:
+    out : number
+  logic:
+    out = if lp.callee == 0 then 0 else if lp.caller == 3 then 1 else if lp.caller == 2 and lp.callee == 1 then 1 else if lp.caller == 2 and lp.callee == 2 then 1 else if lp.caller == 1 and lp.callee == 1 then 1 else 0
+  proofs:
+    purity:
+      reads : [lp.caller, lp.callee]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- LayerCallState: the declared callee names still to check + the full program
+-- rule list to resolve them against + the source + the CALLER's layer code.
+concept LayerCallState
+  @intention: "A declared calls list + the full program rule list + the source text + the caller's layer code"
+  @source: vexprparse.intent:63
+  fields:
+    names : NameList
+    rules : RuleList
+    src : text [..256]
+    caller : number [0, 3]
+
+
+-- layer_call_errors: one error per declared callee the caller's layer may not
+-- reach. An UNRESOLVABLE name charges nothing -- verbosec `continue`s on a
+-- callee that is not in `all_rules`, reporting it through the undefined-callee
+-- path instead, and `rule_named` is the same question gen0's own lint asks. The
+-- guard is also what keeps `find_rule`'s empty-RuleDecl sentinel out of
+-- `rule_layer`, where a name_start of 0 would scan the top of the file.
+rule layer_call_errors
+  @intention: "Number of declared callees whose layer the caller's layer may not call"
+  @source: vexprparse.intent:63
+  input:
+    lc : LayerCallState
+  output:
+    out : number
+  logic:
+    out = match lc.names:
+      NmCons(start, len, rest) => (if rule_named(RuleNamedState { rules: lc.rules, src: lc.src, q_start: start, q_len: len }) == 0 then 0 else if layer_call_ok(LayerPair { caller: lc.caller, callee: rule_layer(RuleLayerState { rd: find_rule(FindRuleState { rules: lc.rules, src: lc.src, q_start: start, q_len: len }), src: lc.src }) }) == 1 then 0 else 1) + layer_call_errors(LayerCallState { names: rest, rules: lc.rules, src: lc.src, caller: lc.caller })
+      NmNil => 0
+  proofs:
+    purity:
+      reads : [lc.names, lc.rules, lc.src, lc.caller]
+      calls : [rule_named, layer_call_ok, rule_layer, find_rule, layer_call_errors]
+    termination:
+      bound : 256
+
+
+-- layer_rule_errors: the stratification violations of ONE rule. An UNLAYERED
+-- caller is unconstrained and returns 0 before anything else runs -- verbosec
+-- only enters the check under `if let Some(caller_layer) = rule.layer`, and
+-- being over-strict here would reject every ordinary program in the corpus.
+rule layer_rule_errors
+  @intention: "Number of @layer stratification violations in one rule (0 if the rule declares no layer)"
+  @source: vexprparse.intent:63
+  input:
+    lr : UndeclCallRuleState
+  output:
+    out : number
+  logic:
+    let caller = rule_layer(RuleLayerState { rd: lr.rd, src: lr.src })
+    out = if caller == 0 then 0 else layer_call_errors(LayerCallState { names: prf_calls(rd_proofs(lr.rd)), rules: lr.rules, src: lr.src, caller: caller })
+  proofs:
+    purity:
+      reads : [lr.rd, lr.src, lr.rules]
+      calls : [rule_layer, layer_call_errors, prf_calls, rd_proofs]
+    termination:
+      bound : 64
+
+
+-- LayerListState: the rule list being ITERATED + the FULL program rule list +
+-- the source text. Same iter/full split as PurityListState, for the same reason
+-- -- every rule resolves its callees against every rule.
+concept LayerListState
+  @intention: "The rule list being iterated + the full program rule list + the source text"
+  @source: vexprparse.intent:63
+  fields:
+    iter : RuleList
+    full : RuleList
+    src : text [..256]
+
+
+-- layer_list: the verrs contribution. Sum layer_rule_errors over every rule.
+rule layer_list
+  @intention: "Total @layer stratification violations across every rule in a program"
+  @source: vexprparse.intent:63
+  input:
+    ll : LayerListState
+  output:
+    out : number
+  logic:
+    out = match ll.iter:
+      RCons(head, tail) => layer_rule_errors(UndeclCallRuleState { rd: head, rules: ll.full, src: ll.src }) + layer_list(LayerListState { iter: tail, full: ll.full, src: ll.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [ll.iter, ll.full, ll.src]
+      calls : [layer_rule_errors, layer_list]
+    termination:
+      bound : 4000
+
+
 -- count_purity_errors: the R6d money-shot driver. Tokenize the program source, parse
 -- the whole rule-decl sequence ONCE, then fold purity_errors over it with iter = all
 -- = the parsed program so every rule resolves its callees against the whole program.
@@ -22768,11 +23023,11 @@ rule verify_errors
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors, proofs_errors]
+      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
     termination:
       bound : 256
 
@@ -34025,7 +34280,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -34097,7 +34352,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
     termination:
       bound : 256
 

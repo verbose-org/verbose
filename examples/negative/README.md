@@ -206,6 +206,45 @@ else can be deferred by sitting next to it.
   INDENT/DEDENT comment, the attribute-PRESENCE "genuinely ambiguous" note, and
   both halves of this one).
 
+## The same mis-pricing, a fifth time — and it named the wrong data structure
+
+`layer_violation` and `layer_calls_unlayered` closed 2026-08-15, and they were
+deferred by a row that said they *"need the call graph, not the source text, and
+need the layer value ATTACHED to each rule, which means retaining attributes
+through the parse rather than re-scanning the source"* — i.e. two independent
+reasons to file it as an arc, one about the analysis and one about the parser.
+
+Both were wrong, and the reference says so in nine lines:
+
+```
+check_layer_discipline (src/verifier.rs)
+        ->  for each call in the rule's facts: resolve the callee BY NAME,
+            error if unlayered, error if !caller.can_call(callee).
+            No transitive closure. No traversal. No fixpoint.
+```
+
+So the "call graph" is one lookup per declared callee. And the second half —
+that a source-line walk cannot attach a layer to a rule — misses that a parsed
+`RuleDecl` already carries `rd_name_start`, its own name's byte offset. That is
+the anchor: scan forward from the line after it, stop at the next header, which
+is exactly `decl_has_intention`'s existing walk with a different payload.
+
+The distinguishing habit is the same one the section above ends on, so it is
+worth stating as a rule rather than as a fifth anecdote: **a deferral note
+describes the check the author imagined, not the check the reference performs.**
+Reading `src/verifier.rs` costs seconds. Five gaps in this corpus have now been
+mis-priced by their own notes, and every one was found by opening the function.
+
+One thing this fixture pair could NOT have shown on its own, and the reason the
+pin does not stop at them: `@layer: interface` appears in **no file anywhere in
+the repo**, fixtures included. Its accepting arms — and the one trap cell,
+`interface -> unlayered`, which `Layer::can_call` gets wrong because its
+Interface arm returns `true` unconditionally and the `None` arm has to run
+first — are exercised only by the enumerated 4×4 matrix in
+`two_generation_gen0_verifies_layer_stratification`. Same lesson as the sampled
+`@intention` matrix two sections down: **enumerate the cells, do not sample
+them.**
+
 ## A fixture set organised by DECLARATION cannot see a defect of POSITION
 
 Every fixture in this directory before 2026-08-14 isolated a **declaration**
@@ -337,7 +376,7 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 41 fixtures**, currently measuring **37 PASS / 4 GAP / 0 INVERSE**.
+- **Only 41 fixtures**, currently measuring **39 PASS / 2 GAP / 0 INVERSE**.
   They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has

@@ -47010,21 +47010,28 @@ rule pick
     /// 2026-08-14 likewise land as PASS in the commit that adds them
     /// (`proofs_errors`, a second TOKEN walk). `termination_bound_short` closed
     /// 2026-08-15 (`count_ops_ast`, a plain structural node walk mirroring
-    /// verbosec's `count_operations` — group 3). So the standing measurement is
-    /// **41 fixtures, 37 PASS, 4 GAP, 0 INVERSE**. The 4 are not four
-    /// surprises — they are three STRUCTURAL causes wearing four faces, and
-    /// reading them that way is the point of the sweep:
+    /// verbosec's `count_operations` — group 3), and the two `layer_*`
+    /// fixtures closed the same day (`layer_list` — group 1). So the standing
+    /// measurement is **41 fixtures, 39 PASS, 2 GAP, 0 INVERSE**. The 2 are
+    /// not two surprises — they are two STRUCTURAL causes, and reading them
+    /// that way is the point of the sweep:
     ///
     ///   1. **gen0's tokenizer discards attribute lines entirely.**
     ///      `tokenize_indent`'s `isattr` (`c0b == 64`) folds an `@`-leading
     ///      line into `isblank`, so `@intention` / `@source` / `@layer` never
     ///      reach the parser at all. Nothing downstream can check what the
-    ///      token stream does not contain — which is why every check that CAN
-    ///      be closed is closed on the RAW SOURCE instead (`attr_errors` for
-    ///      the closed-set NAME, `attr_pres_errors` for PRESENCE). Only
-    ///      stratification is left, and it is the one that a source walk
-    ///      structurally cannot do: it needs the call graph AND the layer
-    ///      value attached to each rule. 2 fixtures remain.
+    ///      token stream does not contain — which is why every check here is
+    ///      closed on the RAW SOURCE instead (`attr_errors` for the closed-set
+    ///      NAME, `attr_pres_errors` for PRESENCE, `decl_layer_at` for the
+    ///      layer VALUE). **This group is now EMPTY**, and its last two
+    ///      occupants are the fourth entry in this arc's tally of rows that
+    ///      mis-priced themselves: stratification was filed here as the one
+    ///      check "a source walk structurally cannot do … it needs the call
+    ///      graph AND the layer value attached to each rule". Neither half
+    ///      held. `check_layer_discipline` is direct-call only, and a parsed
+    ///      RuleDecl already carries `rd_name_start`, so the source walk has
+    ///      its anchor. See
+    ///      `two_generation_gen0_verifies_layer_stratification`.
     ///   2. **gen0 SKIPPED the `hints:` block structurally** —
     ///      `parse_rule_decl_pos` consumes it with `skip_indented_block` so
     ///      the program is not truncated (PR #141/#142), but consuming is not
@@ -47157,18 +47164,27 @@ rule pick
         // prints the full diff either way. Grouped by the structural cause
         // named in the doc comment above.
         const KNOWN_GAPS: &[&str] = &[
-            // (1) attribute lines are lexed away as blank — 2 of the original 7.
+            // (1) attribute lines are lexed away as blank — was 7, now 0.
             //     `attr_unknown_on_rule` and `layer_unknown_name` were CLOSED by
             //     gen0's `attr_errors` source-line walk; the fourteen
             //     `attr_missing_*` PRESENCE fixtures were CLOSED by its sibling
-            //     `attr_pres_errors` (both in the `span_is_hints` neighbourhood
-            //     in examples/vexprparse.verbose). The two left need the CALL
-            //     GRAPH plus the layer value ATTACHED to each rule, i.e.
-            //     retaining attributes through the parse rather than
-            //     re-scanning the source — the one thing a source-line walk
-            //     structurally cannot do.
-            "layer_calls_unlayered",
-            "layer_violation",
+            //     `attr_pres_errors`; and `layer_violation` /
+            //     `layer_calls_unlayered` were CLOSED 2026-08-15 by `layer_list`
+            //     (all three in the `span_is_hints` / purity neighbourhood in
+            //     examples/vexprparse.verbose). This group is EMPTY.
+            //
+            //     The two layer fixtures are the fourth entry in this file's
+            //     running tally of rows that mis-priced themselves. This one
+            //     said they "need the CALL GRAPH plus the layer value ATTACHED
+            //     to each rule, i.e. retaining attributes through the parse
+            //     rather than re-scanning the source — the one thing a
+            //     source-line walk structurally cannot do." Both halves were
+            //     wrong. verbosec's `check_layer_discipline` is DIRECT-CALL
+            //     ONLY (resolve each callee by name, compare two layers — no
+            //     traversal, no closure, no fixpoint), and the source-line walk
+            //     needs no new anchor because a parsed RuleDecl already carries
+            //     `rd_name_start`, its own name's byte offset. See the
+            //     "@layer STRATIFICATION" banner in examples/vexprparse.verbose.
             // (2) the `hints:` block — 1 of the original 4. `hint_unknown_name`,
             //     `hint_bare_no_justification` and `hint_overflow_inverted`
             //     were CLOSED by gen0's `hint_errors` token walk (see
@@ -48650,6 +48666,259 @@ rule pick
                  arm rejects valid programs, which is strictly worse than the gap \
                  this check closes");
         }
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// gen0 must enforce the `@layer` SEALED-SUBGRAPH discipline.
+    ///
+    /// `@layer` is a documented language feature — a rule that declares a layer
+    /// may only call rules that ALSO declare one, and only layers its own is
+    /// allowed to call — and until 2026-08-15 gen0 verified none of it.
+    /// Measured on 2bd3081, both fixtures: `verbosec` reports
+    /// `[rule 'is_dom' / @layer] rule at layer 'domain' calls 'is_app' at layer
+    /// 'application'` and `rule declares layer 'application' but calls
+    /// unlayered rule 'helper'`, while gen0 returned **rc 0 with a 596-byte
+    /// ELF** for each.
+    ///
+    /// THE ROW MIS-PRICED ITSELF, for the fourth time in this arc (after the
+    /// INDENT/DEDENT comment, the attribute-PRESENCE "genuinely ambiguous"
+    /// note, and both halves of the `overflow` / `termination.bound` pairing).
+    /// CLAUDE.md's gaps table said this one "needs the call graph, not the
+    /// source text, and needs the layer value ATTACHED to each rule … the one
+    /// attribute check a source-line walk structurally cannot do." Both halves
+    /// are false, and opening `src/verifier.rs` is what showed it:
+    /// `check_layer_discipline` is **DIRECT-CALL ONLY** — for each call in the
+    /// rule's facts, resolve the callee BY NAME, error if it is unlayered,
+    /// error if `caller_layer.can_call(callee_layer)` is false. No transitive
+    /// closure, no traversal, no fixpoint. And the source-line walk needs no
+    /// new anchor, because a parsed `RuleDecl` already carries
+    /// `rd_name_start` — its own name's byte offset — so `decl_layer_at` is
+    /// `decl_has_intention` with a different payload, scanning O(declaration)
+    /// rather than O(file) per rule.
+    ///
+    /// THE CALLEE SET COMES FROM THE DECLARED `calls:` LIST, not a fresh AST
+    /// walk, and that is sound only because purity is now checked in BOTH
+    /// directions (missing since PR #161, extra since PR #165, the twelve
+    /// opaque families walked since PR #166). For any program verbosec
+    /// ACCEPTS, `check_purity`'s set comparison guarantees declared ==
+    /// performed, so the declared list IS `facts.calls`; on a program where
+    /// they differ, purity refuses it anyway. **It is a real dependency** —
+    /// weaken either purity direction and this check silently weakens with it.
+    ///
+    /// THE MATRIX IS ENUMERATED, NOT SAMPLED. Three caller layers × three
+    /// callee layers is nine cells (six legal, three illegal), plus four
+    /// UNLAYERED-CALLER cells and three UNLAYERED-CALLEE ones: sixteen in all,
+    /// every one asserted against verbosec's own verdict on the same bytes.
+    /// Two of the groups are exactly the kind that a corpus sweep cannot cover
+    /// and a hand-written fixture would skip:
+    ///
+    ///   * `interface` appears in **no file under `examples/`**, so all seven
+    ///     of its cells are untested by every other gate in this repo. It is
+    ///     also where a naive port breaks: `Layer::can_call`'s Interface arm
+    ///     returns `true` unconditionally, so lowering the check as a bare
+    ///     `can_call` would ACCEPT `interface -> unlayered`, which verbosec
+    ///     refuses in the `None` arm that runs *before* `can_call`. Hence the
+    ///     leading `callee == 0` guard in gen0's `layer_call_ok`.
+    ///   * an UNLAYERED CALLER is unconstrained — verbosec only enters the
+    ///     check under `if let Some(caller_layer) = rule.layer`. A check that
+    ///     refused one would REJECT VALID PROGRAMS, which is the direction this
+    ///     arc must never move in, and it would take the ~940 rules of
+    ///     `examples/vexprparse.verbose` (which declares no `@layer` at all)
+    ///     down with it.
+    ///
+    /// NON-VACUITY. A newly-strict check that refuses the two fixtures and
+    /// nothing else looks identical to one that refuses on some incidental
+    /// property, so the last assertion swaps the two `@layer` values in
+    /// `examples/layers.verbose` — the repo's only legitimate `@layer` user —
+    /// and requires the swap to be REFUSED while the file as shipped is still
+    /// ACCEPTED. Same bytes, same declarations, one inverted stratification.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_verifies_layer_stratification() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_layer_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let dir = std::env::temp_dir().join("verbosec_test_layer_probes");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("p.intent"), "title\n1. one\n2. two\n3. three\n").unwrap();
+
+        let out_elf = dir.join("out.elf");
+        let gen0_accepts = |label: &str, text: &str| -> bool {
+            let p = dir.join(format!("{label}.verbose"));
+            fs::write(&p, text).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), p.display(), out_elf.display()))
+                .status().expect("run gen0 over a layer probe");
+            let bytes = fs::metadata(&out_elf).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(status.success(), bytes > 0,
+                "{label}: gen0 must either accept AND emit, or refuse AND emit \
+                 nothing — a half-written ELF at exit 1 is the arena-exhaustion \
+                 signature, not a verdict (see CLAUDE.md on max_nodes)");
+            status.success()
+        };
+        // verbosec's verdict over the same bytes, diagnostics joined so a
+        // refusal can be ATTRIBUTED to @layer rather than to something
+        // incidental — the fixture-body trap PR #167 documents.
+        let verbosec_verdict = |probe_dir: &std::path::Path, text: &str| -> Result<(), String> {
+            let toks = match crate::lexer::Lexer::new(text).tokenize() {
+                Ok(t) => t, Err(e) => return Err(format!("lex: {e:?}")) };
+            let prog = match crate::parser::Parser::new(toks).parse_program() {
+                Ok(p) => p, Err(e) => return Err(format!("parse: {e:?}")) };
+            let errs = crate::verifier::verify_program(&prog, probe_dir);
+            if errs.is_empty() { Ok(()) }
+            else { Err(errs.iter().map(|e| format!("[{}] {}", e.context, e.message))
+                            .collect::<Vec<_>>().join(" | ")) }
+        };
+
+        // A two-rule program: `caller_rule` calls `callee_rule`, each carrying
+        // (or not carrying) an `@layer` line. Everything else is held constant,
+        // so the ONLY thing that can move a verdict is the pair of layers.
+        let probe = |caller: Option<&str>, callee: Option<&str>| -> String {
+            let attr = |l: Option<&str>| l.map(|v| format!("  @layer: {v}\n")).unwrap_or_default();
+            format!("@verbose 0.1.0\n\nconcept Invoice\n  @intention: \"i\"\n  \
+                @source: p.intent:1\n\n  fields:\n    amount : number [0, 1000000]\n\n\
+                rule callee_rule\n  @intention: \"c\"\n  @source: p.intent:2\n{}\n  \
+                input:\n    i : Invoice\n\n  output:\n    ok : bool\n\n  logic:\n    \
+                ok = i.amount > 1000\n\n  proofs:\n    purity:\n      reads   : [i.amount]\n      \
+                calls   : []\n    termination:\n      bound : 1\n\n\
+                rule caller_rule\n  @intention: \"r\"\n  @source: p.intent:3\n{}\n  \
+                input:\n    i : Invoice\n\n  output:\n    ok : bool\n\n  logic:\n    \
+                ok = callee_rule(i)\n\n  proofs:\n    purity:\n      reads   : [i]\n      \
+                calls   : [callee_rule]\n    termination:\n      bound : 3\n",
+                attr(callee), attr(caller))
+        };
+
+        // The reference semantics, transcribed from src/verifier.rs's
+        // `check_layer_discipline` and src/ast.rs's `Layer::can_call`:
+        //   * caller unlayered            -> the check never runs        -> OK
+        //   * callee unlayered            -> the `None` arm              -> ERR
+        //   * Domain      -> Domain only
+        //   * Application -> Domain | Application
+        //   * Interface   -> any LAYERED callee
+        let expect_ok = |caller: Option<&str>, callee: Option<&str>| -> bool {
+            let rank = |l: &str| match l {
+                "domain" => 1, "application" => 2, "interface" => 3, _ => unreachable!() };
+            match (caller, callee) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(a), Some(b)) => rank(b) <= rank(a),
+            }
+        };
+
+        const LAYERS: [Option<&str>; 4] =
+            [None, Some("domain"), Some("application"), Some("interface")];
+        let mut legal = 0usize;
+        let mut illegal = 0usize;
+        for caller in LAYERS {
+            for callee in LAYERS {
+                let label = format!("{}__{}", caller.unwrap_or("none"), callee.unwrap_or("none"));
+                let text = probe(caller, callee);
+                let want = expect_ok(caller, callee);
+                let vc = verbosec_verdict(&dir, &text);
+
+                // The reference first: if verbosec ever stops agreeing with the
+                // transcription above, this test must say so rather than
+                // silently re-baseline gen0 against a moved target.
+                assert_eq!(vc.is_ok(), want,
+                    "REFERENCE MOVED at {label}: verbosec says {vc:?}, but \
+                     src/verifier.rs + src/ast.rs say {}. Re-read \
+                     check_layer_discipline / Layer::can_call before touching gen0.",
+                    if want { "ACCEPT" } else { "REFUSE" });
+                if let Err(msg) = &vc {
+                    assert!(msg.contains("@layer"),
+                        "{label}: verbosec refuses, but not for a layer reason \
+                         ({msg}) — the probe is measuring something else");
+                }
+
+                assert_eq!(gen0_accepts(&label, &text), want,
+                    "gen0 disagrees with verbosec at caller={:?} callee={:?}. \
+                     Expected {}. Two cells carry the traps: \
+                     `interface -> (none)` must be REFUSED even though \
+                     Layer::can_call's Interface arm returns true \
+                     unconditionally (the `None` arm runs first), and every \
+                     `(none) -> *` cell must be ACCEPTED because an unlayered \
+                     caller is unconstrained.",
+                    caller, callee, if want { "ACCEPT" } else { "REFUSE" });
+
+                if want { legal += 1 } else { illegal += 1 }
+            }
+        }
+        assert_eq!((legal, illegal), (10, 6),
+            "the matrix must stay enumerated: 6 legal layered cells + 4 \
+             unlayered-caller cells accept, 3 illegal layered cells + 3 \
+             unlayered-callee cells refuse");
+
+        // The two negative fixtures this slice closes, end to end, each with a
+        // MINIMALLY corrected twin so the refusal is attributable — gen0 emits
+        // no diagnostic, so a bare exit 1 is otherwise unattributable.
+        for (fixture, from, to) in [
+            // domain rule calling an application rule -> demote the callee.
+            ("examples/negative/layer_violation.verbose", "@layer: application", "@layer: domain"),
+            // layered rule calling an unlayered one -> give the callee a layer.
+            ("examples/negative/layer_calls_unlayered.verbose",
+             "  @source: negative.intent:2\n", "  @source: negative.intent:2\n  @layer: domain\n"),
+        ] {
+            let bad = fs::read_to_string(fixture).unwrap_or_else(|_| panic!("{fixture} must exist"));
+            let good = bad.replacen(from, to, 1);
+            assert_ne!(good, bad, "{fixture}: the corrected twin must actually differ");
+
+            assert!(verbosec_verdict(std::path::Path::new("examples/negative"), &bad)
+                        .is_err_and(|m| m.contains("@layer")),
+                "{fixture} must be refused BY VERBOSEC FOR A LAYER REASON");
+            assert!(verbosec_verdict(std::path::Path::new("examples/negative"), &good).is_ok(),
+                "{fixture}'s corrected twin must verify — otherwise the twin is \
+                 not minimal and proves nothing about attribution");
+
+            let stem = std::path::Path::new(fixture).file_stem().unwrap().to_string_lossy();
+            assert!(!gen0_accepts(&format!("fx_{stem}"), &bad),
+                "{fixture} must be REFUSED. Measured on 2bd3081: rc 0, 596 bytes.");
+            assert!(gen0_accepts(&format!("fx_{stem}_ok"), &good),
+                "{fixture}'s corrected twin must be ACCEPTED — if gen0 refuses \
+                 both, the refusal is not attributable to the layer violation");
+        }
+
+        // NON-VACUITY on a REAL corpus file. `examples/layers.verbose` is the
+        // repo's only legitimate `@layer` user; as shipped it must still
+        // compile, and with its two layers SWAPPED it must not. Without this
+        // pair, a check that refused for some incidental reason — or one that
+        // refused nothing at all beyond the two fixtures — would read the same.
+        let layers = fs::read_to_string("examples/layers.verbose")
+            .expect("examples/layers.verbose must exist");
+        assert!(gen0_accepts("layers_real", &layers),
+            "examples/layers.verbose declares @layer legitimately (application \
+             calls domain) and MUST still compile — this is the false-positive \
+             guard for the whole slice");
+        let swapped = layers
+            .replacen("@layer: domain", "@layer: __TMP__", 1)
+            .replacen("@layer: application", "@layer: domain", 1)
+            .replacen("@layer: __TMP__", "@layer: application", 1);
+        assert_ne!(swapped, layers, "the swap must actually change the file");
+        assert!(verbosec_verdict(std::path::Path::new("examples"), &swapped)
+                    .is_err_and(|m| m.contains("@layer")),
+            "the swapped file must be refused by verbosec for a layer reason");
+        assert!(!gen0_accepts("layers_swapped", &swapped),
+            "SWAPPED examples/layers.verbose must be REFUSED — it is now a \
+             domain rule calling an application rule. Measured on 2bd3081: gen0 \
+             accepted it at the same 2023 bytes as the unswapped file, which is \
+             what made this check non-vacuous when it landed.");
 
         let _ = fs::remove_file(&gen0);
         let _ = fs::remove_dir_all(&dir);
