@@ -1,0 +1,32 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the `proofs:` block declares `purity:` but no `termination:`.
+-- verbosec: parse error, proofs missing 'termination'.
+--
+-- This is the one shape of the three that the purity walk could NEVER mask:
+-- gen0 accepted it at rc 0 with a reading body too. Kept on the same no-read
+-- body as its two siblings so all three measure exactly one thing.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : number
+
+  logic:
+    ok = 42
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []

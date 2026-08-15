@@ -1,0 +1,31 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the `proofs:` block declares `termination:` but no `purity:`.
+-- verbosec: parse error, proofs missing 'purity'.
+--
+-- No-read body, for the reason spelled out in proofs_missing.verbose: with a
+-- reading body the purity walk refuses this anyway and the fixture measures
+-- nothing about whether the sub-block is REQUIRED.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : number
+
+  logic:
+    ok = 42
+
+  proofs:
+    termination:
+      bound : 1

@@ -20997,11 +20997,29 @@ mod tests {
     /// A declaration header is `<keyword> <space(s)> <identifier>` — the same
     /// shape gen0's own `decl_header_at` recognises, so this helper and the rule
     /// under test agree on where a declaration starts.
+    ///
+    /// WIDENED (mandatory-`proofs:` slice, 2026-08-14) to add a `proofs:` block
+    /// to any `rule` that has none. gen0 now enforces what verbosec has always
+    /// refused at parse time — a rule with no `proofs:` block, or one missing
+    /// `purity:` or `termination:` — and **15 of the 512 tests had grown into
+    /// that hole**, the same way 55 grew into the attribute hole. Same verdict,
+    /// same remedy: the probes were invalid Verbose and are corrected here, the
+    /// check is not relaxed.
+    ///
+    /// The inserted proof is `reads: [] / calls: [] / bound : 4000000`, and it
+    /// is safe for exactly the reason the presence gap was hard to see in the
+    /// first place. A probe that PERFORMS a read or a call while declaring none
+    /// is refused by gen0's purity walk — so any probe that has been passing
+    /// *without* a `proofs:` block already performs neither, and `[]` is the
+    /// truthful declaration for it. A probe that does perform them already
+    /// carries a real block, which this leaves alone. `bound` is generous
+    /// because verbosec only rejects UNDER-counts.
     fn with_probe_attrs(src: impl AsRef<str>) -> String {
         let src: &str = src.as_ref();
         const KW: &[&str] = &["concept_group", "concept", "rule", "reaction",
                               "service", "resource", "connection"];
-        let header_indent = |line: &str| -> Option<usize> {
+        // -> (indent, is_rule)
+        let header_indent = |line: &str| -> Option<(usize, bool)> {
             let indent = line.len() - line.trim_start_matches(' ').len();
             let s = line.trim_start_matches(' ');
             for kw in KW {
@@ -21009,37 +21027,62 @@ mod tests {
                     if rest.starts_with(' ')
                         && rest.trim_start_matches(' ').chars().next()
                             .map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false) {
-                        return Some(indent);
+                        return Some((indent, *kw == "rule"));
                     }
                 }
             }
             None
         };
+        // Tolerant of `proofs :` (an Ident and a Colon token, whitespace between
+        // them irrelevant to the parser) so the helper stays idempotent against
+        // every spelling the grammar accepts.
+        let has_proofs = |body: &str| -> bool {
+            body.lines().any(|l| {
+                l.trim_start().strip_prefix("proofs")
+                    .map(|r| r.trim_start().starts_with(':')).unwrap_or(false)
+            })
+        };
         let lines: Vec<&str> = src.lines().collect();
-        let hdrs: Vec<(usize, usize)> = lines.iter().enumerate()
-            .filter_map(|(i, l)| header_indent(l).map(|ind| (i, ind))).collect();
+        let hdrs: Vec<(usize, usize, bool)> = lines.iter().enumerate()
+            .filter_map(|(i, l)| header_indent(l).map(|(ind, r)| (i, ind, r))).collect();
         if hdrs.is_empty() {
             return src.to_string();
         }
-        let mut out: Vec<String> = Vec::with_capacity(lines.len() + hdrs.len() * 2);
-        let mut next = 0usize;
-        for (n, &(i, ind)) in hdrs.iter().enumerate() {
-            for l in &lines[next..=i] {
-                out.push((*l).to_string());
-            }
-            let end = hdrs.get(n + 1).map(|&(j, _)| j).unwrap_or(lines.len());
+        let mut out: Vec<String> = Vec::with_capacity(lines.len() + hdrs.len() * 8);
+        for l in &lines[..hdrs[0].0] {
+            out.push((*l).to_string());
+        }
+        for (n, &(i, ind, is_rule)) in hdrs.iter().enumerate() {
+            let end = hdrs.get(n + 1).map(|&(j, _, _)| j).unwrap_or(lines.len());
             let body = lines[i + 1..end].join("\n");
             let pad = " ".repeat(ind + 2);
+            out.push(lines[i].to_string());
             if !body.contains("@intention") {
                 out.push(format!("{pad}@intention: \"probe\""));
             }
             if !body.contains("@source") {
                 out.push(format!("{pad}@source: probe.intent:1"));
             }
-            next = i + 1;
-        }
-        for l in &lines[next..] {
-            out.push((*l).to_string());
+            // Trailing blank lines belong BETWEEN declarations, so the proofs
+            // block has to land before them or it lands in the next one.
+            let mut k = end;
+            while k > i + 1 && lines[k - 1].trim().is_empty() {
+                k -= 1;
+            }
+            for l in &lines[i + 1..k] {
+                out.push((*l).to_string());
+            }
+            if is_rule && !has_proofs(&body) {
+                out.push(format!("{pad}proofs:"));
+                out.push(format!("{pad}  purity:"));
+                out.push(format!("{pad}    reads   : []"));
+                out.push(format!("{pad}    calls   : []"));
+                out.push(format!("{pad}  termination:"));
+                out.push(format!("{pad}    bound : 4000000"));
+            }
+            for l in &lines[k..end] {
+                out.push((*l).to_string());
+            }
         }
         let mut s = out.join("\n");
         if src.ends_with('\n') {
@@ -46963,8 +47006,10 @@ rule pick
     /// `purity_reads_missing_in_fold`, `purity_calls_missing_in_fold`,
     /// `purity_reads_extra_in_fold` — and all three land as PASS in the same
     /// commit, because the purity walks now descend into the twelve node
-    /// families they stubbed. So the standing measurement is
-    /// **38 fixtures, 33 PASS, 5 GAP, 0 INVERSE**. The 5 are not five
+    /// families they stubbed. The **three** `proofs_missing*` fixtures added
+    /// 2026-08-14 likewise land as PASS in the commit that adds them
+    /// (`proofs_errors`, a second TOKEN walk). So the standing measurement is
+    /// **41 fixtures, 36 PASS, 5 GAP, 0 INVERSE**. The 5 are not five
     /// surprises — they are three STRUCTURAL causes wearing five faces, and
     /// reading them that way is the point of the sweep:
     ///
@@ -47028,6 +47073,22 @@ rule pick
     /// The calls half was measured at the same time and was already correct, so
     /// the asymmetry named above is between MISSING and EXTRA, not between
     /// reads and calls.
+    ///
+    /// THE `proofs_missing*` FIXTURES ARE THE SAME LESSON A FIFTH TIME, AND
+    /// THEIR BODIES ARE WHY THEY MEASURE ANYTHING. `verbosec` refuses three
+    /// shapes at parse time — no `proofs:` block, no `purity:`, no
+    /// `termination:` — and gen0 refused none of them. But with a body that
+    /// READS a field, two of the three came back rc 1 anyway: no `purity:`
+    /// block means an empty declared read set, so the under-declaration check
+    /// fires and the shape *looks* checked. A fixture written that way would
+    /// have scored PASS against a compiler with no presence check whatsoever —
+    /// the vacuous PASS again, arrived at from a new direction. All three
+    /// fixtures therefore use a CONSTANT body (`ok = 42`), which leaves the
+    /// purity walk nothing to disagree with, so the only thing that can refuse
+    /// them is the check under test. The reading-body variants are pinned in
+    /// `two_generation_gen0_requires_proofs_purity_and_termination` instead,
+    /// where a corrected twin per shape makes each refusal attributable — the
+    /// right home for a case whose PASS would otherwise be ambiguous.
     ///
     /// The 5th, `input_type_unsupported`, is its own thing: verbosec refuses
     /// it at NATIVE rather than at verify, and gen0 mirrors none of verbosec's
@@ -48038,6 +48099,236 @@ rule pick
             assert!(gen0_accepts(&format!("{f}_fixed"), &fixed),
                 "{f}: the corrected twin must be ACCEPTED by gen0 — without it the \
                  refusal above is not attributable to the omitted entry");
+        }
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// gen0 must require a `proofs:` block on every rule, containing BOTH
+    /// `purity:` and `termination:`.
+    ///
+    /// A rule's proofs are what make it verifiable at all — a rule with no
+    /// `proofs:` block has nothing to verify — so `verbosec` refuses all three
+    /// shapes at PARSE time (`rule 'X' missing 'proofs' block`, `proofs missing
+    /// 'purity'`, `proofs missing 'termination'`). gen0 refused none of them.
+    ///
+    /// TWO OF THE THREE ONLY *LOOKED* CAUGHT, AND THAT IS THE FINDING. Measured
+    /// on 517451e, with the body reading a field (`ok = i.amount`), the
+    /// no-`proofs:` and no-`purity:` shapes came back rc 1 — which reads exactly
+    /// like a presence check and is not one. It was the PURITY walk: with no
+    /// `purity:` block the declared read set is empty, the body performs a read,
+    /// and the under-declaration check fires. Change the body to a constant and
+    /// all three sail through:
+    ///
+    /// ```text
+    ///                                   verbosec   gen0 body READS   gen0 body reads NOTHING
+    ///   no `proofs:` at all             refuses    rc 1 (incidental)  rc 0, 548 B   <- GAP
+    ///   `proofs:` without `termination:` refuses   rc 0, 562 B  GAP   rc 0, 548 B   <- GAP
+    ///   `proofs:` without `purity:`     refuses    rc 1 (incidental)  rc 0, 548 B   <- GAP
+    /// ```
+    ///
+    /// This is the fifth check in this arc found to be **correct on half the
+    /// input space** (text `==` stuck-false, `purity_reads_missing` testing only
+    /// the empty declaration, the degenerate-only hint fixtures, and now this),
+    /// so the negative-corpus fixtures all use the NO-READ body — with a reading
+    /// body they would score PASS against a compiler that has no presence check
+    /// whatsoever. Both bodies are pinned below, in that order, so a regression
+    /// to incidental-catching shows up as a distinct failing assertion rather
+    /// than as green.
+    ///
+    /// THE MATRIX IS RULE-ONLY, DERIVED NOT ASSUMED. The `@intention` /
+    /// `@source` slice found all seven declaration kinds requiring both
+    /// attributes, so a seven-cell matrix was the expectation here too. It is
+    /// one cell: `parse_proofs_block` has exactly ONE call site in
+    /// `src/parser.rs` (`parse_rule`, line 567) and exactly one `.ok_or_else`
+    /// consuming it (line 588). The other six kinds do not merely not-require a
+    /// `proofs:` block — they do not ACCEPT one, each rejecting it with its own
+    /// closed-set body error, confirmed by probing all six. So gen0's
+    /// `proofs_errors` charges rules and nothing else.
+    ///
+    /// ORDER IS NOT ASSUMED, and that is the over-strictness risk this test
+    /// guards. gen0's own `parse_proofs` reaches the sub-blocks positionally
+    /// (purity, then termination), but verbosec's `parse_proofs_block` is a
+    /// `while` loop dispatching on whichever keyword it finds, so
+    /// `termination:` first is valid Verbose. A positional check would refuse a
+    /// program verbosec accepts — the one direction this arc must never move
+    /// in — so the walk SCANS, and the reversed-order case is asserted ACCEPTED.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_requires_proofs_purity_and_termination() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_proofs_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let dir = std::env::temp_dir().join("verbosec_test_proofs_probes");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("p.intent"), "title\n1. one\n2. two\n3. three\n4. four\n").unwrap();
+
+        // `body` picks the half of the input space: "42" reads NOTHING (so only a
+        // real presence check can refuse), "i.amount" reads a field (so the
+        // purity walk refuses two of the three shapes for the wrong reason).
+        // `proofs` is the block text, empty for "no proofs: block at all".
+        let probe = |body: &str, proofs: &str| -> String {
+            format!(
+                "@verbose 0.1.0\n\nconcept Invoice\n  @intention: \"i\"\n  @source: p.intent:1\n\n  \
+                 fields:\n    amount : number [0, 1000000]\n\n\
+                 rule gate\n  @intention: \"g\"\n  @source: p.intent:2\n\n  input:\n    i : Invoice\n\n  \
+                 output:\n    ok : number\n\n  logic:\n    ok = {body}\n{proofs}"
+            )
+        };
+        const PURITY_EMPTY: &str = "      reads   : []\n      calls   : []\n";
+        const PURITY_AMOUNT: &str = "      reads   : [i.amount]\n      calls   : []\n";
+        const TERM: &str = "    termination:\n      bound : 2\n";
+        let full = |p: &str| format!("\n  proofs:\n    purity:\n{p}{TERM}");
+        let no_term = |p: &str| format!("\n  proofs:\n    purity:\n{p}");
+        let no_purity = format!("\n  proofs:\n{TERM}");
+        // termination BEFORE purity — valid Verbose, must stay accepted.
+        let reversed = |p: &str| format!("\n  proofs:\n{TERM}    purity:\n{p}");
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_proofs_out.elf");
+        let gen0_accepts = |label: &str, text: &str| -> bool {
+            let p = dir.join(format!("{label}.verbose"));
+            fs::write(&p, text).unwrap();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), p.display(), out_elf.display()))
+                .status().expect("run gen0 over a proofs probe");
+            let bytes = fs::metadata(&out_elf).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(status.success(), bytes > 0,
+                "{label}: gen0 must either accept AND emit, or refuse AND emit \
+                 nothing — a half-written ELF at exit 1 is the arena-exhaustion \
+                 signature, not a verdict (see CLAUDE.md on max_nodes)");
+            status.success()
+        };
+        // verbosec refuses all three at PARSE time, so this cannot use the
+        // verifier alone the way the purity pins do.
+        let verbosec_accepts = |text: &str| -> bool {
+            let toks = match crate::lexer::Lexer::new(text).tokenize() {
+                Ok(t) => t, Err(_) => return false };
+            let prog = match crate::parser::Parser::new(toks).parse_program() {
+                Ok(p) => p, Err(_) => return false };
+            crate::verifier::verify_program(&prog, &dir).is_empty()
+        };
+
+        // ---- 1. NO-READ body. The only half that measures a presence check.
+        let n_ok = probe("42", &full(PURITY_EMPTY));
+        let n_no_proofs = probe("42", "");
+        let n_no_term = probe("42", &no_term(PURITY_EMPTY));
+        let n_no_purity = probe("42", &no_purity);
+        assert!(verbosec_accepts(&n_ok)
+                && !verbosec_accepts(&n_no_proofs)
+                && !verbosec_accepts(&n_no_term)
+                && !verbosec_accepts(&n_no_purity),
+            "the no-read probes must be (accepted, refused, refused, refused) \
+             under VERBOSEC before they can measure anything about gen0");
+
+        assert!(gen0_accepts("noread_ok", &n_ok),
+            "THE CORRECTED TWIN. A rule with a complete proofs block and a body \
+             that reads nothing must be ACCEPTED. gen0 emits no diagnostic, so \
+             without this the three refusals below would be unattributable.");
+        assert!(!gen0_accepts("noread_no_proofs", &n_no_proofs),
+            "THE DEFECT THIS TEST EXISTS FOR (1/3): a rule with NO `proofs:` \
+             block and a body that reads nothing must be REFUSED (verbosec: \
+             `rule 'gate' missing 'proofs' block`). It was accepted at rc 0 with \
+             a 548-byte ELF. Note the body: with `ok = i.amount` this shape is \
+             refused by the PURITY walk even with no presence check at all, \
+             which is exactly how the gap stayed invisible.");
+        assert!(!gen0_accepts("noread_no_termination", &n_no_term),
+            "THE DEFECT THIS TEST EXISTS FOR (2/3): `proofs:` with `purity:` but \
+             no `termination:` must be REFUSED (verbosec: `proofs missing \
+             'termination'`). This is the shape the purity walk could NEVER \
+             mask — it was accepted at rc 0 with a reading body too.");
+        assert!(!gen0_accepts("noread_no_purity", &n_no_purity),
+            "THE DEFECT THIS TEST EXISTS FOR (3/3): `proofs:` with `termination:` \
+             but no `purity:` must be REFUSED (verbosec: `proofs missing \
+             'purity'`). Accepted at rc 0, 548 B, with a no-read body.");
+
+        // ---- 2. READING body. Two of these were refused BEFORE the check
+        // existed, for an unrelated reason. Pinned so a regression to
+        // incidental-catching is a distinct failure rather than green.
+        let r_ok = probe("i.amount", &full(PURITY_AMOUNT));
+        assert!(verbosec_accepts(&r_ok), "the reading corrected twin must verify");
+        assert!(gen0_accepts("read_ok", &r_ok),
+            "the reading corrected twin must be ACCEPTED");
+        assert!(!gen0_accepts("read_no_proofs", &probe("i.amount", "")),
+            "reading body, no proofs block: must be REFUSED. Was already refused \
+             pre-change — by the PURITY walk, not a presence check.");
+        assert!(!gen0_accepts("read_no_purity", &probe("i.amount", &no_purity)),
+            "reading body, no purity block: must be REFUSED. Also an incidental \
+             pre-change catch.");
+        assert!(!gen0_accepts("read_no_termination",
+                              &probe("i.amount", &no_term(PURITY_AMOUNT))),
+            "reading body, no termination block: must be REFUSED. This one was \
+             genuinely ACCEPTED pre-change (rc 0, 562 B) — the purity walk has \
+             nothing to say about termination, so no body shape masked it.");
+
+        // ---- 3. Over-strictness guards. Each of these is valid Verbose, and
+        // each is a shape a cheaper implementation would wrongly refuse.
+        let rev = probe("42", &reversed(PURITY_EMPTY));
+        assert!(verbosec_accepts(&rev),
+            "termination-before-purity must VERIFY — verbosec's parse_proofs_block \
+             is a dispatch loop, not a fixed sequence");
+        assert!(gen0_accepts("order_reversed", &rev),
+            "ORDER MUST NOT MATTER. A positional check (index to the first \
+             sub-block, expect `purity`) would refuse this, and refusing a \
+             program verbosec accepts is the one direction this arc must never \
+             move in.");
+
+        // Whitespace between the keyword and its colon is irrelevant to the
+        // parser — this is why the check is a TOKEN walk and not a byte match on
+        // "proofs:" in the raw source.
+        let spaced = probe("42", "\n  proofs :\n    purity  :\n      reads   : []\n      calls   : []\n    termination :\n      bound : 2\n");
+        assert!(verbosec_accepts(&spaced),
+            "`proofs :` / `purity  :` / `termination :` are Ident + Colon tokens \
+             and must VERIFY");
+        assert!(gen0_accepts("spaced_colons", &spaced),
+            "a byte-level match on \"proofs:\" would refuse this VALID program. \
+             The check walks tokens precisely so whitespace cannot matter.");
+
+        // A `hints:` block sits at the same column as `proofs:` and is consumed
+        // by the same skip; the presence walk must not be confused by it.
+        let hinted = format!("{}  hints:\n    vectorizable : \"scalar body\"\n",
+                             probe("42", &full(PURITY_EMPTY)));
+        assert!(verbosec_accepts(&hinted), "proofs + hints must VERIFY");
+        assert!(gen0_accepts("with_hints", &hinted),
+            "a trailing `hints:` block must not disturb the proofs presence walk");
+
+        // The SECOND rule is the one missing its block — a walk that only ever
+        // reached the first declaration would score this clean.
+        let two_rules = format!(
+            "{}\nrule second\n  @intention: \"s\"\n  @source: p.intent:3\n\n  input:\n    i : Invoice\n\n  \
+             output:\n    v : number\n\n  logic:\n    v = 7\n",
+            probe("42", &full(PURITY_EMPTY)));
+        assert!(!verbosec_accepts(&two_rules), "the second rule has no proofs block");
+        assert!(!gen0_accepts("second_rule_missing", &two_rules),
+            "the walk must reach EVERY rule, not just the first. A first-rule-only \
+             check passes the three single-rule fixtures above and is still broken.");
+
+        // ---- 4. False-positive guard on real, valid programs. The corpus sweep
+        // covers all 151, but naming two here makes a regression legible without
+        // running it.
+        for f in ["examples/invoices.verbose", "examples/factorial.verbose"] {
+            let text = fs::read_to_string(f).unwrap();
+            assert!(gen0_accepts(&format!("real_{}", f.replace(['/', '.'], "_")), &text),
+                "{f} is valid Verbose with complete proofs on every rule and MUST \
+                 still be accepted — an over-strict presence check that rejects \
+                 valid programs is worse than the gap it closes");
         }
 
         let _ = fs::remove_file(&gen0);

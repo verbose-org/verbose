@@ -1,0 +1,31 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the rule declares no `proofs:` block at all.
+-- verbosec: parse error, rule 'gate' missing 'proofs' block.
+--
+-- THE BODY READS NOTHING ON PURPOSE. With a reading body (`ok = i.amount`)
+-- gen0 refuses this shape via the PURITY walk — no proofs block means an empty
+-- declared read set, so the read is undeclared — and the fixture would score
+-- PASS without any presence check existing at all. That is the vacuous-PASS
+-- trap the README documents. `ok = 42` gives the purity walk nothing to
+-- disagree with, so the only thing that can refuse this file is a genuine
+-- proofs-presence check.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : number
+
+  logic:
+    ok = 42

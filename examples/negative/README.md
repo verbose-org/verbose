@@ -219,6 +219,46 @@ POSITION while holding the declaration constant.
   rather than here, on purpose: the sweep compares exit status only, and a
   corrected twin per family is what makes each refusal attributable.
 
+## A fixture's BODY can hand the verdict to a different check
+
+The three `proofs_missing*` fixtures, added 2026-08-14. `verbosec` refuses three
+distinct shapes at parse time — a rule with no `proofs:` block, a block with no
+`purity:`, a block with no `termination:` — and gen0 checked none of them. But
+only ONE of the three was visibly broken, and which one depended entirely on
+what the fixture's rule body happened to do:
+
+```
+                                  verbosec   gen0, body READS    gen0, body reads NOTHING
+no `proofs:` at all               refuses    rc 1  (incidental)   rc 0, 548 B   <- GAP
+`proofs:` without `termination:`  refuses    rc 0, 562 B   GAP    rc 0, 548 B   <- GAP
+`proofs:` without `purity:`       refuses    rc 1  (incidental)   rc 0, 548 B   <- GAP
+```
+
+The two rc-1 cells are **not a presence check**. With no `purity:` block the
+declared read set is empty; if the body reads a field, the under-declaration
+check fires and refuses — the right answer, from the wrong check, for a reason
+that has nothing to do with the block being mandatory. Write those two fixtures
+the obvious way, with `ok = i.amount`, and they score PASS against a compiler
+that has no presence check whatsoever.
+
+So all three use a CONSTANT body, `ok = 42`. That leaves the purity walk nothing
+to disagree with, so the only thing that can refuse the file is the check under
+test. The reading-body variants are pinned in
+`two_generation_gen0_requires_proofs_purity_and_termination` instead, where a
+corrected twin per shape makes each refusal attributable — the right home for a
+case whose PASS would otherwise be ambiguous.
+
+- **Ask what ELSE could refuse your fixture.** A negative fixture is only a
+  measurement if the defect under test is the *only* reason the file is
+  rejected. Vary the incidental parts of the program until nothing else can
+  fire.
+- This is the same vacuous-PASS trap as the `reads: []` one two sections up, and
+  the fifth time in this arc a check has read as green while being **correct on
+  half the input space** — after text `==` (stuck-`false`, right on every
+  non-matching pair), `purity_reads_missing` (right on every empty declaration),
+  and the degenerate-only `hints:` fixtures. It keeps arriving from a new
+  direction, which is the argument for the habit rather than for a checklist.
+
 ## And a fixture set can SAMPLE a matrix while reading as if it enumerated one
 
 The lesson above is about a fixture that passes for the wrong reason. There is a
@@ -274,16 +314,13 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 38 fixtures**, currently measuring **33 PASS / 5 GAP / 0 INVERSE**.
+- **Only 41 fixtures**, currently measuring **36 PASS / 5 GAP / 0 INVERSE**.
   They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has
   many more refusal paths (resources, connections, services, reactions,
   `concept_group` bounds, `Result` arm typing, layer/effect composition) with
-  no fixture here at all. One is known and named without a fixture: gen0 does
-  not require a `proofs:` block at all, which `verbosec` refuses at parse time.
-  It is closable in its own slice, and rule 6 below is why it is not parked in
-  `KNOWN_GAPS` in the meantime.
+  no fixture here at all.
 - **One defect per fixture, in isolation.** Nothing measures how gen0 behaves
   when two violations co-occur, or when a violation sits inside a construct
   gen0 parses differently (a service handler, a reaction, a `concept_group`).
