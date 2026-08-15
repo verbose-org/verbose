@@ -46773,6 +46773,22 @@ rule pick
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
+        // READ THIS BEFORE QUOTING THE NUMBER (2026-08-15). This sweep invokes
+        // gen0 at entry index 0, so it measures breadth AT RULE #0 — which, for
+        // 37 of the 100 accepted files, is a HELPER another rule calls, not the
+        // file's subject. `aes_gcm.verbose` counts as accepted because gen0
+        // compiled `aes_sbox`. With the entry DECLARED instead of inferred from
+        // source order (each file swept at its call-graph root), the figure is
+        // 106/151: the same 100 plus label_tree, print_chain, purchase,
+        // sum_chain, token_classify and token_label, with nothing lost.
+        //
+        // The asserted number stays 100 on purpose — this test's invocation has
+        // not changed, and moving it in the slice that introduced selection
+        // would make one constant mean two things across a commit boundary. But
+        // quote it as "100/151 at rule #0 (106/151 at the declared entry)", not
+        // as breadth-of-subject. See CLAUDE.md, "THE CORPUS FIGURE HAS BEEN
+        // MEASURING THE WRONG PROGRAM FOR 37 OF ITS 100 FILES".
+        //
         // The asserted figure. Bump it — in the same commit as the slice that
         // moves it — only after reading the refused list this test prints.
         //
@@ -51049,6 +51065,250 @@ rule probe
             let _ = fs::remove_file(p);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ENTRY-RULE SELECTION (2026-08-15). gen0's entry rule was hardwired to
+    /// rule #0 — `x86_program` lays procs out in source order with the head at
+    /// blob offset 0, and every trampoline's `call rel32` targets that offset —
+    /// so which rule an emitted binary RUNS was decided by which rule happened
+    /// to be written first. Measured over the 100 corpus files gen0 accepts,
+    /// rule #0 is a helper another rule calls in **37** of them, so gen0's
+    /// `aes_gcm` binary is the AES S-box and not AES-GCM at all.
+    ///
+    /// `ScanState.pos` (argv[1], which every gen0 invocation in this repo
+    /// already passes a literal 0 into) now names the entry by 0-based
+    /// declaration index. This test pins the three things that can go wrong:
+    ///
+    ///   1. SELECTION IS CORRECT, not merely accepted. Four previously-refused
+    ///      files are compiled at their intended index and RUN, against
+    ///      verbosec's own native binary for the same rule. Acceptance alone
+    ///      would pass against an emitter that selected the wrong proc — the
+    ///      whole defect being fixed is a binary that runs the wrong rule at
+    ///      rc 0.
+    ///   2. INDEX 0 IS UNCHANGED. Asserted on a two-rule file where index 0 and
+    ///      index 1 must produce DIFFERENT bytes and each must match its own
+    ///      verbosec reference. A rotation that silently no-op'd, or one that
+    ///      rotated at index 0 too, each fails a different half.
+    ///   3. AN OUT-OF-RANGE INDEX FAILS CLEANLY — rc 1 and ZERO bytes, never a
+    ///      binary built around `rl_head_decl`'s zero-span sentinel. Both the
+    ///      refusal (`bad_entry` in the verrs gate) and the clamp are needed:
+    ///      verrs is consumed by `abort_if` AFTER every let is evaluated, so
+    ///      without the clamp a bogus index would size a binary first.
+    ///
+    /// It also asserts, AS-IS, a divergence this slice SURFACED rather than
+    /// caused: `token_label::label_of`'s text-typed variant binder is itoa'd.
+    /// That rule was unreachable while gen0 always entered at rule #0, so no
+    /// differential in this repo had ever run it. See the note under CLAUDE.md's
+    /// gaps table; when it is fixed, this assertion flips and says so.
+    ///
+    ///   cargo test --release -- --ignored --test-threads=1 two_generation_gen0_selects
+    #[test]
+    #[ignore = "builds gen0 then compiles + runs ~20 corpus binaries + needs `ulimit -s unlimited`; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_selects_the_entry_rule() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_entrysel_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // gen0(<file>, <index>) -> (exit code, emitted bytes).
+        let emit = |path: &str, idx: usize| -> (Option<i32>, Vec<u8>) {
+            let out = std::env::temp_dir().join("verbosec_test_entrysel_out.elf");
+            let _ = fs::remove_file(&out);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' {} < '{}' > '{}' 2>/dev/null",
+                gen0.display(), idx, path, out.display()))
+                .status().expect("run gen0");
+            let bytes = fs::read(&out).unwrap_or_default();
+            let _ = fs::remove_file(&out);
+            (status.code(), bytes)
+        };
+        // Park emitted bytes as an executable so they can be RUN.
+        let executable = |bytes: &[u8], tag: &str| -> std::path::PathBuf {
+            let p = std::env::temp_dir().join(format!("verbosec_test_entrysel_{tag}"));
+            fs::write(&p, bytes).unwrap();
+            let mut pm = fs::metadata(&p).unwrap().permissions();
+            pm.set_mode(0o755);
+            fs::set_permissions(&p, pm).unwrap();
+            p
+        };
+        // verbosec's own native binary for the same rule — the reference.
+        let reference = |path: &str, rule: &str, tag: &str| -> std::path::PathBuf {
+            let psrc = fs::read_to_string(path).unwrap();
+            let ptok = crate::lexer::Lexer::new(&psrc).tokenize().unwrap();
+            let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+            let p = std::env::temp_dir().join(format!("verbosec_test_entrysel_{tag}_ref"));
+            compile_native(&pprog, rule, p.to_str().unwrap(), false, false)
+                .expect("verbosec must compile the reference rule");
+            let mut pm = fs::metadata(&p).unwrap().permissions();
+            pm.set_mode(0o755);
+            fs::set_permissions(&p, pm).unwrap();
+            p
+        };
+
+        // ---- 1. SELECTION IS CORRECT --------------------------------------
+        // Four files whose intended subject is NOT rule #0 and which gen0
+        // refuses outright at index 0 (their rule #0 returns a group-typed
+        // value the record trampoline refuses, or is otherwise unemittable).
+        // Each is compiled at its intended index and run against verbosec.
+        let selected: &[(&str, usize, &str, &[&[&str]])] = &[
+            ("examples/sum_chain.verbose",      2, "sum_seed",
+             &[&["0"], &["3"], &["5"], &["10"]]),
+            ("examples/print_chain.verbose",    2, "show",
+             &[&["0"], &["3"], &["5"]]),
+            ("examples/label_tree.verbose",     2, "measure",
+             &[&["0"], &["1"], &["3"], &["5"]]),
+            ("examples/token_classify.verbose", 1, "score",
+             &[&["0"], &["5"], &["7"], &["1000"]]),
+        ];
+        for (path, idx, rule, inputs) in selected {
+            let stem = std::path::Path::new(path).file_stem().unwrap()
+                .to_string_lossy().to_string();
+
+            // Pre-condition: index 0 refuses. If a future slice makes rule #0
+            // emittable this stops being the discriminator and should be
+            // replaced, not deleted — the point is that the two indices are
+            // observably different programs.
+            let (rc0, bytes0) = emit(path, 0);
+            assert_eq!((rc0, bytes0.len()), (Some(1), 0),
+                "{stem}: gen0 must still REFUSE at index 0 (rule #0 is the \
+                 unemittable helper) — otherwise this case no longer \
+                 discriminates between selecting and not selecting");
+
+            let (rc, bytes) = emit(path, *idx);
+            assert_eq!(rc, Some(0),
+                "{stem}: gen0 must ACCEPT at index {idx} ({rule}) — entry \
+                 selection is what makes this file's actual subject compilable");
+            assert!(bytes.starts_with(&[0x7f, 0x45, 0x4c, 0x46]),
+                "{stem}: gen0's output at index {idx} must be an ELF");
+
+            let got_bin = executable(&bytes, &stem);
+            let ref_bin = reference(path, rule, &stem);
+            for argv in inputs.iter() {
+                let g = Command::new(&got_bin).args(argv.iter()).output().unwrap();
+                let v = Command::new(&ref_bin).args(argv.iter()).output().unwrap();
+                assert_eq!(
+                    (String::from_utf8_lossy(&g.stdout).to_string(), g.status.code()),
+                    (String::from_utf8_lossy(&v.stdout).to_string(), v.status.code()),
+                    "{stem}::{rule} argv {argv:?}: gen0's selected-entry binary must \
+                     produce verbosec's exact stdout and exit code. ACCEPTANCE IS NOT \
+                     THE ASSERTION — a binary that selected the wrong proc would still \
+                     be an ELF and would still exit 0.");
+            }
+            let _ = fs::remove_file(&got_bin);
+            let _ = fs::remove_file(&ref_bin);
+        }
+
+        // ---- 1b. SURFACED, NOT CAUSED: token_label's text variant binder ---
+        // `label_of` is reachable for the first time here. Its Int and Eof arms
+        // are byte-exact; its Ident arm prints the text binder's packed
+        // (start, len) span as a decimal — the same itoa-a-pointer mechanism
+        // the 2026-08-08 streamed-text slice fixed for FIELDS, in the arena
+        // variant-binder position, which no differential could previously
+        // reach. Asserted as-is so the fix flips a named test.
+        {
+            let (rc, bytes) = emit("examples/token_label.verbose", 1);
+            assert_eq!(rc, Some(0), "token_label: gen0 must accept at index 1 (label_of)");
+            let got_bin = executable(&bytes, "token_label");
+            let ref_bin = reference("examples/token_label.verbose", "label_of", "token_label");
+            for argv in [["5", "hello"], ["200", "hello"], ["42", "zz"]] {
+                let g = Command::new(&got_bin).args(argv).output().unwrap();
+                let v = Command::new(&ref_bin).args(argv).output().unwrap();
+                assert_eq!(g.stdout, v.stdout,
+                    "token_label {argv:?}: the number-payload and no-payload arms \
+                     must be byte-exact against verbosec");
+            }
+            let g = Command::new(&got_bin).args(["0", "hello"]).output().unwrap();
+            let v = Command::new(&ref_bin).args(["0", "hello"]).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&v.stdout), "id:hello\n",
+                "verbosec's reference for the Ident arm");
+            let got_s = String::from_utf8_lossy(&g.stdout).to_string();
+            assert_ne!(got_s, "id:hello\n",
+                "KNOWN GAP CLOSED: gen0 now writes a TEXT variant binder's bytes \
+                 instead of itoa-ing its packed span. Delete this as-is assertion, \
+                 replace it with the equality above, and move the row in CLAUDE.md.");
+            assert!(got_s.starts_with("id:")
+                    && got_s.trim_start_matches("id:").trim_end()
+                           .parse::<u64>().map(|n| (n & 0xffff_ffff) == 5).unwrap_or(false),
+                "token_label Ident arm: expected the documented itoa-a-pointer shape \
+                 (`id:<decimal>` whose low 32 bits are len(\"hello\") == 5), got \
+                 {got_s:?}. A DIFFERENT wrong answer here is a new defect, not the \
+                 documented one.");
+            let _ = fs::remove_file(&got_bin);
+            let _ = fs::remove_file(&ref_bin);
+        }
+
+        // ---- 2. INDEX 0 IS UNCHANGED --------------------------------------
+        // clients.verbose has two bool rules: active_client (#0) and vip_client
+        // (#1). Index 0 must still be active_client — byte-identical to what
+        // gen0 emitted before selection existed, which is what the corpus
+        // sweep's 99-of-100 byte-identity measurement establishes globally —
+        // and the two indices must be DIFFERENT programs, each matching its own
+        // reference. Asserting only "index 0 still works" would pass against a
+        // rotation that ignored the index entirely.
+        let (rc_a, bytes_a) = emit("examples/clients.verbose", 0);
+        let (rc_b, bytes_b) = emit("examples/clients.verbose", 1);
+        assert_eq!((rc_a, rc_b), (Some(0), Some(0)),
+            "clients.verbose must compile at both index 0 and index 1");
+        assert_ne!(bytes_a, bytes_b,
+            "clients.verbose: index 0 and index 1 must be DIFFERENT binaries — \
+             identical bytes mean the index is being ignored");
+        for (bytes, rule, tag) in [(&bytes_a, "active_client", "cl0"),
+                                   (&bytes_b, "vip_client", "cl1")] {
+            let got_bin = executable(bytes, tag);
+            let ref_bin = reference("examples/clients.verbose", rule, tag);
+            for argv in [["30", "gold"], ["90", "gold"], ["30", "bronze"]] {
+                let g = Command::new(&got_bin).args(argv).output().unwrap();
+                let v = Command::new(&ref_bin).args(argv).output().unwrap();
+                assert_eq!((g.stdout, g.status.code()), (v.stdout, v.status.code()),
+                    "clients::{rule} argv {argv:?}: gen0 at its index must match verbosec");
+            }
+            let _ = fs::remove_file(&got_bin);
+            let _ = fs::remove_file(&ref_bin);
+        }
+
+        // ---- 3. OUT OF RANGE FAILS CLEANLY --------------------------------
+        // ZERO BYTES is the load-bearing half. A refusal that had already
+        // streamed a partial ELF is the failure mode PR #142 documents, and an
+        // index past the end would otherwise build a program headed by
+        // rl_head_decl's zero-span sentinel.
+        for (path, idx) in [("examples/clients.verbose", 2usize),
+                            ("examples/clients.verbose", 99),
+                            ("examples/invoices.verbose", 1),
+                            ("examples/sum_chain.verbose", 3),
+                            ("examples/sum_chain.verbose", 1000)] {
+            let (rc, bytes) = emit(path, idx);
+            assert_eq!((rc, bytes.len()), (Some(1), 0),
+                "{path} at index {idx}: an out-of-range entry index must refuse with \
+                 rc 1 and ZERO bytes, not emit a binary around the sentinel rule");
+        }
+        // The boundary itself: the last valid index must still be accepted, so
+        // the range check cannot be an off-by-one that refuses a legal index.
+        let (rc, bytes) = emit("examples/clients.verbose", 1);
+        assert_eq!(rc, Some(0), "the LAST valid index must be accepted");
+        assert!(!bytes.is_empty(), "the last valid index must emit an ELF");
+        // A NEGATIVE index never reaches the check: `pos : number [0, 4000000]`
+        // is a declared field range, so PR #35's runtime bounds-check exits at
+        // field-load before the rule body runs.
+        let out = std::env::temp_dir().join("verbosec_test_entrysel_neg.elf");
+        let status = Command::new("sh").arg("-c").arg(format!(
+            "ulimit -s unlimited; '{}' -1 < 'examples/clients.verbose' > '{}' 2>/dev/null",
+            gen0.display(), out.display())).status().unwrap();
+        assert_eq!((status.code(), fs::metadata(&out).unwrap().len()), (Some(1), 0),
+            "a negative index must fail closed at the declared field bound");
+
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_file(&gen0);
     }
 
     /// THE EFFECT-POSITION DIFFERENTIAL (2026-08-10). The text-position matrix that

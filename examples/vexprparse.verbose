@@ -16585,6 +16585,122 @@ rule rl_head_proofs
       bound : 16
 
 
+-- ============================================================================
+-- ENTRY-RULE SELECTION (2026-08-15).
+--
+-- gen0's entry rule was HARDWIRED to rule #0: x86_program lays procs out in
+-- source order with the head at blob offset 0, and every entry trampoline's
+-- `call rel32` targets that offset. So whichever rule happens to be written
+-- FIRST is the one the emitted binary runs — a source-ORDER accident, not a
+-- declaration. Measured over the 100 corpus files gen0 accepts, rule #0 is a
+-- HELPER another rule calls in 37 of them: every aes_* file enters at
+-- aes_sbox, every sha256_* at rotr32, so gen0's `aes_gcm` binary IS the AES
+-- S-box (0 -> 99, 255 -> 22) and not AES-GCM at all.
+--
+-- The three rules below let the caller NAME the entry by index. The chosen
+-- rule is moved to the FRONT of the RuleList once, at the top of
+-- elf_program_src, and every downstream consumer — the entry_rule_* trampoline
+-- cascade, blob_end_off's size chain, x86_program's layout, proc_offset's
+-- callee resolution, resource_errors / connection_errors / reaction_errors'
+-- entry-shape checks — reads that same reordered list. Nothing else changes:
+-- selection is a LIST ROTATION, not a new addressing mode, which is why it
+-- needs no rel32 arithmetic and no second entry convention.
+--
+-- Index 0 returns the list UNCHANGED (the same arena node, not a rebuilt
+-- copy), so the default is byte-for-byte the pre-selection emitter.
+--
+-- The index arrives in ScanState.pos, which elf_program_src never read (it
+-- passes a literal `pos: 0` to begin_tokenize). In the stdin channel that
+-- vexprparse's own [..4194304] source bound selects, x86_stdin_fields still
+-- atoi's NUMBER fields out of argv, so `pos` is argv[1] — the slot every
+-- gen0 invocation in the repo already passes a literal 0 into.
+-- ============================================================================
+
+
+-- rl_head_decl: the head RuleDecl of a rule list — the whole-declaration
+-- sibling of rl_head_body / rl_head_params, which each return one PART of it.
+-- The RNil arm returns the SAME zero-span sentinel find_rule returns for an
+-- unresolvable name (name_len 0, empty body whose result is AstErr), so a
+-- caller that reaches it produces an inert proc rather than reading garbage.
+-- Used by rules_select_entry to lift the selected rule out of the list.
+rule rl_head_decl
+  @intention: "The head rule declaration of a rule list (a zero-span sentinel if the list is empty)"
+  @source: vexprparse.intent:31
+  input:
+    rl : RuleList
+  output:
+    out : RuleDecl
+  logic:
+    out = match rl:
+      RCons(head, tail) => head
+      RNil => RuleDecl::MkRule { name_start: 0, name_len: 0, params: ParamList::PNil, return_type: 0, body: Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: FieldList::FNil, out_name_start: 0, out_name_len: 0, out_ty: 0, out_ty_start: 0, out_ty_len: 0, proofs: Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 } }
+  proofs:
+    purity:
+      reads : [rl]
+      calls : []
+    termination:
+      bound : 4000
+
+
+-- rules_without_nth: the rule list with its n-th cell REMOVED, every other
+-- cell keeping its relative order. The cons-list sibling of drop_rules, which
+-- removes a PREFIX; this removes one interior cell. An n past the end returns
+-- the list unchanged (each step just re-conses the head it walked past).
+-- Termination is the same decreasing-n proof drop_rules carries.
+rule rules_without_nth
+  @intention: "The rule list with its n-th cell removed, the other cells keeping their order"
+  @source: vexprparse.intent:31
+  input:
+    dr : DropRules
+  output:
+    out : RuleList
+  logic:
+    out = match dr.rl:
+      RCons(head, tail) => if dr.n == 0 then tail else RuleList::RCons { head: head, tail: rules_without_nth(DropRules { rl: tail, n: dr.n - 1 }) }
+      RNil => RuleList::RNil
+  proofs:
+    purity:
+      reads : [dr.rl, dr.n]
+      calls : [rules_without_nth]
+    termination:
+      bound : 8000
+      decreasing : n
+
+
+-- rules_select_entry: the rule list ROTATED so its n-th rule sits FIRST, the
+-- remaining rules keeping their source order. This is gen0's entry-rule
+-- selection, and it is deliberately expressed as a list transform rather than
+-- as an addressing change: x86_program already lays the HEAD at blob offset 0
+-- and proc_offset already resolves every callee by NAME against whatever order
+-- it is handed, so moving one cell is enough to redirect the entry with no
+-- rel32 arithmetic anywhere.
+--
+-- n == 0 returns the input list itself — the same arena node, unrotated — so
+-- the default path allocates nothing and emits byte-identical binaries.
+--
+-- CALLER CONTRACT: n must be < rule_list_len(rl). elf_program_src both REFUSES
+-- an out-of-range index (it joins the verrs gate, exit 1, zero bytes) and
+-- CLAMPS it to 0 before calling here, so the sentinel arm of rl_head_decl is
+-- unreachable from the emitter. The clamp is not redundant with the refusal:
+-- verrs is summed and consumed by abort_if AFTER these lets are evaluated, so
+-- without it a bogus index would build a bogus list first.
+rule rules_select_entry
+  @intention: "The rule list rotated so its n-th rule is first — gen0's entry-rule selection"
+  @source: vexprparse.intent:31
+  input:
+    dr : DropRules
+  output:
+    out : RuleList
+  logic:
+    out = if dr.n == 0 then dr.rl else RuleList::RCons { head: rl_head_decl(drop_rules(DropRules { rl: dr.rl, n: dr.n })), tail: rules_without_nth(DropRules { rl: dr.rl, n: dr.n }) }
+  proofs:
+    purity:
+      reads : [dr.rl, dr.n]
+      calls : [rl_head_decl, drop_rules, rules_without_nth]
+    termination:
+      bound : 8000
+
+
 -- count_reads (records-arc brick R5 driver): tokenize a program, parse it, and
 -- return the number of `reads` entries in the FIRST rule's proofs. Proves the purity
 -- reads list parses into the right number of NameList entries (e.g. `reads : [s.source,
@@ -34224,7 +34340,30 @@ rule elf_program_src
     out : bytes
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    -- ENTRY-RULE SELECTION (2026-08-15). `s.pos` names the entry rule by its
+    -- 0-based declaration index; 0 (every existing invocation) means rule #0,
+    -- the pre-selection behaviour, and rules_select_entry returns the parsed
+    -- list unrotated in that case, so the default emit is byte-identical.
+    --
+    -- `entry_idx` CLAMPS an out-of-range index to 0 and `bad_entry` REFUSES
+    -- it. Both are needed and neither is redundant: verrs is consumed by
+    -- abort_if at the head of `out`, i.e. AFTER every let above has already
+    -- been evaluated, so without the clamp an index past the end would build
+    -- a list headed by rl_head_decl's zero-span sentinel and size a binary
+    -- around it before the refusal ever fired. The clamp keeps every walk on
+    -- a well-formed list; the refusal is what makes the bad index an error
+    -- rather than a silent fallback to rule #0.
+    --
+    -- A NEGATIVE index cannot reach here at all: `pos : number [0, 4000000]`
+    -- is a declared field range, and PR #35's runtime bounds-check sys_exit(1)s
+    -- at field-load before the rule body runs. The `nrules > 0` guard keeps the
+    -- empty-program refusal attributable to its own `rule_list_len == 0` term
+    -- below instead of double-counting here.
+    let prog0 = parse_program(ProgramState { cell: toks, src: s.source })
+    let nrules = rule_list_len(prog0)
+    let bad_entry = if nrules > 0 and s.pos >= nrules then 1 else 0
+    let entry_idx = if s.pos < nrules then s.pos else 0
+    let prog = rules_select_entry(DropRules { rl: prog0, n: entry_idx })
     let concepts0 = parse_concepts(ProgramState { cell: toks, src: s.source })
     -- Self-hosting service slice 1: the service list + has_service gate, and the
     -- HttpRequest / HttpResponse NAME SPANS extracted from the handler (its input
@@ -34280,7 +34419,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(bad_entry + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -34351,8 +34490,8 @@ rule elf_program_src
     out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else if entryrec == 1 then concat(b"\xe8", le32(62 + entryrjfs + (if anytx == 1 then 86 else 0)), b"\x50", x86_json_record(JsonRecState { fields: entryrfields, esize: 8 * (max_payload_fields(concepts) + 1), off: 0 - (61 + entryrjfs + (if anytx == 1 then 86 else 0)), src: s.source, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns }), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrybool == 1 then concat(b"\xe8", le32(78 + (if anytx == 1 then 86 else 0)), b"\x31\xdb\x48\x85\xc0\x74\x14\x48\xb8\x74\x72\x75\x65\x0a\x00\x00\x00\x50\x48\xc7\xc2\x05\x00\x00\x00\xeb\x14\x48\xb8\x66\x61\x6c\x73\x65\x0a\x00\x00\x50\x48\xc7\xc2\x06\x00\x00\x00\xb3\x01\x48\x89\xe6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x89\xdf\x0f\x05") else if entrytextspan == 1 then concat(b"\xe8", le32(75 + (if anytx == 1 then 86 else 0)), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
-      reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
+      reads : [s.source, s.pos]
+      calls : [begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
     termination:
       bound : 256
 
