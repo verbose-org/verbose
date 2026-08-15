@@ -175,13 +175,36 @@ it needs no notion of what the rule computes. `hint_overflow_inverted` closed
 justification checks; `hint_overflow_bad` is still open and still genuinely an
 arc.
 
+**The same sentence caught a third fixture, and that one was cheap too.** It
+also claimed `termination_bound_short` needed "the same missing machinery",
+which put an operation counter in the same bucket as an abstract interpreter.
+It is not in that bucket:
+
+```
+declared bound N < actual operation count M
+        ->  verbosec's count_operations: a plain structural node count.
+            Every arm `1 + sum(children)`; Number / Text / Bytes / Ident are 0;
+            Field is a pass-through. No intervals, no dataflow, no scoping.
+```
+
+Four rules in `examples/vexprparse.verbose` (`count_ops_ast` plus three list
+walks), closed 2026-08-15, zero emitted bytes. `hint_overflow_bad` is now the
+ONLY fixture in this directory that genuinely needs abstract interpretation —
+which is why it is stated alone rather than as the head of a family, so nothing
+else can be deferred by sitting next to it.
+
 - **Read a gap's cost off the reference's own error message**, not off the
   keyword the fixture shares with its neighbour. Two fixtures under one heading
   invite one estimate, and the expensive one sets it.
+- **Read the reference IMPLEMENTATION, not a summary of it.** Both cheap
+  closures here came from opening the function the gaps table described. Thirty
+  seconds in `src/verifier.rs` is what separated "a real arc" from "a plain
+  walk", twice.
 - **When a "known gap" note declares something expensive, that note is a claim
-  and it decays.** This one deferred the cheap half for a slice. It is the third
-  time in this arc a stale framing cost more than the code (the INDENT/DEDENT
-  comment, the attribute-PRESENCE "genuinely ambiguous" note, this).
+  and it decays.** This one deferred TWO cheap halves. It is now the third and
+  fourth time in this arc a stale framing cost more than the code (the
+  INDENT/DEDENT comment, the attribute-PRESENCE "genuinely ambiguous" note, and
+  both halves of this one).
 
 ## A fixture set organised by DECLARATION cannot see a defect of POSITION
 
@@ -314,7 +337,7 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 41 fixtures**, currently measuring **36 PASS / 5 GAP / 0 INVERSE**.
+- **Only 41 fixtures**, currently measuring **37 PASS / 4 GAP / 0 INVERSE**.
   They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has

@@ -4222,7 +4222,13 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
     }
 }
 
-fn count_operations(expr: &Expr) -> usize {
+/// Structural operation count of an expression — the reference `termination.bound`
+/// is checked against. Crate-visible (not private) so
+/// `two_generation_gen0_verifies_termination_bound_against_operation_count` can
+/// DERIVE each probe's boundary from this function instead of hard-coding a
+/// number: the pin then asserts gen0's cutoff is exactly verbosec's, arm by arm,
+/// and cannot drift if a weight here ever changes.
+pub(crate) fn count_operations(expr: &Expr) -> usize {
     match expr {
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => 0,
         Expr::If(c, t, e) => 1 + count_operations(c) + count_operations(t) + count_operations(e),
