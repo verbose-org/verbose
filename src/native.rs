@@ -46781,6 +46781,12 @@ rule pick
         // source order (each file swept at its call-graph root), the figure is
         // 106/151: the same 100 plus label_tree, print_chain, purchase,
         // sum_chain, token_classify and token_label, with nothing lost.
+        // PR #171 revises that to 105/151: purchase at its declared entry
+        // (discounted_purchase) now REFUSES, deliberately — its callee's
+        // Err(concat(...)) is fresh text gen0 cannot represent, and the
+        // 2563-byte binary the 106 figure counted SIGTRAP'd on its Err arm.
+        // A refusal is the honest verdict; the count was measuring an ELF
+        // that existed, not a program that worked.
         //
         // The asserted number stays 100 on purpose — this test's invocation has
         // not changed, and moving it in the slice that introduced selection
@@ -46901,6 +46907,21 @@ rule pick
         // the REACTION trampoline, which precedes the entry cascade, so they
         // correctly did not move. The exit code is deliberately NOT part of
         // the slice — see the note under CLAUDE.md's gaps table.
+        //
+        // 100 -> 100 (PR #171: variant text binders + reachable fresh text):
+        // NO MOVE at index 0, measured both ways. The variant-binder fix
+        // (token_label's Ident arm) touches only files with a TEXT-payload
+        // match binder in a streamed position — no accepted file has one at
+        // index 0, so 99 of 100 binaries are byte-identical and the 100th is
+        // vexprparse itself (its source carries the fix). The fresh-text
+        // reachability refusal fires only on entries that REACH an offender,
+        // and every corpus file with an offender anywhere (fullname,
+        // gate_result, ledger_line, order_intake, purchase, tier — plus the
+        // service files, which the verrs gate exempts wholesale) was already
+        // refused at index 0 for its rule #0's own reasons. Both defect
+        // files' index-1 entries moved instead: token_label::label_of is now
+        // byte-exact against verbosec, purchase::discounted_purchase now
+        // refuses instead of emitting a binary whose Err arm SIGTRAPs.
         const EXPECTED_ACCEPTED: usize = 100;
         const EXPECTED_TOTAL: usize = 151;
 
@@ -47156,17 +47177,45 @@ rule pick
     /// 151 files in `examples/` still compile and 99 of the 100 accepted
     /// binaries are byte-identical (the 100th is `vexprparse` itself).
     ///
-    /// THE INVERSE SET IS NOW EMPTY, AND IT EARNED ITS KEEP ON THE WAY OUT.
+    /// THE INVERSE BUCKET IS TWO PHENOMENA, AND THE TRIPWIRE ONLY WORKS IF
+    /// THEY STAY APART (split 2026-08-16). "verbosec accepts, gen0 refuses"
+    /// was one constant until a second entry arrived that meant something
+    /// completely different from the first.
+    ///
     /// `bad_arity` calls a one-input rule with two arguments. From 2026-08-10
     /// to 2026-08-13 **verbosec ACCEPTED it** — it had no arity check on rule
     /// calls at all — while gen0 REFUSED via `badarity_rule`. Asserting that
     /// explicitly, instead of letting it sit unremarked in some bucket, is
     /// what kept the discrepancy visible until it was fixed; the row is now a
-    /// PASS because verbosec's verifier grew `check_call_arity`. The `INVERSE`
-    /// constant stays (empty) rather than being deleted: it is the tripwire
-    /// for the NEXT time gen0 out-strictens the reference, which is a state
-    /// that always needs a deliberate verdict — a program verbosec blesses
-    /// but the self-hosted compiler will not build.
+    /// PASS because verbosec's verifier grew `check_call_arity`. **That is a
+    /// defect in the REFERENCE**, and the empty set is its tripwire.
+    ///
+    /// `match_freshtext_in_callee` is NOT that. verbosec is right, and is
+    /// strictly MORE CAPABLE: it inlines the callee and materializes the Err
+    /// `concat(...)`. gen0 cannot, because a gen0 text value is a packed
+    /// (start, len) span into the embedded source and fresh text sits at no
+    /// addressable offset — so its refusal is correct given its own
+    /// representation, and the alternative it shipped until PR #171 was a
+    /// binary that SIGTRAPped on a reachable arm.
+    ///
+    /// Filing both under one name would have made the set permanently
+    /// non-empty, which retires the tripwire, and would have invited a reader
+    /// to hunt for a verbosec bug that is not there. Hence
+    /// `INVERSE_REFERENCE_GAP` (asserted empty — fix belongs in the reference)
+    /// and `INVERSE_CAPABILITY` (non-empty by design — fix belongs in gen0,
+    /// as a future arc). The discriminator is one question, stated at the
+    /// constants and repeated in the failure message: **which compiler would
+    /// you change to make the two agree?** Equivalently, and checkably: a
+    /// REFERENCE_GAP fixture is an INVALID program, a CAPABILITY fixture is a
+    /// VALID one that verbosec compiles and runs correctly.
+    ///
+    /// A consequence worth stating, because it corrects this directory's own
+    /// charter: `examples/negative/` is described as holding programs
+    /// "verbosec refuses", and an INVERSE fixture never was one. `bad_arity`
+    /// sat here for three days as a program verbosec ACCEPTED, and nobody
+    /// noticed because it moved to `mirrored` before anyone re-read the
+    /// sentence. The corpus holds programs **at least one of the two
+    /// compilers refuses**; the bucket records which, and why.
     #[test]
     #[ignore = "builds gen0 from the full self-source then runs it over the negative corpus; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
@@ -47230,10 +47279,54 @@ rule pick
             "input_type_unsupported",
         ];
 
-        // verbosec ACCEPTS these; gen0 refuses. The reverse direction.
-        // EMPTY since 2026-08-13: `bad_arity` was the only entry and it moved
-        // to `mirrored` when verbosec's verifier grew `check_call_arity`.
-        const INVERSE: &[&str] = &[];
+        // verbosec ACCEPTS these; gen0 refuses. The reverse direction — and it
+        // is TWO phenomena, not one, so it is two constants (2026-08-16).
+        //
+        // THE DISCRIMINATOR IS ONE QUESTION: **which compiler would you change
+        // to make the two agree?**
+        //
+        //   * Change VERBOSEC -> `INVERSE_REFERENCE_GAP`. The fixture is an
+        //     INVALID program and the reference wrongly blesses it. That is a
+        //     defect in the reference, and the project's thesis rests on the
+        //     verifier being the durable artifact, so it must be fixed there.
+        //   * Change GEN0 -> `INVERSE_CAPABILITY`. The fixture is a VALID
+        //     program, verbosec is RIGHT to accept it and emits a working
+        //     binary; gen0 refuses because its own representation cannot
+        //     express the shape. Nothing is wrong with either compiler's
+        //     verdict — gen0 is simply less capable, in the safe direction.
+        //
+        // Collapsing the two would destroy the tripwire in both directions: a
+        // future reference defect would land in an already-non-empty set and
+        // go unremarked, and a reader would go hunting for a verbosec bug that
+        // does not exist. So REFERENCE_GAP is asserted EMPTY on its own.
+        //
+        // Its one historical occupant: `bad_arity`, an inverse from 2026-08-10
+        // to 2026-08-13 — verbosec had no rule-call arity check at all, so
+        // `helper(i, i)` on a one-input rule verified clean while gen0 refused
+        // it. Asserting it explicitly is what kept it visible until
+        // `check_call_arity` landed in `src/verifier.rs`; it is a PASS now.
+        const INVERSE_REFERENCE_GAP: &[&str] = &[];
+
+        // gen0 refuses a program verbosec correctly accepts, because gen0's
+        // representation cannot express it. Non-empty BY DESIGN.
+        //
+        // `match_freshtext_in_callee` (2026-08-16): verbosec's native emitter
+        // inlines the callee and materializes the Err `concat(...)` through
+        // the Phase 1B/2F buffer machinery. gen0's text values are packed
+        // (start, len) spans into the embedded source blob, and FRESH text
+        // exists at no addressable offset, so there is nothing for a span to
+        // point at. Refusing at verify time (exit 1, zero bytes) is the only
+        // honest verdict available: the alternative gen0 shipped until PR #171
+        // was a binary that compiled at rc 0 and SIGTRAPped on its Err arm
+        // (`purchase::discounted_purchase` at entry index 1, rc 133).
+        //
+        // The entry stays asserted so the sweep keeps PINNING the refusal. The
+        // day gen0 grows the fresh-text materialization arc PR #151 named
+        // (runtime buffer + itoa-to-memory + span rebasing), this fixture
+        // becomes `both_ok` — which the sweep refuses outright, since a
+        // fixture both compilers accept measures nothing. At that point it
+        // must be REPLACED by runtime-agreement pins, not silently deleted.
+        const INVERSE_CAPABILITY: &[&str] = &["match_freshtext_in_callee"];
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
@@ -47332,12 +47425,47 @@ rule pick
             mirrored.len(), mirrored
         );
 
+        // The two inverse buckets are disjoint by name, so the measured set is
+        // compared against their union — but the FAILURE MESSAGE is what does
+        // the work, because the only thing a measurement cannot tell you is
+        // WHICH bucket a new entry belongs in.
+        let mut expected_inverse: Vec<String> = INVERSE_REFERENCE_GAP
+            .iter()
+            .chain(INVERSE_CAPABILITY.iter())
+            .map(|s| s.to_string())
+            .collect();
+        expected_inverse.sort();
+        inverse.sort();
         assert_eq!(
-            inverse, INVERSE,
-            "THE INVERSE SET MOVED (verbosec accepts, gen0 refuses). gen0 being \
-             STRICTER is not automatically wrong, but it means a program \
-             verbosec blesses will not build under the self-hosted compiler — \
-             so each entry needs a deliberate verdict, not a silent baseline."
+            inverse, expected_inverse,
+            "THE INVERSE SET MOVED (verbosec accepts, gen0 refuses).\n\
+             \n\
+             gen0 being STRICTER is not automatically wrong — but a program\n\
+             verbosec blesses that will not build under the self-hosted\n\
+             compiler always needs a DELIBERATE verdict, and there are two\n\
+             very different verdicts. Classify with one question:\n\
+             \n\
+               WHICH COMPILER WOULD YOU CHANGE TO MAKE THE TWO AGREE?\n\
+             \n\
+               * VERBOSEC -> add the name to INVERSE_REFERENCE_GAP, and treat\n\
+                 it as a BUG in the reference. The fixture is an INVALID\n\
+                 program the reference wrongly accepts. This set is asserted\n\
+                 empty precisely so this case cannot land quietly; the fix\n\
+                 belongs in src/verifier.rs, not here.\n\
+               * GEN0 -> add the name to INVERSE_CAPABILITY. The fixture is a\n\
+                 VALID program, verbosec is right to accept it, and gen0\n\
+                 refuses because its representation cannot express the shape.\n\
+                 Record WHICH representation limit, and what the refusal is\n\
+                 protecting against (usually: an emitted binary that would\n\
+                 trap or lie at runtime).\n\
+             \n\
+             Do NOT let the two collapse into one bucket. A reference defect\n\
+             hiding behind a capability entry is exactly what the empty set\n\
+             exists to catch.\n\
+             \n\
+             REFERENCE_GAP (must stay empty): {:?}\n\
+             CAPABILITY (non-empty by design):  {:?}\n",
+            INVERSE_REFERENCE_GAP, INVERSE_CAPABILITY
         );
 
         let _ = fs::remove_file(&gen0);
@@ -51209,41 +51337,42 @@ rule probe
             let _ = fs::remove_file(&ref_bin);
         }
 
-        // ---- 1b. SURFACED, NOT CAUSED: token_label's text variant binder ---
-        // `label_of` is reachable for the first time here. Its Int and Eof arms
-        // are byte-exact; its Ident arm prints the text binder's packed
-        // (start, len) span as a decimal — the same itoa-a-pointer mechanism
-        // the 2026-08-08 streamed-text slice fixed for FIELDS, in the arena
-        // variant-binder position, which no differential could previously
-        // reach. Asserted as-is so the fix flips a named test.
+        // ---- 1b. token_label's text variant binder — FIXED (PR #171) -------
+        // `label_of` became reachable in this slice's predecessor (#170), and
+        // its Ident arm printed the text binder's packed (start, len) span as
+        // a decimal (`id:2287823529757900805` for argv `0 hello`) — the same
+        // itoa-a-pointer mechanism the 2026-08-08 streamed-text slice fixed
+        // for FIELDS, in the arena variant-binder position. This block held
+        // the defect as-is until the fix landed; it now asserts full
+        // stdout + exit-code agreement on ALL THREE arms, the Ident (text
+        // binder) arm on several payloads, and both classification
+        // boundaries (100 -> Int, 101 -> Eof). The mechanism: the stream-side
+        // arm walks append binders through lets_append_typed_binders, which
+        // marks a TEXT-payload binder's dummy value AstStr, and the stream
+        // walks' AstVar let-branch dispatches on let_marks_textspan to the
+        // same 36-byte span write the AstField text branch uses (all in
+        // examples/vexprparse.verbose).
         {
             let (rc, bytes) = emit("examples/token_label.verbose", 1);
             assert_eq!(rc, Some(0), "token_label: gen0 must accept at index 1 (label_of)");
             let got_bin = executable(&bytes, "token_label");
             let ref_bin = reference("examples/token_label.verbose", "label_of", "token_label");
-            for argv in [["5", "hello"], ["200", "hello"], ["42", "zz"]] {
+            for argv in [["0", "hello"], ["0", "ada"], ["0", "x"],
+                         ["5", "hello"], ["100", "edge"], ["101", "e"],
+                         ["200", "hello"], ["42", "zz"]] {
                 let g = Command::new(&got_bin).args(argv).output().unwrap();
                 let v = Command::new(&ref_bin).args(argv).output().unwrap();
-                assert_eq!(g.stdout, v.stdout,
-                    "token_label {argv:?}: the number-payload and no-payload arms \
+                assert_eq!(
+                    (String::from_utf8_lossy(&g.stdout).to_string(), g.status.code()),
+                    (String::from_utf8_lossy(&v.stdout).to_string(), v.status.code()),
+                    "token_label {argv:?}: every arm — text binder included — \
                      must be byte-exact against verbosec");
             }
-            let g = Command::new(&got_bin).args(["0", "hello"]).output().unwrap();
+            // The Ident arm's reference is pinned literally so this cannot
+            // pass vacuously against a reference that itself regressed.
             let v = Command::new(&ref_bin).args(["0", "hello"]).output().unwrap();
             assert_eq!(String::from_utf8_lossy(&v.stdout), "id:hello\n",
                 "verbosec's reference for the Ident arm");
-            let got_s = String::from_utf8_lossy(&g.stdout).to_string();
-            assert_ne!(got_s, "id:hello\n",
-                "KNOWN GAP CLOSED: gen0 now writes a TEXT variant binder's bytes \
-                 instead of itoa-ing its packed span. Delete this as-is assertion, \
-                 replace it with the equality above, and move the row in CLAUDE.md.");
-            assert!(got_s.starts_with("id:")
-                    && got_s.trim_start_matches("id:").trim_end()
-                           .parse::<u64>().map(|n| (n & 0xffff_ffff) == 5).unwrap_or(false),
-                "token_label Ident arm: expected the documented itoa-a-pointer shape \
-                 (`id:<decimal>` whose low 32 bits are len(\"hello\") == 5), got \
-                 {got_s:?}. A DIFFERENT wrong answer here is a new defect, not the \
-                 documented one.");
             let _ = fs::remove_file(&got_bin);
             let _ = fs::remove_file(&ref_bin);
         }
@@ -51308,6 +51437,200 @@ rule probe
             "a negative index must fail closed at the declared field bound");
 
         let _ = fs::remove_file(&out);
+        let _ = fs::remove_file(&gen0);
+    }
+
+    /// gen0 must REFUSE fresh text in a match_result callee it can reach — never
+    /// emit a binary that traps at runtime (PR #171, Defect B).
+    ///
+    /// PR #151 refused fresh text (concat / texty-rule call) in the ENTRY rule's
+    /// value-lowered positions and NAMED its residual: "an entry that CALLS a
+    /// non-texty helper whose body builds fresh text still traps in the callee's
+    /// proc — no current corpus file has that shape." Entry selection (PR #170)
+    /// gave a corpus file exactly that shape: `purchase::discounted_purchase` at
+    /// index 1 compiled to a 2563-byte ELF whose Ok arm was byte-exact and whose
+    /// Err arm executed x86_node's int3 placeholder inside validate_purchase's
+    /// proc — measured rc 133 (SIGTRAP) with zero output on argv `500 12`, where
+    /// verbosec writes `customer age 12 is under 18` to stderr and exits 1.
+    ///
+    /// The classification matters: this is a REFUSE, not a fix. gen0's text
+    /// values are packed (start, len) spans into the embedded source; concat
+    /// output exists at no addressable offset, and materializing it is the arc
+    /// PR #151 named (runtime buffer + itoa-to-memory + span rebasing). Until
+    /// that arc lands, the only honest verdict for a REACHABLE fresh-text
+    /// position is verify-time refusal: exit 1, zero bytes.
+    ///
+    /// Reachability is the DECLARED call graph (sound because purity is checked
+    /// in both directions and descends into every node family — the layer_list
+    /// dependency, restated), walked by a visited-list DFS that a call CYCLE
+    /// cannot diverge, and gated on an offender existing at all so the
+    /// self-compile pays one linear sweep and never builds a visited list.
+    /// Scope is REACHABLE, never PRESENT: probe 4 pins the difference, because
+    /// no corpus file exercises it (every accepted file has zero offenders; every
+    /// file with one was already refused at index 0).
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_refuses_reachable_match_result_fresh_text() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_freshreach_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let emit = |path: &std::path::Path, idx: usize| -> (Option<i32>, Vec<u8>) {
+            let out = std::env::temp_dir().join("verbosec_test_freshreach_out.elf");
+            let _ = fs::remove_file(&out);
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' {} < '{}' > '{}' 2>/dev/null",
+                gen0.display(), idx, path.display(), out.display()))
+                .status().expect("run gen0");
+            let bytes = fs::read(&out).unwrap_or_default();
+            let _ = fs::remove_file(&out);
+            (status.code(), bytes)
+        };
+
+        // ---- 1. THE DEFECT SHAPE REFUSES: purchase at index 1 --------------
+        // Pre-change this emitted 2563 bytes at rc 0 and the binary's Err arm
+        // SIGTRAP'd. ZERO BYTES is the load-bearing half of the assertion — a
+        // refusal that had already streamed a partial ELF is PR #142's failure
+        // mode, and an accepted-but-trapping binary is this slice's.
+        let purchase = std::path::Path::new("examples/purchase.verbose");
+        let (rc, bytes) = emit(purchase, 1);
+        assert_eq!((rc, bytes.len()), (Some(1), 0),
+            "purchase::discounted_purchase (entry index 1): gen0 must refuse at \
+             verify time with rc 1 and ZERO bytes — the callee's Err(concat(...)) \
+             is fresh text gen0 cannot represent, and the pre-change alternative \
+             was a binary whose Err arm executes an int3");
+        // Index 0 (validate_purchase, its OWN Err concat) stays refused — the
+        // PR #151 posture this slice extends, not replaces.
+        let (rc0, bytes0) = emit(purchase, 0);
+        assert_eq!((rc0, bytes0.len()), (Some(1), 0),
+            "purchase::validate_purchase (entry index 0) must remain refused");
+
+        // The refusal is a CAPABILITY refusal, so the reference must still
+        // ACCEPT: verbosec inlines the callee and materializes the concat. If
+        // this ever fails, the fixture stopped isolating gen0's limit.
+        let psrc = fs::read_to_string(purchase).unwrap();
+        let ptok = crate::lexer::Lexer::new(&psrc).tokenize().unwrap();
+        let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+        let vc_ref = std::env::temp_dir().join("verbosec_test_freshreach_ref");
+        compile_native(&pprog, "discounted_purchase", vc_ref.to_str().unwrap(), false, false)
+            .expect("verbosec must still ACCEPT discounted_purchase natively — \
+                     gen0's refusal is capability, not validity");
+        let _ = fs::remove_file(&vc_ref);
+
+        // ---- 2. THE NEGATIVE FIXTURE mirrors it ----------------------------
+        let fixture = std::path::Path::new("examples/negative/match_freshtext_in_callee.verbose");
+        let (rc, bytes) = emit(fixture, 0);
+        assert_eq!((rc, bytes.len()), (Some(1), 0),
+            "match_freshtext_in_callee: gen0 must refuse the committed fixture \
+             at its entry (rule #0 reaches the fresh-text callee)");
+
+        // ---- 3. THE CORRECTED TWIN accepts, and runs correctly -------------
+        // Same two-rule shape, the callee's Err payload a LITERAL — the
+        // minimal correction. gen0 must accept it and the binary must match
+        // verbosec on stdout + exit code on BOTH arms; that pair is what makes
+        // probe 1's refusal attributable to the concat and nothing else.
+        let dir = std::env::temp_dir().join("verbosec_test_freshreach_probes");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("p.intent"), "title\n1. one\n2. two\n3. three\n").unwrap();
+        let twin = "@verbose 0.1.0\n\n\
+            concept Purchase\n  @intention: \"p\"\n  @source: p.intent:1\n\n  \
+            fields:\n    amount        : number [0, 1000000]\n    customer_age  : number [0, 150]\n\n\
+            rule discounted_purchase\n  @intention: \"d\"\n  @source: p.intent:3\n\n  \
+            input:\n    p : Purchase\n\n  output:\n    r : Result(number, text)\n\n  \
+            logic:\n    r = match_result(validate_purchase(p), amount => Ok(amount * 90 / 100), reason => Err(reason))\n\n  \
+            proofs:\n    purity:\n      reads   : [p]\n      calls   : [validate_purchase]\n    \
+            termination:\n      bound : 10\n\n\
+            rule validate_purchase\n  @intention: \"v\"\n  @source: p.intent:2\n\n  \
+            input:\n    p : Purchase\n\n  output:\n    r : Result(number, text)\n\n  \
+            logic:\n    r = if p.customer_age >= 18 then Ok(p.amount) else Err(\"customer is under 18\")\n\n  \
+            proofs:\n    purity:\n      reads   : [p.customer_age, p.amount]\n      calls   : []\n    \
+            termination:\n      bound : 5\n";
+        let twin_path = dir.join("twin.verbose");
+        fs::write(&twin_path, twin).unwrap();
+        let (rc, bytes) = emit(&twin_path, 0);
+        assert_eq!(rc, Some(0),
+            "the corrected twin (literal Err payload) must be ACCEPTED at the \
+             match_result rule's entry — otherwise the refusal above is not \
+             attributable to the fresh text");
+        assert!(bytes.starts_with(&[0x7f, 0x45, 0x4c, 0x46]), "twin output must be an ELF");
+        let twin_bin = dir.join("twin_gen0");
+        fs::write(&twin_bin, &bytes).unwrap();
+        let mut pm = fs::metadata(&twin_bin).unwrap().permissions();
+        pm.set_mode(0o755);
+        fs::set_permissions(&twin_bin, pm).unwrap();
+        let ttok = crate::lexer::Lexer::new(twin).tokenize().unwrap();
+        let tprog = crate::parser::Parser::new(ttok).parse_program().unwrap();
+        let twin_ref = dir.join("twin_ref");
+        compile_native(&tprog, "discounted_purchase", twin_ref.to_str().unwrap(), false, false)
+            .expect("verbosec must compile the twin");
+        let mut pm = fs::metadata(&twin_ref).unwrap().permissions();
+        pm.set_mode(0o755);
+        fs::set_permissions(&twin_ref, pm).unwrap();
+        for argv in [["500", "30"], ["500", "12"]] {
+            let g = Command::new(&twin_bin).args(argv).output().unwrap();
+            let v = Command::new(&twin_ref).args(argv).output().unwrap();
+            assert_eq!(
+                (String::from_utf8_lossy(&g.stdout).to_string(), g.status.code()),
+                (String::from_utf8_lossy(&v.stdout).to_string(), v.status.code()),
+                "twin argv {argv:?}: gen0's binary must match verbosec on stdout \
+                 and exit code on both arms (stderr bytes not compared, per the \
+                 differential's standing convention)");
+        }
+
+        // ---- 4. REACHABLE, NOT PRESENT — and cycles terminate --------------
+        // A program with (a) an entry whose only callee is SELF-RECURSIVE (the
+        // DFS must cross the cycle and stop), and (b) an offender rule the
+        // entry never reaches. No corpus file has this shape: every accepted
+        // file has zero offenders, so nothing else asserts that the walk is
+        // scoped to reachability rather than presence — the enrich /
+        // order_intake discipline. Index 0 must ACCEPT; the offender's own
+        // index must REFUSE.
+        let probe = "@verbose 0.1.0\n\n\
+            concept N\n  @intention: \"n\"\n  @source: p.intent:1\n\n  \
+            fields:\n    v : number [0, 10]\n\n\
+            rule top\n  @intention: \"t\"\n  @source: p.intent:2\n\n  \
+            input:\n    n : N\n\n  output:\n    out : number\n\n  \
+            logic:\n    out = spin(n)\n\n  \
+            proofs:\n    purity:\n      reads   : [n]\n      calls   : [spin]\n    \
+            termination:\n      bound : 16\n\n\
+            rule spin\n  @intention: \"s\"\n  @source: p.intent:2\n\n  \
+            input:\n    n : N\n\n  output:\n    out : number\n\n  \
+            logic:\n    out = if n.v == 0 then 0 else spin(N { v: n.v - 1 })\n\n  \
+            proofs:\n    purity:\n      reads   : [n.v]\n      calls   : [spin]\n    \
+            termination:\n      bound : 16\n\n\
+            rule loose\n  @intention: \"l\"\n  @source: p.intent:3\n\n  \
+            input:\n    n : N\n\n  output:\n    r : Result(number, text)\n\n  \
+            logic:\n    r = if n.v > 5 then Ok(n.v) else Err(concat(\"low \", n.v))\n\n  \
+            proofs:\n    purity:\n      reads   : [n.v]\n      calls   : []\n    \
+            termination:\n      bound : 16\n";
+        let probe_path = dir.join("probe.verbose");
+        fs::write(&probe_path, probe).unwrap();
+        let (rc, bytes) = emit(&probe_path, 0);
+        assert_eq!(rc, Some(0),
+            "reachability probe at index 0: an offender the entry cannot reach \
+             must NOT refuse (presence is not the defect), and the DFS must \
+             terminate across the self-recursive callee");
+        assert!(bytes.starts_with(&[0x7f, 0x45, 0x4c, 0x46]),
+            "reachability probe at index 0 must emit an ELF");
+        let (rc, bytes) = emit(&probe_path, 2);
+        assert_eq!((rc, bytes.len()), (Some(1), 0),
+            "reachability probe at index 2 (the offender as entry) must refuse \
+             with rc 1 and zero bytes — its own Err(concat(...)) is the entry's");
+
+        let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(&gen0);
     }
 

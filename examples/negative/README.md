@@ -1,9 +1,18 @@
 # The negative corpus
 
-Small, deliberately-**invalid** `.verbose` programs. Each isolates ONE thing
-`verbosec` refuses. They exist to measure a surface nothing else in this repo
-measures: **whether the self-hosted compiler (gen0, `examples/vexprparse.verbose`)
-refuses what `verbosec` refuses.**
+Small `.verbose` programs that **at least one of the two compilers refuses**.
+Each isolates ONE reason. They exist to measure a surface nothing else in this
+repo measures: **whether the self-hosted compiler (gen0,
+`examples/vexprparse.verbose`) refuses what `verbosec` refuses.**
+
+Almost every fixture is deliberately **invalid** — `verbosec` refuses it, and
+the question is whether gen0 does too. A small minority run the other way; see
+[The two INVERSE buckets](#the-two-inverse-buckets-and-why-they-must-not-be-one)
+below. (This opening sentence used to say the directory held only programs
+"`verbosec` refuses", and that had been inaccurate since the `INVERSE` constant
+was introduced in 2026-08-10: `bad_arity` sat here for three days as a program
+`verbosec` *accepted*. Nobody noticed because it moved to `mirrored` before
+anyone re-read the sentence.)
 
 Run the sweep:
 
@@ -40,16 +49,65 @@ them too — which requires programs that are not in `examples/`, because
 - Fixtures are **not** picked up by the corpus-acceptance sweep: that sweep
   reads `examples/` non-recursively and filters on the `.verbose` extension, so
   a subdirectory is excluded. `EXPECTED_TOTAL` stays 151.
-- The sweep's `INVERSE` set — fixtures `verbosec` ACCEPTS and gen0 refuses — is
-  currently **empty**, and the constant is kept as a tripwire rather than
-  deleted. Its one occupant, `bad_arity.verbose`, was an inverse case from
-  2026-08-10 until 2026-08-13: `verbosec` had no rule-call arity check at all,
-  so `helper(i, i)` on a one-input rule verified clean while gen0 refused it.
-  Keeping it asserted — instead of filing it away in some bucket — is what kept
-  it visible until `check_call_arity` landed in `src/verifier.rs`; the fixture
-  is now a PASS (both compilers refuse). **A fixture that measures a gap in the
-  other direction is still a measurement**, and the empty set is what will
-  catch the next one.
+- The sweep's INVERSE direction — fixtures `verbosec` ACCEPTS and gen0 refuses
+  — is **two constants, not one**, for reasons set out in its own section
+  below. `INVERSE_REFERENCE_GAP` is asserted **empty** and is a tripwire;
+  `INVERSE_CAPABILITY` is non-empty by design.
+
+## The two INVERSE buckets, and why they must not be one
+
+Most fixtures measure `verbosec` refuses / gen0 accepts — a **gap** in gen0's
+verifier. The reverse also happens: `verbosec` accepts and gen0 refuses. That
+shape needs a deliberate verdict every time, because it means *a program the
+reference blesses will not build under the self-hosted compiler*.
+
+It arises for **two opposite reasons**, and the sweep keeps them in two
+separate constants (`src/native.rs`, 2026-08-16):
+
+| bucket | what it means | the fixture is | fix belongs in | asserted |
+|---|---|---|---|---|
+| `INVERSE_REFERENCE_GAP` | **`verbosec` is wrong.** It is the permissive one — a check it should perform and does not. | an **invalid** program | `src/verifier.rs` | **empty** — tripwire |
+| `INVERSE_CAPABILITY` | **`verbosec` is right, and more capable.** gen0's representation cannot express the shape, so it refuses in the safe direction. | a **valid** program | gen0, as a future arc | non-empty by design |
+
+**The discriminator is one question: which compiler would you change to make
+the two agree?** Equivalently, and checkably: a REFERENCE_GAP fixture is an
+invalid program, a CAPABILITY fixture is a valid one that `verbosec` compiles
+into a binary that runs correctly.
+
+### Why not one bucket
+
+Because the two demand opposite responses, and merging them destroys
+information in both directions:
+
+- The empty set is a **tripwire**. `bad_arity` — a one-input rule called with
+  two arguments — sat in it from 2026-08-10 to 2026-08-13, when `verbosec` had
+  no rule-call arity check at all. Asserting it explicitly is what kept it
+  visible until `check_call_arity` landed; it is a PASS today. If a capability
+  entry lives in the same constant, the set is permanently non-empty and the
+  next reference defect lands quietly beside it.
+- It also misdirects the reader. `INVERSE = ["match_freshtext_in_callee"]`
+  invites someone to go hunting for a `verbosec` bug. There is none: that
+  program is valid, `verbosec` compiles it, and the binary is correct.
+
+**"gen0 refuses more than verbosec" and "verbosec has a bug" are not the same
+statement, and neither is a licence to relax gen0.** A capability refusal is
+still the right verdict — the alternative for
+`match_freshtext_in_callee` was, until PR #171, a binary that compiled at rc 0
+and SIGTRAPped on a reachable arm.
+
+### Current occupants
+
+`INVERSE_REFERENCE_GAP`: **empty.**
+
+`INVERSE_CAPABILITY`: `match_freshtext_in_callee` — a `match_result` whose
+callee's `Err` arm builds fresh text with `concat(...)`. `verbosec` inlines the
+callee and materializes it through the Phase 1B/2F buffer machinery. gen0's
+text values are packed `(start, len)` spans into the embedded source blob, and
+fresh text exists at no addressable offset, so there is nothing for a span to
+point at; it refuses at verify time (exit 1, zero bytes). It leaves the bucket
+when gen0 grows the fresh-text materialization arc PR #151 named — at which
+point the fixture becomes `both_ok`, which the sweep refuses outright, so it
+must be **replaced** by runtime-agreement pins rather than deleted.
 
 ## One defect can have several SHAPES, and a fixture only holds the one it tests
 
