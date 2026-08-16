@@ -1,0 +1,86 @@
+@verbose 0.1.0
+
+-- CATEGORY: INVERSE_CAPABILITY. Read that label carefully — it is NOT the
+-- other kind of inverse, and the two are opposites.
+--
+-- THIS PROGRAM IS VALID. verbosec verifies it, compiles it, and the binary is
+-- correct on both arms: its native emitter inlines the callee and materializes
+-- the Err concat through the Phase 1B/2F buffer machinery. So there is no bug
+-- in the reference here, and nothing to fix in src/verifier.rs. Do not go
+-- looking. (Contrast `bad_arity`, the corpus's only OTHER inverse ever, where
+-- verbosec was the permissive one and the fix genuinely belonged in the
+-- reference — that is `INVERSE_REFERENCE_GAP`, which is asserted EMPTY.)
+--
+-- gen0 REFUSES it, and must. A gen0 text value is a packed (start, len) span
+-- into the embedded source blob; FRESH text (concat output) exists at no
+-- addressable offset, so there is nothing for a span to point at. gen0 is
+-- simply less capable than the reference, and the refusal is in the safe
+-- direction. Until PR #171 it did the unsafe thing instead: compiled this
+-- shape at rc 0 into a binary whose Err arm executed an int3 placeholder in
+-- the callee's proc — a runtime SIGTRAP (rc 133, zero output) on
+-- `examples/purchase.verbose::discounted_purchase`, argv `500 12`, where
+-- verbosec writes `customer age 12 is under 18` and exits 1. A compiler must
+-- never emit a binary that traps on a reachable arm, so the verdict moved to
+-- verify time (exit 1, zero bytes) via entry_freshtext's reachable-callee
+-- walk. PR #151 refused the same fresh text in the ENTRY rule and NAMED this
+-- callee position as its residual; this fixture holds it.
+--
+-- WHEN THIS STOPS BEING AN INVERSE: gen0 grows the fresh-text materialization
+-- arc (runtime buffer + itoa-to-memory + span rebasing) and accepts. The
+-- fixture then lands in `both_ok`, which the sweep refuses outright, because
+-- a program both compilers accept measures nothing. REPLACE it with runtime
+-- agreement pins at that point — do not just delete it.
+--
+-- The gen0-ACCEPTED corrected twin (literal Err payload, so the refusal here
+-- is attributable to the concat and nothing else) is pinned in
+-- two_generation_gen0_refuses_reachable_match_result_fresh_text.
+
+concept Order
+  @intention: "An order has an amount and the customer's age"
+  @source: negative.intent:1
+
+  fields:
+    amount        : number [0, 1000000]
+    customer_age  : number [0, 150]
+
+
+rule discounted_order
+  @intention: "Apply a discount if validation succeeded; propagate the reason otherwise"
+  @source: negative.intent:3
+
+  input:
+    o : Order
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = match_result(validate_order(o), amount => Ok(amount * 90 / 100), reason => Err(reason))
+
+  proofs:
+    purity:
+      reads   : [o]
+      calls   : [validate_order]
+    termination:
+      bound : 10
+
+
+rule validate_order
+  @intention: "Accept the order's amount if the customer is 18 or older; reject with a composed reason otherwise"
+  @source: negative.intent:2
+
+  input:
+    o : Order
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if o.customer_age >= 18 then Ok(o.amount) else Err(concat("customer age ", o.customer_age, " is under 18"))
+
+  proofs:
+    purity:
+      reads   : [o.customer_age, o.amount]
+      calls   : []
+    termination:
+      bound : 7

@@ -27109,13 +27109,199 @@ rule count_streamtext_ast
       bound : 4000
 
 
+-- ============ FRESH TEXT IN REACHABLE CALLEES (2026-08-16) ============
+-- PR #151 scoped the fresh-text refusal to the ENTRY rule's own positions and
+-- NAMED the residual: "an entry that CALLS a non-texty helper whose body
+-- builds fresh text still traps in the callee's proc — no current corpus file
+-- has that shape." Entry selection (PR #170) is what gave a corpus file that
+-- shape: `purchase.verbose::discounted_purchase` at index 1 inlines nothing —
+-- gen0 emits `validate_purchase` as a VALUE-lowered proc, whose Err arm's
+-- `concat(...)` is x86_node's int3 placeholder, so the Err path SIGTRAPs at
+-- runtime (rc 133, measured argv `500 12`) where verbosec writes the reason
+-- and exits 1. The compiler must never emit a binary that traps on a
+-- reachable arm: the refusal moves to verify time, extended over the entry's
+-- TRANSITIVE callees.
+--
+-- REACHABILITY IS THE DECLARED CALL GRAPH, the same dependency layer_list
+-- states: purity is checked in BOTH directions and descends into all node
+-- families, so for any program gen0 ACCEPTS the declared `calls:` list IS the
+-- performed call set. The walk is a visited-list DFS (reach_visit /
+-- reach_calls) — the visited NameList is what makes a call CYCLE terminate,
+-- since a revisited name returns the list unchanged; name identity is byte
+-- comparison (name_in_namelist), so a declaration-site span and a calls-list
+-- span of the same name dedup correctly.
+--
+-- THE DFS IS OFFENDER-GATED, and the gate is a cost statement, not a
+-- semantic one: nonentry_offenders first sweeps every non-entry rule's
+-- per-rule count (each walk arena_scope'd, so its nodes are reclaimed), and
+-- only when at least one rule in the PROGRAM builds fresh text does the DFS
+-- run at all. vexprparse itself has zero offenders, so the self-compile pays
+-- one linear body sweep and never builds a visited list; a program WITH an
+-- offender is small today, and the DFS cost is bounded by rules × declared
+-- calls either way. Scope stays "reachable", never "present": a fresh-text
+-- rule the entry cannot reach must not refuse (the enrich / order_intake
+-- shape, asserted by the corpus staying at 100).
+
+concept RuleFreshState
+  @intention: "One rule + the program + the source, for the per-rule fresh-text count"
+  @source: vexprparse.intent:33
+  fields:
+    rd : RuleDecl
+    prog : RuleList
+    src : text [..256]
+
+
+concept ReachVisitState
+  @intention: "The program + source + a visited name list + one rule-name span to visit, for the reachability DFS"
+  @source: vexprparse.intent:33
+  fields:
+    rules : RuleList
+    src : text [..256]
+    visited : NameList
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept ReachCallsState
+  @intention: "The program + source + a callee name list to fold + the visited name list, for the reachability DFS"
+  @source: vexprparse.intent:33
+  fields:
+    rules : RuleList
+    src : text [..256]
+    calls : NameList
+    visited : NameList
+
+
+concept ReachedOffState
+  @intention: "The rule list being iterated + the reached name set + the program + the source, to count reachable fresh-text rules"
+  @source: vexprparse.intent:33
+  fields:
+    iter : RuleList
+    reached : NameList
+    prog : RuleList
+    src : text [..256]
+
+
+-- rule_freshtext: ONE rule's fresh-text count, dispatched exactly as x86_proc
+-- lowers that rule — let RHSes always through the value walk (x86_let_stores
+-- value-lowers every let), the body through the stream walk iff the rule is
+-- texty. This is PR #151's entry check factored out so the same shape can be
+-- asked of every reachable rule.
+rule rule_freshtext
+  @intention: "Fresh-text producers in one rule's value-lowered positions, dispatched as its proc lowers it"
+  @source: vexprparse.intent:33
+  input:
+    rf : RuleFreshState
+  output:
+    out : number
+  logic:
+    out = count_valtext_binds(BadCallBindsState { binds: block_binds(rd_body(rf.rd)), rules: rf.prog, src: rf.src }) + (if ast_is_texty(TextyState { node: block_result(rd_body(rf.rd)), src: rf.src, prog: rf.prog }) == 1 then count_streamtext_ast(BadCallState { node: block_result(rd_body(rf.rd)), rules: rf.prog, src: rf.src }) else count_valtext_ast(BadCallState { node: block_result(rd_body(rf.rd)), rules: rf.prog, src: rf.src }))
+  proofs:
+    purity:
+      reads : [rf.rd, rf.prog, rf.src]
+      calls : [count_valtext_binds, count_valtext_ast, count_streamtext_ast, ast_is_texty, block_binds, block_result, rd_body]
+    termination:
+      bound : 8000
+
+
+-- nonentry_offenders: how many rules in `iter` build fresh text in a
+-- value-lowered position — the DFS gate. Each per-rule walk is arena_scope'd
+-- so the linear sweep's peak allocation is one rule's body, not the program's.
+rule nonentry_offenders
+  @intention: "Count of rules in a list whose value-lowered positions build fresh text"
+  @source: vexprparse.intent:33
+  input:
+    pl : PurityListState
+  output:
+    out : number
+  logic:
+    out = match pl.iter:
+      RCons(head, tail) => (if arena_scope(rule_freshtext(RuleFreshState { rd: head, prog: pl.full, src: pl.src })) > 0 then 1 else 0) + nonentry_offenders(PurityListState { iter: tail, full: pl.full, src: pl.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pl.iter, pl.full, pl.src]
+      calls : [rule_freshtext, nonentry_offenders]
+    termination:
+      bound : 8000
+
+
+-- reach_visit: visit one rule name — if already visited, the set is returned
+-- unchanged (this arm is what terminates a call CYCLE); otherwise cons the
+-- name and fold over the rule's DECLARED calls. find_rule's sentinel carries
+-- an empty proofs node (calls: NmNil), so a name that resolves to no rule —
+-- possible only in a program the badcall lint refuses anyway — folds over
+-- nothing rather than diverging.
+rule reach_visit
+  @intention: "Extend a visited name set with one rule and everything its declared calls reach"
+  @source: vexprparse.intent:33
+  input:
+    rv : ReachVisitState
+  output:
+    out : NameList
+  logic:
+    out = if name_in_namelist(NameInListState { names: rv.visited, src: rv.src, q_start: rv.q_start, q_len: rv.q_len }) == 1 then rv.visited else reach_calls(ReachCallsState { rules: rv.rules, src: rv.src, calls: prf_calls(rd_proofs(find_rule(FindRuleState { rules: rv.rules, src: rv.src, q_start: rv.q_start, q_len: rv.q_len }))), visited: NameList::NmCons { start: rv.q_start, len: rv.q_len, rest: rv.visited } })
+  proofs:
+    purity:
+      reads : [rv.rules, rv.src, rv.visited, rv.q_start, rv.q_len]
+      calls : [name_in_namelist, reach_calls, prf_calls, rd_proofs, find_rule]
+    termination:
+      bound : 8000
+
+
+-- reach_calls: fold reach_visit over a declared-calls NameList, threading the
+-- growing visited set through each step.
+rule reach_calls
+  @intention: "Fold the reachability visit over a callee name list, threading the visited set"
+  @source: vexprparse.intent:33
+  input:
+    rc : ReachCallsState
+  output:
+    out : NameList
+  logic:
+    out = match rc.calls:
+      NmCons(start, len, rest) => reach_calls(ReachCallsState { rules: rc.rules, src: rc.src, calls: rest, visited: reach_visit(ReachVisitState { rules: rc.rules, src: rc.src, visited: rc.visited, q_start: start, q_len: len }) })
+      NmNil => rc.visited
+  proofs:
+    purity:
+      reads : [rc.rules, rc.src, rc.calls, rc.visited]
+      calls : [reach_calls, reach_visit]
+    termination:
+      bound : 8000
+
+
+-- reached_offenders: count the rules in `iter` that are BOTH in the reached
+-- set AND fresh-text offenders. Membership first: short-circuit `and` skips
+-- the body walk for every unreached rule, which is what keeps the second
+-- sweep as cheap as the gate.
+rule reached_offenders
+  @intention: "Count of rules that are reachable from the entry and build fresh text in value-lowered positions"
+  @source: vexprparse.intent:33
+  input:
+    ro : ReachedOffState
+  output:
+    out : number
+  logic:
+    out = match ro.iter:
+      RCons(head, tail) => (if name_in_namelist(NameInListState { names: ro.reached, src: ro.src, q_start: rd_name_start(head), q_len: rd_name_len(head) }) == 1 and arena_scope(rule_freshtext(RuleFreshState { rd: head, prog: ro.prog, src: ro.src })) > 0 then 1 else 0) + reached_offenders(ReachedOffState { iter: tail, reached: ro.reached, prog: ro.prog, src: ro.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [ro.iter, ro.reached, ro.prog, ro.src]
+      calls : [name_in_namelist, rd_name_start, rd_name_len, rule_freshtext, reached_offenders]
+    termination:
+      bound : 8000
+
+
 -- entry_freshtext: the verrs term. Fresh-text producers reachable in the
--- ENTRY rule's proc: its let RHSes (always value-lowered by x86_let_stores)
--- plus its body, dispatched exactly as x86_proc dispatches it — the texty
--- body takes the stream walk, everything else the value walk. Nonzero
--- refuses emission (exit 1, zero bytes) through the verrs gate.
+-- ENTRY rule's proc — its let RHSes (always value-lowered by x86_let_stores)
+-- plus its body, dispatched exactly as x86_proc dispatches it — PLUS, since
+-- 2026-08-16, every rule the entry TRANSITIVELY reaches through declared
+-- calls whose own proc has fresh text in a value-lowered position (the
+-- banner above). Nonzero refuses emission (exit 1, zero bytes) through the
+-- verrs gate.
 rule entry_freshtext
-  @intention: "Fresh-text producers reachable in the entry rule's value-lowered positions (nonzero refuses emission)"
+  @intention: "Fresh-text producers in the entry rule's and its reachable callees' value-lowered positions (nonzero refuses emission)"
   @source: vexprparse.intent:33
   input:
     pg : ProgGenState
@@ -27123,12 +27309,12 @@ rule entry_freshtext
     out : number
   logic:
     out = match pg.rules:
-      RCons(head, tail) => count_valtext_binds(BadCallBindsState { binds: block_binds(rd_body(head)), rules: pg.prog, src: pg.src }) + (if ast_is_texty(TextyState { node: block_result(rd_body(head)), src: pg.src, prog: pg.prog }) == 1 then count_streamtext_ast(BadCallState { node: block_result(rd_body(head)), rules: pg.prog, src: pg.src }) else count_valtext_ast(BadCallState { node: block_result(rd_body(head)), rules: pg.prog, src: pg.src }))
+      RCons(head, tail) => rule_freshtext(RuleFreshState { rd: head, prog: pg.prog, src: pg.src }) + (if nonentry_offenders(PurityListState { iter: tail, full: pg.prog, src: pg.src }) == 0 then 0 else reached_offenders(ReachedOffState { iter: tail, reached: reach_visit(ReachVisitState { rules: pg.prog, src: pg.src, visited: NameList::NmNil, q_start: rd_name_start(head), q_len: rd_name_len(head) }), prog: pg.prog, src: pg.src }))
       RNil => 0
   proofs:
     purity:
       reads : [pg.rules, pg.src, pg.prog]
-      calls : [count_valtext_binds, count_valtext_ast, count_streamtext_ast, ast_is_texty, block_binds, block_result, rd_body]
+      calls : [rule_freshtext, nonentry_offenders, reached_offenders, reach_visit, rd_name_start, rd_name_len]
     termination:
       bound : 8000
 
@@ -27913,6 +28099,160 @@ rule lets_append_binders
     purity:
       reads : [ab.lets, ab.bs]
       calls : [lets_append_binders, binds_with_binders]
+    termination:
+      bound : 4000
+
+
+-- ============ TYPED MATCH BINDERS (2026-08-16) ============
+-- The EIGHTH member of the itoa-a-pointer family, in a position none of the
+-- text-position matrix's cells covered: the ARENA VARIANT BINDER. A match arm
+-- over a variant with a TEXT payload (`Ident of (label : text)`) binds `label`
+-- to the arena entry's payload slot, which holds a packed (start, len) span —
+-- but the binder entries lets_append_binders conses carry a DUMMY AstNum-0
+-- value, so the stream walk's AstVar let-branch had no way to know the slot
+-- holds a span and itoa'd it: `token_label::label_of` on argv `0 hello`
+-- printed `id:2287823529757900805` (= 0x1fbffb61_00000005, low 32 bits ==
+-- len("hello")) at rc 0 where verbosec prints `id:hello`. Surfaced by entry
+-- selection (PR #170): nothing in the repo had ever RUN label_of before.
+--
+-- The fix is WIRING, the tenth-plus time in this arc: the 36-byte unpack+write
+-- (pop; edx=len; shr 32; movabs src_base; add; write(1, rsi, rdx)) already
+-- serves x86_stream_node's AstField text branch verbatim — the binder simply
+-- was not recognised as a span source. Recognition rides in the dummy VALUE:
+-- the STREAM-side arm walks (stream_size_arms / x86_stream_dispatch /
+-- x86_stream_arms) now append binders through lets_append_typed_binders, which
+-- pairs each positional binder with its variant payload field (the same
+-- binder/field lock-step walk the type checker's bind_binders does) and marks
+-- a TEXT-payload binder with an AstStr{0,0} dummy instead of AstNum-0. The
+-- stream walks' AstVar let-branch then dispatches on let_marks_textspan — ONE
+-- rule both the size and emit walks call, the bin_text_mode discipline, so the
+-- two-pass pair cannot drift. A NUMBER binder keeps the AstNum-0 dummy and the
+-- itoa path byte-for-byte; the VALUE-side arm walks (code_size_arms /
+-- x86_dispatch / x86_arms) keep the untyped append, because the value walks
+-- never read the marker — a binder in a value position is a slot load either
+-- way.
+--
+-- The marker deliberately reuses ast_is_str rather than a fresh sentinel: a
+-- REAL let whose RHS is a bare string literal also holds a packed span at
+-- runtime (x86_let_stores value-lowers AstStr to the packed-span push), so the
+-- marker's semantic — "this slot holds a span" — is true for every entry that
+-- carries it. No corpus file outside vexprparse has a string-literal let, so
+-- the only bytes this moves at entry index 0 are vexprparse's own.
+
+concept AppendTypedBindersState
+  @intention: "A binding list + a match arm's binders + the arm variant's payload fields, to append type-marked binders at the tail"
+  @source: vexprparse.intent:64
+  fields:
+    lets : Binding
+    bs : BinderList
+    fields : FieldList
+
+
+concept TypedBinderConvState
+  @intention: "A match arm's binder list walked in step with its variant's payload fields, to cons type-marked binder entries"
+  @source: vexprparse.intent:64
+  fields:
+    bs : BinderList
+    fields : FieldList
+
+
+-- typed_binder_values: convert a BinderList to Binding entries whose dummy
+-- VALUE marks the binder's payload type — AstStr{0,0} for a text payload
+-- (fl_head_ty == 2, the lossy ty CODE parse_fields stored), AstNum-0 for
+-- everything else. Walks binders and payload fields in lock-step, exactly like
+-- the type checker's bind_binders; a binder past the payload's end pairs with
+-- FNil, whose fl_head_ty is 0, so it degrades to the number dummy rather than
+-- guessing.
+rule typed_binder_values
+  @intention: "Convert a match arm's binders to binding entries whose dummy value marks text payloads"
+  @source: vexprparse.intent:64
+  input:
+    tb : TypedBinderConvState
+  output:
+    out : Binding
+  logic:
+    out = match tb.bs:
+      BindCons(start, len, rest) => Binding::BCons { name_start: start, name_len: len, value: (if fl_head_ty(tb.fields) == 2 then Ast::AstStr { start: 0, len: 0 } else Ast::AstNum { value: 0 }), rest: typed_binder_values(TypedBinderConvState { bs: rest, fields: fl_tail(tb.fields) }) }
+      BindNil => Binding::BNil
+  proofs:
+    purity:
+      reads : [tb.bs, tb.fields]
+      calls : [fl_head_ty, fl_tail, typed_binder_values]
+    termination:
+      bound : 512
+
+
+-- lets_append_typed_binders: lets_append_binders with type-marked binder
+-- entries. Same tail-append discipline (real lets keep indices 0..nlets-1, so
+-- their emitted slots are untouched; binders get slots nlets..), same
+-- name-resolution order; only the dummy VALUE differs, and only for text
+-- payloads. The STREAM-side arm walks call this; the VALUE-side walks keep
+-- lets_append_binders, whose entries the value walks read identically.
+rule lets_append_typed_binders
+  @intention: "Append type-marked match-arm binders at the tail of a binding list (text payloads marked AstStr)"
+  @source: vexprparse.intent:64
+  input:
+    ab : AppendTypedBindersState
+  output:
+    out : Binding
+  logic:
+    out = match ab.lets:
+      BCons(name_start, name_len, value, rest) => Binding::BCons { name_start: name_start, name_len: name_len, value: value, rest: lets_append_typed_binders(AppendTypedBindersState { lets: rest, bs: ab.bs, fields: ab.fields }) }
+      BNil => typed_binder_values(TypedBinderConvState { bs: ab.bs, fields: ab.fields })
+  proofs:
+    purity:
+      reads : [ab.lets, ab.bs, ab.fields]
+      calls : [lets_append_typed_binders, typed_binder_values]
+    termination:
+      bound : 4000
+
+
+-- arm_payload_by_name: the payload FieldList of the variant whose name matches
+-- an arm's span, searched across every concept in order — the FieldList sibling
+-- of arm_tag_by_name, using the same cross-concept walk (arm variant names are
+-- unique per group). FNil if no concept declares the name, which downgrades
+-- every binder to the number dummy rather than refusing.
+rule arm_payload_by_name
+  @intention: "The payload field list of the variant matching an arm's name, searched across all concepts"
+  @source: vexprparse.intent:64
+  input:
+    at : ArmTagState
+  output:
+    out : FieldList
+  logic:
+    out = match at.concepts:
+      CCons(head, tail) => if variant_present(FindVariantState { variants: cd_variants(head), src: at.src, q_start: at.vstart, q_len: at.vlen }) == 1 then variant_payload(FindVariantState { variants: cd_variants(head), src: at.src, q_start: at.vstart, q_len: at.vlen }) else arm_payload_by_name(ArmTagState { concepts: tail, src: at.src, vstart: at.vstart, vlen: at.vlen, cidx: 0 })
+      CNil => FieldList::FNil
+  proofs:
+    purity:
+      reads : [at.concepts, at.src, at.vstart, at.vlen]
+      calls : [variant_present, variant_payload, cd_variants, arm_payload_by_name]
+    termination:
+      bound : 4000
+
+
+-- let_marks_textspan: 1 iff the binding entry matching the query name carries
+-- a span-marked value (an AstStr — the typed-binder dummy, or a real
+-- string-literal let RHS, whose slot holds the packed span either way). The
+-- ONE rule both stream walks call for the AstVar let-branch dispatch —
+-- code_size_stream_node for the +36-vs-+6 count, x86_stream_node for the
+-- bytes — so the size/emit pair cannot disagree about which sequence is there
+-- (the two-pass drift edge, same discipline as bin_text_mode).
+rule let_marks_textspan
+  @intention: "1 if the named binding entry's stored value marks a packed text span, 0 otherwise"
+  @source: vexprparse.intent:64
+  input:
+    li : LetIndexState
+  output:
+    out : number
+  logic:
+    out = match li.binds:
+      BCons(name_start, name_len, value, rest) => if name_len == li.q_len and name_eq(NameEqState { src: li.src, a_start: name_start, b_start: li.q_start, len: li.q_len, off: 0 }) == 1 then ast_is_str(value) else let_marks_textspan(LetIndexState { binds: rest, src: li.src, q_start: li.q_start, q_len: li.q_len, idx: 0 })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [li.binds, li.src, li.q_start, li.q_len]
+      calls : [name_eq, ast_is_str, let_marks_textspan]
     termination:
       bound : 4000
 
@@ -29235,7 +29575,7 @@ rule code_size_stream_node
       AstBin(op, lhs, rhs) => code_size_node(bg) + 6
       AstNeg(inner) => code_size_node(bg) + 6
       AstNot(inner) => 1
-      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 42 else code_size_node(bg) + 6) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then code_size_node(bg) + 6 else 1)
+      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 42 else code_size_node(bg) + 6) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if let_marks_textspan(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 1 then code_size_node(bg) + 36 else code_size_node(bg) + 6) else 1)
       AstField(base, fstart, flen) => if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then code_size_node(bg) + 36 else code_size_node(bg) + 6
       AstStr(start, len) => 33
       AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then 0 else 35 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)
@@ -29289,7 +29629,7 @@ rule code_size_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [code_size_node, code_size_stream_node, ast_field_is_text, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_list_len, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders, fold_stream_ok, ast_call_args, arg_rest, fold_size_cargs, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index, map_out_nf, code_size_map_record, code_size_filter_record, span_is_fetch, connection_index_of]
+      calls : [code_size_node, code_size_stream_node, ast_field_is_text, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, let_marks_textspan, arm_list_len, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_list_len, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders, fold_stream_ok, ast_call_args, arg_rest, fold_size_cargs, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index, map_out_nf, code_size_map_record, code_size_filter_record, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -29328,12 +29668,12 @@ rule stream_size_arms
     out : number
   logic:
     out = match az.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: az.src, off: 0, params: az.params, lets: lets_append_binders(AppendBindersState { lets: az.lets, bs: binders }), prog: az.prog, concepts: az.concepts, sizes: az.sizes, ress: az.ress , conns: az.conns}) + 5 + stream_size_arms(ArmSizeState { arms: rest, src: az.src, params: az.params, lets: az.lets, prog: az.prog, concepts: az.concepts, sizes: az.sizes, ress: az.ress , conns: az.conns})
+      ArmCons(vstart, vlen, binders, body, rest) => 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: az.src, off: 0, params: az.params, lets: lets_append_typed_binders(AppendTypedBindersState { lets: az.lets, bs: binders, fields: arm_payload_by_name(ArmTagState { concepts: az.concepts, src: az.src, vstart: vstart, vlen: vlen, cidx: 0 }) }), prog: az.prog, concepts: az.concepts, sizes: az.sizes, ress: az.ress , conns: az.conns}) + 5 + stream_size_arms(ArmSizeState { arms: rest, src: az.src, params: az.params, lets: az.lets, prog: az.prog, concepts: az.concepts, sizes: az.sizes, ress: az.ress , conns: az.conns})
       ArmNil => 0
   proofs:
     purity:
       reads : [az.arms, az.src, az.params, az.lets, az.prog, az.concepts, az.sizes, az.ress, az.conns]
-      calls : [binder_list_len, code_size_stream_node, lets_append_binders, stream_size_arms]
+      calls : [binder_list_len, code_size_stream_node, lets_append_typed_binders, arm_payload_by_name, stream_size_arms]
     termination:
       bound : 8000
 
@@ -29744,7 +30084,7 @@ rule x86_stream_node
       AstBin(op, lhs, rhs) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
       AstNeg(inner) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
       AstNot(inner) => b"\xcc"
-      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92))) else b"\xcc")
+      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if let_marks_textspan(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else b"\xcc")
       AstField(base, fstart, flen) => if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
       AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil }) + start + 1), b"\x48\xc7\xc2", le32(if len >= 2 then len - 2 else 0), b"\x0f\x05")
       AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then b"" else concat(b"\xe9", le32(4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)), emit_bytes_data(BytesEmitState { src: bg.src, start: start, len: len, i: 0, dlen: bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) }), b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x35", le32(0 - (21 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4))), b"\x48\xc7\xc2", le32(bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 })), b"\x0f\x05")
@@ -29812,7 +30152,7 @@ rule x86_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, ast_field_is_text, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds, fold_stream_ok, ast_call_args, arg_rest, x86_fold_cargs, fold_size_cargs, x86_elem_load, lets_append_elem_binders, static_concept_of, cd_fields, cd_name_start, cd_name_len, concept_at_index, map_out_nf, x86_map_record, x86_filter_record, span_is_fetch, connection_index_of]
+      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, ast_field_is_text, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, let_marks_textspan, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds, fold_stream_ok, ast_call_args, arg_rest, x86_fold_cargs, fold_size_cargs, x86_elem_load, lets_append_elem_binders, static_concept_of, cd_fields, cd_name_start, cd_name_len, concept_at_index, map_out_nf, x86_map_record, x86_filter_record, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -29852,12 +30192,12 @@ rule x86_stream_dispatch
     out : bytes
   logic:
     out = match ds.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 5 + ds.pre_arms), x86_stream_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + arena_scope(code_size_stream_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, ress: ds.ress , conns: ds.conns})) + 5, ress: ds.ress , conns: ds.conns}))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 5 + ds.pre_arms), x86_stream_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + arena_scope(code_size_stream_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_typed_binders(AppendTypedBindersState { lets: ds.lets, bs: binders, fields: arm_payload_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 }) }), prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, ress: ds.ress , conns: ds.conns})) + 5, ress: ds.ress , conns: ds.conns}))
       ArmNil => b""
   proofs:
     purity:
       reads : [ds.arms, ds.src, ds.params, ds.lets, ds.prog, ds.concepts, ds.sizes, ds.rest_disp, ds.pre_arms, ds.ress, ds.conns]
-      calls : [arm_tag_by_name, x86_stream_dispatch, binder_list_len, code_size_stream_node, lets_append_binders]
+      calls : [arm_tag_by_name, x86_stream_dispatch, binder_list_len, code_size_stream_node, lets_append_typed_binders, arm_payload_by_name]
     termination:
       bound : 8000
 
@@ -29875,12 +30215,12 @@ rule x86_stream_arms
     out : bytes
   logic:
     out = match ag.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_stream_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress , conns: ag.conns}), b"\xe9", le32(arena_scope(stream_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress , conns: ag.conns}))), x86_stream_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + arena_scope(code_size_stream_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress , conns: ag.conns})) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress , conns: ag.conns}))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_stream_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_typed_binders(AppendTypedBindersState { lets: ag.lets, bs: binders, fields: arm_payload_by_name(ArmTagState { concepts: ag.concepts, src: ag.src, vstart: vstart, vlen: vlen, cidx: 0 }) }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress , conns: ag.conns}), b"\xe9", le32(arena_scope(stream_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress , conns: ag.conns}))), x86_stream_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + arena_scope(code_size_stream_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_typed_binders(AppendTypedBindersState { lets: ag.lets, bs: binders, fields: arm_payload_by_name(ArmTagState { concepts: ag.concepts, src: ag.src, vstart: vstart, vlen: vlen, cidx: 0 }) }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress , conns: ag.conns})) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress , conns: ag.conns}))
       ArmNil => b""
   proofs:
     purity:
       reads : [ag.arms, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes, ag.ress, ag.conns]
-      calls : [x86_binder_loads, x86_stream_node, code_size_stream_node, stream_size_arms, lets_append_binders, binder_list_len, count_binds, x86_stream_arms]
+      calls : [x86_binder_loads, x86_stream_node, code_size_stream_node, stream_size_arms, lets_append_typed_binders, arm_payload_by_name, binder_list_len, count_binds, x86_stream_arms]
     termination:
       bound : 8000
 
