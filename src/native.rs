@@ -40756,6 +40756,210 @@ rule do_shl
         let _ = std::fs::remove_file(&out);
     }
 
+    /// The SIX other AES-family files, whose embedded copies of the same
+    /// S-box became declared tables too. Sibling of the test above.
+    ///
+    /// Three things it pins that the single-file test structurally cannot:
+    ///
+    /// 1. **Every copy is checked against the DERIVATION, per file.** The
+    ///    seven files each carry their own literal; nothing but this loop
+    ///    stops one of them drifting. Checking one file and generalising is
+    ///    exactly the mistake this repo's text-position matrix exists to
+    ///    prevent.
+    ///
+    /// 2. **The tables are byte-identical to each other AND to
+    ///    `aes_sbox.verbose`'s.** Seven agreeing tables that are all wrong in
+    ///    the same way would still fail check 1, so this is not redundant with
+    ///    it — it is what makes a future single-file edit fail loudly instead
+    ///    of producing an AES that is self-consistent and not AES.
+    ///
+    /// 3. **The `which`-dispatch chains SURVIVE.** This is the non-vacuity
+    ///    guard, and it is the assertion most worth having. The conversion is
+    ///    "replace one 254-branch chain per file"; every other long chain in
+    ///    these files selects among COMPUTED values (`round_key`'s 174-way
+    ///    pick over `b0..b175`, the 14-way `which` dispatches, `gcm_encrypt`'s
+    ///    30-way C||T pick) and can never become a table. A form check that
+    ///    only asserted "few `else if` remain" would go green if someone
+    ///    deleted those chains, so each file asserts a FLOOR on the branches
+    ///    it must still have.
+    #[test]
+    fn aes_family_declared_sbox_tables_match_fips197_oracle() {
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(aes_family_declared_tables_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn aes_family_declared_tables_body() {
+        let oracle = derive_aes_sbox();
+
+        // (file, minimum surviving `else if` count — the DISPATCH chains)
+        let family: [(&str, usize); 6] = [
+            ("aes_key_expansion", 174), // round_key: 176 bytes over 11 rounds
+            ("aes_transforms", 56),     // 4 transforms x 14-way `which`
+            ("aes_encrypt", 14),        // encrypt: 16-way `which`
+            ("aes_ctr", 14),            // ctr_block: 16-way `which`
+            ("aes_gctr", 14),           // gctr: 16-way `which`
+            ("aes_gcm", 30),            // gcm_encrypt: 32-way C||T pick
+        ];
+
+        // The reference literal is the one PR #173 shipped; every family file
+        // must carry exactly these bytes.
+        let ref_src = std::fs::read_to_string("examples/aes_sbox.verbose")
+            .expect("examples/aes_sbox.verbose must exist");
+        let ref_table = extract_declared_byte_table(&ref_src);
+        assert_eq!(
+            ref_table.len(), 256,
+            "the reference table in aes_sbox.verbose must be 256 bytes"
+        );
+        assert_eq!(
+            ref_table.as_slice(), &oracle[..],
+            "the reference table must itself match the GF(2^8) derivation"
+        );
+
+        for (name, min_dispatch_branches) in family {
+            let path = format!("examples/{name}.verbose");
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("{path} must exist"));
+
+            // FORM: the S-box is a declared table here too.
+            assert!(
+                src.contains("byte_at(b\""),
+                "{name} must read a declared b\"...\" S-box table"
+            );
+
+            // NON-VACUITY: the `which`-dispatch chains are NOT tables and must
+            // still be here. Only the 254-branch S-box chain was removed.
+            let branches = src.matches("else if").count();
+            assert!(
+                branches >= min_dispatch_branches,
+                "{name} must keep its computed-value dispatch chains \
+                 (expected >= {min_dispatch_branches} `else if`, found {branches}); \
+                 those select among computed lets and can never become a table"
+            );
+            assert!(
+                branches < min_dispatch_branches + 100,
+                "{name} still looks like it carries an unrolled 254-branch \
+                 S-box chain: {branches} `else if` against a dispatch floor \
+                 of {min_dispatch_branches}"
+            );
+
+            // VALUES: this file's own table, byte for byte.
+            let table = extract_declared_byte_table(&src);
+            assert_eq!(table.len(), 256, "{name}'s declared table must be 256 bytes");
+            assert_eq!(
+                table.as_slice(), &oracle[..],
+                "{name}'s declared table must match the GF(2^8)-derived S-box"
+            );
+            assert_eq!(
+                table, ref_table,
+                "{name}'s table must be byte-identical to aes_sbox.verbose's"
+            );
+
+            // RUNTIME: compile this file's `aes_sbox` rule and exercise all 256.
+            let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            assert!(
+                crate::verifier::verify_program(&program, std::path::Path::new("examples"))
+                    .is_empty(),
+                "{name} must verify"
+            );
+
+            let out = std::env::temp_dir().join(format!("verbosec_test_family_{name}"));
+            compile_native(&program, "aes_sbox", out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{name}::aes_sbox must compile: {e:?}"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+
+            for b in 0u16..=255 {
+                let o = std::process::Command::new(&out)
+                    .arg(b.to_string())
+                    .output()
+                    .expect("run aes_sbox");
+                assert!(o.status.success(), "{name}::aes_sbox({b}) must exit 0");
+                let got: u16 = String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse()
+                    .expect("numeric output");
+                assert_eq!(
+                    got as u8, oracle[b as usize],
+                    "{name}::aes_sbox({b}) = {got}, GF(2^8)-derived S-box says {}",
+                    oracle[b as usize]
+                );
+            }
+
+            // Fail-closed out of range, in every file.
+            for bad in ["256", "300", "-1"] {
+                let o = std::process::Command::new(&out)
+                    .arg(bad)
+                    .output()
+                    .expect("run aes_sbox out of range");
+                assert_eq!(
+                    o.status.code(), Some(1),
+                    "{name}::aes_sbox({bad}) must exit 1"
+                );
+                assert!(
+                    o.stdout.is_empty(),
+                    "{name}::aes_sbox({bad}) must print nothing"
+                );
+            }
+
+            let _ = std::fs::remove_file(&out);
+        }
+    }
+
+    /// Decode the byte table read by the first `byte_at(b"...", ...)` in a
+    /// source file.
+    ///
+    /// Deliberately a SEPARATE decoder from the lexer's: this test exists to
+    /// check the bytes an auditor reads in the file, so reusing the lexer
+    /// would let a lexer bug agree with itself.
+    ///
+    /// The anchor is `byte_at(b"` rather than a bare `b"`, and that is not
+    /// pedantry — every one of these files carries a PROSE comment above the
+    /// rule containing the characters `b"..."`, so a bare search finds the
+    /// comment and decodes three dots. Caught by this test on its first run.
+    fn extract_declared_byte_table(src: &str) -> Vec<u8> {
+        const ANCHOR: &str = "byte_at(b\"";
+        let start = src.find(ANCHOR).expect("a byte_at(b\"...\") read must be present")
+            + ANCHOR.len();
+        let rest = &src[start..];
+        let end = rest.find('"').expect("the byte literal must be terminated");
+        let body = &rest[..end];
+
+        let raw: Vec<char> = body.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == '\\' {
+                assert!(i + 1 < raw.len(), "dangling backslash in byte literal");
+                match raw[i + 1] {
+                    'x' | 'X' => {
+                        assert!(i + 3 < raw.len(), "truncated \\xNN in byte literal");
+                        let hex: String = raw[i + 2..i + 4].iter().collect();
+                        out.push(u8::from_str_radix(&hex, 16).expect("two hex digits"));
+                        i += 4;
+                    }
+                    'n' => { out.push(b'\n'); i += 2; }
+                    'r' => { out.push(b'\r'); i += 2; }
+                    't' => { out.push(b'\t'); i += 2; }
+                    '\\' => { out.push(b'\\'); i += 2; }
+                    '"' => { out.push(b'"'); i += 2; }
+                    other => panic!("unexpected escape \\{other} in byte literal"),
+                }
+            } else {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(raw[i].encode_utf8(&mut buf).as_bytes());
+                i += 1;
+            }
+        }
+        out
+    }
+
     #[test]
     fn aes_round_transforms_match_reference() {
         // Validates sub_bytes / shift_rows / mix_columns / add_round_key in
@@ -47418,7 +47622,35 @@ rule pick
         // own binary grew 651769 -> 657831 B (+6062, eight rules, no new
         // concepts); R0/R1/R2 hold. Tracked as the second INVERSE_CAPABILITY
         // fixture, `examples/negative/byte_table_indexed`.
-        const EXPECTED_ACCEPTED: usize = 99;
+        //
+        // 99 -> 93 (the AES family adopts the same declared table): the other
+        // SIX files that carried an embedded copy of the same 254-branch
+        // S-box chain — `aes_key_expansion`, `aes_transforms`, `aes_encrypt`,
+        // `aes_ctr`, `aes_gctr`, `aes_gcm` — now spell it as
+        // `byte_at(b"...", inp.b)` too, so gen0 refuses all six for exactly
+        // the reason it already refused `aes_sbox`. Same `bytelit_operands`
+        // gate, same fail-closed shape: measured rc 1 with ZERO bytes on all
+        // seven AES files.
+        //
+        // THE COST IS REAL AND IS NOT WHAT THE COUNT SUGGESTS, so it is
+        // measured here rather than waved through. Unlike the 100 -> 99 drop
+        // above, gen0's pre-change binaries for these six WORKED — they did
+        // not trap. But all six were THE SAME PROGRAM. Rule #0 in each of
+        // these files is `aes_sbox`, and gen0 enters at rule #0, so each
+        // "acceptance" compiled the shared leaf helper and none of them
+        // compiled the file's subject. Measured with this same gen0 against
+        // the pre-change sources: `aes_gcm` produced a 672023-byte binary
+        // answering 99 / 124 / 202 / 22 for inputs 0 / 1 / 16 / 255 — the
+        // FIPS-197 S-box, byte-exact, with no GCM anywhere in it — and the
+        // other five answered identically at 53884 / 30295 / 72215 / 73207 /
+        // 136045 bytes. So the six units of corpus credit were six copies of
+        // one leaf helper, which is precisely the over-claim the metric note
+        // in CLAUDE.md documents ("gen0 accepts aes_gcm" meant "gen0 compiled
+        // aes_sbox"). What is genuinely lost is ONE working S-box binary,
+        // counted six times; `aes_sbox.verbose` had already been dropped at
+        // 99 for the same shape, so the capability gap itself is not new and
+        // no NEW class of program became uncompilable.
+        const EXPECTED_ACCEPTED: usize = 93;
         const EXPECTED_TOTAL: usize = 151;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
@@ -50425,43 +50657,56 @@ rule probe
             (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).trim().to_string())
         };
 
-        // ── (a) NUMBER upper/lower bound on the argv channel, FIPS-197 oracle ──
+        // ── (a) NUMBER upper/lower bound on the argv channel, external oracle ──
         //
-        // THE SOURCE FILE MOVED, AND THE PIN DID NOT WEAKEN (2026-08-17). This
-        // read `examples/aes_sbox.verbose` until that file became a DECLARED
-        // CONSTANT TABLE (`byte_at(b"...", inp.b)`) — a shape gen0 cannot emit,
-        // so gen0 now refuses it and `emit("sbox", ...)` started failing on its
-        // `gen0 must accept + emit` assertion. The right response was to source
-        // the SAME MEASUREMENT from a file gen0 still compiles, not to relax
-        // anything: `examples/aes_transforms.verbose` declares the identical
-        // entry field `b : number [0, 255]`, its rule #0 is likewise named
-        // `aes_sbox`, it is likewise a 254-branch if/else chain, and it answers
-        // with the identical FIPS-197 values (0 -> 99, 255 -> 22). Every
-        // assertion below is byte-for-byte what it was; only the file supplying
-        // the bounded field changed. Both facts are asserted rather than
-        // assumed, so a future edit to aes_transforms fails HERE with a clear
-        // reason instead of silently making the sub-case vacuous.
-        let sbox_src = fs::read_to_string("examples/aes_transforms.verbose")
-            .expect("examples/aes_transforms.verbose must exist");
-        assert!(sbox_src.contains("b : number [0, 255]"),
-            "this pin assumes aes_transforms' entry field is `b : number [0, 255]`");
-        assert!(sbox_src.contains("\nrule aes_sbox\n"),
-            "this pin assumes aes_transforms' rule #0 is the S-box, so gen0's \
+        // THE SOURCE FILE HAS MOVED TWICE, AND THE PIN HAS NOT WEAKENED EITHER
+        // TIME. It read `examples/aes_sbox.verbose` until that file became a
+        // DECLARED CONSTANT TABLE (`byte_at(b"...", inp.b)`, PR #173) — a shape
+        // gen0 cannot emit — and was re-hosted on
+        // `examples/aes_transforms.verbose`, whose rule #0 was the same S-box
+        // spelled as a 254-branch if/else chain. That re-host was correct and
+        // SHORT-LIVED BY CONSTRUCTION: it parked the pin on the very spelling
+        // the table form exists to replace, so the next file to adopt the table
+        // reclaimed it. It did, one slice later, when the whole AES family
+        // converted.
+        //
+        // So the host is now chosen for a property that is NOT about to be
+        // refactored away: `examples/factorial.verbose` declares
+        // `v : number [0, 10]` and computes `v!`. It is a better host than
+        // either predecessor on the two axes that matter here. (1) The oracle is
+        // arithmetic — `0! = 1`, `10! = 3628800` — so the in-range answers are
+        // still checkable against something outside this repo, which is the
+        // whole reason the sub-case used FIPS-197 rather than a synthetic rule.
+        // (2) The bound is LOAD-BEARING rather than incidental: CLAUDE.md's
+        // slice-5.1b row rests the "audit-defensible max stack" claim for
+        // recursion on exactly this field-load check, since `[0, 10]` is what
+        // caps `fact`'s recursion depth at 11. A regression here is therefore a
+        // safety regression, not just a wrong number.
+        //
+        // Both host assumptions are asserted rather than assumed, so a future
+        // edit to factorial.verbose fails HERE with a clear reason instead of
+        // silently making the sub-case vacuous.
+        let bnd_src = fs::read_to_string("examples/factorial.verbose")
+            .expect("examples/factorial.verbose must exist");
+        assert!(bnd_src.contains("v : number [0, 10]"),
+            "this pin assumes factorial's entry field is `v : number [0, 10]`");
+        assert!(bnd_src.contains("\nrule fact\n"),
+            "this pin assumes factorial's rule #0 is `fact`, so gen0's \
              entry-index-0 invocation lands on it");
-        let sbox = emit("sbox", &sbox_src);
-        // In range: the answers are FIPS-197's forward S-box, not the
-        // compiler's opinion.
-        assert_eq!(run(&sbox, &["0"]), (0, "99".to_string()),
-            "aes_sbox(0) must be S-box[0] = 0x63 = 99 at rc 0");
-        assert_eq!(run(&sbox, &["255"]), (0, "22".to_string()),
-            "aes_sbox(255) must be S-box[255] = 0x16 = 22 at rc 0");
-        // Out of range: fail closed. Pre-slice ALL of these returned 22 at rc 0.
-        for bad in ["256", "300", "-5", "99999"] {
-            let (code, out) = run(&sbox, &[bad]);
+        let bnd = emit("bounded_number", &bnd_src);
+        // In range: the answers are arithmetic, not the compiler's opinion.
+        assert_eq!(run(&bnd, &["0"]), (0, "1".to_string()),
+            "fact(0) must be 0! = 1 at rc 0");
+        assert_eq!(run(&bnd, &["10"]), (0, "3628800".to_string()),
+            "fact(10) must be 10! = 3628800 at rc 0");
+        // Out of range: fail closed. Pre-slice these ran the rule body anyway,
+        // which for a recursive rule means unbounded recursion depth.
+        for bad in ["11", "300", "-5", "99999"] {
+            let (code, out) = run(&bnd, &[bad]);
             assert_eq!(code, 1,
-                "gen0-emitted aes_sbox must exit 1 on out-of-range b={bad} (got rc {code}, stdout {out:?})");
+                "gen0-emitted fact must exit 1 on out-of-range v={bad} (got rc {code}, stdout {out:?})");
             assert!(out.is_empty(),
-                "an out-of-range input must produce NO output, got {out:?} for b={bad}");
+                "an out-of-range input must produce NO output, got {out:?} for v={bad}");
         }
 
         // ── (b) NEGATIVE min, and (e) an unbounded companion stays unchecked ──
@@ -50633,7 +50878,7 @@ rule pick
             "exactly ONE 54-byte number check must separate the two programs; a `bytes [..16]` \
              field must contribute no check at all (got a {d}-byte difference)");
 
-        for p in [&gen0, &sbox, &neg, &txt, &big, &with_num, &no_num] {
+        for p in [&gen0, &bnd, &neg, &txt, &big, &with_num, &no_num] {
             let _ = fs::remove_file(p);
         }
     }
