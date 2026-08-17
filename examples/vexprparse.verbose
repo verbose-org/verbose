@@ -18130,6 +18130,299 @@ rule lint_callees_list
       bound : 4000
 
 
+-- ============ BYTE-LITERAL OPERAND CHECK (2026-08-17) ============
+-- verbosec's `byte_at(<text>, <i>)` and `length(<text>)` now accept a b"..."
+-- byte-string LITERAL where a text expression is expected, so a constant byte
+-- table can be DECLARED instead of unrolled (examples/aes_sbox.verbose: 10967 B
+-- of chained if/else collapsed to an 833 B indexed read). gen0 CANNOT EMIT that,
+-- and — until this check — did not know it.
+--
+-- Why gen0 cannot: a gen0 text value is a packed (start, len) SPAN into the
+-- EMBEDDED SOURCE BLOB, and the blob holds the raw four-character escape text
+-- `\x63`, not the decoded byte 0x63. x86_node's byte_at arm emits
+-- `movzx eax, [src_base + start + i]`, so an AstBytes operand would index the
+-- ESCAPE TEXT even if it lowered at all — and it does not lower: x86_node's
+-- AstBytes arm is the int3 placeholder, so the emitted binary SIGTRAPs.
+-- Measured on the new examples/aes_sbox.verbose before this check: gen0
+-- accepted at rc 0, wrote a 2952-byte ELF, and every valid input 0..255 died
+-- with rc 133 (SIGTRAP). That is the accept-what-you-cannot-emit class, the
+-- most serious one in this file's gaps table.
+--
+-- gen0 HAS a byte-literal decoder (bytelit_decoded_len / bytelit_byte_at), but
+-- it feeds only the EFFECT paths (reaction / service / fetch content), which
+-- emit a real inline data block rather than a span. Serving byte_at / length
+-- would need a post-blob DATA REGION threaded through blob_end_off's size chain
+-- so the two walks agree on where the blob ends — a real arc, not a slice. So
+-- this is a REFUSAL, in the safe direction (gen0 refusing what verbosec
+-- accepts: the INVERSE_CAPABILITY bucket), not a silently wrong binary.
+--
+-- SCOPE is PRESENT, not REACHABLE — anywhere in the program, not just what the
+-- entry rule reaches. Cheaper and stricter than entry_freshtext's DFS, and
+-- admissible here because the operand form is BRAND NEW: no program predating
+-- it can contain one, so a PRESENT scope cannot cost an existing file. (Compare
+-- entry_freshtext, where PRESENT scope WOULD have refused enrich /
+-- order_intake, which is why that one walks reachability instead.)
+--
+-- SCOPE is also exactly the two BYTE-ADDRESSED primitives, keyed on the CALLEE
+-- SPAN, and that is the load-bearing constraint: THIS FILE IS BUILT OUT OF
+-- b"..." LITERALS -- every emitted machine-code fragment is
+-- concat(b"\x48\xb8", le64(...), ...). A check that fired on an AstBytes in any
+-- other position would make gen0 REFUSE ITSELF and collapse the self-hosting
+-- fixed point. So the count is charged ONLY when the callee span spells
+-- `byte_at` or `length` AND that call's FIRST argument is an AstBytes leaf --
+-- which is the whole shape, since byte_at's first arg is the haystack and
+-- length takes exactly one. Verified: this file contains zero `byte_at(b"` and
+-- zero `length(b"` sites.
+--
+-- The walk descends into every Ast node family, arm-for-arm identically to
+-- count_badcall_ast (the reference full-tree lint), so a byte_at(b"..") nested
+-- inside if / concat / a collection node / Ok(...) is caught. It reuses that
+-- lint's five state concepts unchanged rather than declaring its own: the
+-- `rules` field is threaded but never consulted (there is no callee to
+-- resolve), which costs one slot per state node and keeps the two walks
+-- textually comparable.
+
+
+-- ast_is_bytelit: 1 iff the node is a b"..." byte-literal leaf, 0 for every
+-- other shape. Flat one-arm-per-variant predicate, the same shape as
+-- ast_var_start / ast_var_len (no recursion, no descent) -- the caller decides
+-- WHERE to ask the question.
+rule ast_is_bytelit
+  @intention: "1 if an AST node is a byte-string literal leaf, 0 otherwise"
+  @source: vexprparse.intent:33
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 1
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- count_bytelit_args: sum count_bytelit_ast over every argument of a call.
+-- Mutually recursive with count_bytelit_ast, exactly as count_badcall_args is
+-- with count_badcall_ast -- this is how a byte_at(b"..") sitting INSIDE another
+-- call's argument list is reached.
+rule count_bytelit_args
+  @intention: "Total byte-literal byte_at/length operands across every argument of a call"
+  @source: vexprparse.intent:33
+  input:
+    a : BadCallArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_bytelit_ast(BadCallState { node: head, rules: a.rules, src: a.src }) + count_bytelit_args(BadCallArgsState { args: tail, rules: a.rules, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.rules, a.src]
+      calls : [count_bytelit_ast, count_bytelit_args]
+    termination:
+      bound : 4000
+
+
+-- count_bytelit_vfields: sum count_bytelit_ast over every field value of a
+-- variant / record construction.
+rule count_bytelit_vfields
+  @intention: "Total byte-literal byte_at/length operands across every field value of a variant construct"
+  @source: vexprparse.intent:33
+  input:
+    a : BadCallVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_bytelit_ast(BadCallState { node: val, rules: a.rules, src: a.src }) + count_bytelit_vfields(BadCallVFieldsState { fields: rest, rules: a.rules, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.rules, a.src]
+      calls : [count_bytelit_ast, count_bytelit_vfields]
+    termination:
+      bound : 4000
+
+
+-- count_bytelit_arms: sum count_bytelit_ast over every match arm body. Arm
+-- binders are irrelevant here (the check is on a callee SPAN and a literal
+-- leaf, neither of which a binder can shadow), so nothing is threaded but the
+-- source.
+rule count_bytelit_arms
+  @intention: "Total byte-literal byte_at/length operands across every match arm body"
+  @source: vexprparse.intent:33
+  input:
+    a : BadCallArmsState
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src }) + count_bytelit_arms(BadCallArmsState { arms: rest, rules: a.rules, src: a.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.rules, a.src]
+      calls : [count_bytelit_ast, count_bytelit_arms]
+    termination:
+      bound : 4000
+
+
+-- count_bytelit_ast: walk an Ast and count the byte_at / length calls whose
+-- FIRST argument is a b"..." literal. Every arm mirrors count_badcall_ast's
+-- descent node-for-node -- including the twelve Result / collection families
+-- PR #150 and PR #166 found stubbed in the sibling walks -- so an offending
+-- site is caught wherever the language can put it. Only the AstCall arm
+-- contributes; every other arm is pure descent or a 0 leaf.
+--
+-- The AstCall test is deliberately narrow (see the banner): the callee span
+-- must spell `byte_at` or `length` (reusing span_is_byte_at / span_is_length,
+-- the SAME recognizers x86_node's emit arms dispatch on, so this check can
+-- never disagree with the emitter about which primitive a call is), AND
+-- arg_first must be the byte literal. A byte literal ANYWHERE ELSE -- a concat
+-- argument, an le32 / le64 argument, a bare result -- charges nothing, which is
+-- what keeps this file (built entirely out of such literals) compiling itself.
+rule count_bytelit_ast
+  @intention: "Total byte_at/length calls taking a byte-string literal operand in an AST"
+  @source: vexprparse.intent:33
+  input:
+    a : BadCallState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_bytelit_ast(BadCallState { node: lhs, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: rhs, rules: a.rules, src: a.src })
+      AstNeg(inner) => count_bytelit_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstNot(inner) => count_bytelit_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => count_bytelit_ast(BadCallState { node: base, rules: a.rules, src: a.src })
+      AstCall(callee_start, callee_len, args) => (if (span_is_byte_at(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1 or span_is_length(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1) and ast_is_bytelit(arg_first(args)) == 1 then 1 else 0) + count_bytelit_args(BadCallArgsState { args: args, rules: a.rules, src: a.src })
+      AstIf(cond, thn, els) => count_bytelit_ast(BadCallState { node: cond, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: thn, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: els, rules: a.rules, src: a.src })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_bytelit_vfields(BadCallVFieldsState { fields: fields, rules: a.rules, src: a.src })
+      AstMatch(scrut, arms) => count_bytelit_ast(BadCallState { node: scrut, rules: a.rules, src: a.src }) + count_bytelit_arms(BadCallArmsState { arms: arms, rules: a.rules, src: a.src })
+      AstOk(inner) => count_bytelit_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstResErr(inner) => count_bytelit_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => count_bytelit_ast(BadCallState { node: scrut, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: ok_body, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: err_body, rules: a.rules, src: a.src })
+      AstSum(coll, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstCount(coll, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: init, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstAll(coll, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstAny(coll, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMap(coll, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstFilter(coll, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMinFold(coll, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMaxFold(coll, item_start, item_len, body) => count_bytelit_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_bytelit_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+  proofs:
+    purity:
+      reads : [a.node, a.rules, a.src]
+      calls : [count_bytelit_ast, count_bytelit_args, count_bytelit_vfields, count_bytelit_arms, span_is_byte_at, span_is_length, ast_is_bytelit, arg_first]
+    termination:
+      bound : 4000
+
+
+-- count_bytelit_binds: walk every let RHS in a rule's binding list. A let RHS is
+-- as much a part of the rule's body as its result, and x86_let_stores lowers it
+-- through the same x86_node -- so an offending site there traps identically.
+rule count_bytelit_binds
+  @intention: "Total byte-literal byte_at/length operands across every binding's RHS"
+  @source: vexprparse.intent:33
+  input:
+    b : BadCallBindsState
+  output:
+    out : number
+  logic:
+    out = match b.binds:
+      BCons(name_start, name_len, value, rest) => count_bytelit_ast(BadCallState { node: value, rules: b.rules, src: b.src }) + count_bytelit_binds(BadCallBindsState { binds: rest, rules: b.rules, src: b.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b.binds, b.rules, b.src]
+      calls : [count_bytelit_ast, count_bytelit_binds]
+    termination:
+      bound : 4000
+
+
+-- bytelit_rule: the offending-site count for ONE rule -- its let RHSes plus its
+-- result expression, the same two halves badcall_rule splits a body into.
+rule bytelit_rule
+  @intention: "Number of byte_at/length calls with a byte-literal operand in one rule"
+  @source: vexprparse.intent:33
+  input:
+    br : BadCallRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(br.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let bad_in_binds = count_bytelit_binds(BadCallBindsState { binds: binds, rules: br.rules, src: br.src })
+    out = bad_in_binds + count_bytelit_ast(BadCallState { node: result, rules: br.rules, src: br.src })
+  proofs:
+    purity:
+      reads : [br.rd, br.rules, br.src]
+      calls : [rd_body, block_binds, block_result, count_bytelit_binds, count_bytelit_ast]
+    termination:
+      bound : 16
+
+
+-- bytelit_operands: the verrs term. Sum bytelit_rule over EVERY rule in the
+-- program (PRESENT scope -- see the banner). Each per-rule walk is arena_scope'd
+-- so the sweep's peak allocation is one rule's body rather than the whole
+-- program's, the same discipline nonentry_offenders uses. Nonzero refuses
+-- emission (exit 1, zero bytes) through the verrs gate.
+rule bytelit_operands
+  @intention: "Total byte_at/length calls taking a byte-string literal operand in a program (nonzero refuses emission)"
+  @source: vexprparse.intent:33
+  input:
+    lc : LintCalleesState
+  output:
+    out : number
+  logic:
+    out = match lc.iter:
+      RCons(head, tail) => arena_scope(bytelit_rule(BadCallRuleState { rd: head, rules: lc.full, src: lc.src })) + bytelit_operands(LintCalleesState { iter: tail, full: lc.full, src: lc.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [lc.iter, lc.full, lc.src]
+      calls : [bytelit_rule, bytelit_operands]
+    termination:
+      bound : 4000
+
+
 -- lint_callees: the brick-15 money-shot driver. Tokenize the program source (with
 -- indentation), parse the whole rule-decl sequence into a RuleList, then fold
 -- badcall_rule over it with `iter = full = the parsed program` so every rule
@@ -34759,7 +35052,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(bad_entry + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -34831,7 +35124,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
+      calls : [begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
     termination:
       bound : 256
 

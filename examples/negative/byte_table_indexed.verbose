@@ -1,0 +1,72 @@
+@verbose 0.1.0
+
+-- CATEGORY: INVERSE_CAPABILITY. Read that label carefully — it is NOT the
+-- other kind of inverse, and the two are opposites.
+--
+-- THIS PROGRAM IS VALID. verbosec verifies it, compiles it, and the binary is
+-- correct: `byte_at` over a `b"..."` literal is a DECLARED CONSTANT TABLE read
+-- by index, bounds-checked fail-closed. So there is no bug in the reference
+-- here and nothing to fix in src/verifier.rs. Do not go looking. (Contrast
+-- `bad_arity`, the corpus's only ever INVERSE_REFERENCE_GAP, where verbosec
+-- was the permissive one and the fix genuinely belonged in the reference.)
+--
+-- gen0 REFUSES it, and must, for the SAME representational reason as
+-- `match_freshtext_in_callee` — which is why the two sit in the same bucket
+-- rather than each getting its own story. A gen0 text value is a packed
+-- (start, len) span into the embedded SOURCE BLOB, and the source blob holds
+-- the raw four characters `\x63`, not the decoded byte 0x63. There is nothing
+-- for a span to point at, and the offset a real inline data block would need
+-- is BELOW src_base, i.e. negative, which the packing cannot carry. gen0 does
+-- own a `\xNN` decoder (`bytelit_unit_byte`), but it feeds only the EFFECT
+-- paths (reaction content, service body, fetch request), which emit a real
+-- data block instead of a span.
+--
+-- Until this refusal landed, gen0 did the unsafe thing: it ACCEPTED the
+-- rewritten `examples/aes_sbox.verbose` at rc 0 and emitted a 2956-byte binary
+-- that SIGTRAPped (int3, rc -5) on EVERY valid input 0..255, where verbosec's
+-- 833-byte binary returns the byte-exact FIPS-197 S-box. Before the rewrite
+-- gen0 emitted a working 19418-byte binary for the same file's 254-branch
+-- if/else spelling, so this is a capability gap the language feature exposed,
+-- not a regression in gen0's own logic. A compiler must never emit a binary
+-- that traps on a reachable arm, so the verdict is verify time: exit 1, zero
+-- bytes.
+--
+-- WHEN THIS STOPS BEING AN INVERSE: gen0 grows a post-blob data region wired
+-- through `blob_end_off`'s size chain, so a decoded table can live at a
+-- POSITIVE offset from src_base and a span can address it. The fixture then
+-- lands in `both_ok`, which the sweep refuses outright, because a program both
+-- compilers accept measures nothing. REPLACE it with runtime agreement pins at
+-- that point — do not just delete it.
+--
+-- The table below is deliberately tiny and deliberately contains `\x00`: that
+-- byte is the one a text literal could not carry at all, and it is why
+-- `examples/aes_sbox.verbose` needs `\xNN` rather than merely liking it
+-- (S[82] = 0x00).
+
+concept Idx
+  @intention: "A zero-based index into a declared constant byte table"
+  @source: negative.intent:1
+
+  fields:
+    i : number [0, 3]
+
+
+rule table_byte
+  @intention: "Read one byte out of a declared constant table"
+  @source: negative.intent:2
+
+  input:
+    inp : Idx
+
+  output:
+    out : number
+
+  logic:
+    out = byte_at(b"\x00\x41\x80\xff", inp.i)
+
+  proofs:
+    purity:
+      reads   : [inp.i]
+      calls   : []
+    termination:
+      bound : 1

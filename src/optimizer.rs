@@ -828,10 +828,18 @@ pub fn optimize_expr(
         // `length(<text_expr>)` — if the inner is a text literal, fold the
         // byte count at compile time. Otherwise recurse and keep the
         // wrapper for the backend to lower at runtime.
+        //
+        // A `b"..."` byte-string literal folds the same way, and is EXACT
+        // where the text form is not: the lexer decoded each `\xNN` into one
+        // byte of a `Vec<u8>`, so `b.len()` is the declared table's real size.
+        // `length("\x..")` has no such spelling — text has no `\xNN`.
         Expr::Length(inner) => {
             let inner = optimize_expr(inner, input_name, field_ranges);
             if let Expr::Text(s) = &inner {
                 return Expr::Number(s.as_bytes().len() as i64);
+            }
+            if let Expr::Bytes(b) = &inner {
+                return Expr::Number(b.len() as i64);
             }
             Expr::Length(Box::new(inner))
         }
@@ -925,11 +933,21 @@ pub fn optimize_expr(
         // fold when both have collapsed to literals AND the index is in
         // range. Out-of-range literal indices keep the wrapper so the
         // runtime path can fail-closed (sys_exit(1) in native).
+        //
+        // A `b"..."` byte-string haystack folds through the same gate. The
+        // `*idx as usize` cast is what makes a NEGATIVE index safe in both
+        // arms: it wraps to a huge value, `.get()` returns None, the wrapper
+        // survives and the runtime bounds check fails closed.
         Expr::ByteAt(t, i) => {
             let t_opt = optimize_expr(t, input_name, field_ranges);
             let i_opt = optimize_expr(i, input_name, field_ranges);
             if let (Expr::Text(text), Expr::Number(idx)) = (&t_opt, &i_opt) {
                 if let Some(&b) = text.as_bytes().get(*idx as usize) {
+                    return Expr::Number(b as i64);
+                }
+            }
+            if let (Expr::Bytes(table), Expr::Number(idx)) = (&t_opt, &i_opt) {
+                if let Some(&b) = table.get(*idx as usize) {
                     return Expr::Number(b as i64);
                 }
             }
