@@ -15606,6 +15606,14 @@ fn emit_length(
             emit_mov_rax_imm(code, n);
             Ok(())
         }
+        // Same defensive shape for a `b"..."` byte-string literal: the
+        // optimizer folds `length(b"...")` to a Number and this arm should
+        // never run, but a non-optimized path must not silently fall through
+        // to the catch-all refusal and lose a length the compiler knows.
+        Expr::Bytes(b) => {
+            emit_mov_rax_imm(code, b.len() as i64);
+            Ok(())
+        }
         Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) => {
             // BoundText path takes precedence: a field whose name is in
             // text_bindings has its length at the registered len_slot
@@ -15952,10 +15960,27 @@ fn emit_starts_with_load_text(
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match expr {
-        Expr::Text(s) => {
-            let bytes = s.as_bytes();
+        // A `b"..."` byte-string literal is embedded exactly like a text
+        // literal — the bytes differ, the shape does not. `Expr::Bytes` already
+        // holds the DECODED `Vec<u8>` (the lexer turned each `\xNN` into one
+        // byte), so there is no re-decoding here and no UTF-8 in the path.
+        //
+        // Reachable only from `byte_at` / `length`: every other caller of this
+        // helper has its operand checked against `Type::Text` by the verifier,
+        // so a bytes literal never gets here through `starts_with`, `contains`,
+        // `ends_with`, `substring`, `json_escape` or `parse_int`. The verifier
+        // is the gate; this arm is the lowering.
+        Expr::Text(_) | Expr::Bytes(_) => {
+            let bytes: &[u8] = match expr {
+                Expr::Text(s) => s.as_bytes(),
+                Expr::Bytes(b) => b.as_slice(),
+                _ => unreachable!(),
+            };
             let n = bytes.len() as i32;
-            // jmp over inline bytes
+            // jmp over inline bytes. The rel8 form only reaches 127, so a
+            // table larger than that (a 256-entry lookup, say) takes the
+            // rel32 form — both displacements are measured from the END of
+            // the jmp, which is why the operand is exactly `n` either way.
             if n <= 127 {
                 code.push(0xEB);
                 code.push(n as u8);
@@ -40289,6 +40314,448 @@ rule do_shl
         let _ = std::fs::remove_file(&out);
     }
 
+    // ---------------------------------------------------------------
+    // Declared constant byte tables: `byte_at(b"...", i)` / `length(b"...")`
+    //
+    // The slice that made examples/aes_sbox.verbose a DECLARED TABLE instead
+    // of a 254-branch if/else chain (10967 B -> 833 B). `b"..."` was already
+    // the only place `\xNN` is legal; what these pin is that the two
+    // BYTE-ADDRESSED primitives can now read one, that the bytes survive
+    // exactly (0x00 and >= 0x80 included), that the isolation between `bytes`
+    // and `text` is otherwise untouched, and that the table is the real
+    // FIPS-197 S-box measured against an independently DERIVED oracle.
+    // ---------------------------------------------------------------
+
+    /// Build a one-rule probe whose body is `out = <expr>` over `inp : Idx`
+    /// with a single field `i : number [0, hi]`. Used by the byte-table pins.
+    fn byte_table_probe_src(expr: &str, hi: i64) -> String {
+        format!(
+            "@verbose 0.1.0\n\
+             \n\
+             concept Idx\n\
+             \x20 @intention: \"index into a declared table\"\n\
+             \x20 @source: probe.intent:1\n\
+             \x20 fields:\n\
+             \x20   i : number [0, {hi}]\n\
+             \n\
+             \n\
+             rule pick\n\
+             \x20 @intention: \"read one byte of a declared constant table\"\n\
+             \x20 @source: probe.intent:2\n\
+             \x20 input:\n\
+             \x20   inp : Idx\n\
+             \x20 output:\n\
+             \x20   out : number\n\
+             \x20 logic:\n\
+             \x20   out = {expr}\n\
+             \x20 proofs:\n\
+             \x20   purity:\n\
+             \x20     reads : [inp.i]\n\
+             \x20     calls : []\n\
+             \x20   termination:\n\
+             \x20     bound : 20\n"
+        )
+    }
+
+    /// The AES forward S-box DERIVED from first principles in GF(2^8)
+    /// (FIPS-197 sec 5.1.1): S(a) = affine(multiplicative_inverse(a)) under
+    /// the AES reduction polynomial x^8 + x^4 + x^3 + x + 1.
+    ///
+    /// This is deliberately a DERIVATION and not a transcription. The sibling
+    /// test `aes_sbox_exhaustive_matches_fips197` compares the binary against
+    /// a pasted 256-entry constant, which validates the emitter but cannot
+    /// validate the constant — and the constant and the .verbose table would
+    /// now come from the same place. Computing the field inverse by search
+    /// makes the oracle independent of anything in this repository.
+    fn derive_aes_sbox() -> [u8; 256] {
+        fn gmul(mut a: u8, mut b: u8) -> u8 {
+            let mut p = 0u8;
+            for _ in 0..8 {
+                if b & 1 != 0 {
+                    p ^= a;
+                }
+                let hi = a & 0x80;
+                a <<= 1;
+                if hi != 0 {
+                    a ^= 0x1b;
+                }
+                b >>= 1;
+            }
+            p
+        }
+        let mut sbox = [0u8; 256];
+        for a in 0u16..=255 {
+            let a = a as u8;
+            // Multiplicative inverse by exhaustive search over the field.
+            let inv = if a == 0 {
+                0
+            } else {
+                (1u16..=255)
+                    .map(|x| x as u8)
+                    .find(|&x| gmul(a, x) == 1)
+                    .expect("every non-zero element of GF(2^8) has an inverse")
+            };
+            let r = |s: u32| inv.rotate_left(s);
+            sbox[a as usize] = inv ^ r(1) ^ r(2) ^ r(3) ^ r(4) ^ 0x63;
+        }
+        sbox
+    }
+
+    /// A `b"..."` byte-string literal read by `byte_at` yields the DECODED
+    /// byte, exactly, for every value a byte can take — including `\x00`
+    /// (which no text literal can carry through a length) and anything
+    /// `>= 0x80` (which a text literal would silently widen to two UTF-8
+    /// bytes, because `Expr::Text` is a Rust `String` and every backend
+    /// reads it back with `.as_bytes()`).
+    ///
+    /// Also pins the two properties that make the table safe to index:
+    /// native and the interpreter agree byte for byte, and an index outside
+    /// the table fails CLOSED (exit 1, nothing on stdout).
+    #[test]
+    fn byte_table_literal_indexes_byte_exactly() {
+        let src = byte_table_probe_src("byte_at(b\"\\x00\\x41\\x80\\xff\", inp.i)", 3);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_byte_table_exact");
+        compile_native(&program, "pick", out.to_str().unwrap(), false, false)
+            .expect("byte_at over a declared byte table must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+
+        // 0x00 first and 0xff last: the two values that a text literal cannot
+        // express at all (`"\x00"` / `"\xff"` are lex errors — text has no
+        // \xNN) and that a naive Latin-1 -> UTF-8 widening would corrupt.
+        let expected = [0i64, 65, 128, 255];
+        for (i, &want) in expected.iter().enumerate() {
+            let o = std::process::Command::new(&out)
+                .arg(i.to_string())
+                .output()
+                .expect("run the declared-table binary");
+            assert!(o.status.success(), "index {i} must succeed");
+            let got: i64 = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .expect("numeric output");
+            assert_eq!(
+                got, want,
+                "byte_at(b\"\\x00\\x41\\x80\\xff\", {i}) must be {want}, got {got}. \
+                 A value of 194 or 195 here means the bytes went through UTF-8."
+            );
+        }
+
+        // Out of the declared [0, 3] range: fail-closed, no output. Both the
+        // field bounds-check and byte_at's own unsigned compare cover this;
+        // what the pin asserts is the OBSERVABLE contract.
+        for bad in ["4", "9", "-1"] {
+            let o = std::process::Command::new(&out)
+                .arg(bad)
+                .output()
+                .expect("run the declared-table binary out of range");
+            assert_eq!(
+                o.status.code(),
+                Some(1),
+                "index {bad} must exit 1 (fail-closed), got {:?}",
+                o.status.code()
+            );
+            assert!(
+                o.stdout.is_empty(),
+                "index {bad} must write nothing to stdout, got {:?}",
+                String::from_utf8_lossy(&o.stdout)
+            );
+        }
+
+        // The interpreter must agree byte for byte — a declared table that
+        // means one thing under --run and another under --native would be
+        // exactly the silent-divergence class this repo treats as worst.
+        let all_rules: Vec<&crate::ast::Rule> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                crate::ast::Item::Rule(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let pick = *all_rules.iter().find(|r| r.name == "pick").unwrap();
+        for (i, &want) in expected.iter().enumerate() {
+            let mut input = std::collections::HashMap::new();
+            input.insert(
+                "i".to_string(),
+                crate::interpreter::Value::Number(i as i64),
+            );
+            match crate::interpreter::eval_rule(pick, &all_rules, &concepts, &input) {
+                Ok(crate::interpreter::Value::Number(n)) => assert_eq!(
+                    n, want,
+                    "interpreter disagrees with native at index {i}: {n} vs {want}"
+                ),
+                other => panic!("interpreter must return a number; got {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_file(&out);
+
+        // `length(b"...")` normally folds in the optimizer and never reaches
+        // the emitter — but `compile_native` is reachable WITHOUT the
+        // optimizer (this call, and several probe paths), so the defensive
+        // `Expr::Bytes` arm in `emit_length` is live code and is exercised
+        // here rather than left as an unrun branch. The table's four bytes
+        // include 0x00 and 0xff, so a length that counted anything but raw
+        // bytes would not be 4.
+        let src = byte_table_probe_src("length(b\"\\x00\\x41\\x80\\xff\") + inp.i", 3);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_byte_table_len");
+        compile_native(&program, "pick", out.to_str().unwrap(), false, false)
+            .expect("length over a declared byte table must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let o = std::process::Command::new(&out)
+            .arg("1")
+            .output()
+            .expect("run the length probe");
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            "5",
+            "length(b\"\\x00\\x41\\x80\\xff\") must be 4 (+ inp.i = 1)"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// The `\xNN` escape set stays CLOSED, and stays confined to `b"..."`.
+    ///
+    /// None of this is new behaviour — `b"..."` has carried `\xNN` since the
+    /// backend-bytes slice, and `src/lexer.rs` says so in as many words
+    /// ("This is the only place `\xNN` is legal — text stays a closed UTF-8
+    /// escape set, untouched"). It is pinned HERE because the declared-table
+    /// feature now depends on it: the table's correctness is the decoder's
+    /// correctness, and a malformed escape silently becoming two literal
+    /// characters would shift every subsequent entry.
+    #[test]
+    fn byte_table_escape_set_stays_closed() {
+        let lexes = |body: &str| -> Result<(), String> {
+            let src = byte_table_probe_src(body, 3);
+            crate::lexer::Lexer::new(&src)
+                .tokenize()
+                .map(|_| ())
+                .map_err(|e| e.message)
+        };
+
+        // Accepted: two hex digits, either case, either `\x` or `\X`.
+        for good in [
+            "byte_at(b\"\\x00\", inp.i)",
+            "byte_at(b\"\\xff\", inp.i)",
+            "byte_at(b\"\\xAb\", inp.i)",
+            "byte_at(b\"\\X41\", inp.i)",
+        ] {
+            assert!(lexes(good).is_ok(), "{good} must lex");
+        }
+
+        // Refused: a malformed \x is a LEX error, never two pass-through
+        // characters. Same discipline as the unknown-escape rule the closed
+        // set already enforces.
+        for (bad, want) in [
+            ("byte_at(b\"\\x\", inp.i)", "two hex digits"),
+            ("byte_at(b\"\\x0\", inp.i)", "two hex digits"),
+            ("byte_at(b\"\\xzz\", inp.i)", "two hex digits"),
+            ("byte_at(b\"\\xg1\", inp.i)", "two hex digits"),
+            ("byte_at(b\"\\q\", inp.i)", "unknown escape"),
+        ] {
+            let err = lexes(bad).expect_err(&format!("{bad} must be a lex error"));
+            assert!(
+                err.contains(want),
+                "{bad}: expected an error mentioning {want:?}, got {err:?}"
+            );
+        }
+
+        // And a TEXT literal still has no \xNN at all. This is the half that
+        // keeps the feature honest: `"\x80"` would have to become two UTF-8
+        // bytes, so the language refuses to let anyone write it rather than
+        // quietly meaning something else.
+        let err = lexes("byte_at(\"\\x41\", inp.i)")
+            .expect_err("\\x in a text literal must stay a lex error");
+        assert!(
+            err.contains("unknown escape"),
+            "text \\x must be refused as an unknown escape, got {err:?}"
+        );
+    }
+
+    /// A byte table is readable by `byte_at` and `length` and by NOTHING
+    /// else. `Type::Bytes` documents that "bytes never implicitly convert to
+    /// or from Text — the isolation is the point", and widening two
+    /// byte-addressed primitives must not have widened the rest.
+    ///
+    /// This one passes before the slice as well as after; it is a guard, not
+    /// a demonstration. Its job is to fail the day someone reaches for the
+    /// same relaxation in `check_expr_against`'s other text arms.
+    #[test]
+    fn byte_table_literal_refused_outside_byte_at_and_length() {
+        for body in [
+            "if starts_with(b\"\\x41\", \"A\") then 1 else 0",
+            "if contains(b\"\\x41\", \"A\") then 1 else 0",
+            "if ends_with(b\"\\x41\", \"A\") then 1 else 0",
+            "length(substring(b\"\\x41\\x42\", 0, 1))",
+            "parse_int(b\"\\x31\")",
+            "length(json_escape(b\"\\x41\"))",
+            "length(concat(\"x\", b\"\\x41\"))",
+        ] {
+            let src = byte_table_probe_src(body, 3);
+            let tokens = crate::lexer::Lexer::new(&src)
+                .tokenize()
+                .unwrap_or_else(|e| panic!("{body} must lex; got {e:?}"));
+            let program = crate::parser::Parser::new(tokens)
+                .parse_program()
+                .unwrap_or_else(|e| panic!("{body} must parse; got {e:?}"));
+            let errors = crate::verifier::verify_program(&program, std::path::Path::new("."));
+            assert!(
+                errors.iter().any(|e| e.message.contains("bytes")),
+                "{body} must be refused with a bytes/text type error; got {:?}",
+                errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// `length(b"...")` and a literal-indexed `byte_at(b"...", k)` fold at
+    /// compile time, so a declared table costs nothing when the index is
+    /// known. The negative index case is the interesting one: it must NOT
+    /// fold, so the runtime bounds check keeps its fail-closed job.
+    #[test]
+    fn declared_byte_table_folds_at_compile_time() {
+        let cases: [(&str, Option<i64>); 5] = [
+            ("length(b\"\\x00\\x01\\x02\")", Some(3)),
+            ("length(b\"\")", Some(0)),
+            ("byte_at(b\"\\x00\\x41\\x80\\xff\", 2)", Some(128)),
+            ("byte_at(b\"\\x00\\x41\", 9)", None),
+            ("byte_at(b\"\\x00\\x41\", 0 - 1)", None),
+        ];
+        for (body, want) in cases {
+            let src = byte_table_probe_src(body, 3);
+            let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            let (opt, _stats) = crate::optimizer::optimize_program(&program);
+            let rule = opt
+                .items
+                .iter()
+                .find_map(|i| match i {
+                    crate::ast::Item::Rule(r) if r.name == "pick" => Some(r),
+                    _ => None,
+                })
+                .expect("rule pick");
+            match (&rule.logic.value, want) {
+                (crate::ast::Expr::Number(n), Some(w)) => assert_eq!(
+                    *n, w,
+                    "{body} must fold to {w}, folded to {n}"
+                ),
+                (other, Some(w)) => panic!("{body} must fold to Number({w}); got {other:?}"),
+                (crate::ast::Expr::Number(n), None) => panic!(
+                    "{body} must NOT fold — an out-of-range index has to reach the \
+                     runtime bounds check; it folded to {n}"
+                ),
+                (_, None) => {}
+            }
+        }
+    }
+
+    /// examples/aes_sbox.verbose, as a DECLARED TABLE, against an S-box
+    /// derived in GF(2^8) rather than transcribed. All 256 entries.
+    ///
+    /// The test also pins the FORM, not just the values: the file must
+    /// express the table as one `byte_at(b"...")` read, not as the 254-branch
+    /// if/else chain it used to be. Values alone would stay green through a
+    /// revert, and the chain is what this slice exists to remove.
+    #[test]
+    fn aes_sbox_declared_table_matches_fips197_oracle() {
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(aes_sbox_declared_table_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn aes_sbox_declared_table_body() {
+        let oracle = derive_aes_sbox();
+
+        // Structural anchors on the DERIVATION itself, so a broken oracle
+        // fails here rather than quietly agreeing with a broken table.
+        // These are properties of the standard, not table entries: the
+        // S-box is a bijection, and it has exactly one zero (at 82, which
+        // is why a `\x00` in the literal is load-bearing rather than
+        // decorative).
+        let mut seen = [false; 256];
+        for &v in oracle.iter() {
+            assert!(!seen[v as usize], "the derived S-box must be a permutation");
+            seen[v as usize] = true;
+        }
+        let zeros: Vec<usize> = (0..256).filter(|&i| oracle[i] == 0).collect();
+        assert_eq!(zeros, vec![82], "the S-box has exactly one zero, at index 82");
+
+        let src = std::fs::read_to_string("examples/aes_sbox.verbose")
+            .expect("examples/aes_sbox.verbose must exist");
+
+        // FORM: a declared table, not an unrolled chain.
+        assert!(
+            src.contains("byte_at(b\""),
+            "aes_sbox must read a declared b\"...\" table"
+        );
+        let branches = src.matches("else if").count();
+        assert!(
+            branches < 8,
+            "aes_sbox must not be an unrolled if/else chain; found {branches} `else if`"
+        );
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        assert!(
+            crate::verifier::verify_program(&program, std::path::Path::new("examples")).is_empty(),
+            "aes_sbox must verify"
+        );
+
+        let out = std::env::temp_dir().join("verbosec_test_aes_sbox_declared");
+        compile_native(&program, "aes_sbox", out.to_str().unwrap(), false, false)
+            .expect("aes_sbox must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+
+        for b in 0u16..=255 {
+            let o = std::process::Command::new(&out)
+                .arg(b.to_string())
+                .output()
+                .expect("run aes_sbox");
+            assert!(o.status.success(), "aes_sbox({b}) must exit 0");
+            let got: u16 = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .expect("numeric output");
+            assert_eq!(
+                got as u8, oracle[b as usize],
+                "aes_sbox({b}) = {got}, GF(2^8)-derived S-box says {}",
+                oracle[b as usize]
+            );
+        }
+
+        // The declared `b : number [0, 255]` range is enforced at field-load,
+        // so an index the table cannot serve never reaches the table.
+        for bad in ["256", "300", "-1"] {
+            let o = std::process::Command::new(&out)
+                .arg(bad)
+                .output()
+                .expect("run aes_sbox out of range");
+            assert_eq!(o.status.code(), Some(1), "aes_sbox({bad}) must exit 1");
+            assert!(o.stdout.is_empty(), "aes_sbox({bad}) must print nothing");
+        }
+
+        let _ = std::fs::remove_file(&out);
+    }
+
     #[test]
     fn aes_round_transforms_match_reference() {
         // Validates sub_bytes / shift_rows / mix_columns / add_round_key in
@@ -46922,7 +47389,36 @@ rule pick
         // files' index-1 entries moved instead: token_label::label_of is now
         // byte-exact against verbosec, purchase::discounted_purchase now
         // refuses instead of emitting a binary whose Err arm SIGTRAPs.
-        const EXPECTED_ACCEPTED: usize = 100;
+        //
+        // 100 -> 99 (declared constant byte tables): a DELIBERATE drop of
+        // exactly ONE file, `aes_sbox`, and the first one in this series
+        // caused by a LANGUAGE FEATURE rather than by a gen0 slice. verbosec
+        // learned to read a `b"..."` byte-string literal with `byte_at` /
+        // `length`, so `examples/aes_sbox.verbose` became a declared 256-byte
+        // table (10967 B of chained if/else -> 833 B, byte-exact FIPS-197).
+        // gen0 cannot emit that shape: its text values are packed (start, len)
+        // spans into the embedded SOURCE BLOB, and the blob holds the raw four
+        // characters `\x63`, not the decoded byte 0x63 — so `x86_node`'s
+        // AstBytes arm is the int3 placeholder. Measured before the refusal:
+        // gen0 ACCEPTED at rc 0, wrote 2956 bytes, and EVERY valid input
+        // 0..255 died with SIGTRAP (rc 133), where gen0 had emitted a WORKING
+        // 19418-byte binary for the same file's previous if/else spelling. So
+        // the file went from correct to trapping the moment the feature
+        // landed, which is the accept-what-you-cannot-emit class.
+        // `bytelit_operands` now refuses it at verify time (exit 1, zero
+        // bytes) — the safe direction, and the same call PR #151/#152/#171
+        // made. The drop is the count becoming TRUE, exactly as PR #171's
+        // 106 -> 105 was: the 100 would have been counting an ELF that
+        // existed, not a program that worked. Mechanically confirmed
+        // verify-side: sweeping all 151 files with a gen0 built from the
+        // parent and one from the patched source, EXACTLY ONE line differs
+        // (`aes_sbox ACCEPT 2956 <sha>` -> `aes_sbox REFUSE`), the other 150
+        // are byte-identical by size + sha256 INCLUDING vexprparse itself,
+        // and the baseline-vs-baseline control came back empty first. gen0's
+        // own binary grew 651769 -> 657831 B (+6062, eight rules, no new
+        // concepts); R0/R1/R2 hold. Tracked as the second INVERSE_CAPABILITY
+        // fixture, `examples/negative/byte_table_indexed`.
+        const EXPECTED_ACCEPTED: usize = 99;
         const EXPECTED_TOTAL: usize = 151;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
@@ -47326,7 +47822,33 @@ rule pick
         // becomes `both_ok` — which the sweep refuses outright, since a
         // fixture both compilers accept measures nothing. At that point it
         // must be REPLACED by runtime-agreement pins, not silently deleted.
-        const INVERSE_CAPABILITY: &[&str] = &["match_freshtext_in_callee"];
+        // `byte_table_indexed` (2026-08-17): the SAME representational limit
+        // as the entry above, reached from a different direction, which is why
+        // it belongs in this bucket rather than getting a story of its own.
+        // `byte_at(b"\x00\x41\x80\xff", i)` is a DECLARED CONSTANT TABLE read
+        // by index — verbosec compiles it to 578 B and it returns 0/65/128/255
+        // byte-exactly. gen0 cannot: its text values are packed (start, len)
+        // spans into the embedded SOURCE BLOB, the blob holds the raw four
+        // characters `\x63` rather than the decoded byte, and a real inline
+        // data block would sit BELOW src_base — a negative offset the packing
+        // cannot carry. gen0 does own a `\xNN` decoder (`bytelit_unit_byte`)
+        // but it feeds only the EFFECT paths, which emit a data block instead
+        // of a span.
+        //
+        // Until the refusal landed, gen0 ACCEPTED the rewritten
+        // `examples/aes_sbox.verbose` at rc 0 and emitted 2956 bytes that
+        // SIGTRAPped on every valid input 0..255 (int3, rc -5), where
+        // verbosec's 833-byte binary is the byte-exact FIPS-197 S-box. It had
+        // emitted a WORKING 19418-byte binary for the same file's previous
+        // 254-branch if/else spelling, so this is a capability gap the
+        // language feature exposed, not a regression in gen0's own logic.
+        //
+        // Stops being an inverse when gen0 grows a post-blob data region wired
+        // through `blob_end_off`'s size chain, so a decoded table lives at a
+        // POSITIVE offset from src_base. Same instruction as above then:
+        // REPLACE with runtime-agreement pins, do not silently delete.
+        const INVERSE_CAPABILITY: &[&str] =
+            &["byte_table_indexed", "match_freshtext_in_callee"];
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
@@ -49904,10 +50426,28 @@ rule probe
         };
 
         // ── (a) NUMBER upper/lower bound on the argv channel, FIPS-197 oracle ──
-        let sbox_src = fs::read_to_string("examples/aes_sbox.verbose")
-            .expect("examples/aes_sbox.verbose must exist");
+        //
+        // THE SOURCE FILE MOVED, AND THE PIN DID NOT WEAKEN (2026-08-17). This
+        // read `examples/aes_sbox.verbose` until that file became a DECLARED
+        // CONSTANT TABLE (`byte_at(b"...", inp.b)`) — a shape gen0 cannot emit,
+        // so gen0 now refuses it and `emit("sbox", ...)` started failing on its
+        // `gen0 must accept + emit` assertion. The right response was to source
+        // the SAME MEASUREMENT from a file gen0 still compiles, not to relax
+        // anything: `examples/aes_transforms.verbose` declares the identical
+        // entry field `b : number [0, 255]`, its rule #0 is likewise named
+        // `aes_sbox`, it is likewise a 254-branch if/else chain, and it answers
+        // with the identical FIPS-197 values (0 -> 99, 255 -> 22). Every
+        // assertion below is byte-for-byte what it was; only the file supplying
+        // the bounded field changed. Both facts are asserted rather than
+        // assumed, so a future edit to aes_transforms fails HERE with a clear
+        // reason instead of silently making the sub-case vacuous.
+        let sbox_src = fs::read_to_string("examples/aes_transforms.verbose")
+            .expect("examples/aes_transforms.verbose must exist");
         assert!(sbox_src.contains("b : number [0, 255]"),
-            "this pin assumes aes_sbox's entry field is `b : number [0, 255]`");
+            "this pin assumes aes_transforms' entry field is `b : number [0, 255]`");
+        assert!(sbox_src.contains("\nrule aes_sbox\n"),
+            "this pin assumes aes_transforms' rule #0 is the S-box, so gen0's \
+             entry-index-0 invocation lands on it");
         let sbox = emit("sbox", &sbox_src);
         // In range: the answers are FIPS-197's forward S-box, not the
         // compiler's opinion.

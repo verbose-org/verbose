@@ -109,6 +109,31 @@ when gen0 grows the fresh-text materialization arc PR #151 named — at which
 point the fixture becomes `both_ok`, which the sweep refuses outright, so it
 must be **replaced** by runtime-agreement pins rather than deleted.
 
+`INVERSE_CAPABILITY`: `byte_table_indexed` — `byte_at(b"\x00\x41\x80\xff", i)`,
+a **declared constant byte table** read by index. verbosec compiles it to 578 B
+and it returns 0/65/128/255 byte-exactly. This is the *same* representational
+limit as the entry above reached from a different direction, which is the
+useful thing about having both: a gen0 text value is a packed `(start, len)`
+span into the embedded **source blob**, and the blob holds the raw four
+characters `\x63`, not the decoded byte `0x63`. A real inline data block would
+sit *below* `src_base` — a negative offset the packing cannot carry. gen0 does
+own a `\xNN` decoder (`bytelit_unit_byte`), but it feeds only the **effect**
+paths (reaction content, service body, `fetch` request), which emit a data
+block instead of a span.
+
+Worth knowing why this fixture exists at all: until the refusal landed, gen0
+**accepted** the rewritten `examples/aes_sbox.verbose` at rc 0 and emitted a
+2956-byte binary that SIGTRAPped (int3, rc −5) on **every** valid input 0..255,
+where verbosec's 833-byte binary is the byte-exact FIPS-197 S-box. gen0 had
+emitted a *working* 19418-byte binary for that same file's previous 254-branch
+`if/else` spelling — so this is a capability gap a **language feature exposed**,
+not a regression in gen0's own logic, and it is the clearest example so far of
+why a new primitive has to be measured against gen0 and not just against the
+reference. It leaves the bucket when gen0 grows a post-blob data region wired
+through `blob_end_off`'s size chain, so a decoded table can live at a positive
+offset from `src_base`. Same instruction as above then: **replace**, don't
+delete.
+
 ## One defect can have several SHAPES, and a fixture only holds the one it tests
 
 The sharpest thing this corpus has produced so far is a lesson about itself.

@@ -924,13 +924,18 @@ fn eval_expr(
         // evaluate to Value::Text (else type error). Returns the byte
         // length as a Number, mirroring what native emits via the
         // strlen scan / len_slot load.
+        // A `b"..."` byte-string literal is also accepted: it is a run of
+        // bytes with a known length, which is exactly what `length` reports.
+        // The verifier already limits this to the LITERAL shape, so the only
+        // Value::Bytes that can reach here is one the source spelled out.
         Expr::Length(inner) => {
             let v = eval_expr(inner, env, all_rules, concepts)?;
             match v {
                 Value::Text(s) => Ok(Value::Number(s.as_bytes().len() as i64)),
+                Value::Bytes(b) => Ok(Value::Number(b.len() as i64)),
                 other => Err(RuntimeError {
                     message: format!(
-                        "length requires a text value, got {}",
+                        "length requires a text or bytes value, got {}",
                         other
                     ),
                 }),
@@ -1035,9 +1040,25 @@ fn eval_expr(
                     }
                     Ok(Value::Number(bytes[idx as usize] as i64))
                 }
+                // Declared constant byte table: `byte_at(b"...", i)`. Same
+                // fail-closed bounds posture as the text arm — the table's
+                // length is exact because `Expr::Bytes` holds the decoded
+                // `Vec<u8>`, one element per `\xNN`.
+                (Value::Bytes(table), Value::Number(idx)) => {
+                    let len = table.len() as i64;
+                    if idx < 0 || idx >= len {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "byte_at index out of range: index={}, length={}",
+                                idx, len
+                            ),
+                        });
+                    }
+                    Ok(Value::Number(table[idx as usize] as i64))
+                }
                 (t, i) => Err(RuntimeError {
                     message: format!(
-                        "byte_at requires (text, number), got ({}, {})",
+                        "byte_at requires (text or bytes, number), got ({}, {})",
                         t, i
                     ),
                 }),

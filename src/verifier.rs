@@ -1904,6 +1904,48 @@ fn verify_rule(
 ///   - Record(C) where C is unknown, or field set differs from C's declaration,
 ///     or a field's inferable type differs from C's declared field type,
 ///   - Any other inferable expression whose type != expected.
+/// Operand check for the two BYTE-ADDRESSED text primitives, `byte_at` and
+/// `length`. Both answer a question about a run of BYTES, so both accept a
+/// `b"..."` byte-string LITERAL in addition to the usual text shapes.
+///
+/// Why a literal and nothing else. `b"..."` is the only place in the language
+/// where `\xNN` is legal (`src/lexer.rs`), so it is the only expression that
+/// can name an arbitrary byte — including `\x00` and anything `>= 0x80`. A
+/// `text` literal cannot: `Expr::Text` is a Rust `String`, the lexer builds it
+/// with `s.push(ch as char)`, and every backend reads it back with
+/// `.as_bytes()`, so a scalar `>= 0x80` would round-trip as TWO UTF-8 bytes.
+/// That makes `b"..."` the honest way to declare a constant byte table, and
+/// indexing it with `byte_at` the honest way to read one.
+///
+/// Deliberately NOT widened: a bytes-typed FIELD, `le32`/`le64`, or a bytes
+/// `concat`. Those are runtime byte values with no compile-time length, and
+/// each would need its own emitter arm. The declared-constant-table case is
+/// the whole slice. Everything else (`starts_with`, `contains`, `ends_with`,
+/// `substring`, `parse_int`, `json_escape`, text `concat`) still checks its
+/// operand against `Type::Text`, so a `b"..."` there stays a verify error and
+/// the `bytes`/`text` isolation documented on `Type::Bytes` is preserved.
+fn check_byte_addressable_operand(
+    expr: &Expr,
+    rule: &Rule,
+    all_rules: &[&Rule],
+    input_concept: Option<&Concept>,
+    all_concepts: &HashMap<String, &Concept>,
+    errors: &mut Vec<VerifyError>,
+) {
+    if matches!(expr, Expr::Bytes(_)) {
+        return;
+    }
+    check_expr_against(
+        expr,
+        &Type::Text,
+        rule,
+        all_rules,
+        input_concept,
+        all_concepts,
+        errors,
+    );
+}
+
 fn check_expr_against(
     expr: &Expr,
     expected: &Type,
@@ -2035,10 +2077,13 @@ fn check_expr_against(
             });
         }
         // `length(<text_expr>)` produces number. When the surrounding
-        // context expects number, recurse into the inner with expected=Text.
-        // Otherwise surface a clear mismatch (mirror of the ParseInt arms).
+        // context expects number, recurse into the inner with expected=Text —
+        // or accept a `b"..."` byte-string literal, whose length is likewise a
+        // byte count. See check_byte_addressable_operand for why the literal
+        // and only the literal. Otherwise surface a clear mismatch (mirror of
+        // the ParseInt arms).
         (Expr::Length(inner), Type::Number) => {
-            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_byte_addressable_operand(inner, rule, all_rules, input_concept, all_concepts, errors);
         }
         (Expr::Length(_), other) => {
             errors.push(VerifyError {
@@ -2157,8 +2202,10 @@ fn check_expr_against(
         // into the first child with expected=Text and into the index child
         // with expected=Number. Otherwise surface a clear mismatch (mirror of
         // the Substring arms, but with two children and a Number return).
+        // The haystack may also be a `b"..."` byte-string literal — a declared
+        // constant byte table read by index. See check_byte_addressable_operand.
         (Expr::ByteAt(t, i), Type::Number) => {
-            check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_byte_addressable_operand(t, rule, all_rules, input_concept, all_concepts, errors);
             check_expr_against(i, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
         }
         (Expr::ByteAt(_, _), other) => {
