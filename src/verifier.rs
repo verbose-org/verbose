@@ -302,6 +302,12 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                         if let Effect::AppendFile { content, .. } = effect {
                             // content must produce text at runtime — the
                             // interpreter writes bytes from a text value.
+                            // Empty binding scope: a reaction's effect
+                            // expression is written in the REACTION, not in
+                            // the rule's `logic:` block, so the trigger rule's
+                            // `let` bindings are not in scope for it. Only the
+                            // input concept is, and that is passed above.
+                            let no_bindings: HashMap<String, &Concept> = HashMap::new();
                             check_expr_against(
                                 content,
                                 &Type::Text,
@@ -309,6 +315,7 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                                 &all_rules,
                                 input_concept,
                                 &concepts,
+                                &no_bindings,
                                 &mut errors,
                             );
                         }
@@ -1825,6 +1832,20 @@ fn verify_rule(
         _ => None,
     };
 
+    // The `context:` binding is the rule's second concept in scope. Resolved
+    // the same way the input is; a name that does not resolve to a record
+    // concept simply yields None and everything downstream stays silent.
+    let context_concept: Option<&Concept> = rule
+        .context_ty
+        .as_ref()
+        .and_then(|t| record_concept_of(t, concepts));
+
+    // Every OTHER binding whose type is a known record concept — the context
+    // binding plus each typeable top-level `let`. Consulted both by the
+    // field-existence loop below and, through `check_expr_against`, by
+    // `infer_expr_type`, so the two halves of the check agree by construction.
+    let bindings = collect_binding_concepts(rule, all_rules, input_concept, concepts);
+
     let mut facts = collect_logic_facts(&rule.logic);
     // Transitive resource/connection reads via `match_result` chains.
     // When a rule does `match_result(callee(input), ...)`, the native
@@ -1839,11 +1860,39 @@ fn verify_rule(
     );
 
     for path in &facts.reads {
-        if let Some(msg) = validate_read_path(path, rule, input_concept, all_resources, all_connections) {
+        if let Some(msg) = validate_read_path(
+            path,
+            rule,
+            input_concept,
+            context_concept,
+            all_resources,
+            all_connections,
+        ) {
             errors.push(VerifyError {
                 context: format!("rule '{}' / logic", rule.name),
                 message: msg,
             });
+        }
+    }
+
+    // The same field-existence check, for a `.field` whose base is a `let`
+    // bound to a record. `local_reads` holds exactly those paths (see
+    // `LogicFacts`); a base absent from `bindings` is a binding this pass
+    // cannot type, and stays silent. Sorted so the diagnostic order does not
+    // depend on hash iteration.
+    let mut local: Vec<&Vec<String>> = facts.local_reads.iter().collect();
+    local.sort();
+    for path in local {
+        if path.len() < 2 {
+            continue;
+        }
+        if let Some(c) = bindings.get(path[0].as_str()) {
+            if let Some(msg) = concept_field_error(c, &path[1], path) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: msg,
+                });
+            }
         }
     }
 
@@ -1891,6 +1940,7 @@ fn verify_rule(
         all_rules,
         input_concept,
         concepts,
+        &bindings,
         errors,
     );
 }
@@ -1930,6 +1980,7 @@ fn check_byte_addressable_operand(
     all_rules: &[&Rule],
     input_concept: Option<&Concept>,
     all_concepts: &HashMap<String, &Concept>,
+    bindings: &HashMap<String, &Concept>,
     errors: &mut Vec<VerifyError>,
 ) {
     if matches!(expr, Expr::Bytes(_)) {
@@ -1942,6 +1993,7 @@ fn check_byte_addressable_operand(
         all_rules,
         input_concept,
         all_concepts,
+        bindings,
         errors,
     );
 }
@@ -1953,14 +2005,15 @@ fn check_expr_against(
     all_rules: &[&Rule],
     input_concept: Option<&Concept>,
     all_concepts: &HashMap<String, &Concept>,
+    bindings: &HashMap<String, &Concept>,
     errors: &mut Vec<VerifyError>,
 ) {
     match (expr, expected) {
         (Expr::Ok(inner), Type::Result(t, _)) => {
-            check_expr_against(inner, t, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, t, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Err(inner), Type::Result(_, e)) => {
-            check_expr_against(inner, e, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, e, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Ok(_), other) | (Expr::Err(_), other) => {
             errors.push(VerifyError {
@@ -1972,16 +2025,16 @@ fn check_expr_against(
             });
         }
         (Expr::If(cond, then_e, else_e), _) => {
-            check_expr_against(cond, &Type::Bool, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(then_e, expected, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(else_e, expected, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(cond, &Type::Bool, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(then_e, expected, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(else_e, expected, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         // Phase 11 slice 1: fetch(<connection>, <request_bytes>) — request
         // bytes must produce text. The fetch itself produces text; the
         // outer-context check is handled by the fall-through arm via
         // `infer_expr_type(Expr::Fetch(..))` returning Text.
         (Expr::Fetch(_, req), expected_outer) => {
-            check_expr_against(req, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(req, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
             // Outer-context check: fetch returns text. If context expected
             // something else, surface the same error the fall-through arm
             // would produce.
@@ -2000,7 +2053,7 @@ fn check_expr_against(
         // shape — recurse on the inner with expected=Text, then surface
         // an outer-context error when the surrounding type isn't text.
         (Expr::JsonEscape(inner), Type::Text) => {
-            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::JsonEscape(_), other) => {
             errors.push(VerifyError {
@@ -2015,7 +2068,7 @@ fn check_expr_against(
         // outer-context type is Number (parse_int returns a number). Inner
         // must still produce text.
         (Expr::ParseInt(inner), Type::Number) => {
-            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::ParseInt(_), other) => {
             errors.push(VerifyError {
@@ -2032,8 +2085,8 @@ fn check_expr_against(
         // context expects something else, surface a clear mismatch naming
         // `starts_with` (mirror of the JsonEscape/ParseInt arms).
         (Expr::StartsWith(h, n), Type::Bool) => {
-            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::StartsWith(_, _), other) => {
             errors.push(VerifyError {
@@ -2048,8 +2101,8 @@ fn check_expr_against(
         // StartsWith: when context is bool, both children must be text;
         // otherwise surface a mismatch naming `contains`.
         (Expr::Contains(h, n), Type::Bool) => {
-            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Contains(_, _), other) => {
             errors.push(VerifyError {
@@ -2064,8 +2117,8 @@ fn check_expr_against(
         // StartsWith / Contains: when context is bool, both children must be
         // text; otherwise surface a mismatch naming `ends_with`.
         (Expr::EndsWith(h, n), Type::Bool) => {
-            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::EndsWith(_, _), other) => {
             errors.push(VerifyError {
@@ -2083,7 +2136,7 @@ fn check_expr_against(
         // and only the literal. Otherwise surface a clear mismatch (mirror of
         // the ParseInt arms).
         (Expr::Length(inner), Type::Number) => {
-            check_byte_addressable_operand(inner, rule, all_rules, input_concept, all_concepts, errors);
+            check_byte_addressable_operand(inner, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Length(_), other) => {
             errors.push(VerifyError {
@@ -2099,7 +2152,7 @@ fn check_expr_against(
         // expects number, recurse into the inner with expected=Number; the
         // verifier will reject text/bool args via that recursion.
         (Expr::Abs(inner), Type::Number) => {
-            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Abs(_), other) => {
             errors.push(VerifyError {
@@ -2114,8 +2167,8 @@ fn check_expr_against(
         // recurse against Type::Number so non-number args are rejected through
         // the usual channel. Mirror of the Abs arms, but with two children.
         (Expr::Min(l, r), Type::Number) => {
-            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Min(_, _), other) => {
             errors.push(VerifyError {
@@ -2129,8 +2182,8 @@ fn check_expr_against(
         // `max(<a>, <b>)` — same shape as Min: both children number-typed,
         // outer produces number.
         (Expr::Max(l, r), Type::Number) => {
-            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Max(_, _), other) => {
             errors.push(VerifyError {
@@ -2156,11 +2209,11 @@ fn check_expr_against(
         | (Expr::BitXor(l, r), Type::Number)
         | (Expr::Shl(l, r), Type::Number)
         | (Expr::Shr(l, r), Type::Number) => {
-            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::BitNot(inner), Type::Number) => {
-            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::BitAnd(_, _), other)
         | (Expr::BitOr(_, _), other)
@@ -2184,9 +2237,9 @@ fn check_expr_against(
         // mismatch (mirror of the JsonEscape/Length arms but with three
         // children).
         (Expr::Substring(t, s, e), Type::Text) => {
-            check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(s, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(e, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(s, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(e, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Substring(_, _, _), other) => {
             errors.push(VerifyError {
@@ -2205,8 +2258,8 @@ fn check_expr_against(
         // The haystack may also be a `b"..."` byte-string literal — a declared
         // constant byte table read by index. See check_byte_addressable_operand.
         (Expr::ByteAt(t, i), Type::Number) => {
-            check_byte_addressable_operand(t, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(i, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_byte_addressable_operand(t, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(i, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::ByteAt(_, _), other) => {
             errors.push(VerifyError {
@@ -2225,8 +2278,8 @@ fn check_expr_against(
         // pass), consistent with how Fold's body is handled. Otherwise
         // surface a clear mismatch.
         (Expr::FoldBytes(t, init, _, _, _, _body), Type::Number) => {
-            check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(init, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(init, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::FoldBytes(_, _, _, _, _, _), other) => {
             errors.push(VerifyError {
@@ -2241,8 +2294,8 @@ fn check_expr_against(
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
             // this pass does not track. Skipped, not fabricated.
-            check_expr_against(ok_body, expected, rule, all_rules, input_concept, all_concepts, errors);
-            check_expr_against(err_body, expected, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(ok_body, expected, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_expr_against(err_body, expected, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         // Map and Filter only fit a Collection context. Their bodies depend
         // on lambda-bound variables we do not yet track, so the body is left
@@ -2263,7 +2316,7 @@ fn check_expr_against(
         // serializes scalar values.
         (Expr::Concat(args), Type::Text) => {
             for arg in args {
-                if let Some(inferred) = infer_expr_type(arg, rule, all_rules, input_concept) {
+                if let Some(inferred) = infer_expr_type(arg, rule, all_rules, input_concept, bindings) {
                     match inferred {
                         Type::Number | Type::Bool | Type::Text => {}
                         Type::Bytes => {
@@ -2297,8 +2350,8 @@ fn check_expr_against(
             for arg in args {
                 // Each arg must itself check out as bytes; recurse so le32/le64
                 // arg-type errors and nested-concat errors surface.
-                check_expr_against(arg, &Type::Bytes, rule, all_rules, input_concept, all_concepts, errors);
-                if let Some(inferred) = infer_expr_type(arg, rule, all_rules, input_concept) {
+                check_expr_against(arg, &Type::Bytes, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                if let Some(inferred) = infer_expr_type(arg, rule, all_rules, input_concept, bindings) {
                     if inferred != Type::Bytes {
                         errors.push(VerifyError {
                             context: format!("rule '{}' / logic", rule.name),
@@ -2325,7 +2378,7 @@ fn check_expr_against(
         // expected=Number so text/bool args are rejected through the usual
         // channel (mirror of the Abs arms).
         (Expr::Le32(inner), Type::Bytes) | (Expr::Le64(inner), Type::Bytes) => {
-            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Le32(_), other) | (Expr::Le64(_), other) => {
             errors.push(VerifyError {
@@ -2343,7 +2396,7 @@ fn check_expr_against(
         // to a bytes context is what makes it sound: a stored / let-bound
         // result would dangle after the reset.
         (Expr::ArenaScope(inner), Type::Bytes) => {
-            check_expr_against(inner, &Type::Bytes, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, &Type::Bytes, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         // `arena_scope(inner)` : number — the SCALAR form (slice 2). The inner
         // walk's arena nodes are reclaimed and the inner's NUMBER is returned
@@ -2354,7 +2407,7 @@ fn check_expr_against(
         // `(ArenaScope, Named(..))` must keep erroring: a concept-typed inner
         // yields an arena INDEX, which would point into the reclaimed region.
         (Expr::ArenaScope(inner), Type::Number) => {
-            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::ArenaScope(_), other) => {
             errors.push(VerifyError {
@@ -2375,7 +2428,7 @@ fn check_expr_against(
         // stream and contributes no bytes to it — a value position would
         // have nothing meaningful to evaluate to.
         (Expr::AbortIf(inner), Type::Bytes) => {
-            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::AbortIf(_), other) => {
             errors.push(VerifyError {
@@ -2482,6 +2535,7 @@ fn check_expr_against(
                         all_rules,
                         input_concept,
                         all_concepts,
+                        bindings,
                         errors,
                     );
                 }
@@ -2501,7 +2555,7 @@ fn check_expr_against(
             // — input ident, VariantConstruct, Call returning Named —
             // are all covered by `infer_expr_type`; let/lambda-bound
             // scrutinees infer to None and are reported.
-            let concept_name = match infer_expr_type(scrutinee, rule, all_rules, input_concept) {
+            let concept_name = match infer_expr_type(scrutinee, rule, all_rules, input_concept, bindings) {
                 Some(Type::Named(n)) => n,
                 Some(other) => {
                     errors.push(VerifyError {
@@ -2610,7 +2664,7 @@ fn check_expr_against(
                 // Binders are in scope for the body — the lambda-bound
                 // walk (`collect_lambda_bound_names`) accounts for them
                 // when purity checks the body's `reads:` proof.
-                check_expr_against(&arm.body, expected, rule, all_rules, input_concept, all_concepts, errors);
+                check_expr_against(&arm.body, expected, rule, all_rules, input_concept, all_concepts, bindings, errors);
             }
             // Exhaustiveness: every declared variant must have an arm.
             for declared in &concept.variants {
@@ -2689,13 +2743,14 @@ fn check_expr_against(
                         all_rules,
                         input_concept,
                         all_concepts,
+                        bindings,
                         errors,
                     );
                 }
             }
         }
         _ => {
-            if let Some(inferred) = infer_expr_type(expr, rule, all_rules, input_concept) {
+            if let Some(inferred) = infer_expr_type(expr, rule, all_rules, input_concept, bindings) {
                 if &inferred != expected {
                     errors.push(VerifyError {
                         context: format!("rule '{}' / logic", rule.name),
@@ -2719,6 +2774,7 @@ fn infer_expr_type(
     rule: &Rule,
     all_rules: &[&Rule],
     concept: Option<&Concept>,
+    bindings: &HashMap<String, &Concept>,
 ) -> Option<Type> {
     match expr {
         Expr::Number(_) => Some(Type::Number),
@@ -2734,8 +2790,26 @@ fn infer_expr_type(
         Expr::Ident(name) if name == &rule.input_name => Some(rule.input_ty.clone()),
         Expr::Ident(_) => None, // let/lambda-bound — not tracked in this pass
         Expr::Field(base, field_name) => {
-            if let (Expr::Ident(n), Some(c)) = (base.as_ref(), concept) {
+            if let Expr::Ident(n) = base.as_ref() {
                 if n == &rule.input_name {
+                    return concept.and_then(|c| {
+                        c.fields
+                            .iter()
+                            .find(|f| &f.name == field_name)
+                            .map(|f| f.ty.clone())
+                    });
+                }
+                // The input is not the only base whose concept is known. A
+                // `context:` binding and a `let` bound to a record both name a
+                // concept too, and `bindings` carries exactly those (see
+                // `collect_binding_concepts`). Resolving them here is what lets
+                // the surrounding expression be typechecked the same way it
+                // already is for an input field — one lookup, one map, no
+                // second mechanism.
+                //
+                // `bindings` is empty for every caller with no such scope, so
+                // this arm is inert there.
+                if let Some(c) = bindings.get(n.as_str()) {
                     return c
                         .fields
                         .iter()
@@ -2756,7 +2830,7 @@ fn infer_expr_type(
             .iter()
             .find(|r| r.name == *name)
             .map(|r| r.output_ty.clone()),
-        Expr::If(_, then_e, _) => infer_expr_type(then_e, rule, all_rules, concept),
+        Expr::If(_, then_e, _) => infer_expr_type(then_e, rule, all_rules, concept, bindings),
         Expr::Quantifier(_, _, _, _) => Some(Type::Bool),
         Expr::Record(name, _) => Some(Type::Named(name.clone())),
         // Phase A slice 2: variant construction yields the concept type —
@@ -2768,7 +2842,7 @@ fn infer_expr_type(
         // inference we report Bytes if any inferable arg is bytes, else Text.
         Expr::Concat(args) => {
             let any_bytes = args.iter().any(|a| {
-                matches!(infer_expr_type(a, rule, all_rules, concept), Some(Type::Bytes))
+                matches!(infer_expr_type(a, rule, all_rules, concept, bindings), Some(Type::Bytes))
             });
             if any_bytes { Some(Type::Bytes) } else { Some(Type::Text) }
         }
@@ -2776,7 +2850,7 @@ fn infer_expr_type(
         Expr::Le32(_) | Expr::Le64(_) => Some(Type::Bytes),
         // `arena_scope(inner)` is transparent: its type IS inner's type
         // (which the bytes-context check constrains to bytes).
-        Expr::ArenaScope(inner) => infer_expr_type(inner, rule, all_rules, concept),
+        Expr::ArenaScope(inner) => infer_expr_type(inner, rule, all_rules, concept, bindings),
         // `abort_if(<number>)` types as BYTES (it occupies a bytes-stream
         // position and contributes zero bytes to it) — NOT as its inner's
         // number type. Typing it bytes is what keeps an all-bytes concat's
@@ -2975,6 +3049,18 @@ fn verify_source_ref(sref: &SourceRef, base_dir: &StdPath) -> Result<(), String>
 struct LogicFacts {
     reads: HashSet<Vec<String>>,
     calls: HashSet<Vec<String>>,
+    /// Paths whose base is a TOP-LEVEL `let` binding.
+    ///
+    /// These are not reads of the input — they read a local — so they are
+    /// correctly kept out of `reads` and out of the purity proof. But they
+    /// still carry a `.field` access, and until this field existed they were
+    /// simply DISCARDED, which is the whole reason the verifier typechecked
+    /// `p.a` and never `r.a`. Partitioned here rather than dropped, then
+    /// validated in `verify_rule` by the same helper the input path uses.
+    ///
+    /// Lambda- and arm-bound paths never reach this set: `collect_expr_facts`
+    /// filters them inside each body, before the partition below sees them.
+    local_reads: HashSet<Vec<String>>,
 }
 
 /// When a rule's body contains `match_result(callee(...), ...)`, the
@@ -3317,10 +3403,19 @@ fn collect_logic_facts(logic: &LogicStmt) -> LogicFacts {
         collect_expr_facts(expr, &mut facts.reads, &mut facts.calls);
     }
     collect_expr_facts(&logic.value, &mut facts.reads, &mut facts.calls);
-    // Remove reads that reference let-bound names (they're local, not field reads)
-    facts.reads.retain(|path| {
-        path.first().map_or(true, |name| !binding_names.contains(name))
-    });
+    // Reads that reference let-bound names are local, not field reads — they
+    // must not reach the purity proof. They are MOVED to `local_reads` rather
+    // than dropped, so `verify_rule` can still check the field they name.
+    let local: Vec<Vec<String>> = facts
+        .reads
+        .iter()
+        .filter(|path| path.first().map_or(false, |name| binding_names.contains(name)))
+        .cloned()
+        .collect();
+    for path in local {
+        facts.reads.remove(&path);
+        facts.local_reads.insert(path);
+    }
     facts
 }
 
@@ -3609,6 +3704,7 @@ fn validate_read_path(
     path: &[String],
     rule: &Rule,
     input_concept: Option<&Concept>,
+    context_concept: Option<&Concept>,
     all_resources: &HashSet<String>,
     all_connections: &HashSet<String>,
 ) -> Option<String> {
@@ -3661,23 +3757,143 @@ fn validate_read_path(
         ));
     }
     if path.len() >= 2 {
-        // For context fields, we don't have the concept here to validate field names,
-        // so skip field validation (the native backend will catch unknown fields).
-        if let Some(c) = input_concept {
-            if is_input {
-                let field_name = &path[1];
-                if !c.fields.iter().any(|f| &f.name == field_name) {
-                    return Some(format!(
-                        "concept '{}' has no field '{}' (accessed via '{}')",
-                        c.name,
-                        field_name,
-                        path.join(".")
-                    ));
-                }
+        // Both scopes get the SAME check, from the same helper. The `context:`
+        // binding used to be skipped here with the comment "we don't have the
+        // concept here to validate field names" — which was simply false:
+        // `Rule::context_ty` names it and `verify_rule` resolves it exactly as
+        // it resolves the input's. The consequence was that `p.nosuchfield` on
+        // a context concept verified clean and was then refused by the native
+        // emitter ("unknown field 'nosuchfield' in native codegen") — a
+        // verifier certifying a program its own backend rejects.
+        let scope_concept = if is_input {
+            input_concept
+        } else if is_context {
+            context_concept
+        } else {
+            None
+        };
+        if let Some(c) = scope_concept {
+            if let Some(msg) = concept_field_error(c, &path[1], path) {
+                return Some(msg);
             }
         }
     }
     None
+}
+
+/// The ONE field-existence check: a `.field` access on a value whose type is a
+/// named concept must name a field that concept declares.
+///
+/// Extracted so that every scope which knows its base's concept — the input,
+/// the `context:` binding, and a `let` bound to a record — produces the same
+/// diagnostic from the same comparison. Until this existed only the input had
+/// the check at all, and the other two accepted any field name whatsoever.
+fn concept_field_error(c: &Concept, field_name: &str, path: &[String]) -> Option<String> {
+    if c.fields.iter().any(|f| f.name == field_name) {
+        return None;
+    }
+    Some(format!(
+        "concept '{}' has no field '{}' (accessed via '{}')",
+        c.name,
+        field_name,
+        path.join(".")
+    ))
+}
+
+/// Resolve a type to the RECORD concept it denotes, or None.
+///
+/// Returns None for a non-named type, an unknown concept name, and — the case
+/// worth stating — a SUM-TYPE concept (`variants:`, empty `fields:`). A
+/// sum-type value is consumed by `match`, never by field access, and the
+/// arm-binder scope is not tracked by the walks that use this. Reporting "has
+/// no field" for every access on one would be a new refusal class rather than
+/// the mirror of the input-field check, so those stay silent.
+fn record_concept_of<'a>(
+    ty: &Type,
+    all_concepts: &HashMap<String, &'a Concept>,
+) -> Option<&'a Concept> {
+    match ty {
+        Type::Named(n) => all_concepts
+            .get(n)
+            .copied()
+            .filter(|c| c.variants.is_empty()),
+        _ => None,
+    }
+}
+
+/// Every binding in a rule's scope whose type is a known RECORD concept:
+/// the `context:` binding, and each `let` the pass can type.
+///
+/// This is what `infer_expr_type` consults for a `.field` access whose base is
+/// not the input, and what `verify_rule` consults to check that such a field
+/// exists. Cases deliberately left OUT — inference is best-effort and silence
+/// is the only safe answer when a binding's type is not known:
+///
+///   * a `let` whose RHS type is not inferable (`match_result`, `map` /
+///     `filter` / `fold`, a lambda-bound var) — `infer_expr_type` returns None
+///     and the binding is absent from the map, so nothing is checked;
+///   * a `let` whose type is scalar (number / text / bool) — `.field` on it is
+///     meaningless, but flagging it is a new refusal class, not this check;
+///   * lambda binders and `match` / `match_result` arm binders — their scope is
+///     local to a body expression, and `collect_expr_facts` already filters
+///     their paths out before anything here can see them. That filtering is
+///     what the "conservative on lambda/let-bound vars" posture protects, and
+///     it is untouched: this map only ever gains TOP-LEVEL let names;
+///   * a binding that SHADOWS the input or context name — see the guard below.
+fn collect_binding_concepts<'a>(
+    rule: &Rule,
+    all_rules: &[&Rule],
+    input_concept: Option<&'a Concept>,
+    all_concepts: &HashMap<String, &'a Concept>,
+) -> HashMap<String, &'a Concept> {
+    let mut env: HashMap<String, &'a Concept> = HashMap::new();
+
+    if let (Some(cn), Some(cty)) = (&rule.context_name, &rule.context_ty) {
+        if let Some(c) = record_concept_of(cty, all_concepts) {
+            env.insert(cn.clone(), c);
+        }
+    }
+
+    // Source order, so a later binding can see an earlier one.
+    for (name, rhs) in &rule.logic.bindings {
+        // A `let` that shadows the input or the context name is dropped from
+        // the map entirely. `collect_logic_facts` already removes such paths
+        // from `reads`, so the input check does not fire on them either, and
+        // deciding which of the two the author meant is precisely the kind of
+        // guess the compiler must not make.
+        if name == &rule.input_name || rule.context_name.as_deref() == Some(name.as_str()) {
+            env.remove(name.as_str());
+            continue;
+        }
+
+        // A bare alias (`let r2 = r1`, or `let r = p`). Resolved here rather
+        // than by teaching `infer_expr_type`'s `Expr::Ident` arm about
+        // bindings: that arm feeds every `Ident` position in the bidirectional
+        // check, so widening it would add strictness far beyond a `.field`
+        // access. This adds none — it only propagates a concept the map
+        // already holds.
+        if let Expr::Ident(src) = rhs {
+            let resolved = if src == &rule.input_name {
+                input_concept.filter(|c| c.variants.is_empty())
+            } else {
+                env.get(src.as_str()).copied()
+            };
+            match resolved {
+                Some(c) => env.insert(name.clone(), c),
+                None => env.remove(name.as_str()),
+            };
+            continue;
+        }
+
+        match infer_expr_type(rhs, rule, all_rules, input_concept, &env)
+            .and_then(|t| record_concept_of(&t, all_concepts))
+        {
+            Some(c) => env.insert(name.clone(), c),
+            None => env.remove(name.as_str()),
+        };
+    }
+
+    env
 }
 
 /// Collect every identifier that's bound by a lambda-shaped construct
@@ -5304,6 +5520,306 @@ rule uses_primitives
             errs.is_empty(),
             "the arity check fired on a built-in primitive (0/1/2/3-arg forms \
              are all legal for primitives); got {:#?}",
+            errs
+        );
+    }
+
+    /// Two concepts with DISTINCT field names, a rule producing the second,
+    /// and a consumer that binds it with `let`. `{BODY}` is the only thing that
+    /// varies between the shapes below — so every refusal is attributable to
+    /// the body under test and nothing else.
+    fn let_record_program(body: &str) -> String {
+        format!(
+            r#"@verbose 0.1.0
+
+concept P
+  @intention: "doc"
+  @source: invoices.intent:1
+  fields:
+    a : number [0, 1000000]
+    b : number [0, 1000000]
+
+concept Q
+  @intention: "doc"
+  @source: invoices.intent:1
+  fields:
+    x : number
+    label : text
+
+rule swap2
+  @intention: "doc"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    q : Q
+  logic:
+    q = Q {{ x: p.b, label: "hi" }}
+  proofs:
+    purity:
+      reads   : [p.b]
+      calls   : []
+    termination:
+      bound : 5
+
+rule use_it
+  @intention: "doc"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    o : number
+  logic:
+    let r = swap2(p)
+    o = {body}
+  proofs:
+    purity:
+      reads   : [p]
+      calls   : [swap2]
+    termination:
+      bound : 10
+"#
+        )
+    }
+
+    #[test]
+    fn record_typed_let_binding_field_access_is_typechecked() {
+        // The verifier has always typechecked `.field` on the INPUT concept and
+        // never on a `let` bound to a record. That asymmetry let a program that
+        // NEITHER backend accepts pass verification at rc 0: `--run` failed with
+        // "no field 'a' on record" and `--native` refused the shape outright.
+        //
+        // Every bad shape below carries a corrected twin, so the refusal is
+        // attributable to the defect under test rather than to anything else in
+        // the fixture.
+
+        // 1. A field of the INPUT concept, read off the Q-typed binding. The
+        //    nastiest shape: `a` exists, just not on Q — and once aggregate
+        //    return lands, native's bare-field-name lookup would resolve it to
+        //    the INPUT's slot and print a plausible number at rc 0.
+        let errs = verify_str(&let_record_program("r.a * 1000 + r.x"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("use_it")
+                && e.message.contains("concept 'Q' has no field 'a'")
+                && e.message.contains("r.a")),
+            "expected a field-existence refusal naming the binding's concept, \
+             the field, and the path; got {:#?}",
+            errs
+        );
+
+        // 2. A field of nothing at all.
+        let errs = verify_str(&let_record_program("r.zzz * 1000 + r.x"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("use_it")
+                && e.message.contains("concept 'Q' has no field 'zzz'")
+                && e.message.contains("r.zzz")),
+            "expected a field-existence refusal for a field of nothing; got {:#?}",
+            errs
+        );
+
+        // 3. TYPE mismatch: `label` exists on Q and is text, used where the
+        //    declared output is number. Distinct from 1 and 2 — it exercises
+        //    the inference half (the field must yield its DECLARED type), not
+        //    the existence half. Only reachable in a position the bidirectional
+        //    check descends into; that is exactly as far as the input-field path
+        //    reaches today, and this deliberately does not go further.
+        let errs = verify_str(&let_record_program("r.label"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("use_it")
+                && e.message.contains("type 'text'")
+                && e.message.contains("expects 'number'")),
+            "expected a type mismatch for a text field of a let-bound record \
+             used where number is declared; got {:#?}",
+            errs
+        );
+
+        // 4. THE CORRECTED TWIN — the same program with correct field names must
+        //    still verify. This is what makes 1-3 attributable and what proves
+        //    the check is not simply "refuse any field access on a let".
+        let errs = verify_str(&let_record_program("r.x * 1000 + r.x"));
+        assert!(
+            errs.is_empty(),
+            "the corrected twin must still verify; got {:#?}",
+            errs
+        );
+
+        // 5. …and must still RUN, producing the value it produced before. A
+        //    verifier change that quietly altered semantics would pass 1-4.
+        use crate::interpreter::eval_rule;
+        let src = let_record_program("r.x * 1000 + r.x");
+        let tokens = Lexer::new(&src).tokenize().unwrap();
+        let program = Parser::new(tokens).parse_program().unwrap();
+        let rules: Vec<&Rule> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rule(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let concepts: Vec<&Concept> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Concept(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        let use_it = rules.iter().find(|r| r.name == "use_it").unwrap();
+        let mut input = HashMap::new();
+        input.insert("a".to_string(), crate::interpreter::Value::Number(9));
+        input.insert("b".to_string(), crate::interpreter::Value::Number(7));
+        let got = eval_rule(use_it, &rules, &concepts, &input).unwrap();
+        assert_eq!(
+            format!("{:?}", got),
+            format!("{:?}", crate::interpreter::Value::Number(7007)),
+            "the corrected twin's runtime value changed"
+        );
+    }
+
+    #[test]
+    fn let_binding_field_check_stays_silent_when_the_type_is_unknown() {
+        // Strictness must be EXACT. An over-strict version of the check above
+        // would reject valid programs, so each shape here is a binding the pass
+        // cannot type — or a binder it must not look at — and every one must
+        // verify clean.
+        //
+        // The last two are the "conservative on lambda/let-bound vars" posture
+        // the bidirectional check has always had: a lambda binder's `.field` is
+        // filtered out inside `collect_expr_facts`, before the let-partition can
+        // ever see it, and nothing here changes that.
+        let program = |bindings: &str, body: &str, reads: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept Item
+  @intention: "doc"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 1000]
+
+concept Bag
+  @intention: "doc"
+  @source: invoices.intent:1
+  fields:
+    amount : number [0, 1000000]
+    items  : collection(Item)
+
+rule use_it
+  @intention: "doc"
+  @source: invoices.intent:1
+  input:
+    g : Bag
+  output:
+    o : number
+  logic:
+{bindings}
+    o = {body}
+  proofs:
+    purity:
+      reads   : [{reads}]
+      calls   : []
+    termination:
+      bound : 40
+"#
+            )
+        };
+
+        let cases = [
+            // A scalar let — `.field` on it is meaningless, but flagging that
+            // is a different refusal class, not this one.
+            ("    let t = g.amount", "t + g.amount", "g.amount"),
+            // A collection-typed let: `map` is not inferable, so silence.
+            (
+                "    let m = map(g.items, e => e.v)",
+                "g.amount",
+                "g.amount, g.items",
+            ),
+            // A lambda binder's field access, in a quantifier and in a fold.
+            (
+                "",
+                "if all(g.items, e => e.v > 0) then g.amount else 0",
+                "g.amount, g.items",
+            ),
+            ("", "sum(g.items, e => e.v) + g.amount", "g.amount, g.items"),
+            // A let whose RHS reads a lambda binder's field.
+            (
+                "    let s = sum(g.items, e => e.v)",
+                "s + g.amount",
+                "g.amount, g.items",
+            ),
+        ];
+        for (bindings, body, reads) in cases {
+            let errs = verify_str(&program(bindings, body, reads));
+            assert!(
+                errs.is_empty(),
+                "the let-binding field check must stay silent here \
+                 (bindings={bindings:?} body={body:?}); got {:#?}",
+                errs
+            );
+        }
+    }
+
+    #[test]
+    fn context_binding_field_access_is_typechecked() {
+        // The `context:` binding had the IDENTICAL hole, and it was documented
+        // in `validate_read_path` as a deliberate skip whose stated reason —
+        // "we don't have the concept here to validate field names" — was simply
+        // false: `Rule::context_ty` names it. The consequence was the same
+        // verify/emit split: the verifier said "all proofs check out" and the
+        // native emitter then refused with "unknown field 'nosuchfield' in
+        // native codegen".
+        let program = |field: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept Policy
+  @intention: "doc"
+  @source: invoices.intent:1
+  fields:
+    max_amount : number [0, 10000000]
+
+concept Request
+  @intention: "doc"
+  @source: invoices.intent:1
+  fields:
+    amount : number [0, 10000000]
+
+rule is_allowed
+  @intention: "doc"
+  @source: invoices.intent:1
+  context:
+    p : Policy
+  input:
+    r : Request
+  output:
+    allowed : bool
+  logic:
+    allowed = r.amount <= p.{field}
+  proofs:
+    purity:
+      reads   : [r.amount, p.{field}]
+      calls   : []
+    termination:
+      bound : 5
+"#
+            )
+        };
+
+        let errs = verify_str(&program("nosuchfield"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("is_allowed")
+                && e.message.contains("concept 'Policy' has no field 'nosuchfield'")
+                && e.message.contains("p.nosuchfield")),
+            "expected a field-existence refusal on the context concept; got {:#?}",
+            errs
+        );
+
+        // Corrected twin.
+        let errs = verify_str(&program("max_amount"));
+        assert!(
+            errs.is_empty(),
+            "the corrected twin must still verify; got {:#?}",
             errs
         );
     }
