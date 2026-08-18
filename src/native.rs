@@ -856,6 +856,14 @@ struct RecordLoopCtx<'a> {
     /// 0 otherwise. `match_slots_at_depth` derives slot offsets for
     /// depths > 0 from this and the depth-0 slots above.
     extra_match_slot_quartets: usize,
+    /// Slot just ABOVE the reserved `MatchVariant` arm-binder pool (i.e. the
+    /// last of the `n_reserved` bottom-of-frame slots), or 0 when the rule
+    /// declares no `MatchVariant` and no pool was reserved. `emit_eval_expr`'s
+    /// arena dispatch derives its first binder slot as
+    /// `min(lowest_live_slot, floor) - 8`; without the floor it aliased the
+    /// match_result quartet and `exit_flag_slot`, so the 5th binder of a
+    /// single arm silently became the process exit code.
+    match_arm_binder_floor: i32,
     /// Exit code flag: 0 = all records succeeded, 1 = at least one failed.
     /// Bool rules set this to 1 on false; Result rules set it on Err.
     /// The epilogue loads this into rdi for sys_exit.
@@ -3336,6 +3344,24 @@ fn emit_record_loop_prologue<'a>(
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
     concept_group: Option<&'a ConceptGroup>,
+    // Reserve the arena `MatchVariant` arm-binder pool in this frame?
+    //
+    // True at exactly ONE call site: `emit_full_program`, which is the only
+    // emitter that builds an entry-level `ArenaCtx` (via
+    // `ArenaCtx::from_record_ctx`) and therefore the only one whose body can
+    // reach `emit_eval_expr`'s arena dispatch — the sole consumer of the pool.
+    //
+    // The other six callers pass `false` and keep their frames byte-for-byte
+    // unchanged. They are not merely "unlikely" to need it, they cannot: with
+    // `arena_ctx == None` a `match` falls to the Phase A 4.1 pure-AST-
+    // substitution path, which uses no frame slots at all. Notably
+    // `emit_self_recursive_program` also passes `false` — the SCC's matches run
+    // inside callables, and `emit_callable_into` reserves its own pool below
+    // its own input+let slots; reserving again in `_start` would churn
+    // `examples/vexprparse.verbose` for nothing. Measured: with all seven
+    // callers reserving, 292 rule-binaries across 11 files change bytes; with
+    // only `emit_full_program`, 162 across 2.
+    reserve_match_binder_pool: bool,
 ) -> Result<RecordLoopCtx<'a>, NativeError> {
     let n_ctx = context_concept.map_or(0, |c| c.fields.len());
     let nfields = input_concept.fields.len();
@@ -3368,7 +3394,22 @@ fn emit_record_loop_prologue<'a>(
     //   base + 7: err_len_slot        (depth 1)
     //   base + 8: err_frame_save_slot (depth 1)
     //   ... 4 slots per added depth ...
-    //   base + 4*N + 1: exit_flag_slot
+    //   base + 4*N + 1: exit_flag_slot                          <-- last of `n_reserved`
+    //   base + n_reserved + 1 .. + n_binder_slots: MatchVariant arm binder pool
+    //   ... then the resource / connection / now_unix / arena blocks ...
+    //
+    // The binder pool is the fix for a frame-layout collision: the arena
+    // `MatchVariant` dispatch in `emit_eval_expr` allocates one slot per
+    // bound arm binder BELOW every live slot it can see, and it can only
+    // see `binding_offsets` + `text_bindings` — the four match_result
+    // slots and `exit_flag_slot` live in NEITHER map. So binder #1 landed
+    // on `match_slot`, #2 on `err_ptr_slot`, … and #5 squarely on
+    // `exit_flag_slot`: a rule with 5+ binder slots produced the RIGHT
+    // answer with the 5th binder's value (mod 256) as its EXIT CODE, and
+    // binders past that ran on into the resource / arena region. Now the
+    // prologue reserves the pool explicitly and `ctx.match_arm_binder_floor`
+    // tells the dispatch where it starts. Rules with no `MatchVariant`
+    // reserve 0 slots and compile byte-for-byte unchanged.
     //
     // Nested match_result (slice "nested match"): one quartet per
     // `match_result` nesting level, indexed by depth via
@@ -3440,6 +3481,34 @@ fn emit_record_loop_prologue<'a>(
         }
         None => (0, 0),
     };
+    // MatchVariant arm binder pool (see the layout comment above).
+    //
+    // Gated on `arena_size > 0` — the SAME condition `ArenaCtx::from_record_ctx`
+    // uses to decide whether an entry-level arena context exists at all. Only
+    // the arena dispatch in `emit_eval_expr` allocates binder slots; a `match`
+    // on a plain `variants:` concept (no `concept_group`) reaches
+    // `arena_ctx == None` and takes the Phase A 4.1 pure-AST-substitution path,
+    // which uses no frame slots. Reserving for those would grow the frame of
+    // `token_classify` / `token_label` for nothing — measured: without this
+    // gate `token_classify::score` and `token_label::label_of` both change
+    // bytes at an unchanged size.
+    //
+    // Sized by `max_stacked_match_binder_slots`, which answers "how DEEP can
+    // the pool get", not "how WIDE is one arm": the dispatch places each nested
+    // match's binders below the enclosing arm's (they are in the extended
+    // `offsets` map by then), and nesting reaches through an inlined rule Call
+    // because `emit_full_program` passes `self_call: None`, so every Call on
+    // this path is inlined with the arm-extended map.
+    //
+    // Only `rule.logic.value` is walked — the prologue evaluates `let` RHSes
+    // with `arena_ctx: None` (the ctx is built from the ctx this function
+    // RETURNS), so a `MatchVariant` in a let RHS takes the substitution path
+    // too and consumes no slot.
+    let n_binder_slots = if reserve_match_binder_pool && arena_size > 0 {
+        max_stacked_match_binder_slots(&rule.logic.value, concept_group, all_rules) as usize
+    } else {
+        0
+    };
     // Phase B slice 4a.2 / 4c — tmp slot pool for VariantConstruct
     // subterm spilling. Each tmp slot holds an i64 (8 B for Number /
     // arena-index) or a (ptr, len) pair (16 B for Text). Pool sized at
@@ -3476,7 +3545,7 @@ fn emit_record_loop_prologue<'a>(
         0
     };
 
-    let frame_slots = n_ctx + nfields + n_binding_slots + n_reserved;
+    let frame_slots = n_ctx + nfields + n_binding_slots + n_reserved + n_binder_slots;
     let frame_size = (frame_slots * 8) as i32
         + resource_extra_bytes
         + connection_extra_bytes
@@ -3491,6 +3560,15 @@ fn emit_record_loop_prologue<'a>(
     // exit_flag sits past all match-result quartets so its offset stays
     // stable for non-nested rules.
     let exit_flag_slot: i32 = -((base + 4 * (n_match_quartets as i32) + 1) * 8);
+    // Floor for the MatchVariant binder pool: the slot just ABOVE the pool,
+    // i.e. the last reserved slot (`exit_flag_slot`). The dispatch derives
+    // its first binder slot as `min(lowest_live_slot, floor) - 8`, so at the
+    // top level it lands on the first reserved pool slot, and inside a
+    // nested arm the enclosing binders (already in `offsets`) win the min
+    // and the nesting keeps stacking downwards exactly as before. 0 when no
+    // pool was reserved — `min(lowest, 0)` is `lowest` for every real frame,
+    // which is what keeps non-MatchVariant rules byte-for-byte identical.
+    let match_arm_binder_floor: i32 = if n_binder_slots > 0 { exit_flag_slot } else { 0 };
 
     // mov r12, [rsp]            — argc
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
@@ -3555,7 +3633,8 @@ fn emit_record_loop_prologue<'a>(
     // freed by `mov rsp, rbp; pop rbp` in the epilogue). open/read failure
     // patches into the shared abort label emitted by emit_record_loop_epilogue.
     let mut text_bindings: TextBindings<'a> = HashMap::new();
-    let mut resource_next_slot: i32 = -((base + n_reserved as i32 + 1) * 8);
+    let mut resource_next_slot: i32 =
+        -((base + n_reserved as i32 + n_binder_slots as i32 + 1) * 8);
     for r in &referenced_resources {
         let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
             code,
@@ -3970,6 +4049,7 @@ fn emit_record_loop_prologue<'a>(
         err_len_slot,
         err_frame_save_slot,
         extra_match_slot_quartets: n_match_quartets - 1,
+        match_arm_binder_floor,
         exit_flag_slot,
         resource_abort_patches,
         arena_size,
@@ -4154,7 +4234,7 @@ fn emit_full_program<'a>(
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
-    let mut ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, concept_group)?;
+    let mut ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, concept_group, true)?;
 
     // Phase B slice 4a.2 — build an arena context iff the program
     // declares a concept_group. Non-group programs pass `None` (byte-
@@ -4377,6 +4457,10 @@ fn emit_self_recursive_program<'a>(
     let ctx = emit_record_loop_prologue(
         &mut code, &entry_for_prologue, concept, None, all_rules, all_resources, all_connections,
         concept_group,
+        // The SCC's `match`es are emitted inside callables, each of which
+        // reserves its own binder pool in its own frame. `_start` never runs
+        // one, so it needs none.
+        false,
     )?;
     if entry_is_group {
         // Single i64 — load from the synthetic slot keyed by input_name.
@@ -4834,6 +4918,11 @@ fn emit_callable_into<'a>(
             // arena_base_slot, so these are inert in the callable path.
             use_mmap: false,
             arena_base_slot: 0,
+            // Callable frames reserve their binder pool directly below the
+            // input + let slots, which is where the `lowest_offset - 8`
+            // derivation already lands. No floor needed, and none applied —
+            // this keeps every callable byte-for-byte unchanged.
+            match_arm_binder_floor: 0,
         }
     });
     let arena_ctx_ref = arena_ctx_owned.as_ref();
@@ -5160,6 +5249,161 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
     }
     walk(expr, &mut max_slots, concept_group);
     max_slots
+}
+
+/// Slots to reserve for the entry-level `MatchVariant` arm-binder pool.
+///
+/// `count_max_match_arm_binder_slots` above answers "how WIDE is the widest
+/// single arm". That is the right question for a callable, which has one
+/// dispatch and no reserved slots below it, and the WRONG one for the entry
+/// frame — because `emit_eval_expr`'s arena dispatch allocates each binder
+/// BELOW every slot currently live, and the binders an enclosing arm just
+/// placed ARE live (they are in the `extended_offsets` map handed to the arm
+/// body). So nested dispatches stack, and the pool must be as deep as the
+/// deepest chain, not as wide as the widest arm.
+///
+/// Two things make a dispatch "nested" here:
+///   - an arm body containing another `match` (any depth), and
+///   - an arm body calling a rule whose body matches — `emit_full_program`
+///     passes `self_call: None`, so on this path every `Call` is INLINED with
+///     the arm-extended offsets map, and the callee's binders stack below the
+///     caller's exactly as a lexically nested match would.
+/// Hence the walk follows callees, guarded by a `visiting` set (the recursion
+/// detector refuses cycles before this runs, but a stack overflow inside the
+/// compiler is not an acceptable way to find that out).
+///
+/// Everything that is not a `MatchVariant` contributes the MAX of its
+/// children rather than the sum: a sibling expression's dispatch has finished
+/// and released its slots before the next one starts. A `MatchVariant`'s
+/// SCRUTINEE is likewise a max, not an addend — it is evaluated before any
+/// binder of that match is placed.
+fn max_stacked_match_binder_slots(
+    expr: &Expr,
+    concept_group: Option<&ConceptGroup>,
+    all_rules: &HashMap<&str, &Rule>,
+) -> u32 {
+    fn arm_slots(arm: &MatchArm, cg: Option<&ConceptGroup>) -> u32 {
+        // Same width derivation as count_max_match_arm_binder_slots: text
+        // payloads take 2 slots (ptr, len), everything else 1. Kept in step
+        // with that function deliberately — the two answer different
+        // questions about the same layout.
+        if let Some(g) = cg {
+            if let Some(variant) = g
+                .concepts
+                .iter()
+                .flat_map(|c| c.variants.iter())
+                .find(|v| v.name == arm.variant_name)
+            {
+                return variant
+                    .fields
+                    .iter()
+                    .take(arm.binders.len())
+                    .map(|f| if matches!(f.ty, Type::Text) { 2u32 } else { 1u32 })
+                    .sum();
+            }
+        }
+        arm.binders.len() as u32
+    }
+    fn walk<'r>(
+        e: &Expr,
+        cg: Option<&ConceptGroup>,
+        all_rules: &HashMap<&'r str, &'r Rule>,
+        visiting: &mut Vec<String>,
+    ) -> u32 {
+        let mut go = |x: &Expr, v: &mut Vec<String>| walk(x, cg, all_rules, v);
+        match e {
+            Expr::MatchVariant(scrutinee, arms) => {
+                let mut m = go(scrutinee, visiting);
+                for a in arms {
+                    let deep = arm_slots(a, cg) + walk(&a.body, cg, all_rules, visiting);
+                    if deep > m {
+                        m = deep;
+                    }
+                }
+                m
+            }
+            Expr::Call(name, args) => {
+                let mut m = 0;
+                for a in args {
+                    m = m.max(go(a, visiting));
+                }
+                if !visiting.iter().any(|n| n == name) {
+                    if let Some(callee) = all_rules.get(name.as_str()) {
+                        visiting.push(name.clone());
+                        m = m.max(walk(&callee.logic.value, cg, all_rules, visiting));
+                        visiting.pop();
+                    }
+                }
+                m
+            }
+            Expr::Number(_)
+            | Expr::Text(_)
+            | Expr::Bytes(_)
+            | Expr::Ident(_)
+            | Expr::Read(_)
+            | Expr::NowUnix => 0,
+            Expr::Field(b, _) => go(b, visiting),
+            Expr::Binary(_, l, r) => go(l, visiting).max(go(r, visiting)),
+            Expr::Not(i)
+            | Expr::Neg(i)
+            | Expr::Ok(i)
+            | Expr::Err(i)
+            | Expr::Abs(i)
+            | Expr::BitNot(i)
+            | Expr::Length(i)
+            | Expr::ParseInt(i)
+            | Expr::JsonEscape(i)
+            | Expr::Le32(i)
+            | Expr::Le64(i)
+            | Expr::ArenaScope(i)
+            | Expr::AbortIf(i) => go(i, visiting),
+            Expr::If(c, t, ee) => go(c, visiting).max(go(t, visiting)).max(go(ee, visiting)),
+            Expr::Concat(args) => {
+                let mut m = 0;
+                for a in args {
+                    m = m.max(go(a, visiting));
+                }
+                m
+            }
+            Expr::Quantifier(_, c, _, body) => go(c, visiting).max(go(body, visiting)),
+            Expr::Fold(c, init, _, _, body) => go(c, visiting)
+                .max(go(init, visiting))
+                .max(go(body, visiting)),
+            Expr::FoldBytes(t, init, _, _, _, body) => go(t, visiting)
+                .max(go(init, visiting))
+                .max(go(body, visiting)),
+            Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+                go(c, visiting).max(go(body, visiting))
+            }
+            Expr::MatchResult(t, _, ok, _, err) => go(t, visiting)
+                .max(go(ok, visiting))
+                .max(go(err, visiting)),
+            Expr::Record(_, fields) | Expr::VariantConstruct(_, _, fields) => {
+                let mut m = 0;
+                for (_, x) in fields {
+                    m = m.max(go(x, visiting));
+                }
+                m
+            }
+            Expr::Fetch(_, req) => go(req, visiting),
+            Expr::StartsWith(h, n)
+            | Expr::Contains(h, n)
+            | Expr::EndsWith(h, n)
+            | Expr::Min(h, n)
+            | Expr::Max(h, n)
+            | Expr::ByteAt(h, n)
+            | Expr::BitAnd(h, n)
+            | Expr::BitOr(h, n)
+            | Expr::BitXor(h, n)
+            | Expr::Shl(h, n)
+            | Expr::Shr(h, n) => go(h, visiting).max(go(n, visiting)),
+            Expr::Substring(t, s, en) => go(t, visiting)
+                .max(go(s, visiting))
+                .max(go(en, visiting)),
+        }
+    }
+    let mut visiting: Vec<String> = Vec::new();
+    walk(expr, concept_group, all_rules, &mut visiting)
 }
 
 /// Phase B slice 4a.3 — does the expression tree contain a
@@ -5675,7 +5919,12 @@ fn emit_streaming_text_body(
                 .flat_map(|&(p, l)| [p, l])
                 .min()
                 .unwrap_or(0);
-            let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
+            // `.min(ac.match_arm_binder_floor)` mirrors the eval-context
+            // dispatch so the three copies cannot drift. Streaming bodies only
+            // run inside a callable, where the floor is 0 and the min is a
+            // no-op — these two sites are byte-for-byte unchanged by it.
+            let lowest_offset: i32 =
+                lowest_in_offsets.min(lowest_in_text).min(ac.match_arm_binder_floor);
             let binder_base = lowest_offset - 8;
 
             let mut end_patches: Vec<usize> = Vec::new();
@@ -5921,7 +6170,7 @@ fn emit_text_program<'a>(
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
 
     // Phase 2I — pass the text_bindings built from the prologue's let-eval
     // loop so text-write resolves Ident(let-name) as a BoundText (same path
@@ -6019,7 +6268,7 @@ fn emit_bytes_program<'a>(
         }
     }
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
 
     // The streaming body needs the in-scope bindings the prologue populated so
     // a future le32(<field>) can read a field. r11 is not live here (no arena),
@@ -6177,7 +6426,12 @@ fn emit_streaming_bytes_body(
                 .flat_map(|&(p, l)| [p, l])
                 .min()
                 .unwrap_or(0);
-            let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
+            // `.min(ac.match_arm_binder_floor)` mirrors the eval-context
+            // dispatch so the three copies cannot drift. Streaming bodies only
+            // run inside a callable, where the floor is 0 and the min is a
+            // no-op — these two sites are byte-for-byte unchanged by it.
+            let lowest_offset: i32 =
+                lowest_in_offsets.min(lowest_in_text).min(ac.match_arm_binder_floor);
             let binder_base = lowest_offset - 8;
 
             let mut end_patches: Vec<usize> = Vec::new();
@@ -8750,7 +9004,7 @@ fn emit_result_program<'a>(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
@@ -9805,7 +10059,7 @@ fn emit_record_program<'a>(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections, concept_group)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
 
     emit_eval_record_expr(
         &mut code,
@@ -12733,7 +12987,7 @@ fn emit_reaction_program<'a>(
     // Both Print and AppendFile effects are handled below.
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
+    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
 
     // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
     emit_eval_expr(
@@ -13194,6 +13448,21 @@ struct ArenaCtx<'a> {
     /// Off-stack mmap arena: rbp offset of the frame slot holding the mmap
     /// base pointer. Only meaningful at entry level when `use_mmap` is true.
     arena_base_slot: i32,
+    /// Slot just ABOVE the reserved `MatchVariant` arm-binder pool, or 0 for
+    /// "derive it from the live slots alone".
+    ///
+    /// Entry level (`in_callable == false`) sets the real floor, because the
+    /// four match_result slots and `exit_flag_slot` sit at the bottom of the
+    /// prologue frame and appear in NEITHER `offsets` nor `text_bindings` —
+    /// so the naive `lowest_offset - 8` derivation aliased them.
+    ///
+    /// Callables keep 0: `emit_callable_into` already reserves
+    /// `count_max_match_arm_binder_slots` immediately below its input+let
+    /// slots, which is exactly where `lowest_offset - 8` lands, and there are
+    /// no match_result/exit_flag slots in a callable frame to collide with.
+    /// `min(lowest, 0)` is `lowest` for any real frame, so callables and every
+    /// pre-existing binary are byte-for-byte unchanged.
+    match_arm_binder_floor: i32,
 }
 
 /// Off-stack mmap arena (2026-06-22): emit "r11 = arena base" at an
@@ -13252,6 +13521,7 @@ impl<'a> ArenaCtx<'a> {
             callable_node_count_seed: 0,
             use_mmap: ctx.use_mmap,
             arena_base_slot: ctx.arena_base_slot,
+            match_arm_binder_floor: ctx.match_arm_binder_floor,
         })
     }
 
@@ -15009,7 +15279,18 @@ fn emit_eval_expr(
                     .flat_map(|&(p, l)| [p, l])
                     .min()
                     .unwrap_or(0);
-                let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
+                // ... and BELOW the bottom-of-frame reserved slots, which live
+                // in neither map. `ac.match_arm_binder_floor` is the prologue's
+                // last reserved slot (`exit_flag_slot`) at entry level, 0 in a
+                // callable. Without it, binder #1 aliased `match_slot`, #2
+                // `err_ptr_slot`, #3 `err_len_slot`, #4 `err_frame_save_slot`
+                // and #5 `exit_flag_slot` — so a 5-binder arm produced the
+                // correct output with the 5th binder's value (mod 256) as the
+                // process EXIT CODE. Nesting still stacks correctly: an inner
+                // match sees the outer arm's binders in `offsets`, so
+                // `lowest_offset` is already below the floor and wins the min.
+                let lowest_offset: i32 =
+                    lowest_in_offsets.min(lowest_in_text).min(ac.match_arm_binder_floor);
                 // First binder slot is 8 bytes below the lowest existing
                 // offset. binder i sits at first - 8*i.
                 let binder_base = lowest_offset - 8;
@@ -38735,6 +39016,265 @@ rule label_len
             );
         }
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// Frame-layout collision: the arena `MatchVariant` binder pool used to
+    /// ALIAS the bottom-of-frame reserved slots.
+    ///
+    /// `emit_eval_expr`'s arena dispatch places arm binders below every slot it
+    /// can see, and it can only see `binding_offsets` + `text_bindings`. The
+    /// prologue's `match_slot` / `err_ptr_slot` / `err_len_slot` /
+    /// `err_frame_save_slot` / `exit_flag_slot` are in NEITHER map and were not
+    /// reserved either, so binder #N landed on reserved slot #N:
+    ///
+    ///     binder 1 -> match_slot        binder 4 -> err_frame_save_slot
+    ///     binder 2 -> err_ptr_slot      binder 5 -> exit_flag_slot
+    ///     binder 3 -> err_len_slot      binder 6+ -> resource / arena region
+    ///
+    /// The observable symptom is the nastiest possible shape: the rule printed
+    /// the RIGHT answer and then exited with the 5th binder's value mod 256. A
+    /// number-output binary must exit 0 — a nonzero exit is the fail-closed
+    /// signal — so `if ./binary; then …` was wrong for 255 of every 256 values.
+    ///
+    /// THE THRESHOLD IS THE DEFECT, so this pins N = 4 (last good), N = 5
+    /// (first bad) and N = 8 (well past it). A test at a single N would pass
+    /// against an off-by-one fix. Measured against 3df76f8, where N=4 is
+    /// correct and N=5 / N=8 both exit with `a + 5` mod 256.
+    #[test]
+    fn match_variant_binder_pool_does_not_alias_reserved_frame_slots() {
+        // A single variant with N number payloads; the entry rule matches it
+        // and sums every binder, so all N binder slots are genuinely live.
+        fn probe(n: usize) -> String {
+            let fields = (1..=n).map(|i| format!("f{} : number", i)).collect::<Vec<_>>().join(", ");
+            let ctor = (1..=n).map(|i| format!("f{}: s.a + {}", i, i)).collect::<Vec<_>>().join(", ");
+            let binders = (1..=n).map(|i| format!("v{}", i)).collect::<Vec<_>>().join(", ");
+            let sum = (1..=n).map(|i| format!("v{}", i)).collect::<Vec<_>>().join(" + ");
+            format!(
+                r#"@verbose 0.1.0
+
+concept S
+  @intention: "one bounded number input"
+  @source: invoices.intent:1
+  fields:
+    a : number [0, 1000]
+
+concept_group G [max_depth: 8, max_nodes: 64]
+  @intention: "arena group for the binder-pool probe"
+  @source: invoices.intent:1
+
+  concept Node
+    @intention: "one variant carrying {n} number payloads"
+    @source: invoices.intent:1
+    variants:
+      One of ({fields})
+
+rule make
+  @intention: "construct the node"
+  @source: invoices.intent:1
+  input:
+    s : S
+  output:
+    n : Node
+  logic:
+    n = Node::One {{ {ctor} }}
+  proofs:
+    purity:
+      reads   : [s.a]
+      calls   : []
+    termination:
+      bound : {bound}
+
+rule total
+  @intention: "sum every payload of the constructed node"
+  @source: invoices.intent:1
+  input:
+    s : S
+  output:
+    o : number
+  logic:
+    o = match make(s):
+      One({binders}) => {sum}
+  proofs:
+    purity:
+      reads   : [s]
+      calls   : [make]
+    termination:
+      bound : {bound}
+"#,
+                n = n, fields = fields, ctor = ctor, binders = binders, sum = sum,
+                bound = 8 * n + 16,
+            )
+        }
+
+        // N -> (input, expected stdout). sum of (a + 1 .. a + N) = N*a + N(N+1)/2.
+        for n in [4usize, 5, 8] {
+            let src = probe(n);
+            let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            let out = std::env::temp_dir().join(format!("verbosec_test_binder_pool_{}", n));
+            compile_native(&program, "total", out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("N={} probe must compile: {}", n, e.message));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+            // `a = 251` is the mod-256 WRAP case: pre-fix the 5th binder is
+            // `a + 5 = 256`, which truncates to exit code 0 — the one input in
+            // 256 where the buggy binary looks correct. Keeping it here means a
+            // regression cannot hide behind a lucky value.
+            for a in [0i64, 7, 250, 251, 300] {
+                let expected = (n as i64) * a + (n as i64) * (n as i64 + 1) / 2;
+                let r = std::process::Command::new(&out)
+                    .arg(a.to_string())
+                    .output()
+                    .expect("probe binary must run");
+                assert_eq!(
+                    String::from_utf8_lossy(&r.stdout).as_ref(),
+                    format!("{}\n", expected),
+                    "N={} a={}: output must be the sum of all {} binders", n, a, n,
+                );
+                assert_eq!(
+                    r.status.code(), Some(0),
+                    "N={} a={}: a number-output binary must exit 0. Pre-fix this was \
+                     the {}th binder's value mod 256 ({}), because the binder pool \
+                     aliased exit_flag_slot.",
+                    n, a, 5, (a + 5).rem_euclid(256),
+                );
+            }
+            let _ = std::fs::remove_file(&out);
+        }
+    }
+
+    /// Companion to the test above: the binder pool must also survive NESTING.
+    ///
+    /// The pool is consumed by a bump-below-the-lowest-live-slot discipline, so
+    /// a `match` inside another arm's body stacks its binders BELOW the
+    /// enclosing arm's — and nesting reaches through an inlined rule call,
+    /// because `emit_full_program` passes `self_call: None` and every call on
+    /// that path is inlined with the arm-extended offsets map. The reservation
+    /// therefore has to be as DEEP as the deepest chain, not as WIDE as the
+    /// widest arm; sizing it with the per-arm max would leave `2 * 3 = 6`
+    /// stacked slots overflowing a 3-slot pool.
+    ///
+    /// Measured against 3df76f8: N=2 (4 stacked) correct, N=3 (6 stacked) exits
+    /// 9, N=4 (8 stacked) exits 8.
+    #[test]
+    fn nested_match_variant_binder_pool_stacks_without_overflow() {
+        fn probe(n: usize) -> String {
+            let fields = (1..=n).map(|i| format!("f{} : number", i)).collect::<Vec<_>>().join(", ");
+            let ctor = (1..=n).map(|i| format!("f{}: s.a + {}", i, i)).collect::<Vec<_>>().join(", ");
+            let ob = (1..=n).map(|i| format!("x{}", i)).collect::<Vec<_>>().join(", ");
+            let osum = (1..=n).map(|i| format!("x{}", i)).collect::<Vec<_>>().join(" + ");
+            let ib = (1..=n).map(|i| format!("u{}", i)).collect::<Vec<_>>().join(", ");
+            let isum = (1..=n).map(|i| format!("u{}", i)).collect::<Vec<_>>().join(" + ");
+            format!(
+                r#"@verbose 0.1.0
+
+concept S
+  @intention: "one bounded number input"
+  @source: invoices.intent:1
+  fields:
+    a : number [0, 1000]
+
+concept_group G [max_depth: 8, max_nodes: 64]
+  @intention: "arena group for the nested binder-pool probe"
+  @source: invoices.intent:1
+
+  concept Node
+    @intention: "one variant carrying {n} number payloads"
+    @source: invoices.intent:1
+    variants:
+      One of ({fields})
+
+rule make
+  @intention: "construct the node"
+  @source: invoices.intent:1
+  input:
+    s : S
+  output:
+    n : Node
+  logic:
+    n = Node::One {{ {ctor} }}
+  proofs:
+    purity:
+      reads   : [s.a]
+      calls   : []
+    termination:
+      bound : {bound}
+
+rule inner
+  @intention: "match and sum the payloads"
+  @source: invoices.intent:1
+  input:
+    s : S
+  output:
+    o : number
+  logic:
+    o = match make(s):
+      One({ib}) => {isum}
+  proofs:
+    purity:
+      reads   : [s]
+      calls   : [make]
+    termination:
+      bound : {bound}
+
+rule nested
+  @intention: "match, then call a rule that matches again inside the arm body"
+  @source: invoices.intent:1
+  input:
+    s : S
+  output:
+    o : number
+  logic:
+    o = match make(s):
+      One({ob}) => {osum} + inner(s)
+  proofs:
+    purity:
+      reads   : [s]
+      calls   : [make, inner]
+    termination:
+      bound : {bound}
+"#,
+                n = n, fields = fields, ctor = ctor,
+                ib = ib, isum = isum, ob = ob, osum = osum,
+                bound = 16 * n + 32,
+            )
+        }
+
+        for n in [2usize, 3, 4] {
+            let src = probe(n);
+            let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            let out = std::env::temp_dir().join(format!("verbosec_test_nested_binder_pool_{}", n));
+            compile_native(&program, "nested", out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("nested N={} probe must compile: {}", n, e.message));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+            for a in [0i64, 7, 251] {
+                // both matches sum (a+1 .. a+N), so the total is twice that.
+                let expected = 2 * ((n as i64) * a + (n as i64) * (n as i64 + 1) / 2);
+                let r = std::process::Command::new(&out)
+                    .arg(a.to_string())
+                    .output()
+                    .expect("nested probe binary must run");
+                assert_eq!(
+                    String::from_utf8_lossy(&r.stdout).as_ref(),
+                    format!("{}\n", expected),
+                    "nested N={} a={}: both matches must contribute", n, a,
+                );
+                assert_eq!(
+                    r.status.code(), Some(0),
+                    "nested N={} a={} ({} stacked binder slots): a number-output \
+                     binary must exit 0", n, a, 2 * n,
+                );
+            }
+            let _ = std::fs::remove_file(&out);
+        }
     }
 
     #[test]
