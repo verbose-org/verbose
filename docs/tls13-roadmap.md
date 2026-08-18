@@ -232,10 +232,22 @@ its bytes forward, deferring any new return-shape primitive:
   method for the 5 s figure, and it was wrong by ~2 orders of magnitude —
   which mattered, because it was the number that made Gap C look like a
   performance emergency rather than an expressiveness one. Closing Gap C is
-  still worth it: the same measurement puts the ceiling at ~4.5 ms once a
-  stage's bytes cross a rule boundary once, i.e. ~26x less CPU. But the
-  argument is "the `which` pattern is a workaround for a missing concept",
-  not "the demo is too slow to run".)*
+  still worth it, but the argument is "the `which` pattern is a workaround
+  for a missing concept", not "the demo is too slow to run".)*
+
+  *(Second correction, 2026-08-18, same day: the paragraph above originally
+  continued "the same measurement puts the ceiling at ~4.5 ms once a stage's
+  bytes cross a rule boundary once, i.e. ~26x less CPU". **Both figures were
+  struck, and the reason is worth more than the figures were.** "The same
+  measurement" was false — the 0.1 s came from `tools/tls_gen/vcrypto.py`'s
+  self-test, while the 4.5 ms and the 26x came from a report that is not
+  reproducible from anything in this repo. So a commit whose entire purpose
+  was removing an unmeasured number **introduced two more, in the same
+  sentence, laundered by the word "same"**. Nothing is put in their place:
+  the one-process ceiling has not been measured, and an unmeasured
+  replacement is the defect, not the cure. Note also 26x and the 0.1 s -> 4.5
+  ms ratio (22x) never agreed, which is the cheap tell — figures that cannot
+  be reproduced also tend not to reconcile with each other.)*
 So Gap C does NOT block the offline RFC 8448 milestone (§8); the clean
 in-Verbose, in-memory data-flow (a real "rule returns a byte buffer" or mutable
 state) is a LATER infra slice, justified on its own merits once the protocol
