@@ -248,6 +248,32 @@ its bytes forward, deferring any new return-shape primitive:
   replacement is the defect, not the cure. Note also 26x and the 0.1 s -> 4.5
   ms ratio (22x) never agreed, which is the cheap tell — figures that cannot
   be reproduced also tend not to reconcile with each other.)*
+
+- **The `which` cost, MEASURED** (2026-08-18, `hyperfine -N`, this machine,
+  method stated so it can be re-run or refuted). Four points on
+  `examples/hkdf.verbose::hkdf_extract`, compiled `--native --run
+  hkdf_extract` and invoked on RFC 5869 TC-1's salt and IKM:
+
+  | what | mean |
+  |---|---|
+  | 821 B static Verbose ELF, trivial body (spawn floor) | 227.3 µs ± 20.2 (200 runs) |
+  | the 328 KB binary exiting at its argc guard (spawn + page-in, **no compute**) | 244.5 µs ± 28.5 (200 runs) |
+  | one full HKDF-Extract, returning **one** PRK byte | 292.8 µs ± 31.5 (200 runs) |
+  | all 32 invocations, i.e. the whole 32-byte PRK | 14.8 ms ± 0.4 (50 runs) |
+
+  Compute is therefore ~48 µs, about **16 %** of an invocation; process
+  creation and page-in are the other 84 %. **But that split is the less
+  important half, and reading it as the headline is the mistake both struck
+  figures made.** The `which` parameterization does not merely pay 31 extra
+  *spawns* — each invocation recomputes the ENTIRE HMAC and discards 31 of
+  its 32 output bytes, so it pays 31 extra *computations* as well. A
+  one-process version costs one spawn plus one compute (~293 µs) against
+  9.4 ms of pure invocation cost, i.e. **~32x** — exactly the arity of the
+  `which` loop, which is not a coincidence: you pay everything N times.
+
+  Do not generalize the ratio: it is N for an N-way `which` loop, so it is
+  ~32x here and would be ~20x for `ladder`'s 20 limbs. And this measures
+  HKDF-Extract only, on WSL2, where spawn cost is inflated.*
 So Gap C does NOT block the offline RFC 8448 milestone (§8); the clean
 in-Verbose, in-memory data-flow (a real "rule returns a byte buffer" or mutable
 state) is a LATER infra slice, justified on its own merits once the protocol
