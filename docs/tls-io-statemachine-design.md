@@ -115,9 +115,11 @@ self-hosting — buffers/mutable state are on that roadmap too,
 - **Strategy B's claim must be stated precisely** ("TLS crypto in pure Verbose,
   driven by a host state machine"), never overstated as "TLS server in Verbose".
   Overstating it would be the same integrity failure as a false test pass.
-- **Performance**: each X25519 ladder is ~5s; a handshake does 2 → ~10s per
-  connection, plus per-byte recompute for record crypto. Fine for a demo, not
-  for load. Say so.
+- **Performance**: MEASURED, a full X25519 is **0.1 s**
+  (`tools/tls_gen/vcrypto.py` prints `VCRYPTO_OK x25519=0.1s`), so a 2-scalar-mult
+  handshake is sub-second, plus per-byte recompute for record crypto. Fine for a
+  demo, not for load. Say so. *(Was "~5s per ladder → ~10s per connection" until
+  2026-08-18 — unmeasured, and wrong by ~2 orders of magnitude.)*
 - **Constant-time**: not claimed; the host glue and the `which`-recompute are not
   constant-time. Demo-grade only.
 - **Milestone 3 (browser) is a large arc** (Ed25519 ~ the size of the X25519 arc

@@ -203,7 +203,7 @@ encrypted** exchange before any HTTP. Open questions:
 - **Composition vs recursion ABI**: our crypto rules return one Number/byte per
   invocation (the `which` pattern), and recursion can't return a record. A
   handshake that pipes a 32-byte secret from X25519 into HKDF into GCM cannot
-  re-run each stage per output byte (the ladder alone is ~5 s). So the TLS
+  re-run each stage per output byte. So the TLS
   driver needs a way to compute a stage **once** and feed all its bytes
   forward. This is the same wall hit in X25519 (resolved there by external
   orchestration of ladder→finish). For TLS, the orchestration is the protocol
@@ -224,9 +224,18 @@ its bytes forward, deferring any new return-shape primitive:
   rules glued by the OS/filesystem (or by the orchestrating service), exactly
   the ladder→finish external-composition pattern. Per-connection file I/O is
   ugly but works and needs NO language change.
-- **Recompute-per-byte is tolerable for a demo**: the ladder is ~5 s; a
-  handshake does ~2 scalar mults + a few AEAD records ≈ tens of seconds per
-  connection. Unacceptable for load, fine to prove correctness.
+- **Recompute-per-byte is tolerable for a demo**: MEASURED, a full X25519 is
+  **0.1 s** (`tools/tls_gen/vcrypto.py` self-test: `VCRYPTO_OK x25519=0.1s`),
+  which is 52 process spawns hidden behind a 64-thread pool. Unacceptable for
+  load, fine to prove correctness. *(This bullet said "the ladder is ~5 s …
+  tens of seconds per connection" until 2026-08-18. No doc ever recorded a
+  method for the 5 s figure, and it was wrong by ~2 orders of magnitude —
+  which mattered, because it was the number that made Gap C look like a
+  performance emergency rather than an expressiveness one. Closing Gap C is
+  still worth it: the same measurement puts the ceiling at ~4.5 ms once a
+  stage's bytes cross a rule boundary once, i.e. ~26x less CPU. But the
+  argument is "the `which` pattern is a workaround for a missing concept",
+  not "the demo is too slow to run".)*
 So Gap C does NOT block the offline RFC 8448 milestone (§8); the clean
 in-Verbose, in-memory data-flow (a real "rule returns a byte buffer" or mutable
 state) is a LATER infra slice, justified on its own merits once the protocol
@@ -305,8 +314,10 @@ in-Verbose driver come after.
   language-infra slice (byte-buffer return / mutable state) before a pure-Verbose
   handshake driver is possible. Everything else has RFC anchors and known shapes.
 - **Ed25519** is a full arc (SHA-512 + Edwards + mod L), not a brick.
-- **Performance**: the ladder is ~5 s; a handshake doing several scalar mults +
-  N-block AEAD per connection may be seconds-to-minutes. Fine for a demo, not
-  for load. State it honestly.
+- **Performance**: MEASURED, a full X25519 is **0.1 s** (see §5's bullet); a
+  handshake doing several scalar mults + N-block AEAD per connection is
+  sub-second, dominated by process spawns rather than by arithmetic. Fine for
+  a demo, not for load. State it honestly — and state the MEASURED number, not
+  a remembered one.
 - **Constant-time**: more secret-dependent operations enter (tag compare, sig).
   Claim "branch-free where it matters", not "constant-time", until audited.

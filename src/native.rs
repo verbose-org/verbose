@@ -42664,8 +42664,12 @@ rule do_shl
         // below were produced by the field/ladder reference that reproduces the
         // published X25519 output exactly (see the live end-to-end check). Only a
         // few output limbs are checked here because each native invocation re-runs
-        // the entire ladder (~5s); the full 20-limb + inversion + RFC sweep is
-        // covered by the out-of-band validation.
+        // the entire ladder; the full 20-limb + inversion + RFC sweep is
+        // covered by the out-of-band validation. (This comment said "(~5s)"
+        // until 2026-08-18. Unmeasured and wrong by ~2 orders of magnitude:
+        // tools/tls_gen/vcrypto.py reports a FULL X25519 — 52 spawns — at 0.1 s.
+        // Sampling a few limbs is still the right call for test wall-clock, but
+        // for the real reason, not an invented one.)
         let h = std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(x25519_ladder_recursive_test_body)
