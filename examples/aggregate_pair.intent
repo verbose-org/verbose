@@ -1,0 +1,4 @@
+1. Take two bytes.
+2. Produce them swapped, as one aggregate value.
+3. The swapper: return both bytes swapped as one record.
+4. The composer: call the swapper and read both fields of the returned aggregate.

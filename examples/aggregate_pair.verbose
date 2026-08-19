@@ -1,0 +1,48 @@
+@verbose 0.1.0
+
+concept In
+  @intention: "two bytes to be swapped"
+  @source: aggregate_pair.intent:1
+  fields:
+    a : number [0, 255]
+    b : number [0, 255]
+
+concept Pair
+  @intention: "the swapped pair, returned as an aggregate"
+  @source: aggregate_pair.intent:2
+  fields:
+    x : number [0, 255]
+    y : number [0, 255]
+
+rule swap2
+  @intention: "return both bytes swapped, as one record value"
+  @source: aggregate_pair.intent:3
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = Pair { x: i.b, y: i.a }
+  proofs:
+    purity:
+      reads : [i.a, i.b]
+      calls : []
+    termination:
+      bound : 3
+
+rule total
+  @intention: "compose: call swap2 and read both fields of the returned aggregate"
+  @source: aggregate_pair.intent:4
+  input:
+    i : In
+  output:
+    out : number
+  logic:
+    let p = swap2(i)
+    out = p.x * 1000 + p.y
+  proofs:
+    purity:
+      reads : [i]
+      calls : [swap2]
+    termination:
+      bound : 10
