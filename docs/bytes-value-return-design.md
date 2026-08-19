@@ -111,9 +111,16 @@ quoted beside it; the repo's own recorded X25519 figure is **0.1 s**, not 59 ms
 (`docs/tls13-roadmap.md:227-229`); and "0.14 % at 32 bytes" divided by the byte count when
 §2.1(a) establishes that a 32-byte value is a **32-field, 256-byte record** in this
 codebase, which §2.2 prices ~8× higher on its own figure. *(Two of the derived numbers —
-"~4.5 ms", "~26x less CPU" — **are** in the repo, at `docs/tls13-roadmap.md:234-236`, added
-by PR #176. So "nothing is recorded" was itself too strong; what is unrecorded is the pair
-of primitive measurements the derivation rests on, which is the half that matters.)*
+"~4.5 ms", "~26x less CPU" — **were** in the repo, added by PR #176, so "nothing is
+recorded" was too strong when this section was written; what was unrecorded is the pair of
+primitive measurements the derivation rests on, which is the half that matters. **Both have
+since been struck from `docs/tls13-roadmap.md` by PR #180 (`a9f2344`), on this section's own
+reasoning**, and replaced there by a measurement of the same phenomenon with its method
+stated. That measurement is the 32-way `hkdf_extract` loop alone rather than the 74-way
+chain timed below, and it reports **~32x** — consistent with this section, because the ratio
+is essentially the ARITY of the `which` loop: you pay the spawn AND the whole computation N
+times over, and keep one byte of it. Read the two together as one result at two arities, not
+as two competing figures.)*
 
 `HEAD~3` is literally the commit that fixed the previous instance of this failure mode
 (`628a820`, *"docs: replace the unmeasured '~5 s ladder' figure with a measured 0.1 s"*),
@@ -1201,7 +1208,7 @@ Recorded because the same discipline applies in both directions.
   `grep -c " : number"` returns 113 because it also matches the rule's own `out : number`
   line. §2.2's 237 KB arithmetic (265 × 112 × 8) is unchanged.
 - **"~26× less CPU" and "~4.5 ms" ARE recorded in the repo**, at
-  `docs/tls13-roadmap.md:234-236`, added by PR #176 — so "unrecoverable from the repo" was too
+  `docs/tls13-roadmap.md` by PR #176 (and struck again by PR #180) — so "unrecoverable from the repo" was too
   strong as stated. What is genuinely unrecorded is the *pair of primitive measurements* the
   derivation rests on (2.38 cyc/word/call and p256_fmul's 6 670-cycle body), which is the half
   that matters and the reason §1.3 strikes the derived figures anyway: a ratio whose inputs
