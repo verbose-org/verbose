@@ -38,6 +38,8 @@ ENTRIES=(
   "5a      |examples/greeting_line.verbose|greeting_line     |output:text per-record (concat)"
   "5b      |examples/roster.verbose      |roster_line        |output:text via fold (append-only)"
   "Record+concat|examples/fullname.verbose|compose_greeting  |Record text field from concat"
+  "agg-1   |examples/aggregate_pair.verbose|total            |record return via caller-allocated dest"
+  "agg-1-e |examples/aggregate_pair.verbose|swap2            |same record rule as ENTRY (JSON, unchanged)"
 )
 
 printf "╔════════════════════════════════════════════════════════════════════════════╗\n"

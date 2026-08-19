@@ -229,6 +229,53 @@ pub fn compile_wasm(
         message: format!("no rule named '{}'", rule_name),
     })?;
 
+    // Slice agg-1 (docs/bytes-value-return-design.md §6.2) — aggregate return
+    // is native-only. Refuse with a breadcrumb that names the slice instead of
+    // the generic "unsupported expression in WASM backend", so the asymmetry
+    // is deliberate and legible. Covers the rule ITSELF returning a record and
+    // any rule it calls doing so.
+    {
+        let is_record = |ty: &Type| -> Option<&str> {
+            match ty {
+                Type::Named(n) => concepts
+                    .iter()
+                    .find(|c| c.name == *n)
+                    .filter(|c| c.variants.is_empty() && !c.fields.is_empty())
+                    .map(|c| c.name.as_str()),
+                _ => None,
+            }
+        };
+        let mut offender: Option<(&str, &str)> = is_record(&rule.output_ty)
+            .map(|c| (rule.name.as_str(), c));
+        if offender.is_none() {
+            // Direct callees only — WASM inlines one level and refuses the
+            // rest already, so a deeper walk would report a shape the
+            // backend never reaches.
+            let mut names: Vec<String> = Vec::new();
+            for (_, e) in &rule.logic.bindings {
+                crate::native::collect_callee_names(e, &mut names);
+            }
+            crate::native::collect_callee_names(&rule.logic.value, &mut names);
+            names.sort();
+            for n in &names {
+                if let Some(&callee) = rules.get(n.as_str()) {
+                    if let Some(c) = is_record(&callee.output_ty) {
+                        offender = Some((callee.name.as_str(), c));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((rname, cname)) = offender {
+            return Err(WasmError {
+                message: format!(
+                    "wasm: aggregate (record) return is not supported; rule '{}' returns record '{}'. slice agg-1 is native-only. Use --run or --native.",
+                    rname, cname
+                ),
+            });
+        }
+    }
+
     let concept = match &rule.input_ty {
         Type::Named(n) => concepts.iter().find(|c| c.name == *n).ok_or_else(|| WasmError {
             message: format!("unknown concept '{}'", n),

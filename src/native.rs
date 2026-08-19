@@ -269,11 +269,46 @@ fn compile_native_code(
     // Reactions are checked against their trigger rule's call graph
     // (the reaction itself doesn't recurse, but its trigger might).
     let recursion_witness = detect_native_recursion(rule, &rules);
+    // Slice agg-1 (docs/bytes-value-return-design.md §6.1): a reachable
+    // callee whose `output:` is a plain record concept returns its value
+    // through a caller-allocated destination, so it MUST be emitted as a
+    // real callable. The entry itself is excluded — a record-OUTPUT entry
+    // is served by `emit_record_program` (JSON to stdout) and stays there.
+    let record_returning_callees: Vec<String> = {
+        let reachable = collect_transitive_recursive_callees(rule, &rules, &concepts);
+        reachable
+            .iter()
+            .filter(|n| {
+                n.as_str() != rule.name.as_str()
+                    && rules.get(n.as_str()).map_or(false, |r| {
+                        plain_record_concept(&r.output_ty, &concepts).is_some()
+                    })
+            })
+            .cloned()
+            .collect()
+    };
+    let has_record_callee = !record_returning_callees.is_empty();
+    // Refusal #7 (§6.2) — the CALLER's output must be Number or Bool.
+    // `emit_self_recursive_program`'s result dispatch ends in
+    // `emit_itoa_inline`, so a record / text / bytes caller would print
+    // the DESTINATION POINTER as a decimal: the itoa-a-pointer family
+    // CLAUDE.md spends five gen0 slices closing, reproduced in verbosec.
+    if has_record_callee && !matches!(&rule.output_ty, Type::Number | Type::Bool) {
+        return Err(NativeError {
+            message: format!(
+                "aggregate return: rule '{}' calls record-returning rule '{}', but {}'s own output is '{:?}'; slice agg-1 requires a number or bool caller, because _start's result dispatch would itoa the destination pointer. A record-output rule is already served by emit_record_program.",
+                rule.name, record_returning_callees[0], rule.name, rule.output_ty
+            ),
+        });
+    }
+    if has_record_callee {
+        check_aggregate_shape(rule, &rules, &concepts)?;
+    }
     // Also route through the callable path if any transitively-reachable
     // callee has a different input concept than the entry — the inline
     // path shares the caller's offsets map, which has the wrong fields
     // for a cross-concept call.
-    let needs_callable_path = recursion_witness.is_some() || {
+    let needs_callable_path = recursion_witness.is_some() || has_record_callee || {
         // Cross-concept callee detection only applies for scalar-output
         // entry rules. Result/Collection/Record output rules have their
         // own specialized emit paths that handle cross-concept calls
@@ -285,7 +320,7 @@ fn compile_native_code(
             _ => None,
         };
         entry_scalar && {
-            let reachable = collect_transitive_recursive_callees(rule, &rules);
+            let reachable = collect_transitive_recursive_callees(rule, &rules, &concepts);
             reachable.iter().any(|name| {
                 rules.get(name.as_str()).map_or(false, |r| {
                     let r_in = match &r.input_ty {
@@ -337,7 +372,7 @@ fn compile_native_code(
             let mut already_in: std::collections::HashSet<String> =
                 scc_rules_owned.iter().map(|r| r.name.clone()).collect();
             let recursive_reachable =
-                collect_transitive_recursive_callees(rule, &rules);
+                collect_transitive_recursive_callees(rule, &rules, &concepts);
             for name in &recursive_reachable {
                 if already_in.contains(name) {
                     continue;
@@ -364,6 +399,28 @@ fn compile_native_code(
         let entry_is_recursive = recursion_witness.is_some();
         for r in &scc_rules_owned {
             let is_in_entry_scc = scc_names.contains(&r.name);
+            // Slice agg-1, refusal #1 (§6.2). A record-returning rule needs a
+            // destination in the CALLER's live frame; a recursive program has
+            // no single live frame to point at, so the destination would have
+            // to be per-frame (slice agg-2). Two shapes are refused: the rule
+            // itself being in a cycle, and the rule sitting on the callable
+            // path of a program whose ENTRY is recursive — the latter because
+            // `emit_self_recursive_program` lays every SCC member out as a
+            // callable and the recursive frames interleave with it.
+            if let Some(rc) = plain_record_concept(&r.output_ty, &concepts) {
+                let own_cycle = detect_native_recursion(r, &rules);
+                if own_cycle.is_some() || entry_is_recursive {
+                    let witness = own_cycle
+                        .or_else(|| recursion_witness.clone())
+                        .unwrap_or_else(|| rule.name.clone());
+                    return Err(NativeError {
+                        message: format!(
+                            "aggregate return: rule '{}' returns record '{}' and is on the callable path of a recursive program (cycle through '{}'); a recursive aggregate return needs a per-frame destination (slice agg-2). Use --run.",
+                            r.name, rc.name, witness
+                        ),
+                    });
+                }
+            }
             if !entry_is_recursive {
                 // No cycle: only the inlining-correctness extension; skip
                 // recursion-specific constraints.
@@ -2051,9 +2108,401 @@ fn decide_streaming_bytes_mode(scc_rules: &[&Rule]) -> Result<(), NativeError> {
 /// cost is negligible. The entry rule is included if it's itself
 /// recursive (its own cycle); the slice-5.4 SCC path already adds it
 /// otherwise via `scc_rules_owned`.
+/// Slice agg-1 — is `ty` a PLAIN RECORD concept (has `fields:`, no
+/// `variants:`)? Returns the concept when it is.
+///
+/// The `variants.is_empty()` half is load-bearing and is refusal #3 of
+/// docs/bytes-value-return-design.md §6.2: a `concept_group` (sum-type)
+/// output ALREADY has a return convention — a single i64 arena index in
+/// rax (`is_group_output`, `src/native.rs`) — and routing it through the
+/// caller-allocated destination would be two conventions for one shape.
+fn plain_record_concept<'a>(ty: &Type, concepts: &[&'a Concept]) -> Option<&'a Concept> {
+    match ty {
+        Type::Named(n) => concepts
+            .iter()
+            .copied()
+            .find(|c| c.name == *n)
+            .filter(|c| c.variants.is_empty() && !c.fields.is_empty()),
+        _ => None,
+    }
+}
+
+/// Slice agg-1 — the destination layout for a record-returning rule:
+/// `(field_name, byte_offset)` in CONCEPT DECLARATION ORDER.
+///
+/// Declaration order comes from `concept.fields`, a `Vec` — never from a
+/// `HashMap`. See the DETERMINISM comment in `emit_eval_expr`'s Call arm:
+/// iterating a map at a call site produced a different byte sequence on
+/// every compile. Slice agg-1 only permits Number fields (refusal #2), so
+/// every field is 8 bytes wide.
+fn record_return_layout(concept: &Concept) -> Vec<(String, i32)> {
+    let mut out = Vec::with_capacity(concept.fields.len());
+    let mut off = 0i32;
+    for f in &concept.fields {
+        out.push((f.name.clone(), off));
+        off += 8;
+    }
+    out
+}
+
+/// Slice agg-1 — does `Ident(name)` appear anywhere in `expr` OTHER than as
+/// the base of a `Field` access?
+///
+/// This is refusal #5's detector (§6.2), and it must stand on its own in the
+/// emitter: `let p = swap2(i)` followed by `out = p * 1000` **verifies clean
+/// at rc 0** on `main` — PR #178 typechecked `.field` ON a record binding and
+/// deliberately added no rule for a bare record `Ident` in a scalar position.
+///
+/// The match is EXHAUSTIVE (no catch-all) on purpose: a future `Expr` variant
+/// must fail to compile here rather than silently open a hole.
+fn expr_uses_ident_outside_field(expr: &Expr, name: &str) -> bool {
+    let rec = |e: &Expr| expr_uses_ident_outside_field(e, name);
+    match expr {
+        Expr::Ident(n) => n == name,
+        // The ONE legal position: `p.<field>`. Do not descend into the base
+        // when it is exactly our binding; any other base is walked normally.
+        Expr::Field(base, _) => !matches!(base.as_ref(), Expr::Ident(n) if n == name) && rec(base),
+        Expr::Call(_, args) => args.iter().any(rec),
+        Expr::If(c, t, e) => rec(c) || rec(t) || rec(e),
+        Expr::Binary(_, l, r) => rec(l) || rec(r),
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
+        | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i)
+        | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => rec(i),
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
+        | Expr::EndsWith(a, b) | Expr::Contains(a, b) => rec(a) || rec(b),
+        Expr::Concat(args) => args.iter().any(rec),
+        Expr::MatchResult(t, _, ok, _, err) => rec(t) || rec(ok) || rec(err),
+        Expr::MatchVariant(s, arms) => rec(s) || arms.iter().any(|a| rec(&a.body)),
+        Expr::Quantifier(_, coll, _, body) => rec(coll) || rec(body),
+        Expr::Fold(coll, init, _, _, body) => rec(coll) || rec(init) || rec(body),
+        Expr::FoldBytes(t, init, _, _, _, body) => rec(t) || rec(init) || rec(body),
+        Expr::Map(coll, _, body) | Expr::Filter(coll, _, body) => rec(coll) || rec(body),
+        Expr::Record(_, fields) | Expr::VariantConstruct(_, _, fields) => {
+            fields.iter().any(|(_, e)| rec(e))
+        }
+        Expr::Substring(t, a, b) => rec(t) || rec(a) || rec(b),
+        Expr::ByteAt(t, i) => rec(t) || rec(i),
+        Expr::Fetch(_, request) => rec(request),
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Read(_) | Expr::NowUnix => false,
+    }
+}
+
+/// Slice agg-1 — every rule transitively reachable from `entry` via `Call`
+/// edges, entry included. Sorted for determinism (this drives diagnostics,
+/// never emitted bytes, but the discipline is cheap).
+fn collect_reachable_rule_names(entry: &Rule, all_rules: &HashMap<&str, &Rule>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(entry.name.clone());
+    let mut stack = vec![entry.name.clone()];
+    while let Some(n) = stack.pop() {
+        if let Some(&r) = all_rules.get(n.as_str()) {
+            let mut callees: Vec<String> = Vec::new();
+            for (_, e) in &r.logic.bindings {
+                collect_native_callees(e, &mut callees);
+            }
+            collect_native_callees(&r.logic.value, &mut callees);
+            for c in callees {
+                if seen.insert(c.clone()) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = seen.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// Slice agg-1 — the whole §6.1 scope check, in one place, so every refusal
+/// carries a breadcrumb that names the offender and the slice that lifts it.
+///
+/// Only invoked when the program actually has a reachable record-returning
+/// callee, so no existing program can reach any of these messages.
+fn check_aggregate_shape(
+    entry: &Rule,
+    all_rules: &HashMap<&str, &Rule>,
+    concepts: &[&Concept],
+) -> Result<(), NativeError> {
+    let reachable = collect_reachable_rule_names(entry, all_rules);
+    let record_rules: HashSet<&str> = reachable
+        .iter()
+        .filter(|n| {
+            all_rules
+                .get(n.as_str())
+                .map_or(false, |r| plain_record_concept(&r.output_ty, concepts).is_some())
+        })
+        .map(|n| n.as_str())
+        .collect();
+    // Refusal #4's detector: does this expression contain a call to a
+    // record-returning rule anywhere inside it?
+    let calls_a_record_rule = |e: &Expr| -> Option<String> {
+        let mut callees: Vec<String> = Vec::new();
+        collect_native_callees(e, &mut callees);
+        callees.into_iter().find(|c| record_rules.contains(c.as_str()))
+    };
+
+    for rname in &reachable {
+        let r = match all_rules.get(rname.as_str()) {
+            Some(&r) => r,
+            None => continue,
+        };
+        // Refusal #2 — the returned concept's fields must all be Number.
+        // Text needs the (ptr, len) pair convention (slice agg-3); Bool does
+        // not emit as a record field in ANY native path today.
+        if let Some(rc) = plain_record_concept(&r.output_ty, concepts) {
+            // Refusal #1's own-cycle half, checked HERE rather than only in
+            // the SCC constraint walk so it beats refusal #8 to the message:
+            // a SELF-recursive record-returning rule trivially "calls a
+            // record-returning rule", and #8's breadcrumb would send the
+            // reader looking for a second aggregate that does not exist.
+            if let Some(cycle) = detect_native_recursion(r, all_rules) {
+                return Err(NativeError {
+                    message: format!(
+                        "aggregate return: rule '{}' returns record '{}' and is on the callable path of a recursive program (cycle through '{}'); a recursive aggregate return needs a per-frame destination (slice agg-2). Use --run.",
+                        r.name, rc.name, cycle
+                    ),
+                });
+            }
+            for f in &rc.fields {
+                if f.ty != Type::Number {
+                    return Err(NativeError {
+                        message: format!(
+                            "aggregate return: concept '{}' field '{}' has type {:?}; slice agg-1 returns number fields only — text fields need the (ptr, len) pair convention (slice agg-3), and bool record fields do not emit in any path today (emit_record_as_json).",
+                            rc.name, f.name, f.ty
+                        ),
+                    });
+                }
+            }
+            // Refusal #8 — one aggregate hop per slice. A second destination
+            // needs a nested slot group with expression-scoped lifetime.
+            let mut inner: Vec<String> = Vec::new();
+            for (_, e) in &r.logic.bindings {
+                collect_native_callees(e, &mut inner);
+            }
+            collect_native_callees(&r.logic.value, &mut inner);
+            if let Some(r2) = inner.into_iter().find(|c| record_rules.contains(c.as_str())) {
+                return Err(NativeError {
+                    message: format!(
+                        "aggregate return: record-returning rule '{}' itself calls record-returning rule '{}'; slice agg-1 allows one aggregate hop, because a second destination needs a nested slot group with expression-scoped lifetime (slice agg-2).",
+                        r.name, r2
+                    ),
+                });
+            }
+        }
+        // Per-rule: classify the let bindings, then check every use.
+        let mut record_lets: Vec<(&str, &Concept)> = Vec::new();
+        for (bname, rhs) in &r.logic.bindings {
+            match rhs {
+                Expr::Call(callee, args) if record_rules.contains(callee.as_str()) => {
+                    // Constraint 3: the call is the ENTIRE RHS of the let.
+                    // Its ARGUMENT must not smuggle a second aggregate call.
+                    for a in args {
+                        if let Some(inner) = calls_a_record_rule(a) {
+                            return Err(NativeError {
+                                message: format!(
+                                    "aggregate return: the call to record-returning rule '{}' must be the entire right-hand side of a let-binding in slice agg-1 (found it in a call argument of '{}'); nested aggregate calls are slice agg-2.",
+                                    inner, callee
+                                ),
+                            });
+                        }
+                    }
+                    let rc = all_rules
+                        .get(callee.as_str())
+                        .and_then(|c| plain_record_concept(&c.output_ty, concepts))
+                        .expect("record_rules membership implies a plain record output");
+                    record_lets.push((bname.as_str(), rc));
+                }
+                other => {
+                    if let Some(inner) = calls_a_record_rule(other) {
+                        return Err(NativeError {
+                            message: format!(
+                                "aggregate return: the call to record-returning rule '{}' must be the entire right-hand side of a let-binding in slice agg-1 (found it nested inside the RHS of let '{}'); nested aggregate calls are slice agg-2.",
+                                inner, bname
+                            ),
+                        });
+                    }
+                    // Refusal #3 — a sum-type (concept_group) return already
+                    // has a convention: one i64 arena index in rax. Do not
+                    // route it through the destination convention.
+                    if let Expr::Call(callee, _) = other {
+                        if let Some(&cr) = all_rules.get(callee.as_str()) {
+                            if let Type::Named(n) = &cr.output_ty {
+                                let is_group = concepts
+                                    .iter()
+                                    .find(|c| c.name == *n)
+                                    .map_or(false, |c| !c.variants.is_empty());
+                                let field_read = expr_reads_field_of(&r.logic.value, bname)
+                                    || r.logic
+                                        .bindings
+                                        .iter()
+                                        .any(|(_, e)| expr_reads_field_of(e, bname));
+                                if is_group && field_read {
+                                    return Err(NativeError {
+                                        message: format!(
+                                            "aggregate return: '{}' is a concept_group concept; a group value already returns as an arena index in rax — do not route it through the destination convention.",
+                                            n
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Refusal #4 (body position) — an aggregate call anywhere in the
+        // rule's own logic value is not a let RHS.
+        if let Some(inner) = calls_a_record_rule(&r.logic.value) {
+            return Err(NativeError {
+                message: format!(
+                    "aggregate return: the call to record-returning rule '{}' must be the entire right-hand side of a let-binding in slice agg-1 (found it in rule '{}'s logic body); nested aggregate calls are slice agg-2.",
+                    inner, r.name
+                ),
+            });
+        }
+        // Refusal #5 — a record-typed binding may only be READ with `.field`.
+        for (p, rc) in &record_lets {
+            let mut bad = expr_uses_ident_outside_field(&r.logic.value, p);
+            if !bad {
+                for (bn, e) in &r.logic.bindings {
+                    if bn == p {
+                        continue;
+                    }
+                    if expr_uses_ident_outside_field(e, p) {
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+            if bad {
+                return Err(NativeError {
+                    message: format!(
+                        "aggregate return: binding '{}' of record type '{}' may only be read with '.field' in slice agg-1; passing the whole record as a call argument is slice agg-2.",
+                        p, rc.name
+                    ),
+                });
+            }
+            // Every `.field` read must name a field the concept declares —
+            // the verifier checks this since PR #178, but the emitter must
+            // not depend on that, since a missing key would otherwise fall
+            // back to the BARE-NAME lookup (refusal #9's silent collision).
+            let mut missing: Option<String> = None;
+            collect_field_reads_of(&r.logic.value, p, &mut |f| {
+                if missing.is_none() && !rc.fields.iter().any(|cf| cf.name == f) {
+                    missing = Some(f.to_string());
+                }
+            });
+            for (_, e) in &r.logic.bindings {
+                collect_field_reads_of(e, p, &mut |f| {
+                    if missing.is_none() && !rc.fields.iter().any(|cf| cf.name == f) {
+                        missing = Some(f.to_string());
+                    }
+                });
+            }
+            if let Some(f) = missing {
+                return Err(NativeError {
+                    message: format!(
+                        "aggregate return: binding '{}' of record type '{}' has no field '{}'; slice agg-1 keys the destination slots by '__agg_<let>_<field>' so an unknown field cannot fall back to the input's slot.",
+                        p, rc.name, f
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Slice agg-1 — does `expr` contain `Field(Ident(name), _)`?
+fn expr_reads_field_of(expr: &Expr, name: &str) -> bool {
+    let mut found = false;
+    collect_field_reads_of(expr, name, &mut |_| found = true);
+    found
+}
+
+/// Slice agg-1 — call `f` with every `<name>.<field>` read in `expr`.
+/// Shares `expr_uses_ident_outside_field`'s exhaustive shape so the two
+/// cannot disagree about where a binding can appear.
+fn collect_field_reads_of(expr: &Expr, name: &str, f: &mut dyn FnMut(&str)) {
+    match expr {
+        Expr::Field(base, fname) => {
+            if matches!(base.as_ref(), Expr::Ident(n) if n == name) {
+                f(fname);
+            } else {
+                collect_field_reads_of(base, name, f);
+            }
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                collect_field_reads_of(a, name, f);
+            }
+        }
+        Expr::If(c, t, e) => {
+            collect_field_reads_of(c, name, f);
+            collect_field_reads_of(t, name, f);
+            collect_field_reads_of(e, name, f);
+        }
+        Expr::Binary(_, l, r) => {
+            collect_field_reads_of(l, name, f);
+            collect_field_reads_of(r, name, f);
+        }
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
+        | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i)
+        | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
+            collect_field_reads_of(i, name, f)
+        }
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
+        | Expr::EndsWith(a, b) | Expr::Contains(a, b) | Expr::ByteAt(a, b) => {
+            collect_field_reads_of(a, name, f);
+            collect_field_reads_of(b, name, f);
+        }
+        Expr::MatchResult(t, _, ok, _, err) => {
+            collect_field_reads_of(t, name, f);
+            collect_field_reads_of(ok, name, f);
+            collect_field_reads_of(err, name, f);
+        }
+        Expr::MatchVariant(s, arms) => {
+            collect_field_reads_of(s, name, f);
+            for a in arms {
+                collect_field_reads_of(&a.body, name, f);
+            }
+        }
+        Expr::Quantifier(_, coll, _, body) | Expr::Map(coll, _, body)
+        | Expr::Filter(coll, _, body) => {
+            collect_field_reads_of(coll, name, f);
+            collect_field_reads_of(body, name, f);
+        }
+        Expr::Fold(coll, init, _, _, body) => {
+            collect_field_reads_of(coll, name, f);
+            collect_field_reads_of(init, name, f);
+            collect_field_reads_of(body, name, f);
+        }
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            collect_field_reads_of(t, name, f);
+            collect_field_reads_of(init, name, f);
+            collect_field_reads_of(body, name, f);
+        }
+        Expr::Record(_, fields) | Expr::VariantConstruct(_, _, fields) => {
+            for (_, e) in fields {
+                collect_field_reads_of(e, name, f);
+            }
+        }
+        Expr::Substring(t, a, b) => {
+            collect_field_reads_of(t, name, f);
+            collect_field_reads_of(a, name, f);
+            collect_field_reads_of(b, name, f);
+        }
+        Expr::Fetch(_, request) => collect_field_reads_of(request, name, f),
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_)
+        | Expr::NowUnix => {}
+    }
+}
+
 fn collect_transitive_recursive_callees(
     entry: &Rule,
     all_rules: &HashMap<&str, &Rule>,
+    concepts: &[&Concept],
 ) -> Vec<String> {
     let mut forward: std::collections::HashSet<String> = std::collections::HashSet::new();
     forward.insert(entry.name.clone());
@@ -2095,9 +2544,15 @@ fn collect_transitive_recursive_callees(
                 _ => None,
             };
             let cross_concept = entry_input.is_some() && r_input.is_some() && entry_input != r_input;
+            // Slice agg-1: a rule whose output is a plain record concept
+            // must be a real callable too — it writes its result through
+            // a caller-allocated destination passed in rsi, which the
+            // inline path has no way to provide.
+            let returns_record = plain_record_concept(&r.output_ty, concepts).is_some();
             if detect_native_recursion(r, all_rules).is_some()
                 || !r.logic.bindings.is_empty()
                 || cross_concept
+                || returns_record
             {
                 out.push(name.clone());
             }
@@ -2112,6 +2567,13 @@ fn collect_transitive_recursive_callees(
 /// shapes as `gather_transitive_callee_reads` but only emits the callee
 /// names (no resource reads, no further walking — the caller does the
 /// recursion via the DFS).
+/// Slice agg-1 — crate-visible re-export of `collect_native_callees` so
+/// `wasm.rs` can reuse the same walk for its aggregate-return refusal
+/// rather than growing a second, drift-prone copy.
+pub(crate) fn collect_callee_names(expr: &Expr, out: &mut Vec<String>) {
+    collect_native_callees(expr, out)
+}
+
 fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Call(name, args) => {
@@ -4408,10 +4870,19 @@ fn emit_self_recursive_program<'a>(
             struct_layouts.insert(r.name.as_str(), layout);
         }
     }
+    // Slice agg-1 — destination layout per record-returning SCC member.
+    // The width and field order come from `concept.fields` (a Vec, in
+    // declaration order), never from a HashMap: see `record_return_layout`.
+    let mut record_returns: HashMap<&str, Vec<(String, i32)>> = HashMap::new();
+    for &r in scc_rules {
+        if let Some(rc) = plain_record_concept(&r.output_ty, all_concepts) {
+            record_returns.insert(r.name.as_str(), record_return_layout(rc));
+        }
+    }
     let placeholder_labels: HashMap<&str, i32> = scc_rules.iter()
         .map(|r| (r.name.as_str(), 0_i32))
         .collect();
-    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities, struct_layouts: &struct_layouts, param_in_rbx: None };
+    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities, struct_layouts: &struct_layouts, param_in_rbx: None, record_returns: &record_returns, sret_dest: None };
     let mut sizes: Vec<usize> = Vec::with_capacity(scc_rules.len());
     for &r in scc_rules {
         let mut scratch = Vec::new();
@@ -4426,7 +4897,7 @@ fn emit_self_recursive_program<'a>(
         labels.insert(r.name.as_str(), next_offset);
         next_offset += sizes[i] as i32;
     }
-    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities, struct_layouts: &struct_layouts, param_in_rbx: None };
+    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities, struct_layouts: &struct_layouts, param_in_rbx: None, record_returns: &record_returns, sret_dest: None };
 
     // Pass 2: emit each callable with real labels.
     for &r in scc_rules {
@@ -4650,6 +5121,11 @@ fn emit_callable_into<'a>(
 ) -> Result<(), NativeError> {
     let is_text = rule.output_ty == Type::Text;
     let is_bytes = rule.output_ty == Type::Bytes;
+    // Slice agg-1 — this callable returns a plain record through a
+    // caller-allocated destination whose address arrives in rsi.
+    let sret_layout: Option<&Vec<(String, i32)>> =
+        self_call.record_returns.get(rule.name.as_str());
+    let is_record_output = sret_layout.is_some();
     // Phase B slice 4a.3: group-concept input has no `fields` (sum
     // type). The callable's ABI degenerates to single i64 in rdi
     // (the arena INDEX), spilled to `[rbp - 8]`. The input name (e.g.
@@ -4689,19 +5165,42 @@ fn emit_callable_into<'a>(
     // `let x = 0 + y` to `let x = y` where y is a number let). The previous
     // blanket `Ident => true` mis-sized those as text and then dropped them
     // in the eval loop's `_ => {}` text no-op, leaving the name unresolved.
+    //
+    // Slice agg-1 adds a THIRD class: a `let p = <record-returning call>`
+    // occupies one slot per field of the returned concept. The classifier
+    // runs first so the record class wins over the number default.
+    let callable_binding_record: Vec<Option<&Vec<(String, i32)>>> = rule
+        .logic
+        .bindings
+        .iter()
+        .map(|(_, expr)| match expr {
+            Expr::Call(callee, _) => self_call.record_returns.get(callee.as_str()),
+            _ => None,
+        })
+        .collect();
     let callable_binding_is_text: Vec<bool> = {
         let mut seen_text: HashSet<&str> = HashSet::new();
-        rule.logic.bindings.iter()
-            .map(|(name, expr)| {
+        rule.logic.bindings.iter().enumerate()
+            .map(|(idx, (name, expr))| {
+                if callable_binding_record[idx].is_some() { return false; }
                 let is_text = callable_let_is_text_for_frame_ctx(expr, concept, &seen_text);
                 if is_text { seen_text.insert(name.as_str()); }
                 is_text
             })
             .collect()
     };
-    let n_let_slots: usize = callable_binding_is_text.iter()
-        .map(|b| if *b { 2 } else { 1 })
+    let n_let_slots: usize = callable_binding_is_text.iter().enumerate()
+        .map(|(idx, b)| match callable_binding_record[idx] {
+            Some(layout) => layout.len(),
+            None => if *b { 2 } else { 1 },
+        })
         .sum();
+    // Slice agg-1 — the destination-pointer spill slot. It goes STRICTLY
+    // BELOW the tmp pool: `tmp_slot_base_local` is computed WITHOUT
+    // `tmp_slots` while `total_slots` includes it, so a slot inserted
+    // anywhere above that anchor would silently re-point every
+    // VariantConstruct spill (PR #175 was exactly that bug in this frame).
+    let sret_slots: usize = if is_record_output { 1 } else { 0 };
     // Frame layout:
     //   [rbp - 8 .. -8*nfields]                    input fields / index
     //   [rbp - 8*(nfields+1) .. -8*(nfields+lets)]  let binding slots
@@ -4710,7 +5209,15 @@ fn emit_callable_into<'a>(
     let binder_slot_base = -((nfields as i32 + 1) * 8);
     let _ = binder_slot_base;
     let tmp_slot_base_local = -((nfields as i32 + n_let_slots as i32 + max_arm_binder_slots as i32 + 1) * 8);
-    let total_slots = nfields + n_let_slots + (max_arm_binder_slots as usize) + (tmp_slots as usize);
+    let total_slots = nfields + n_let_slots + (max_arm_binder_slots as usize) + (tmp_slots as usize) + sret_slots;
+    // Slice agg-1 — the sret slot is the LAST regular slot, i.e. strictly
+    // below the tmp pool (see the comment at `sret_slots`). Zero when the
+    // rule does not return a record, so no existing frame moves.
+    let sret_slot: i32 = if is_record_output {
+        -((nfields as i32 + n_let_slots as i32 + max_arm_binder_slots as i32 + tmp_slots + 1) * 8)
+    } else {
+        0
+    };
     // Read-let support inside a callable (2026-07): a `let s = read(<res>)`
     // let RHS opens/reads a resource ONCE at callable entry, into a buffer
     // that lives in THIS callable's frame (a callable has its own rbp, so
@@ -4765,9 +5272,22 @@ fn emit_callable_into<'a>(
         && concept.fields.len() == 1
         && matches!(concept.fields[0].ty, Type::Number | Type::Bool);
     let scalar_output = !is_text && !is_bytes;
+    // Slice agg-1 — `&& !is_record_output` is NOT redundant, and getting
+    // this wrong ships a wrong binary rather than a refusal. For
+    // `Type::Named(C)` both `is_text` and `is_bytes` are false, so
+    // `scalar_output` is TRUE for a record output, and
+    // `body_is_pure_scalar_arith` has an `Expr::Record` arm — so a
+    // single-Number-field callable with a `Record { … }` body of arithmetic
+    // satisfies every other conjunct, takes the A2 prologue (which emits NO
+    // `sub rsp`), and the sret slot at `[rbp - 8]` would land exactly on the
+    // PUSHED RBX. Switching A2/A4 off puts the callable back on the ordinary
+    // slot prologue, where the destination has a frame to live in.
+    // Conservative direction: a missed optimisation, never a wrong store.
+    // Pinned by negative control NC-2.
     let qualifies_rbx = single_scalar_field
         && rule.logic.bindings.is_empty()
         && scalar_output
+        && !is_record_output
         && concept_group.is_none()
         && body_is_pure_scalar_arith(&rule.logic.value);
 
@@ -4800,6 +5320,13 @@ fn emit_callable_into<'a>(
     } else {
         code.extend_from_slice(&[0x48, 0x81, 0xEC]);
         code.extend_from_slice(&frame_bytes.to_le_bytes());
+    }
+    // Slice agg-1 — spill the destination pointer BEFORE anything else runs.
+    // `rsi` is caller-saved and every syscall, `emit_strlen` and
+    // `emit_itoa_inline` clobbers it, so it cannot be left in the register
+    // across the body. Same shape as `rdi`'s spill below. Pinned by NC-1.
+    if is_record_output {
+        emit_store_reg_to_rbp(code, 6, sret_slot); // mov [rbp + disp], rsi
     }
     if !is_multi_field {
         code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xF8]); // mov [rbp - 8], rdi
@@ -4838,6 +5365,30 @@ fn emit_callable_into<'a>(
         }
     }
     } // end `else` of qualifies_rbx prologue branch
+
+    // Slice agg-1, refusal #9 (§4.2) — COMPOSITE KEYING. Native field lookup
+    // is keyed by BARE field name, with `__state_<field>` the one existing
+    // precedent. If the returned concept `Q` has a field `a` and the caller's
+    // input concept `P` also has an `a`, both accesses are legal (the verifier
+    // is right to accept them) and a bare-name registration would make `p.a`
+    // silently resolve to the INPUT's slot — a plausible number at rc 0, the
+    // silent-wrong-answer class this repo spent eight gen0 slices closing.
+    //
+    // The keys are built HERE, before `callable_offsets` exists, because the
+    // map borrows them for the rest of the function. Pinned by NC-3.
+    let agg_keys: Vec<Vec<String>> = rule
+        .logic
+        .bindings
+        .iter()
+        .enumerate()
+        .map(|(idx, (name, _))| match callable_binding_record[idx] {
+            Some(layout) => layout
+                .iter()
+                .map(|(fname, _)| format!("__agg_{}_{}", name, fname))
+                .collect(),
+            None => Vec::new(),
+        })
+        .collect();
 
     // Build offsets / field_ranges maps for the body.
     let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
@@ -4931,6 +5482,34 @@ fn emit_callable_into<'a>(
     {
         let mut let_slot_idx = nfields;
         for (idx, (name, expr)) in rule.logic.bindings.iter().enumerate() {
+            if let Some(layout) = callable_binding_record[idx] {
+                // Slice agg-1 — a record-typed let. The destination is this
+                // let's slot GROUP: N consecutive rbp slots, one per field of
+                // the returned concept. Field i of the concept sits at
+                // `dest_base + 8*i`, so `dest_base` is the group's LOWEST
+                // address (the LAST slot index) — rbp slots descend while
+                // struct offsets ascend, and the callee stores at ascending
+                // offsets from the pointer it gets in rsi.
+                let n = layout.len();
+                let dest_base = -(((let_slot_idx + n - 1) as i32 + 1) * 8);
+                // Register each field's key BEFORE the call so the callee's
+                // own emit can never see them (they belong to the caller).
+                for (i, (_fname, off)) in layout.iter().enumerate() {
+                    callable_offsets.insert(agg_keys[idx][i].as_str(), dest_base + off);
+                }
+                // Hand the destination to the Call arm through the ctx. There
+                // is at most one live at a time: §6.1 constraint 3 makes the
+                // call the ENTIRE RHS, and refusal #4 enforces it.
+                let mut sc = self_call;
+                sc.sret_dest = Some(dest_base);
+                emit_eval_expr(
+                    code, expr, &rule.input_name, &callable_offsets,
+                    all_rules, &callable_field_ranges, &callable_text_bindings,
+                    Some(sc), arena_ctx_ref,
+                )?;
+                let_slot_idx += n;
+                continue;
+            }
             if callable_binding_is_text[idx] {
                 // Text let: produce (rax=ptr, rdx=len) via inline emit.
                 // Only allocation-free shapes reach here (constraint
@@ -5031,7 +5610,15 @@ fn emit_callable_into<'a>(
     }
 
     // Body.
-    if is_bytes {
+    if let Some(layout) = sret_layout {
+        // Slice agg-1 — write each field through the caller-allocated
+        // destination instead of serialising it to stdout.
+        emit_record_to_sret(
+            code, &rule.logic.value, rule, layout, sret_slot,
+            &callable_offsets, all_rules, &callable_field_ranges,
+            &callable_text_bindings, self_call, arena_ctx_ref,
+        )?;
+    } else if is_bytes {
         // Brick b3-native: streaming bytes body — the recursive bytes
         // analogue of emit_streaming_text_body. WRITES raw machine-code
         // bytes to fd 1 in order during the walk; the (rax, rdx) return
@@ -5142,11 +5729,123 @@ fn emit_callable_into<'a>(
         code.push(0x5D);                                   // pop rbp
         code.push(0xC3);                                   // ret
     } else {
+        // Slice agg-1 — return the destination pointer in rax, mirroring
+        // SysV's sret convention. The caller does not read it today (it
+        // reads the slot group directly), but a DEFINED return beats an
+        // undefined one, and it costs 4 bytes.
+        if is_record_output {
+            load_rax_from_rbp(code, sret_slot);
+        }
         code.extend_from_slice(&[0x48, 0x89, 0xEC]);       // mov rsp, rbp
         code.push(0x5D);                                   // pop rbp
         code.push(0xC3);                                   // ret
     }
     Ok(())
+}
+
+/// Slice agg-1 — emit a record-returning callable's BODY as N stores through
+/// the caller-allocated destination.
+///
+/// Per field, in CONCEPT DECLARATION ORDER:
+/// ```text
+///   <eval field expr>            ; emit_eval_expr leaves the value in RAX
+///   mov  rcx, [rbp - sret_slot]  ; reload the destination (rax holds the value)
+///   mov  [rcx + offset], rax
+/// ```
+/// The destination is reloaded per field rather than parked in a register:
+/// `rbx` and `r15` are the two the A2/A4 fast path claims and `r11` is the
+/// arena base, so a 4-byte reload is the cheap collision-free answer. `rcx`
+/// is ephemeral by CLAUDE.md's register table.
+///
+/// `If` arms are handled the way `emit_ok_record_dispatch` handles them: both
+/// arms write the same offsets and converge on the common tail.
+fn emit_record_to_sret(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    rule: &Rule,
+    layout: &[(String, i32)],
+    sret_slot: i32,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    self_call: SelfCallCtx<'_>,
+    arena_ctx: Option<&ArenaCtx<'_>>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Record(cname, fields) => {
+            if let Type::Named(declared) = &rule.output_ty {
+                if cname != declared {
+                    return Err(NativeError {
+                        message: format!(
+                            "aggregate return: rule '{}' constructs record '{}' but declares output '{}'",
+                            rule.name, cname, declared
+                        ),
+                    });
+                }
+            }
+            for (fname, off) in layout {
+                let fexpr = fields
+                    .iter()
+                    .find(|(n, _)| n == fname)
+                    .map(|(_, e)| e)
+                    .ok_or_else(|| NativeError {
+                        message: format!(
+                            "aggregate return: rule '{}' record constructor is missing field '{}'",
+                            rule.name, fname
+                        ),
+                    })?;
+                emit_eval_expr(
+                    code, fexpr, &rule.input_name, offsets, all_rules, field_ranges,
+                    text_bindings, Some(self_call), arena_ctx,
+                )?;
+                load_rcx_from_rbp(code, sret_slot);
+                // mov [rcx + off], rax
+                if *off == 0 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x01]);
+                } else if *off <= 127 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x41]);
+                    code.push(*off as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x81]);
+                    code.extend_from_slice(&off.to_le_bytes());
+                }
+            }
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            emit_eval_expr(
+                code, cond, &rule.input_name, offsets, all_rules, field_ranges,
+                text_bindings, Some(self_call), arena_ctx,
+            )?;
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+            code.extend_from_slice(&[0x0F, 0x84]);       // je rel32
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            emit_record_to_sret(
+                code, then_e, rule, layout, sret_slot, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            code.push(0xE9);                             // jmp rel32
+            let end_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            let else_pos = code.len() as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_pos.to_le_bytes());
+            emit_record_to_sret(
+                code, else_e, rule, layout, sret_slot, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            let end_pos = code.len() as i32 - (end_patch as i32 + 4);
+            code[end_patch..end_patch + 4].copy_from_slice(&end_pos.to_le_bytes());
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "aggregate return: rule '{}' body must be a record constructor (optionally under if/else) in slice agg-1; got {:?}",
+                rule.name, other
+            ),
+        }),
+    }
 }
 
 /// Phase B slice 4a.3 — recursively count the max arity of any
@@ -6280,11 +6979,14 @@ fn emit_bytes_program<'a>(
     let empty_labels: HashMap<&str, i32> = HashMap::new();
     let empty_arities: HashMap<&str, usize> = HashMap::new();
     let empty_layouts: HashMap<&str, Vec<(String, i32, bool)>> = HashMap::new();
+    let empty_records: HashMap<&str, Vec<(String, i32)>> = HashMap::new();
     let empty_self_call = SelfCallCtx {
         labels: &empty_labels,
         arities: &empty_arities,
         struct_layouts: &empty_layouts,
         param_in_rbx: None,
+        record_returns: &empty_records,
+        sret_dest: None,
     };
     emit_streaming_bytes_body(
         &mut code,
@@ -12629,6 +13331,57 @@ fn emit_store_rdx_to_rsp(code: &mut Vec<u8>, rsp_off: i32) {
     }
 }
 
+/// Slice agg-1 — `mov [rbp+offset], <reg>`, where `reg` is the 3-bit x86
+/// register number (0 = rax, 6 = rsi). ModRM is `mod:rm = [rbp+disp]`, i.e.
+/// `0b01_reg_101` for disp8 and `0b10_reg_101` for disp32; the disp8/disp32
+/// split mirrors `load_rax_from_rbp` exactly.
+fn emit_store_reg_to_rbp(code: &mut Vec<u8>, reg: u8, offset: i32) {
+    debug_assert!(reg < 8);
+    if offset >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45 | (reg << 3)]);
+        code.push(offset as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85 | (reg << 3)]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+}
+
+/// Slice agg-1 — emit `lea rsi, [rbp + dest]` when `callee` returns a record,
+/// and nothing at all otherwise (so no existing call site moves a byte).
+///
+/// **THE POSITION IS LOAD-BEARING: this MUST be the last thing emitted before
+/// the `call`.** The input-struct marshalling above clobbers `rsi` — every
+/// text field does `mov rsi, rax` + `emit_strlen`, and any number field whose
+/// expression reaches `emit_itoa_inline` does `lea rsi, [rsp+22]`. A
+/// destination parked in `rsi` before that loop is gone by the time `call`
+/// executes, and the callee would store the record through a string length.
+/// Emitting it here is safe because `rbp` is stable across the marshalling:
+/// nothing between the caller's prologue and the `call` touches it, the same
+/// invariant the slice-3d iteration epilogue relies on.
+fn emit_sret_dest_lea(
+    code: &mut Vec<u8>,
+    ctx: SelfCallCtx<'_>,
+    callee: &str,
+) -> Result<(), NativeError> {
+    if !ctx.record_returns.contains_key(callee) {
+        return Ok(());
+    }
+    let dest = ctx.sret_dest.ok_or_else(|| NativeError {
+        message: format!(
+            "aggregate return: the call to record-returning rule '{}' must be the entire right-hand side of a let-binding in slice agg-1 (no destination is live here); nested aggregate calls are slice agg-2.",
+            callee
+        ),
+    })?;
+    if dest >= -128 {
+        code.extend_from_slice(&[0x48, 0x8D, 0x75]); // lea rsi, [rbp + disp8]
+        code.push(dest as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8D, 0xB5]); // lea rsi, [rbp + disp32]
+        code.extend_from_slice(&dest.to_le_bytes());
+    }
+    Ok(())
+}
+
 fn load_rax_from_rbp(code: &mut Vec<u8>, offset: i32) {
     if offset >= -128 {
         code.extend_from_slice(&[0x48, 0x8B, 0x45]);
@@ -12691,6 +13444,17 @@ fn emit_eval_simple_into_rcx(
             let lookup_key = match base.as_ref() {
                 Expr::Ident(base_name) if base_name == "state" => {
                     format!("__state_{}", field_name)
+                }
+                // Slice agg-1 — a record-typed `let p = <record-returning
+                // call>` registers its destination slots as
+                // `__agg_<let>_<field>`, NOT as bare field names, so `p.a`
+                // cannot silently resolve to an input field also called `a`
+                // (refusal #9). The probe is on the composite key's presence,
+                // so a program with no aggregate let is byte-for-byte
+                // unchanged. `__agg_` is unreachable as a user identifier.
+                Expr::Ident(base_name) => {
+                    let agg = format!("__agg_{}_{}", base_name, field_name);
+                    if offsets.contains_key(agg.as_str()) { agg } else { field_name.clone() }
                 }
                 _ => field_name.clone(),
             };
@@ -13331,6 +14095,19 @@ struct SelfCallCtx<'a> {
     /// slot path. Per-callable: each `emit_callable_into` sets it on its own
     /// COPY of the ctx before emitting that callable's body.
     param_in_rbx: Option<&'a str>,
+    /// Slice agg-1 — per-callable destination layout for a rule whose
+    /// `output:` is a plain record concept: `(field_name, byte_offset)` in
+    /// CONCEPT DECLARATION ORDER. Membership is the predicate the Call arm
+    /// uses to decide whether the call needs a destination pointer in rsi;
+    /// absence keeps the pre-agg-1 byte-for-byte path.
+    record_returns: &'a HashMap<&'a str, Vec<(String, i32)>>,
+    /// Slice agg-1 — the rbp offset of the CURRENTLY-BEING-EVALUATED record
+    /// let's destination (the LOWEST address of its slot group). Set by
+    /// `emit_callable_into`'s let loop immediately around the one call it is
+    /// evaluating, and `None` everywhere else. There is at most one live
+    /// destination at a time because §6.1 constraint 3 requires the call to
+    /// be the entire RHS of a let (refusal #4 enforces it).
+    sret_dest: Option<i32>,
 }
 
 /// Phase B slice 4a.2 — arena context for `VariantConstruct` emission.
@@ -13748,6 +14525,17 @@ fn emit_eval_expr(
             let lookup_key = match base.as_ref() {
                 Expr::Ident(base_name) if base_name == "state" => {
                     format!("__state_{}", field_name)
+                }
+                // Slice agg-1 — a record-typed `let p = <record-returning
+                // call>` registers its destination slots as
+                // `__agg_<let>_<field>`, NOT as bare field names, so `p.a`
+                // cannot silently resolve to an input field also called `a`
+                // (refusal #9). The probe is on the composite key's presence,
+                // so a program with no aggregate let is byte-for-byte
+                // unchanged. `__agg_` is unreachable as a user identifier.
+                Expr::Ident(base_name) => {
+                    let agg = format!("__agg_{}_{}", base_name, field_name);
+                    if offsets.contains_key(agg.as_str()) { agg } else { field_name.clone() }
                 }
                 _ => field_name.clone(),
             };
@@ -14438,6 +15226,7 @@ fn emit_eval_expr(
                         }
                         // mov rdi, rsp
                         code.extend_from_slice(&[0x48, 0x89, 0xE7]);
+                        emit_sret_dest_lea(code, ctx, name)?;
                         // call <target>
                         code.push(0xE8);
                         let call_end = (code.len() + 4) as i32;
@@ -14547,6 +15336,7 @@ fn emit_eval_expr(
                             code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                         }
                     }
+                    emit_sret_dest_lea(code, ctx, name)?;
                     code.push(0xE8);
                     let call_end = (code.len() + 4) as i32;
                     let rel32 = self_target_offset - call_end;
@@ -48194,8 +48984,29 @@ rule pick
         // counted six times; `aes_sbox.verbose` had already been dropped at
         // 99 for the same shape, so the capability gap itself is not new and
         // no NEW class of program became uncompilable.
-        const EXPECTED_ACCEPTED: usize = 93;
-        const EXPECTED_TOTAL: usize = 151;
+        // 93 -> 94, 151 -> 152 (slice agg-1 adds `examples/aggregate_pair.verbose`).
+        //
+        // READ THIS BEFORE QUOTING THE NEW NUMBER. The 94th acceptance is
+        // `swap2`, the file's rule #0, and it is an HONEST one: gen0 emits a
+        // 2063-byte binary that prints `{"x":9,"y":7}` for argv `7 9`, which
+        // is byte-for-byte what verbosec's own 821-byte binary prints. What
+        // it is NOT is the file's SUBJECT. At the DECLARED entry — index 1,
+        // `total`, the rule the whole fixture exists to demonstrate — gen0
+        // emits **rc 0, an 825-byte ELF that exits 133 (SIGTRAP) with no
+        // output**, where verbosec now emits 793 bytes printing `9007`.
+        //
+        // That is the accept-what-you-cannot-emit class (`iso_date`,
+        // `aes_sbox`), NOT an INVERSE_CAPABILITY: gen0 does not refuse, it
+        // emits a binary that traps. It is a gen0 defect this slice
+        // SURFACED rather than caused — before agg-1, verbosec refused
+        // `total` too, so gen0's trapping binary had no reference to be
+        // wrong against. Recorded as a new row in CLAUDE.md's gen0 gaps
+        // table; closing it is a gen0 slice (a `vexprparse` refusal for a
+        // record-returning callee), not this one.
+        //
+        // So: quote this as "94/152 at rule #0", never as breadth-of-subject.
+        const EXPECTED_ACCEPTED: usize = 94;
+        const EXPECTED_TOTAL: usize = 152;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
@@ -53525,6 +54336,555 @@ bound : 8\n",
         );
 
         let _ = fs::remove_file(&elf);
+    }
+
+
+    // =====================================================================
+    // Slice agg-1 — record return on the callable path.
+    // docs/bytes-value-return-design.md §6.4 (acceptance tests).
+    //
+    // An aggregate crosses a call boundary through a destination the CALLER
+    // allocates in its own frame, whose address is passed in `rsi`. Width and
+    // field order are the concept's declaration, never inferred.
+    // =====================================================================
+
+    /// Shared probe: `mk` returns a 2-number record, `drive` composes.
+    /// `body` is `drive`'s logic value; `lets` its bindings.
+    fn agg_probe(mk_body: &str, drive_lets: &[&str], drive_body: &str, drive_out: &str) -> String {
+        let mut s = String::from(
+            "@verbose 0.1.0\n\n\
+             concept N\n  @intention: \"i\"\n  @source: x.intent:1\n  fields:\n    v : number [0, 1000]\n\n\
+             concept R\n  @intention: \"a\"\n  @source: x.intent:1\n  fields:\n    x : number [0, 1000000]\n    y : number [0, 1000000]\n\n",
+        );
+        s.push_str(&format!(
+            "rule mk\n  @intention: \"m\"\n  @source: x.intent:1\n  input:\n    n : N\n  output:\n    r : R\n  logic:\n    r = {}\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : []\n    termination:\n      bound : 20\n\n",
+            mk_body
+        ));
+        s.push_str("rule drive\n  @intention: \"d\"\n  @source: x.intent:1\n  input:\n    n : N\n  output:\n    out : ");
+        s.push_str(drive_out);
+        s.push_str("\n  logic:\n");
+        for l in drive_lets {
+            s.push_str(&format!("    {}\n", l));
+        }
+        s.push_str(&format!("    out = {}\n", drive_body));
+        s.push_str("  proofs:\n    purity:\n      reads : [n]\n      calls : [mk]\n    termination:\n      bound : 20\n");
+        s
+    }
+
+    fn agg_compile(src: &str, entry: &str, tag: &str) -> Result<std::path::PathBuf, String> {
+        let tokens = crate::lexer::Lexer::new(src).tokenize().map_err(|e| format!("{:?}", e))?;
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .map_err(|e| format!("{:?}", e))?;
+        let out = std::env::temp_dir().join(format!("verbosec_agg1_{}", tag));
+        let _ = std::fs::remove_file(&out);
+        compile_native(&program, entry, out.to_str().unwrap(), false, false)
+            .map_err(|e| e.message)?;
+        Ok(out)
+    }
+
+    /// §6.4 test 5 — THE MILESTONE. Verified to FAIL pre-change: on `main`
+    /// this program is refused with `rich operations (collection/result/
+    /// record/concat) not supported in native backend` and zero bytes.
+    #[test]
+    fn aggregate_return_composes_in_one_process() {
+        use std::process::Command;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("examples/aggregate_pair.verbose"))
+            .expect("examples/aggregate_pair.verbose");
+        let bin = agg_compile(&src, "total", "pair_total").expect("total must compile natively");
+
+        let out = Command::new(&bin).args(["7", "9"]).output().expect("run total");
+        assert!(out.status.success(), "total must exit 0; got {:?}", out.status);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "9007",
+            "p.x * 1000 + p.y for (a=7, b=9) is 9*1000 + 7"
+        );
+
+        // …and the native answer must equal the interpreter's on the same
+        // input, so the aggregate is not merely self-consistent.
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
+        let rules: Vec<&Rule> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rule(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let total = rules.iter().find(|r| r.name == "total").unwrap();
+        let mut input = std::collections::HashMap::new();
+        input.insert("a".to_string(), crate::interpreter::Value::Number(7));
+        input.insert("b".to_string(), crate::interpreter::Value::Number(9));
+        let interp = crate::interpreter::eval_rule(total, &rules, &concepts, &input)
+            .expect("interpreter must evaluate total");
+        assert_eq!(
+            format!("{}", interp),
+            "9007",
+            "native and interpreter must agree on the composed aggregate"
+        );
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// §6.4 test 1 — a record-returning rule compiled as the ENTRY still
+    /// streams JSON through `emit_record_program`; slice agg-1 must not
+    /// hijack it. Pinned at the size measured for the design note.
+    #[test]
+    fn aggregate_return_entry_record_rule_still_streams_json() {
+        use std::process::Command;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("examples/aggregate_pair.verbose")).unwrap();
+        let bin = agg_compile(&src, "swap2", "pair_swap2").expect("swap2 must compile");
+        let n = std::fs::metadata(&bin).unwrap().len();
+        assert_eq!(n, 821, "swap2 as the ENTRY must be byte-identical to pre-agg-1 (821 B)");
+        let out = Command::new(&bin).args(["7", "9"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), r#"{"x":9,"y":7}"#);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// §6.4 test 6 + NEGATIVE CONTROL NC-3 — the returned concept `Q` and the
+    /// caller's input concept `P` deliberately share BOTH field names. Native
+    /// field lookup is keyed by bare name, so without `__agg_<let>_<field>`
+    /// keying `q.a` silently resolves to the INPUT's `a` and the binary
+    /// prints a plausible wrong number at rc 0.
+    ///
+    /// NC-3 verified by hand: reverting the composite key to the bare field
+    /// name makes this print `5007` (the input's own a/b) instead of
+    /// `105207`, at rc 0 and with no diagnostic.
+    #[test]
+    fn aggregate_return_distinguishes_colliding_field_names() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept P
+  @intention: "input whose field names deliberately collide with Q's"
+  @source: x.intent:1
+  fields:
+    a : number [0, 1000]
+    b : number [0, 1000]
+
+concept Q
+  @intention: "returned aggregate sharing field names with P"
+  @source: x.intent:1
+  fields:
+    a : number [0, 1000000]
+    b : number [0, 1000000]
+
+rule mkq
+  @intention: "produce values that cannot be confused with the input's"
+  @source: x.intent:1
+  input:
+    p : P
+  output:
+    q : Q
+  logic:
+    q = Q { a: p.a + 100, b: p.b + 200 }
+  proofs:
+    purity:
+      reads : [p.a, p.b]
+      calls : []
+    termination:
+      bound : 8
+
+rule use_q
+  @intention: "q.a and q.b must NOT resolve to p.a and p.b"
+  @source: x.intent:1
+  input:
+    p : P
+  output:
+    out : number
+  logic:
+    let q = mkq(p)
+    out = q.a * 1000 + q.b
+  proofs:
+    purity:
+      reads : [p]
+      calls : [mkq]
+    termination:
+      bound : 12
+"#;
+        let bin = agg_compile(src, "use_q", "collide").expect("collision fixture must compile");
+        let out = Command::new(&bin).args(["5", "7"]).output().unwrap();
+        assert!(out.status.success());
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            got, "105207",
+            "q.a must be p.a+100 and q.b must be p.b+200; \
+             '5007' would mean both reads resolved to the INPUT's slots"
+        );
+        assert_ne!(got, "5007", "bare-name lookup regression (refusal #9)");
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// NEGATIVE CONTROL NC-2 (§6.4) — the A2/A4 register-allocation fast path
+    /// must be OFF for a record-returning callable.
+    ///
+    /// `scalar_output = !is_text && !is_bytes` is TRUE for `Type::Named(C)`
+    /// and `body_is_pure_scalar_arith` has an `Expr::Record` arm, so a
+    /// single-Number-field callable with a `Record { … }` body of arithmetic
+    /// satisfies every OTHER conjunct of `qualifies_rbx`, takes the A2
+    /// prologue (which emits NO `sub rsp`), and the sret slot would land on
+    /// the PUSHED RBX. The slice's flagship fixture does NOT hit this — its
+    /// 2-field input fails `single_scalar_field` — so the control must use
+    /// exactly this shape.
+    ///
+    /// Verified by hand: removing `&& !is_record_output` from `qualifies_rbx`
+    /// makes this exit 139 (SIGSEGV).
+    #[test]
+    fn aggregate_return_disables_the_a2_fast_path_for_record_output() {
+        use std::process::Command;
+        let src = agg_probe(
+            "R { x: n.v + 1, y: n.v * 2 }",
+            &["let r = mk(n)"],
+            "r.x * 1000 + r.y",
+            "number",
+        );
+        let bin = agg_compile(&src, "drive", "a2guard").expect("A2-shaped callee must compile");
+
+        // The callable must carry a real frame: `push rbp ; mov rbp, rsp ;
+        // sub rsp, imm8`. The A2 prologue would be `push rbp ; mov rbp, rsp ;
+        // push rbx` (0x53) with no `sub rsp` at all.
+        let bytes = std::fs::read(&bin).unwrap();
+        let a2_prologue = [0x55u8, 0x48, 0x89, 0xE5, 0x53];
+        assert!(
+            !bytes.windows(5).any(|w| w == a2_prologue),
+            "no callable in this binary may take the A2 prologue (push rbp / mov rbp,rsp / push rbx)"
+        );
+        // And the destination spill must be present (NEGATIVE CONTROL NC-1):
+        // `mov [rbp - k], rsi`.
+        assert!(
+            bytes.windows(3).any(|w| w == [0x48u8, 0x89, 0x75])
+                || bytes.windows(3).any(|w| w == [0x48u8, 0x89, 0xB5]),
+            "the callee must SPILL rsi (the destination) at prologue — rsi is \
+             caller-saved and every syscall / strlen / itoa clobbers it"
+        );
+
+        for (v, expect) in [(5i64, 6i64 * 1000 + 10), (0, 1 * 1000), (1000, 1001 * 1000 + 2000)] {
+            let out = Command::new(&bin).arg(v.to_string()).output().unwrap();
+            assert!(out.status.success(), "v={} must exit 0; got {:?}", v, out.status);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                expect.to_string(),
+                "A2-shaped record callee produced the wrong aggregate for v={}",
+                v
+            );
+        }
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// §5.3 — both `if` arms of a record body write the SAME destination
+    /// offsets and converge on the common tail.
+    #[test]
+    fn aggregate_return_if_arms_write_the_same_destination() {
+        use std::process::Command;
+        let src = agg_probe(
+            "if n.v > 10 then R { x: 1, y: n.v } else R { x: 2, y: n.v * 3 }",
+            &["let r = mk(n)"],
+            "r.x * 1000000 + r.y",
+            "number",
+        );
+        let bin = agg_compile(&src, "drive", "ifarms").expect("if-in-record-body must compile");
+        for (v, expect) in [(20i64, 1i64 * 1_000_000 + 20), (3, 2 * 1_000_000 + 9)] {
+            let out = Command::new(&bin).arg(v.to_string()).output().unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                expect.to_string(),
+                "wrong arm (or wrong offsets) for v={}",
+                v
+            );
+        }
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Coverage — the caller's input concept differs from the callee's, so
+    /// the argument is a `Record` CONSTRUCTOR rather than a pass-through
+    /// `Ident(input)`. That is a different arm of the call-site marshaller,
+    /// and `lea rsi` has to land after it too (§3.3): the constructor's field
+    /// expressions run through `emit_eval_expr`, which is exactly what can
+    /// reach `emit_itoa_inline`'s `lea rsi, [rsp+22]`.
+    #[test]
+    fn aggregate_return_works_with_a_record_constructor_argument() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept M
+  @intention: "caller input, a DIFFERENT concept from the callee's"
+  @source: x.intent:1
+  fields:
+    m : number [0, 1000]
+
+concept N
+  @intention: "callee input"
+  @source: x.intent:1
+  fields:
+    v : number [0, 1000]
+
+concept R
+  @intention: "aggregate"
+  @source: x.intent:1
+  fields:
+    x : number [0, 1000000]
+    y : number [0, 1000000]
+
+rule mk
+  @intention: "record return, cross-concept input"
+  @source: x.intent:1
+  input:
+    n : N
+  output:
+    r : R
+  logic:
+    r = R { x: n.v + 1, y: n.v * 2 }
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : []
+    termination:
+      bound : 8
+
+rule drive
+  @intention: "call mk with a Record constructor argument"
+  @source: x.intent:1
+  input:
+    q : M
+  output:
+    out : number
+  logic:
+    let r = mk(N { v: q.m })
+    out = r.x * 1000 + r.y
+  proofs:
+    purity:
+      reads : [q.m]
+      calls : [mk]
+    termination:
+      bound : 20
+"#;
+        let bin = agg_compile(src, "drive", "xconcept").expect("cross-concept arg must compile");
+        let out = Command::new(&bin).arg("5").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "6010");
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// §6.2 — every refusal, each paired with a MINIMALLY CORRECTED TWIN that
+    /// must compile and run, so the refusal is attributable to the defect
+    /// under test and not to something else in the fixture.
+    ///
+    /// Each row asserts the breadcrumb names the OFFENDER and the SLICE as
+    /// two separate checks, per §6.4 test 8.
+    #[test]
+    fn aggregate_return_refusals_name_the_offender_and_the_slice() {
+        // (label, source, offender substring, slice substring)
+        let mut cases: Vec<(&str, String, &str, &str)> = Vec::new();
+
+        // #1 — recursive record-returning rule.
+        cases.push((
+            "recursive",
+            agg_probe(
+                "if n.v == 0 then R { x: 1, y: 2 } else mk(N { v: n.v - 1 })",
+                &["let r = mk(n)"],
+                "r.x + r.y",
+                "number",
+            )
+            .replace("      calls : []\n    termination:\n      bound : 20\n\nrule drive",
+                     "      calls : [mk]\n    termination:\n      bound : 20\n\nrule drive"),
+            "'mk' returns record 'R'",
+            "slice agg-2",
+        ));
+
+        // #1, second half — the record-returning rule is NOT itself in a
+        // cycle, but the ENTRY is, so it still lands on the callable path of
+        // a recursive program. `compile_native_code:365-368` makes the legacy
+        // record refusal fire for every `scc_rules_owned` member once the
+        // entry is recursive; agg-1 must replace it with a message that names
+        // the actual offender.
+        cases.push((
+            "recursive_entry",
+            agg_probe("R { x: n.v, y: 2 }", &["let r = mk(n)"],
+                      "if n.v == 0 then r.x else drive(N { v: n.v - 1 })", "number")
+                .replace("      reads : [n]\n      calls : [mk]",
+                         "      reads : [n, n.v]\n      calls : [mk, drive]")
+                .replace("    termination:\n      bound : 20\n",
+                         "    termination:\n      bound : 20\n      decreasing : v\n"),
+            "'mk' returns record 'R'",
+            "cycle through 'drive'",
+        ));
+
+        // #3 — a concept_group (sum-type) return already has a convention:
+        // one i64 arena index in rax. VERIFIES CLEAN today (PR #178's
+        // `.field` check does not fire on a group-typed binding), so this is
+        // another emitter-only refusal.
+        cases.push((
+            "group_return",
+            {
+                let mut s = agg_probe("R { x: n.v, y: 2 }", &["let g = mkg(n)", "let r = mk(n)"],
+                                      "g.value + r.x", "number");
+                s = s.replace(
+                    "concept N\n",
+                    "concept_group G [max_depth: 4, max_nodes: 16]\n  @intention: \"g\"\n  @source: x.intent:1\n  concept T\n    @intention: \"g\"\n    @source: x.intent:1\n    variants:\n      A of (value: number)\n      B\n\nconcept N\n",
+                );
+                s = s.replace(
+                    "rule mk\n",
+                    "rule mkg\n  @intention: \"g\"\n  @source: x.intent:1\n  input:\n    n : N\n  output:\n    t : T\n  logic:\n    t = if n.v == 0 then T::B else T::A { value: n.v }\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : []\n    termination:\n      bound : 8\n\nrule mk\n",
+                );
+                s.replace("      calls : [mk]", "      calls : [mkg, mk]")
+            },
+            "'T' is a concept_group concept",
+            "arena index in rax",
+        ));
+
+        // #2 — non-Number field in the returned concept.
+        cases.push((
+            "text_field",
+            agg_probe("R { x: n.v, y: 2 }", &["let r = mk(n)"], "r.x", "number")
+                .replace("    y : number [0, 1000000]", "    y : text [..8]")
+                .replace("R { x: n.v, y: 2 }", "R { x: n.v, y: \"hi\" }"),
+            "concept 'R' field 'y' has type Text",
+            "slice agg-3",
+        ));
+
+        // #4 — the aggregate call is not the entire RHS of a let (two
+        // positions: nested in a let RHS, and in the body value).
+        cases.push((
+            "nested_in_let",
+            agg_probe("R { x: n.v, y: 2 }", &["let z = 1 + mk(n)"], "z", "number"),
+            "record-returning rule 'mk'",
+            "slice agg-2",
+        ));
+        cases.push((
+            "in_body",
+            agg_probe("R { x: n.v, y: 2 }", &[], "1 + mk(n)", "number"),
+            "record-returning rule 'mk'",
+            "slice agg-2",
+        ));
+
+        // #5 — the binding used as a whole value. NOTE: this shape VERIFIES
+        // CLEAN at rc 0 on main (PR #178 typechecked `.field` on a record
+        // binding and deliberately added no rule for a bare record `Ident`),
+        // so the emitter must enforce it on its own.
+        cases.push((
+            "bare_ident",
+            agg_probe("R { x: n.v, y: 2 }", &["let r = mk(n)"], "r * 1000", "number"),
+            "binding 'r' of record type 'R'",
+            "slice agg-2",
+        ));
+
+        // #7 — the CALLER's output is not Number/Bool.
+        cases.push((
+            "text_caller",
+            agg_probe(
+                "R { x: n.v, y: 2 }",
+                &["let r = mk(n)"],
+                "concat(\"v=\", r.x)",
+                "text",
+            ),
+            "rule 'drive' calls record-returning rule 'mk'",
+            "slice agg-1 requires a number or bool caller",
+        ));
+
+        // #8 — the record-returning callee itself calls a record-returning
+        // rule (one aggregate hop per slice).
+        let two_hops = {
+            let mut s = agg_probe("R { x: t.x, y: 2 }", &["let r = mk(n)"], "r.x + r.y", "number");
+            // Give `mk` its own record-returning callee `inner`.
+            s = s.replace(
+                "rule mk\n",
+                "rule inner\n  @intention: \"i\"\n  @source: x.intent:1\n  input:\n    n : N\n  output:\n    s : R\n  logic:\n    s = R { x: n.v, y: 1 }\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : []\n    termination:\n      bound : 8\n\nrule mk\n",
+            );
+            s = s.replace(
+                "  logic:\n    r = R { x: t.x, y: 2 }\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : []",
+                "  logic:\n    let t = inner(n)\n    r = R { x: t.x, y: 2 }\n  proofs:\n    purity:\n      reads : [n]\n      calls : [inner]",
+            );
+            s
+        };
+        cases.push((
+            "two_hops",
+            two_hops,
+            "record-returning rule 'mk' itself calls record-returning rule 'inner'",
+            "slice agg-2",
+        ));
+
+        for (label, src, offender, slice) in &cases {
+            let err = agg_compile(src, "drive", &format!("refuse_{}", label))
+                .expect_err(&format!("[{}] must be REFUSED", label));
+            assert!(
+                err.contains("aggregate return:"),
+                "[{}] breadcrumb must be the aggregate-return family; got: {}",
+                label,
+                err
+            );
+            assert!(
+                err.contains(offender),
+                "[{}] breadcrumb must name the offender ({:?}); got: {}",
+                label,
+                offender,
+                err
+            );
+            assert!(
+                err.contains(slice),
+                "[{}] breadcrumb must name the lifting slice ({:?}); got: {}",
+                label,
+                slice,
+                err
+            );
+        }
+
+        // The CORRECTED TWIN: the same shape with the single violation
+        // removed must compile AND run. Without this every refusal above
+        // could be "the fixture is broken for some other reason".
+        use std::process::Command;
+        let twin = agg_probe("R { x: n.v, y: 2 }", &["let r = mk(n)"], "r.x * 1000 + r.y", "number");
+        let bin = agg_compile(&twin, "drive", "refuse_twin").expect("the corrected twin must compile");
+        let out = Command::new(&bin).arg("5").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "5002");
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// §6.2 — refusal #10: the three LEGACY messages must no longer be
+    /// reachable for a record-returning callee. Before this slice the
+    /// flagship program produced `rich operations (collection/result/record/
+    /// concat) not supported in native backend`.
+    #[test]
+    fn aggregate_return_retires_the_legacy_rich_operations_refusal() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("examples/aggregate_pair.verbose")).unwrap();
+        let bin = agg_compile(&src, "total", "legacy").expect("must compile, not refuse");
+        assert!(std::fs::metadata(&bin).unwrap().len() > 0);
+        let _ = std::fs::remove_file(&bin);
+
+        // …and `unknown field 'x' in native codegen` (native.rs's bare-name
+        // lookup failure) must not be how a wrong field is reported either:
+        // the composite-key path gives a breadcrumb that names the slice.
+        let bad = agg_probe("R { x: n.v, y: 2 }", &["let r = mk(n)"], "r.zz", "number");
+        let err = agg_compile(&bad, "drive", "legacy_field").expect_err("unknown field must refuse");
+        assert!(
+            err.contains("aggregate return:") && err.contains("has no field 'zz'"),
+            "got: {}",
+            err
+        );
+    }
+
+    /// §6.2 — WASM refuses with a breadcrumb that names the slice, instead of
+    /// the generic `unsupported expression in WASM backend`.
+    #[test]
+    fn aggregate_return_wasm_refuses_with_a_named_breadcrumb() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("examples/aggregate_pair.verbose")).unwrap();
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_agg1_wasm.wasm");
+        let err = crate::wasm::compile_wasm(&program, "total", out.to_str().unwrap())
+            .expect_err("wasm must refuse an aggregate return");
+        assert!(
+            err.message.contains("aggregate (record) return is not supported")
+                && err.message.contains("slice agg-1")
+                && err.message.contains("'Pair'"),
+            "got: {}",
+            err.message
+        );
     }
 
 }

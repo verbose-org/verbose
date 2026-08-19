@@ -1,7 +1,41 @@
 # Aggregate return — design note (native slice "agg-1")
 
-**Status:** design note, **NO implementation**. Written 2026-08-18, revised the same
-day after review, against `main = 47d7b8d`.
+**Status:** **§6 IMPLEMENTED 2026-08-19** (slice agg-1), against `main = f134efb`. This
+note is now FROZEN — read it for rationale, not for the current state; the shipped
+behaviour lives in CLAUDE.md's native-emitter table (row `agg-1`) and in
+`src/native.rs`. Written 2026-08-18, revised the same day after review, against
+`main = 47d7b8d`.
+
+**Implementation notes — what the build measured that the note could not.** Four
+things, all of them in §6's favour and all worth reading before the next slice:
+
+1. **All three "wrong binary rather than a refusal" hazards (§3.3, §3.4) reproduced
+   exactly as written.** NC-1 (drop the `rsi` spill): 5 of 8 acceptance tests fail.
+   NC-2 (remove `&& !is_record_output`): the single-Number-field shape SIGSEGVs at
+   rc 139 — **and the flagship `swap2` fixture still passes**, confirming §6.4's
+   warning that a control written against it would go green on a broken build.
+   NC-3 (revert to bare-name keying): the collision fixture prints **`5007` at
+   rc 0** instead of `105207` — a plausible number, no diagnostic.
+2. **Refusal #4 is reachable, but not through the syntax §6.2 implies.** `mk(n).x`
+   does not parse (`expected DEDENT, got '.'`), which §6.4 already noted for
+   `swap2(i).x`. The reachable shapes are `let z = 1 + mk(n)` and `out = 1 + mk(n)`,
+   and **both VERIFY CLEAN at rc 0**, so the emitter-side check is load-bearing for
+   the same reason refusal #5 is.
+3. **Refusal #3 is reachable and also verifies clean.** A `let g = <group-returning
+   call>` followed by `g.value` is accepted by the verifier — PR #178's `.field`
+   check does not fire on a group-typed binding — so this is a third emitter-only
+   refusal, not the two §4.2 names.
+4. **Refusal #1 needed a second site.** A SELF-recursive record-returning rule
+   trivially satisfies refusal #8 too ("calls a record-returning rule" — itself), so
+   the cycle check runs first, before #8, or the breadcrumb sends the reader looking
+   for a second aggregate that does not exist.
+
+*(One §6.4 figure did not reproduce: the corpus denominator. The note quotes
+`47d7b8d`'s "1340 native rule-binaries (782 emit, 558 refused)"; enumerating
+`rule|reaction|service` declarations across all 151 files gives **1370 (811 emit,
+558 refused)** on the same compiler. The refused count agrees exactly, so the
+difference is in what the two enumerations count as a target, not in the compiler.
+Quote the one you measured — the sweep in this PR reports its own.)*
 
 **Filename note.** The file is named for the question that was *asked* — "can a bounded
 `bytes` value be returned by value in registers?" — because that is the search term a
