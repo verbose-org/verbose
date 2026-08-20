@@ -1924,6 +1924,62 @@ fn verify_rule(
         check_layer_discipline(rule, caller_layer, &facts, all_rules, errors);
     }
 
+    // The binding map the TYPE CHECK gets, with every name that is also a
+    // lambda / `match` arm binder somewhere in the logic removed.
+    //
+    // `infer_expr_type` resolves a bare `Ident` through this map (that is what
+    // catches `let p = mk(i)` then `out = p * 1000`), and the arm bodies of
+    // `match_result` / `match` ARE visited by the type check while their
+    // binders' scope is not tracked. Without this filter a binder shadowing a
+    // record-typed `let` would be read as that let and could produce an error
+    // about a name that, inside that arm, means something else. Filtering only
+    // ever REMOVES inference, so it cannot invent a diagnostic.
+    //
+    // The field-existence loop above keeps the unfiltered map on purpose: it
+    // is driven by `facts.local_reads`, from which `collect_expr_facts` has
+    // already dropped every binder-rooted path.
+    let mut shadowed = collect_lambda_bound_names(&rule.logic.value);
+    for (_, rhs) in &rule.logic.bindings {
+        shadowed.extend(collect_lambda_bound_names(rhs));
+    }
+    let typed_bindings: HashMap<String, &Concept> = bindings
+        .iter()
+        .filter(|(name, _)| !shadowed.contains(name.as_str()))
+        .map(|(name, c)| (name.clone(), *c))
+        .collect();
+    let bindings = typed_bindings;
+
+    // Every `let` RHS, checked against ITS OWN inferred type.
+    //
+    // Until this landed, `check_expr_against` ran on `rule.logic.value` and
+    // nothing else, so a `let` RHS was never type-checked at all — and that
+    // makes every operand check in this pass one `let` away from being
+    // bypassed. Measured: `let z = t.s * 2` then `out = z` on a text field
+    // verified clean and its native binary printed a randomized stack
+    // address, exactly as the direct `out = t.s * 2` form did, because
+    // `infer_expr_type(Ident("z"))` is None so the body check stays silent.
+    //
+    // A `let` has no DECLARED type to check against, so the expected type is
+    // the RHS's own inferred type: the outer comparison is then true by
+    // construction and can never fire, and the whole effect of the call is to
+    // RECURSE into the sub-expressions. Un-inferable RHSes (`map`/`fold`/
+    // `Ok(..)`/a lambda-bound var) yield None and are skipped, which is the
+    // same conservative posture the body check already takes.
+    for (_, rhs) in &rule.logic.bindings {
+        if let Some(t) = infer_expr_type(rhs, rule, all_rules, input_concept, &bindings) {
+            check_expr_against(
+                rhs,
+                &t,
+                rule,
+                all_rules,
+                input_concept,
+                concepts,
+                &bindings,
+                errors,
+            );
+        }
+    }
+
     // Type-shape check: the logic expression must be compatible with the
     // declared output_ty. We do bidirectional checking from the top down —
     // Ok/Err can only appear where a Result is expected, branches of if/else
@@ -1998,6 +2054,78 @@ fn check_byte_addressable_operand(
     );
 }
 
+/// Operand check for `==` and `!=`, the only binary operators whose operand
+/// type is not fixed by the operator.
+///
+/// The rule is the interpreter's, verbatim: `eval_expr` has exactly two arms
+/// per operator — `(Number, Number)` and `(Text, Text)` — and everything else
+/// falls to `cannot apply {op} to {l} and {r}`. So the two operands must have
+/// the SAME type, and that type must be Number or Text. Bool is deliberately
+/// NOT comparable: the interpreter refuses `Bool == Bool`, and inventing a
+/// verifier rule the executors do not implement is the inverse of the defect
+/// this whole check exists to close.
+///
+/// Conservative where inference is: when NEITHER side is inferable (a
+/// lambda-bound var, a `let` this pass cannot type) nothing is reported, which
+/// is the standing posture of the surrounding pass. When exactly one side is
+/// inferable and comparable, the other is checked against it — that catches a
+/// nested violation such as `t.n == (t.s * 2)` without inventing a type for
+/// the un-inferable operand.
+fn check_equality_operands(
+    l: &Expr,
+    r: &Expr,
+    rule: &Rule,
+    all_rules: &[&Rule],
+    input_concept: Option<&Concept>,
+    all_concepts: &HashMap<String, &Concept>,
+    bindings: &HashMap<String, &Concept>,
+    errors: &mut Vec<VerifyError>,
+) {
+    let comparable = |t: &Type| matches!(t, Type::Number | Type::Text);
+    let lt = infer_expr_type(l, rule, all_rules, input_concept, bindings);
+    let rt = infer_expr_type(r, rule, all_rules, input_concept, bindings);
+    match (lt, rt) {
+        (Some(a), Some(b)) => {
+            if a != b {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "'==' / '!=' compares two values of the same type, but the left operand has type '{}' and the right operand has type '{}'",
+                        type_display(&a),
+                        type_display(&b),
+                    ),
+                });
+            } else if !comparable(&a) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "'==' / '!=' compares numbers or text, but both operands have type '{}'",
+                        type_display(&a),
+                    ),
+                });
+            } else {
+                check_expr_against(l, &a, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                check_expr_against(r, &a, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            }
+        }
+        (Some(t), None) | (None, Some(t)) => {
+            if comparable(&t) {
+                check_expr_against(l, &t, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                check_expr_against(r, &t, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            } else {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "'==' / '!=' compares numbers or text, but one operand has type '{}'",
+                        type_display(&t),
+                    ),
+                });
+            }
+        }
+        (None, None) => {}
+    }
+}
+
 fn check_expr_against(
     expr: &Expr,
     expected: &Type,
@@ -2028,6 +2156,90 @@ fn check_expr_against(
             check_expr_against(cond, &Type::Bool, rule, all_rules, input_concept, all_concepts, bindings, errors);
             check_expr_against(then_e, expected, rule, all_rules, input_concept, all_concepts, bindings, errors);
             check_expr_against(else_e, expected, rule, all_rules, input_concept, all_concepts, bindings, errors);
+        }
+        // Arithmetic, ordering, equality and logical OPERANDS.
+        //
+        // This arm exists for the OPERANDS, not the result — the same reason
+        // the bitwise arms further down exist, one level up. `infer_expr_type`
+        // already reports the RESULT type of every `Expr::Binary` (Number for
+        // `+ - * / %`, Bool for the rest), so the catch-all was checking the
+        // outer context and never RECURSING into the children. `t.s * 2` on a
+        // TEXT field therefore verified clean, and native then did pointer
+        // arithmetic on the argv pointer and printed a randomized stack
+        // address to stdout; `t.s > 1` compiled to a predicate that is `true`
+        // for every input, which silently breaks the bool exit-code contract
+        // (`if ./check "$x"` always passes). The interpreter refuses both, so
+        // the verifier was certifying a program one executor refuses and the
+        // other silently mis-answers.
+        //
+        // The operand rules are exactly the interpreter's — `eval_expr`'s
+        // `Expr::Binary` match is the semantic reference, and it has arms for
+        // Number/Number arithmetic and ordering, Bool/Bool `and`/`or`, and
+        // `==` / `!=` over Number/Number OR Text/Text. Text EQUALITY is a
+        // shipped feature (`examples/clients.verbose`, `allowlist.verbose`,
+        // `access_check.verbose`, …) and stays legal; text ORDERING never was.
+        (Expr::Binary(op, l, r), expected_outer) => {
+            let produced = match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => Type::Number,
+                _ => Type::Bool,
+            };
+            match op {
+                // Both operands number-typed; result number (arithmetic) or
+                // bool (ordering).
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                | BinOp::Gt | BinOp::Lt | BinOp::GtEq | BinOp::LtEq => {
+                    check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                    check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                }
+                BinOp::And | BinOp::Or => {
+                    check_expr_against(l, &Type::Bool, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                    check_expr_against(r, &Type::Bool, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                }
+                BinOp::Eq | BinOp::NotEq => {
+                    check_equality_operands(l, r, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                }
+            }
+            // Outer-context check. Deliberately the SAME message the
+            // catch-all below produces for this expression today, so adding
+            // the arm does not change any existing diagnostic.
+            if expected_outer != &produced {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "expression has type '{}' but context expects '{}'",
+                        type_display(&produced),
+                        type_display(expected_outer),
+                    ),
+                });
+            }
+        }
+        // `not <bool>` and `-<number>` — the UNARY members of the family
+        // above, with the same defect: `infer_expr_type` reports Bool / Number
+        // for the node and the catch-all never looked at the child, so
+        // `not t.s` and `-t.s` on a text field both verified clean.
+        (Expr::Not(inner), Type::Bool) => {
+            check_expr_against(inner, &Type::Bool, rule, all_rules, input_concept, all_concepts, bindings, errors);
+        }
+        (Expr::Not(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "expression has type 'bool' but context expects '{}'",
+                    type_display(other),
+                ),
+            });
+        }
+        (Expr::Neg(inner), Type::Number) => {
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
+        }
+        (Expr::Neg(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "expression has type 'number' but context expects '{}'",
+                    type_display(other),
+                ),
+            });
         }
         // Phase 11 slice 1: fetch(<connection>, <request_bytes>) — request
         // bytes must produce text. The fetch itself produces text; the
@@ -2788,7 +3000,25 @@ fn infer_expr_type(
         // walk; this inference path only needs the type.
         Expr::Read(_) => Some(Type::Text),
         Expr::Ident(name) if name == &rule.input_name => Some(rule.input_ty.clone()),
-        Expr::Ident(_) => None, // let/lambda-bound — not tracked in this pass
+        // A `let` bound to a RECORD concept, or the `context:` binding. Same
+        // map, same lookup and the same soundness argument as the `Field` arm
+        // just below — see `collect_binding_concepts` for what is and is not
+        // in it (only top-level lets whose type this pass can name, and only
+        // RECORD concepts: `record_concept_of` filters sum types out).
+        //
+        // `collect_binding_concepts` deliberately declined to widen this arm
+        // when it landed, on the grounds that it "feeds every `Ident` position
+        // in the bidirectional check, so widening it would add strictness far
+        // beyond a `.field` access". That is exactly right, and it is exactly
+        // what is wanted here: `let p = mk(i)` then `out = p * 1000` verified
+        // clean because this arm answered None, and the emitter was left to
+        // refuse it alone (agg-1 refusal #5). The strictness it adds is only
+        // ever about a name whose concept the pass already knows.
+        //
+        // The names in the map are pre-filtered by `verify_rule` against
+        // every lambda / match binder in the logic, so a binder that SHADOWS
+        // a record let cannot be misread as that let.
+        Expr::Ident(name) => bindings.get(name.as_str()).map(|c| Type::Named(c.name.clone())),
         Expr::Field(base, field_name) => {
             if let Expr::Ident(n) = base.as_ref() {
                 if n == &rule.input_name {
@@ -5475,6 +5705,387 @@ rule caller
                  check; got {errs:#?}",
             );
         }
+    }
+
+    /// Source for the binary-operand probes: one concept with a number, a
+    /// text and a bytes-producing field, and one rule whose whole body is
+    /// `{body}`. `{out}` is the declared output type, `{reads}` the purity
+    /// proof — both are per-probe because getting either wrong makes the
+    /// probe refuse for a reason that is not the one under test.
+    fn operand_probe(out: &str, body: &str, reads: &str) -> String {
+        format!(
+            r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    n : number [0, 1000]
+    m : number [0, 1000]
+    s : text [..32]
+    u : text [..32]
+
+rule probe
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    out : {out}
+  logic:
+    out = {body}
+  proofs:
+    purity:
+      reads   : [{reads}]
+      calls   : []
+    termination:
+      bound : 20
+"#
+        )
+    }
+
+    /// Arithmetic and ORDERING operands must be Number; `and`/`or` operands
+    /// must be Bool; `==` / `!=` take two operands of the same type, and that
+    /// type must be Number or Text.
+    ///
+    /// Those are the interpreter's rules, verbatim — `eval_expr`'s
+    /// `Expr::Binary` match has exactly these arms and everything else is
+    /// `cannot apply {op} to {l} and {r}` at runtime. Before this check
+    /// existed, `check_expr_against` had NO `Expr::Binary` arm at all, so
+    /// `infer_expr_type` reported the RESULT type and the operands were never
+    /// visited: `t.s * 2` on a text field verified clean and its native binary
+    /// printed a randomized stack address (see
+    /// `native::tests::text_operand_in_arithmetic_never_reaches_a_binary_that_leaks_a_stack_address`),
+    /// while `t.s > 1` compiled to a predicate that is `true` for every input.
+    ///
+    /// Enumerated rather than sampled: the operator families and the operand
+    /// types are both finite, and a check that is right for `*` and wrong for
+    /// `%` reads exactly like a check that is right, to any test that probes
+    /// one member of a family. Every REFUSE row carries a corrected twin so
+    /// the refusal is attributable to the operand type and not to some other
+    /// property of the probe.
+    #[test]
+    fn binary_operand_types_are_checked_against_interpreter_semantics() {
+        // (label, out_ty, body, reads, must_verify)
+        let cases: &[(&str, &str, &str, &str, bool)] = &[
+            // ---- arithmetic: Number x Number ----
+            ("add text lhs", "number", "t.s + 2", "t.s", false),
+            ("add text rhs", "number", "2 + t.s", "t.s", false),
+            ("sub text lhs", "number", "t.s - 2", "t.s", false),
+            ("mul text lhs", "number", "t.s * 2", "t.s", false),
+            ("mul text rhs", "number", "2 * t.s", "t.s", false),
+            ("div text lhs", "number", "t.s / 2", "t.s", false),
+            ("mod text lhs", "number", "t.s % 2", "t.s", false),
+            ("add bool lhs", "number", "(t.n > 1) + 2", "t.n", false),
+            ("add bytes lhs", "number", "b\"\\x41\" + 2", "", false),
+            ("add both text", "number", "t.s + t.u", "t.s, t.u", false),
+            ("add number twin", "number", "t.n + 2", "t.n", true),
+            ("sub number twin", "number", "t.n - 2", "t.n", true),
+            ("mul number twin", "number", "t.n * 2", "t.n", true),
+            ("div number twin", "number", "t.n / 2", "t.n", true),
+            ("mod number twin", "number", "t.n % 2", "t.n", true),
+            ("mul two fields twin", "number", "t.n * t.m", "t.m, t.n", true),
+            // ---- ordering: Number x Number ----
+            ("gt text lhs", "bool", "t.s > 1", "t.s", false),
+            ("lt text lhs", "bool", "t.s < 1", "t.s", false),
+            ("gteq text lhs", "bool", "t.s >= 1", "t.s", false),
+            ("lteq text lhs", "bool", "t.s <= 1", "t.s", false),
+            ("gt text rhs", "bool", "1 > t.s", "t.s", false),
+            ("gt two texts", "bool", "t.s > t.u", "t.s, t.u", false),
+            ("gt bool lhs", "bool", "(t.n > 1) > 1", "t.n", false),
+            ("gt number twin", "bool", "t.n > 1", "t.n", true),
+            ("lt number twin", "bool", "t.n < 1", "t.n", true),
+            ("gteq number twin", "bool", "t.n >= 1", "t.n", true),
+            ("lteq number twin", "bool", "t.n <= 1", "t.n", true),
+            // ---- equality: same type, Number or Text ----
+            ("eq number vs text", "bool", "t.n == t.s", "t.n, t.s", false),
+            ("eq text vs number", "bool", "t.s == t.n", "t.n, t.s", false),
+            ("eq text vs numlit", "bool", "t.s == 1", "t.s", false),
+            ("neq number vs text", "bool", "t.n != t.s", "t.n, t.s", false),
+            ("eq bool vs bool", "bool", "(t.n > 1) == (t.m > 1)", "t.m, t.n", false),
+            ("eq bytes vs bytes", "bool", "b\"\\x41\" == b\"\\x41\"", "", false),
+            ("eq number twin", "bool", "t.n == t.m", "t.m, t.n", true),
+            ("eq numlit twin", "bool", "t.n == 1", "t.n", true),
+            // Text equality is a SHIPPED feature and must keep verifying:
+            // examples/clients.verbose, allowlist.verbose, access_check.verbose.
+            ("eq text vs text twin", "bool", "t.s == t.u", "t.s, t.u", true),
+            ("eq text vs literal twin", "bool", "t.s == \"ab\"", "t.s", true),
+            ("neq text vs literal twin", "bool", "t.s != \"ab\"", "t.s", true),
+            ("eq literal vs text twin", "bool", "\"ab\" == t.s", "t.s", true),
+            // ---- logical: Bool x Bool ----
+            ("and text lhs", "bool", "t.s and (t.n > 1)", "t.n, t.s", false),
+            ("or text rhs", "bool", "(t.n > 1) or t.s", "t.n, t.s", false),
+            ("and number lhs", "bool", "t.n and (t.n > 1)", "t.n", false),
+            ("and bool twin", "bool", "(t.n > 1) and (t.m > 1)", "t.m, t.n", true),
+            ("or bool twin", "bool", "(t.n > 1) or (t.m > 1)", "t.m, t.n", true),
+            // ---- unary: `not` is Bool, `-` is Number ----
+            ("not text", "bool", "not t.s", "t.s", false),
+            ("not number", "bool", "not t.n", "t.n", false),
+            ("not bool twin", "bool", "not (t.n > 1)", "t.n", true),
+            ("neg text", "number", "-t.s", "t.s", false),
+            ("neg number twin", "number", "-t.n", "t.n", true),
+            // ---- nested: the operand walk must reach through sub-expressions ----
+            ("nested lhs", "number", "(t.s * 2) + t.n", "t.n, t.s", false),
+            ("nested rhs", "number", "t.n + (t.s * 2)", "t.n, t.s", false),
+            ("nested in if branch", "number", "if t.n > 1 then t.s * 2 else 0", "t.n, t.s", false),
+            ("nested in eq operand", "bool", "t.n == (t.s * 2)", "t.n, t.s", false),
+            ("nested twin", "number", "(t.n * 2) + t.m", "t.m, t.n", true),
+        ];
+
+        for (label, out_ty, body, reads, must_verify) in cases {
+            let errs = verify_str(&operand_probe(out_ty, body, reads));
+            if *must_verify {
+                assert!(
+                    errs.is_empty(),
+                    "`{body}` ({label}) is valid Verbose and must still verify; got {errs:#?}",
+                );
+            } else {
+                assert!(
+                    !errs.is_empty(),
+                    "`{body}` ({label}) has an operand the interpreter refuses at \
+                     runtime, so the verifier must refuse it too — it verified clean",
+                );
+            }
+        }
+    }
+
+    /// A `let` RHS is type-checked, so the operand check above cannot be
+    /// bypassed by parking the expression in a binding first.
+    ///
+    /// `check_expr_against` used to run on `rule.logic.value` and nothing
+    /// else. Measured before the fix: `let z = t.s * 2` then `out = z`
+    /// verified clean and produced the SAME stack-address disclosure as the
+    /// direct form, because `infer_expr_type(Ident("z"))` is None so the body
+    /// check stayed silent. Every operand check in this pass was one `let`
+    /// away from being bypassed.
+    #[test]
+    fn let_binding_rhs_is_type_checked() {
+        let with_let = |rhs: &str, out_ty: &str, reads: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    n : number [0, 1000]
+    s : text [..32]
+
+rule probe
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    out : {out_ty}
+  logic:
+    let z = {rhs}
+    out = z
+  proofs:
+    purity:
+      reads   : [{reads}]
+      calls   : []
+    termination:
+      bound : 20
+"#
+            )
+        };
+
+        for (label, rhs, out_ty, reads) in [
+            ("arithmetic on text", "t.s * 2", "number", "t.s"),
+            ("ordering on text", "t.s > 1", "bool", "t.s"),
+            ("and on text", "t.s and (t.n > 1)", "bool", "t.n, t.s"),
+            ("mixed equality", "t.n == t.s", "bool", "t.n, t.s"),
+            ("neg on text", "-t.s", "number", "t.s"),
+        ] {
+            assert!(
+                !verify_str(&with_let(rhs, out_ty, reads)).is_empty(),
+                "`let z = {rhs}` ({label}) must be refused — a let RHS is not a \
+                 hiding place for an operand the direct form rejects",
+            );
+        }
+
+        // Corrected twins: the same shapes with number operands still verify.
+        for (rhs, out_ty, reads) in [
+            ("t.n * 2", "number", "t.n"),
+            ("t.n > 1", "bool", "t.n"),
+            ("(t.n > 1) and (t.n < 9)", "bool", "t.n"),
+            ("t.n == 5", "bool", "t.n"),
+            ("-t.n", "number", "t.n"),
+        ] {
+            let errs = verify_str(&with_let(rhs, out_ty, reads));
+            assert!(errs.is_empty(), "`let z = {rhs}` must still verify; got {errs:#?}");
+        }
+    }
+
+    /// A `let` bound to a record-returning rule may only be used as
+    /// `<binding>.<field>` — never as a scalar.
+    ///
+    /// Slice agg-1 shipped record return with the emitter enforcing this
+    /// alone: `docs/bytes-value-return-design.md` §6.2 records refusals #4
+    /// (`out = 1 + mk(n)`) and #5 (`out = p * 1000`) as emitter-side
+    /// precisely because the verifier accepted both. It accepted them for two
+    /// different reasons — #4 because no arm ever recursed into a binary
+    /// operand, #5 because `infer_expr_type`'s `Expr::Ident` arm answered None
+    /// for every non-input name — and both are closed here.
+    #[test]
+    fn record_valued_bindings_and_calls_are_not_scalars() {
+        let with_logic = |logic: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept In
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    a : number [0, 255]
+    b : number [0, 255]
+
+concept Pair
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    x : number [0, 255]
+    y : number [0, 255]
+
+rule mk
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = Pair {{ x: i.b, y: i.a }}
+  proofs:
+    purity:
+      reads   : [i.a, i.b]
+      calls   : []
+    termination:
+      bound : 3
+
+rule subject
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    i : In
+  output:
+    out : number
+  logic:
+{logic}
+  proofs:
+    purity:
+      reads   : [i]
+      calls   : [mk]
+    termination:
+      bound : 20
+"#
+            )
+        };
+
+        for (label, logic) in [
+            ("record binding as a scalar", "    let p = mk(i)\n    out = p * 1000"),
+            ("record call in arithmetic", "    out = 1 + mk(i)"),
+            ("record call in a let RHS", "    let z = 1 + mk(i)\n    out = z"),
+            ("record binding compared", "    let p = mk(i)\n    out = if p == 1 then 2 else 3"),
+        ] {
+            let errs = verify_str(&with_logic(logic));
+            assert!(
+                errs.iter().any(|e| e.message.contains("Pair")),
+                "{label} must be refused with a diagnostic naming the record \
+                 concept; got {errs:#?}",
+            );
+        }
+
+        // The corrected twin is exactly `examples/aggregate_pair.verbose`'s
+        // shape and must keep verifying — this slice must not weaken agg-1.
+        let errs = with_logic("    let p = mk(i)\n    out = p.x * 1000 + p.y");
+        let errs = verify_str(&errs);
+        assert!(errs.is_empty(), "the agg-1 `.field` shape must still verify; got {errs:#?}");
+    }
+
+    /// A `match_result` / `match` arm binder that shadows a record-typed
+    /// `let` must not be read as that let.
+    ///
+    /// `infer_expr_type` now resolves a bare `Ident` through the binding map,
+    /// and the arm bodies of `match_result` ARE visited by the type check
+    /// while their binders' scope is NOT tracked. `verify_rule` therefore
+    /// removes every lambda / arm binder name from the map before the check.
+    /// Without that filter this program would be refused for a name that,
+    /// inside the arm, is a plain number.
+    #[test]
+    fn arm_binder_shadowing_a_record_let_does_not_false_positive() {
+        let src = r#"@verbose 0.1.0
+
+concept In
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    a : number [0, 255]
+    b : number [0, 255]
+
+concept Pair
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    x : number [0, 255]
+    y : number [0, 255]
+
+rule mk
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = Pair { x: i.b, y: i.a }
+  proofs:
+    purity:
+      reads   : [i.a, i.b]
+      calls   : []
+    termination:
+      bound : 3
+
+rule checked
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    i : In
+  output:
+    r : Result(number, text)
+  logic:
+    r = if i.a > 10 then Ok(i.a) else Err("too small")
+  proofs:
+    purity:
+      reads   : [i.a]
+      calls   : []
+    termination:
+      bound : 4
+
+rule subject
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    i : In
+  output:
+    out : Result(number, text)
+  logic:
+    let p = mk(i)
+    out = match_result(checked(i), p => Ok(p * 2), e => Err(e))
+  proofs:
+    purity:
+      reads   : [i]
+      calls   : [checked, mk]
+    termination:
+      bound : 20
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.is_empty(),
+            "the arm binder `p` shadows the record-typed `let p`; inside the arm \
+             it is a number and `p * 2` is valid — got {errs:#?}",
+        );
     }
 
     /// The arity check must NOT fire on built-in primitives.

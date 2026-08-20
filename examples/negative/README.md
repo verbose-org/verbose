@@ -459,7 +459,9 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 41 fixtures**, currently measuring **39 PASS / 2 GAP / 0 INVERSE**.
+- **Only 42 fixtures**, currently measuring **40 PASS / 2 GAP / 0 INVERSE**
+  (plus the 2 `INVERSE_CAPABILITY` entries, which are valid programs and so
+  are not part of the "verbosec refuses" count — 44 `.verbose` files in all).
   They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has

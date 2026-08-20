@@ -25,6 +25,20 @@ things, all of them in §6's favour and all worth reading before the next slice:
    call>` followed by `g.value` is accepted by the verifier — PR #178's `.field`
    check does not fire on a group-typed binding — so this is a third emitter-only
    refusal, not the two §4.2 names.
+   *(SUPERSEDED 2026-08-20, and the correction matters for anyone reading §6.2's
+   "must be enforced here regardless of the verifier": findings 2 and 3 measured
+   three shapes as verify-clean, and **two of the three are now refused at verify
+   time.** `check_expr_against` had no `Expr::Binary` arm, so `let z = 1 + mk(n)`
+   / `out = 1 + mk(n)` (#4) sailed through as an unvisited operand, and
+   `infer_expr_type`'s `Expr::Ident` arm answered None for every non-input name,
+   so `out = p * 1000` (#5) had nothing to disagree with. Both are closed —
+   #4 by the operand arm, #5 by resolving a record-typed `let` through the same
+   binding map the `.field` check uses, which is the widening PR #178 declined.
+   **Finding 3 — the group-typed `let g = grp(i)` then `g.value` — is NOT closed
+   and is now the family's only survivor**, because `record_concept_of` filters
+   sum-type concepts out of that map by design. The emitter checks stay: they
+   are the backstop and they carry the slice-naming breadcrumbs.)*
+
 4. **Refusal #1 needed a second site.** A SELF-recursive record-returning rule
    trivially satisfies refusal #8 too ("calls a record-returning rule" — itself), so
    the cycle check runs first, before #8, or the breadcrumb sends the reader looking
