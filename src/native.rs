@@ -31189,6 +31189,108 @@ rule lit
         let _ = std::fs::remove_file(&out);
     }
 
+    /// A VERIFIED PROGRAM MUST NOT PRINT A STACK ADDRESS.
+    ///
+    /// The verifier had no `Expr::Binary` arm, so a `text` operand in
+    /// arithmetic verified clean; native then did pointer arithmetic on the
+    /// argv pointer and itoa'd the result. `t.s * 2` on argv `5 ab` printed
+    /// values like `281445402961694`, which halve into `0x7ffc…` — a
+    /// canonical Linux stack address, DIFFERENT on every run because of ASLR.
+    /// A program that verifies must not be an ASLR oracle.
+    ///
+    /// The test asserts the gate and its non-vacuity in the same breath.
+    /// `compile_native` does not consult the verifier, so the emitter is
+    /// asked directly what it WOULD have shipped: the binary still discloses
+    /// an address, and the only thing standing between that binary and a user
+    /// is the refusal asserted first. Assert the magnitude rather than
+    /// run-to-run difference, so the test says the same thing with ASLR off.
+    #[test]
+    fn text_operand_in_arithmetic_never_reaches_a_binary_that_leaks_a_stack_address() {
+        use std::process::Command;
+
+        // `reads` is per-probe: a wrong purity proof would make the probe
+        // refuse for a reason that is not the one under test.
+        let program_src = |body: &str, reads: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    n : number [0, 1000]
+    s : text [..32]
+
+rule probe
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    out : number
+  logic:
+    out = {body}
+  proofs:
+    purity:
+      reads   : [{reads}]
+      calls   : []
+    termination:
+      bound : 5
+"#
+            )
+        };
+        let parse = |src: &str| {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+            crate::parser::Parser::new(tokens).parse_program().expect("parse")
+        };
+
+        // 1. THE GATE. Every arithmetic operator on a text field is refused.
+        for body in ["t.s * 2", "t.s + 2", "t.s - 2", "t.s / 2", "t.s % 2", "2 * t.s"] {
+            let src = program_src(body, "t.s");
+            let errs = crate::verifier::verify_program(&parse(&src), std::path::Path::new("examples"));
+            assert!(
+                !errs.is_empty(),
+                "`out = {body}` on a text field must be refused at verify time — \
+                 the emitter turns it into pointer arithmetic on the argv pointer",
+            );
+        }
+
+        // 2. NON-VACUITY. The emitter, asked directly, still discloses an
+        //    address — so the refusal above is load-bearing, not decoration.
+        let out = std::env::temp_dir().join("verbosec_test_aslr_disclosure");
+        compile_native(&parse(&program_src("t.s * 2", "t.s")), "probe", out.to_str().unwrap(), false, false)
+            .expect("the emitter accepts this shape; only the verifier refuses it");
+        let printed = String::from_utf8_lossy(
+            &Command::new(&out).args(["5", "ab"]).output().expect("spawn").stdout,
+        )
+        .trim_end_matches('\n')
+        .to_string();
+        let value: i64 = printed.parse().unwrap_or_else(|_| panic!("expected a number, got {printed:?}"));
+        assert!(
+            value >= (1i64 << 40),
+            "expected the emitted binary to print a pointer-derived value \
+             (2 * an argv pointer, ~0x7f..), got {value}; if this shape stopped \
+             disclosing an address the verifier gate above may now be vacuous",
+        );
+        let _ = std::fs::remove_file(&out);
+
+        // 3. THE CORRECTED TWIN. The same shape with a NUMBER operand still
+        //    verifies and still produces the right answer.
+        let twin_src = program_src("t.n * 2", "t.n");
+        let errs = crate::verifier::verify_program(&parse(&twin_src), std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "`out = t.n * 2` must still verify; got {errs:#?}");
+        let twin = std::env::temp_dir().join("verbosec_test_aslr_twin");
+        compile_native(&parse(&twin_src), "probe", twin.to_str().unwrap(), false, false)
+            .expect("number arithmetic compiles");
+        let got = String::from_utf8_lossy(
+            &Command::new(&twin).args(["5", "ab"]).output().expect("spawn").stdout,
+        )
+        .trim_end_matches('\n')
+        .to_string();
+        assert_eq!(got, "10", "5 * 2 = 10");
+        let _ = std::fs::remove_file(&twin);
+    }
+
     /// THE BOOL EXIT-CODE CONTRACT, on the emitter that used to break it.
     ///
     /// `examples/invoices.verbose::important_invoice` carries a

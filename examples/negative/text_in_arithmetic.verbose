@@ -1,0 +1,39 @@
+@verbose 0.1.0
+
+-- NEGATIVE: a `text` field used as an arithmetic operand.
+--
+-- The interpreter refuses this at runtime (`cannot apply Mul to ab and 2`),
+-- and until 2026-08-20 the verifier accepted it: `check_expr_against` had no
+-- `Expr::Binary` arm, so operands were never visited. The native binary then
+-- did pointer arithmetic on the argv pointer and printed a randomized stack
+-- address to stdout at rc 0 — a verified program acting as an ASLR oracle.
+--
+-- The sibling shape `t.s > 1` is the same defect in a bool position: it
+-- compares a pointer against 1, so the predicate is `true` for every input.
+concept T
+  @intention: "a text field next to a number field"
+  @source: negative.intent:1
+
+  fields:
+    n : number [0, 1000]
+    s : text [..32]
+
+rule leak
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    t : T
+
+  output:
+    out : number
+
+  logic:
+    out = t.s * 2
+
+  proofs:
+    purity:
+      reads   : [t.s]
+      calls   : []
+    termination:
+      bound : 2
