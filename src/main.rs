@@ -247,8 +247,32 @@ fn real_main() {
         let rust_source = codegen::emit_rust(&program);
         let rust_tmp = format!("{}.rs", rust_path);
         let rust_size = fs::write(&rust_tmp, &rust_source).ok().and_then(|()| {
+            // Size-comparison fairness: the native column is hand-emitted
+            // machine code with no debug info, no unwind tables and no libc.
+            // Comparing it against rustc's DEFAULT build — which is
+            // opt-level=0 WITH debug assertions and symbols — is not a
+            // like-for-like measurement, and it inflated this table by ~12x.
+            //
+            // Measured on examples/invoices.verbose:
+            //     no flags (what this used to do)      3 999 544 B
+            //     -O                                   3 911 248 B
+            //     opt-level=z + panic=abort + strip      385 008 B
+            //     ... + lto + codegen-units=1            327 640 B
+            //     native                                     683 B
+            //
+            // So the honest ratio is ~480x, not ~5700x. The conclusion is
+            // unchanged and the number is now defensible, which is the whole
+            // point: a headline measured against a straw baseline is worth
+            // less than a smaller one that survives scrutiny.
             let status = process::Command::new("rustc")
-                .args([&rust_tmp, "-o", rust_path])
+                .args([
+                    &rust_tmp, "-o", rust_path,
+                    "-C", "opt-level=z",
+                    "-C", "panic=abort",
+                    "-C", "strip=symbols",
+                    "-C", "lto=true",
+                    "-C", "codegen-units=1",
+                ])
                 .stdout(process::Stdio::null())
                 .stderr(process::Stdio::null())
                 .status().ok()?;
