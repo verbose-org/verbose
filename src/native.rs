@@ -399,23 +399,30 @@ fn compile_native_code(
         let entry_is_recursive = recursion_witness.is_some();
         for r in &scc_rules_owned {
             let is_in_entry_scc = scc_names.contains(&r.name);
-            // Slice agg-1, refusal #1 (§6.2). A record-returning rule needs a
-            // destination in the CALLER's live frame; a recursive program has
-            // no single live frame to point at, so the destination would have
-            // to be per-frame (slice agg-2). Two shapes are refused: the rule
-            // itself being in a cycle, and the rule sitting on the callable
-            // path of a program whose ENTRY is recursive — the latter because
-            // `emit_self_recursive_program` lays every SCC member out as a
-            // callable and the recursive frames interleave with it.
+            // Slice agg-2a (docs/bytes-value-return-design.md §7, row 1) LIFTS
+            // agg-1's refusal #1. A record-returning rule may now be in a
+            // cycle, and may sit on the callable path of a recursive program.
+            // The shape that makes that safe is enforced by
+            // `check_aggregate_shape`: every recursive aggregate call must be
+            // in a record TAIL position, where the callee is handed the
+            // destination the caller already owns, so the whole chain shares
+            // ONE destination and only the base case writes it.
+            //
+            // What survives is the ENTRY case, which is a DIFFERENT row of §7
+            // ("a record-output CALLER") and a different mechanism entirely:
+            // this emitter's result dispatch below ends in `emit_itoa_inline`,
+            // so a record-output entry would print the DESTINATION POINTER as
+            // a decimal — the itoa-a-pointer family, reproduced in verbosec.
+            // A non-recursive record-output entry never reaches here; it is
+            // served by `emit_record_program` (JSON to stdout).
             if let Some(rc) = plain_record_concept(&r.output_ty, &concepts) {
-                let own_cycle = detect_native_recursion(r, &rules);
-                if own_cycle.is_some() || entry_is_recursive {
-                    let witness = own_cycle
-                        .or_else(|| recursion_witness.clone())
+                if r.name == rule.name {
+                    let witness = recursion_witness
+                        .clone()
                         .unwrap_or_else(|| rule.name.clone());
                     return Err(NativeError {
                         message: format!(
-                            "aggregate return: rule '{}' returns record '{}' and is on the callable path of a recursive program (cycle through '{}'); a recursive aggregate return needs a per-frame destination (slice agg-2). Use --run.",
+                            "aggregate return: entry rule '{}' returns record '{}' and is on the callable path of a recursive program (cycle through '{}'); _start's result dispatch would itoa the destination pointer, so a record-output ENTRY needs its own result arm (slice agg-2c). Compose it from a number-output caller, or use --run.",
                             r.name, rc.name, witness
                         ),
                     });
@@ -521,12 +528,18 @@ fn compile_native_code(
                     .map_or(false, |c| !c.variants.is_empty()),
                 _ => false,
             };
+            // Slice agg-2a — a plain-record output is now legal on the
+            // callable path (the destination convention, `rsi`). The ENTRY
+            // case was refused above, so anything reaching here is a callee
+            // whose shape `check_aggregate_shape` has already vetted.
+            let is_record_output = plain_record_concept(&r.output_ty, &concepts).is_some();
             if !is_group_output
+                && !is_record_output
                 && !matches!(&r.output_ty, Type::Number | Type::Bool | Type::Text | Type::Bytes)
             {
                 return Err(NativeError {
                     message: format!(
-                        "recursive rule '{}' output must be Number, Bool, Text, or Bytes (got {:?}); Result/Record returns are later slices.",
+                        "recursive rule '{}' output must be Number, Bool, Text, or Bytes (got {:?}); Result returns are later slices.",
                         r.name, r.output_ty
                     ),
                 });
@@ -2145,6 +2158,31 @@ fn record_return_layout(concept: &Concept) -> Vec<(String, i32)> {
     out
 }
 
+/// Slice agg-2a — collect the calls to record-returning rules that sit in a
+/// **record TAIL position** of `expr`: `expr` itself, or (recursively) the
+/// arms of an `if`. Nothing else is a tail position, and in particular an
+/// `if`'s CONDITION is not one.
+///
+/// A call in this position produces the value the enclosing rule returns, so
+/// it can be handed the enclosing rule's OWN destination pointer — which is
+/// what makes recursion need no per-frame destination. Every other position
+/// (a `let` RHS, an operand, a call argument, a record field) needs a
+/// destination whose lifetime is scoped to the expression, and is refused.
+///
+/// The shape mirrors `emit_record_to_sret`'s match exactly, and that is the
+/// point: a call this walk does not report is a call the emitter would refuse
+/// with a shape message instead of the slice-naming breadcrumb.
+fn collect_record_tail_calls(expr: &Expr, record_rules: &HashSet<&str>, out: &mut Vec<String>) {
+    match expr {
+        Expr::If(_, then_e, else_e) => {
+            collect_record_tail_calls(then_e, record_rules, out);
+            collect_record_tail_calls(else_e, record_rules, out);
+        }
+        Expr::Call(name, _) if record_rules.contains(name.as_str()) => out.push(name.clone()),
+        _ => {}
+    }
+}
+
 /// Slice agg-1 — does `Ident(name)` appear anywhere in `expr` OTHER than as
 /// the base of a `Field` access?
 ///
@@ -2247,23 +2285,21 @@ fn check_aggregate_shape(
             Some(&r) => r,
             None => continue,
         };
+        // Slice agg-2a — the record-returning calls in a record TAIL position
+        // of THIS rule's body. Non-empty only for a record-returning rule:
+        // for anything else the "tail" of the body is an ordinary value
+        // position and an aggregate call there is refusal #4.
+        let tail_calls: Vec<String> = if plain_record_concept(&r.output_ty, concepts).is_some() {
+            let mut v = Vec::new();
+            collect_record_tail_calls(&r.logic.value, &record_rules, &mut v);
+            v
+        } else {
+            Vec::new()
+        };
         // Refusal #2 — the returned concept's fields must all be Number.
         // Text needs the (ptr, len) pair convention (slice agg-3); Bool does
         // not emit as a record field in ANY native path today.
         if let Some(rc) = plain_record_concept(&r.output_ty, concepts) {
-            // Refusal #1's own-cycle half, checked HERE rather than only in
-            // the SCC constraint walk so it beats refusal #8 to the message:
-            // a SELF-recursive record-returning rule trivially "calls a
-            // record-returning rule", and #8's breadcrumb would send the
-            // reader looking for a second aggregate that does not exist.
-            if let Some(cycle) = detect_native_recursion(r, all_rules) {
-                return Err(NativeError {
-                    message: format!(
-                        "aggregate return: rule '{}' returns record '{}' and is on the callable path of a recursive program (cycle through '{}'); a recursive aggregate return needs a per-frame destination (slice agg-2). Use --run.",
-                        r.name, rc.name, cycle
-                    ),
-                });
-            }
             for f in &rc.fields {
                 if f.ty != Type::Number {
                     return Err(NativeError {
@@ -2274,17 +2310,39 @@ fn check_aggregate_shape(
                     });
                 }
             }
-            // Refusal #8 — one aggregate hop per slice. A second destination
-            // needs a nested slot group with expression-scoped lifetime.
+            // Slice agg-2a — a tail callee writes into THIS rule's own
+            // destination, so its layout must BE this rule's layout. Same
+            // concept is the checkable form of that, and it is what makes
+            // self-recursion and same-concept mutual recursion both fall out.
+            for t in &tail_calls {
+                let tc = all_rules
+                    .get(t.as_str())
+                    .and_then(|c| plain_record_concept(&c.output_ty, concepts))
+                    .expect("record_rules membership implies a plain record output");
+                if tc.name != rc.name {
+                    return Err(NativeError {
+                        message: format!(
+                            "aggregate return: rule '{}' returns record '{}' but its tail call to '{}' returns record '{}'; slice agg-2a forwards THIS rule's destination to the callee, so the two concepts must be the same — a differing layout needs its own destination (slice agg-2b).",
+                            r.name, rc.name, t, tc.name
+                        ),
+                    });
+                }
+            }
+            // Refusal #8 — one aggregate hop per slice, EXCEPT the agg-2a
+            // tail position, which reuses this rule's own destination instead
+            // of allocating a second one. A `let` RHS aggregate call inside a
+            // record-returning rule is still refused: it needs a destination
+            // whose lifetime is scoped to the expression, and (in a recursive
+            // rule) the callable's lets are evaluated EAGERLY at prologue, so
+            // a recursion guard in the body would never fire.
             let mut inner: Vec<String> = Vec::new();
             for (_, e) in &r.logic.bindings {
                 collect_native_callees(e, &mut inner);
             }
-            collect_native_callees(&r.logic.value, &mut inner);
             if let Some(r2) = inner.into_iter().find(|c| record_rules.contains(c.as_str())) {
                 return Err(NativeError {
                     message: format!(
-                        "aggregate return: record-returning rule '{}' itself calls record-returning rule '{}'; slice agg-1 allows one aggregate hop, because a second destination needs a nested slot group with expression-scoped lifetime (slice agg-2).",
+                        "aggregate return: record-returning rule '{}' binds record-returning rule '{}' to a let; slice agg-1/agg-2a allow one aggregate hop plus a tail forward, because a second destination needs a nested slot group with expression-scoped lifetime (slice agg-2b).",
                         r.name, r2
                     ),
                 });
@@ -2352,14 +2410,30 @@ fn check_aggregate_shape(
             }
         }
         // Refusal #4 (body position) — an aggregate call anywhere in the
-        // rule's own logic value is not a let RHS.
-        if let Some(inner) = calls_a_record_rule(&r.logic.value) {
-            return Err(NativeError {
-                message: format!(
-                    "aggregate return: the call to record-returning rule '{}' must be the entire right-hand side of a let-binding in slice agg-1 (found it in rule '{}'s logic body); nested aggregate calls are slice agg-2.",
-                    inner, r.name
-                ),
-            });
+        // rule's own logic value is not a let RHS, EXCEPT the agg-2a tail
+        // positions accounted for above. Subtraction is by MULTISET, not by
+        // name: a rule may tail-call itself from both arms of an `if`, and
+        // one of those occurrences appearing in a non-tail position too must
+        // still be reported.
+        {
+            let mut all: Vec<String> = Vec::new();
+            collect_native_callees(&r.logic.value, &mut all);
+            let mut unconsumed = tail_calls.clone();
+            for c in all {
+                if !record_rules.contains(c.as_str()) {
+                    continue;
+                }
+                if let Some(pos) = unconsumed.iter().position(|t| *t == c) {
+                    unconsumed.remove(pos);
+                    continue;
+                }
+                return Err(NativeError {
+                    message: format!(
+                        "aggregate return: the call to record-returning rule '{}' must be the entire right-hand side of a let-binding in slice agg-1 (found it in rule '{}'s logic body, in a position that is not a record tail); nested aggregate calls are slice agg-2b.",
+                        c, r.name
+                    ),
+                });
+            }
         }
         // Refusal #5 — a record-typed binding may only be READ with `.field`.
         for (p, rc) in &record_lets {
@@ -5501,7 +5575,7 @@ fn emit_callable_into<'a>(
                 // is at most one live at a time: §6.1 constraint 3 makes the
                 // call the ENTIRE RHS, and refusal #4 enforces it.
                 let mut sc = self_call;
-                sc.sret_dest = Some(dest_base);
+                sc.sret_dest = Some(SretDest::Frame(dest_base));
                 emit_eval_expr(
                     code, expr, &rule.input_name, &callable_offsets,
                     all_rules, &callable_field_ranges, &callable_text_bindings,
@@ -5839,9 +5913,32 @@ fn emit_record_to_sret(
             code[end_patch..end_patch + 4].copy_from_slice(&end_pos.to_le_bytes());
             Ok(())
         }
+        // Slice agg-2a — a record-returning call in a record TAIL position.
+        // Its result IS this rule's result, so it writes into the destination
+        // WE were handed rather than into a fresh one: `mov rsi, [rbp -
+        // sret_slot]` (SretDest::Forward), not `lea`.
+        //
+        // The chain therefore has exactly ONE destination however deep the
+        // recursion goes — the one the outermost non-recursive caller
+        // allocated — and only the base case (the `Expr::Record` arm above)
+        // ever writes it. No per-frame destination, nothing to free.
+        //
+        // Scope is enforced up front by `check_aggregate_shape`: the callee
+        // must return the SAME concept (so this layout is its layout), and a
+        // record-returning call in any NON-tail position is refused there
+        // with an agg-2b breadcrumb. This arm is the emitter half; the
+        // refusals are the verify-time half, and neither is redundant.
+        Expr::Call(callee, _) if self_call.record_returns.contains_key(callee.as_str()) => {
+            let mut sc = self_call;
+            sc.sret_dest = Some(SretDest::Forward(sret_slot));
+            emit_eval_expr(
+                code, expr, &rule.input_name, offsets, all_rules, field_ranges,
+                text_bindings, Some(sc), arena_ctx,
+            )
+        }
         other => Err(NativeError {
             message: format!(
-                "aggregate return: rule '{}' body must be a record constructor (optionally under if/else) in slice agg-1; got {:?}",
+                "aggregate return: rule '{}' body must be a record constructor, a record-returning call, or an if/else over those, in slice agg-1/agg-2a; got {:?}",
                 rule.name, other
             ),
         }),
@@ -13346,8 +13443,15 @@ fn emit_store_reg_to_rbp(code: &mut Vec<u8>, reg: u8, offset: i32) {
     }
 }
 
-/// Slice agg-1 — emit `lea rsi, [rbp + dest]` when `callee` returns a record,
-/// and nothing at all otherwise (so no existing call site moves a byte).
+/// Slice agg-1 / agg-2a — put the destination pointer in `rsi` when `callee`
+/// returns a record, and emit nothing at all otherwise (so no existing call
+/// site moves a byte).
+///
+/// The instruction is decided by `SretDest`, and the two are NOT
+/// interchangeable: `Frame` takes the ADDRESS of a slot group this frame owns
+/// (`lea`), `Forward` reads the VALUE of a pointer this frame was handed
+/// (`mov`). Renamed from `emit_sret_dest_lea` when agg-2a added the second
+/// form — the old name described one of two instructions it emits.
 ///
 /// **THE POSITION IS LOAD-BEARING: this MUST be the last thing emitted before
 /// the `call`.** The input-struct marshalling above clobbers `rsi` — every
@@ -13358,7 +13462,7 @@ fn emit_store_reg_to_rbp(code: &mut Vec<u8>, reg: u8, offset: i32) {
 /// Emitting it here is safe because `rbp` is stable across the marshalling:
 /// nothing between the caller's prologue and the `call` touches it, the same
 /// invariant the slice-3d iteration epilogue relies on.
-fn emit_sret_dest_lea(
+fn emit_sret_dest_pointer(
     code: &mut Vec<u8>,
     ctx: SelfCallCtx<'_>,
     callee: &str,
@@ -13372,12 +13476,27 @@ fn emit_sret_dest_lea(
             callee
         ),
     })?;
-    if dest >= -128 {
-        code.extend_from_slice(&[0x48, 0x8D, 0x75]); // lea rsi, [rbp + disp8]
-        code.push(dest as u8);
-    } else {
-        code.extend_from_slice(&[0x48, 0x8D, 0xB5]); // lea rsi, [rbp + disp32]
-        code.extend_from_slice(&dest.to_le_bytes());
+    match dest {
+        SretDest::Frame(off) => {
+            if off >= -128 {
+                code.extend_from_slice(&[0x48, 0x8D, 0x75]); // lea rsi, [rbp + disp8]
+                code.push(off as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8D, 0xB5]); // lea rsi, [rbp + disp32]
+                code.extend_from_slice(&off.to_le_bytes());
+            }
+        }
+        // Slice agg-2a — forward the destination we were handed. `mov`, not
+        // `lea`: the slot HOLDS the pointer, it is not the destination.
+        SretDest::Forward(off) => {
+            if off >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]); // mov rsi, [rbp + disp8]
+                code.push(off as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]); // mov rsi, [rbp + disp32]
+                code.extend_from_slice(&off.to_le_bytes());
+            }
+        }
     }
     Ok(())
 }
@@ -14101,13 +14220,42 @@ struct SelfCallCtx<'a> {
     /// uses to decide whether the call needs a destination pointer in rsi;
     /// absence keeps the pre-agg-1 byte-for-byte path.
     record_returns: &'a HashMap<&'a str, Vec<(String, i32)>>,
-    /// Slice agg-1 — the rbp offset of the CURRENTLY-BEING-EVALUATED record
-    /// let's destination (the LOWEST address of its slot group). Set by
-    /// `emit_callable_into`'s let loop immediately around the one call it is
-    /// evaluating, and `None` everywhere else. There is at most one live
-    /// destination at a time because §6.1 constraint 3 requires the call to
-    /// be the entire RHS of a let (refusal #4 enforces it).
-    sret_dest: Option<i32>,
+    /// Slice agg-1 / agg-2a — where the CURRENTLY-BEING-EVALUATED aggregate
+    /// call must write. Set immediately around the one call it applies to,
+    /// and `None` everywhere else. There is at most one live destination at
+    /// a time: §6.1 constraint 3 makes an aggregate call the entire RHS of a
+    /// let, and slice agg-2a's tail position is by construction singular.
+    sret_dest: Option<SretDest>,
+}
+
+/// Slice agg-1 / agg-2a — the two ways a caller names the destination it
+/// hands to a record-returning callee in `rsi`.
+///
+/// The distinction is the whole of slice agg-2a's memory story, so it is a
+/// type rather than a boolean: `Frame` passes the ADDRESS of a slot group
+/// this frame owns (`lea`), `Forward` passes the VALUE of a pointer this
+/// frame was itself handed (`mov`). Confusing the two ships a wrong binary —
+/// `lea` where `mov` was meant makes the callee write into the caller's
+/// spill slot instead of the real destination. Pinned by NC-5.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SretDest {
+    /// Slice agg-1 — a record-typed `let`'s slot GROUP in this frame, at
+    /// `[rbp + off]` (the LOWEST address of the group). Emits
+    /// `lea rsi, [rbp + off]`.
+    Frame(i32),
+    /// Slice agg-2a — THIS callable's own destination, spilled at
+    /// `[rbp + off]` by the prologue. Emits `mov rsi, [rbp + off]`, i.e. the
+    /// callee writes straight into the destination our caller allocated.
+    ///
+    /// This is why a recursive aggregate return needs no per-frame
+    /// destination: in a record TAIL position the recursive callee's result
+    /// IS this callable's result, so there is exactly ONE destination for
+    /// the whole chain — the one the outermost non-recursive caller
+    /// allocated — and only the base case ever writes it. See
+    /// docs/bytes-value-return-design.md §7 row 1, whose prescription
+    /// (`sub rsp, N*8 ; lea rsi, [rsp]`) is what a NON-tail call would need;
+    /// that shape stays refused (slice agg-2b).
+    Forward(i32),
 }
 
 /// Phase B slice 4a.2 — arena context for `VariantConstruct` emission.
@@ -15226,7 +15374,7 @@ fn emit_eval_expr(
                         }
                         // mov rdi, rsp
                         code.extend_from_slice(&[0x48, 0x89, 0xE7]);
-                        emit_sret_dest_lea(code, ctx, name)?;
+                        emit_sret_dest_pointer(code, ctx, name)?;
                         // call <target>
                         code.push(0xE8);
                         let call_end = (code.len() + 4) as i32;
@@ -15336,7 +15484,7 @@ fn emit_eval_expr(
                             code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                         }
                     }
-                    emit_sret_dest_lea(code, ctx, name)?;
+                    emit_sret_dest_pointer(code, ctx, name)?;
                     code.push(0xE8);
                     let call_end = (code.len() + 4) as i32;
                     let rel32 = self_target_offset - call_end;
@@ -49107,8 +49255,37 @@ rule pick
         // record-returning callee), not this one.
         //
         // So: quote this as "94/152 at rule #0", never as breadth-of-subject.
-        const EXPECTED_ACCEPTED: usize = 94;
-        const EXPECTED_TOTAL: usize = 152;
+        //
+        // 94 -> 95, 152 -> 153 (slice agg-2a adds
+        // `examples/aggregate_recurse.verbose`). Same two-figures-disagree
+        // shape as agg-1's row above, and the rule-#0 half is the SURPRISING
+        // one this time. Measured:
+        //
+        //   rule #0 (`fib_pair`, the RECURSIVE record-returning rule):
+        //     gen0 ACCEPTS at 3750 B and prints `{"prev":55,"curr":89}` for
+        //     argv `10 0 1` — the CORRECT ten-step Fibonacci pair — while
+        //     **verbosec REFUSES it** (agg-2a's record-output-ENTRY refusal:
+        //     `emit_self_recursive_program`'s result dispatch would itoa the
+        //     destination pointer). So gen0 is genuinely MORE capable in this
+        //     one cell: its record trampoline serializes an arena node index
+        //     that its own recursive emit already produces. That is the
+        //     already-tracked `input_type_unsupported` class — "gen0 mirrors
+        //     none of verbosec's EMIT-time refusal surface" — a GAP, not an
+        //     INVERSE, and no new negative fixture is warranted for it.
+        //
+        //   declared entry (index 1, `fib`): gen0 emits **rc 0, a 1200-byte
+        //     ELF that exits 133 (SIGTRAP) with no output**, where verbosec
+        //     emits 1029 bytes printing `55089`. That is exactly the defect
+        //     the `aggregate_pair::total` row in CLAUDE.md's gaps table
+        //     already records, reproduced on a second file — the
+        //     accept-what-you-cannot-emit class. No new row; the existing one
+        //     names this file too.
+        //
+        // So the 95th acceptance is honest about `fib_pair` and says nothing
+        // about `fib`, and the +1 is arguably generous: verbosec refuses the
+        // rule gen0 accepted. Quote as "95/153 at rule #0".
+        const EXPECTED_ACCEPTED: usize = 95;
+        const EXPECTED_TOTAL: usize = 153;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
@@ -54532,6 +54709,338 @@ bound : 8\n",
         let _ = std::fs::remove_file(&bin);
     }
 
+    // =====================================================================
+    // Slice agg-2a — RECURSIVE aggregate return.
+    // docs/bytes-value-return-design.md §7, row 1.
+    //
+    // agg-1 refused a record-returning rule in a cycle on the grounds that
+    // "a recursive aggregate return needs a per-frame destination". Measured
+    // here: for the shape agg-2a admits — every recursive aggregate call in a
+    // record TAIL position — it needs NO per-frame destination at all. The
+    // callee's result IS the caller's result, so the callee is handed the
+    // pointer the caller was itself handed, and the whole chain writes into
+    // the ONE destination the outermost non-recursive caller allocated.
+    // Only the base case ever writes it.
+    //
+    // The non-tail shape, which genuinely would need a per-frame
+    // destination, stays refused (`recursive_nontail` in the refusal test).
+    // =====================================================================
+
+    /// THE MILESTONE for agg-2a. Verified to FAIL pre-change: on `036d12b`
+    /// this program is refused with `aggregate return: rule 'fib_pair'
+    /// returns record 'FibPair' and is on the callable path of a recursive
+    /// program (cycle through 'fib_pair'); a recursive aggregate return needs
+    /// a per-frame destination (slice agg-2). Use --run.` and zero bytes.
+    ///
+    /// Asserts three independent things, because any one alone is weak:
+    ///   (a) the ANSWER, at five depths including the declared maximum — a
+    ///       per-frame-destination defect shows up as an INTERMEDIATE frame's
+    ///       pair rather than the base case's, so depth 0 alone proves
+    ///       nothing;
+    ///   (b) agreement with the INTERPRETER on the same inputs, so the
+    ///       binary is not merely self-consistent;
+    ///   (c) the declared input bound still fail-closes (n = 21 → rc 1, no
+    ///       output), which is what makes the recursion depth audit-defensible.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_recursive_forwards_one_destination() {
+        use std::process::Command;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("examples/aggregate_recurse.verbose"))
+            .expect("examples/aggregate_recurse.verbose");
+        let bin = agg_compile(&src, "fib", "rec_fib")
+            .expect("a recursive record-returning callee must compile natively (slice agg-2a)");
+
+        // (a) + (b). `prev * 1000 + curr` pins BOTH fields, so a destination
+        // that carried only one across the boundary cannot pass.
+        let cases: [(i64, i64, i64, &str); 5] = [
+            (0, 0, 1, "1"),
+            (1, 0, 1, "1001"),
+            (2, 0, 1, "1002"),
+            (10, 0, 1, "55089"),   // F(10)=55, F(11)=89
+            (20, 0, 1, "6775946"), // F(20)=6765, F(21)=10946
+        ];
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
+        let rules: Vec<&Rule> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rule(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let fib = rules.iter().find(|r| r.name == "fib").unwrap();
+
+        for (n, prev, curr, want) in cases {
+            let out = Command::new(&bin)
+                .args([n.to_string(), prev.to_string(), curr.to_string()])
+                .output()
+                .expect("run fib");
+            assert!(out.status.success(), "fib {} must exit 0; got {:?}", n, out.status);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                want,
+                "fib({}, {}, {}) — a shared destination written by an INTERMEDIATE frame \
+                 would show up here as an earlier step's pair",
+                n,
+                prev,
+                curr
+            );
+
+            let mut input = std::collections::HashMap::new();
+            input.insert("n".to_string(), crate::interpreter::Value::Number(n));
+            input.insert("prev".to_string(), crate::interpreter::Value::Number(prev));
+            input.insert("curr".to_string(), crate::interpreter::Value::Number(curr));
+            let interp = crate::interpreter::eval_rule(fib, &rules, &concepts, &input)
+                .expect("interpreter must evaluate fib");
+            assert_eq!(
+                format!("{}", interp),
+                want,
+                "native and interpreter must agree at depth {}",
+                n
+            );
+        }
+
+        // (c) the declared bound still fail-closes at field-load, BEFORE any
+        // frame is pushed — the property the "max stack" claim rests on.
+        let over = Command::new(&bin).args(["21", "0", "1"]).output().unwrap();
+        assert_eq!(over.status.code(), Some(1), "n = 21 exceeds `n : number [0, 20]`");
+        assert!(over.stdout.is_empty(), "a fail-closed abort writes nothing to stdout");
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// The MECHANISM assertion, and the standing control for the
+    /// "per-frame destination" question — a runtime answer alone cannot
+    /// distinguish `lea` from `mov` at the forward site on shallow input.
+    ///
+    /// Byte-level: `fib`'s frame owns the ONE destination, so the whole
+    /// binary must contain exactly ONE `lea rsi, [rbp+disp8]` (0x48 0x8D
+    /// 0x75) — the caller taking the address of its own let slot group — and
+    /// the recursive site must be a `mov rsi, [rbp+disp8]` (0x48 0x8B 0x75)
+    /// reading the spilled pointer BACK OUT, immediately before its `call`.
+    ///
+    /// NEGATIVE CONTROL NC-5, verified by hand: changing the `SretDest::
+    /// Forward` arm of `emit_sret_dest_pointer` from `mov` (0x8B) to `lea`
+    /// (0x8D) — the natural "give every frame its own destination" slip —
+    /// makes `fib 10 0 1` print 55089 anyway at depth 0/1 and SEGFAULT at
+    /// depth ≥ 2, because the callee then writes through the *address of the
+    /// spill slot* rather than through the pointer it holds. This test fails
+    /// on the byte count before the runtime ever gets there.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_recursive_tail_forwards_rather_than_reallocating() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("examples/aggregate_recurse.verbose")).unwrap();
+        let bin = agg_compile(&src, "fib", "rec_shape").expect("must compile");
+        let bytes = std::fs::read(&bin).unwrap();
+
+        let count = |pat: &[u8]| bytes.windows(pat.len()).filter(|w| *w == pat).count();
+        // `lea rsi, [rbp + disp8]` — allocating a destination. Exactly one:
+        // the non-recursive caller `fib`. A per-frame destination in
+        // `fib_pair` would add a second.
+        assert_eq!(
+            count(&[0x48, 0x8D, 0x75]),
+            1,
+            "exactly ONE frame allocates a destination; the recursion forwards it"
+        );
+        // `mov rsi, [rbp + disp8]` — forwarding. Exactly one: the recursive
+        // tail call in `fib_pair`.
+        assert_eq!(
+            count(&[0x48, 0x8B, 0x75]),
+            1,
+            "the recursive tail call must FORWARD the spilled destination pointer"
+        );
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// NEGATIVE CONTROL NC-4, mechanised — and the reason it needs a
+    /// fixture of its OWN rather than the flagship.
+    ///
+    /// The spill (`mov [rbp-sret], rsi` at prologue) plus the forward
+    /// (`mov rsi, [rbp-sret]` immediately before the recursive `call`) are
+    /// only load-bearing when something CLOBBERS `rsi` in between. Measured
+    /// on `examples/aggregate_recurse.verbose` with the forward deleted
+    /// entirely: **all five depths still print the right answer**, because
+    /// nothing in that body touches `rsi` and the register happens to
+    /// survive from the outer call. A control written against the flagship
+    /// would go green on a build with no forward at all — the same trap
+    /// agg-1's NC-2 documents for `qualifies_rbx`.
+    ///
+    /// `starts_with(<text field>, "…")` in the recursive call's ARGUMENT is
+    /// a shape that does clobber it. Measured with the forward deleted:
+    /// depth 0 → 5003 (correct, no recursion), depth 1 → **0**, depth 3 →
+    /// **0**, all at rc 0 — a silent wrong answer, not a crash.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_recursive_forward_survives_rsi_clobbering_marshalling() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "state carrying a text field"
+  @source: x.intent:1
+  fields:
+    n : number [0, 10]
+    tag : text [..8]
+    a : number [0, 100000]
+
+concept R
+  @intention: "pair"
+  @source: x.intent:1
+  fields:
+    x : number [0, 1000000]
+    y : number [0, 1000000]
+
+rule walk
+  @intention: "recurse with a text predicate in the call argument"
+  @source: x.intent:1
+  input:
+    t : T
+  output:
+    o : R
+  logic:
+    o = if t.n == 0 then R { x : t.a, y : length(t.tag) } else walk(T { n : t.n - 1, tag : t.tag, a : t.a + (if starts_with(t.tag, "a") then 2 else 1) })
+  proofs:
+    purity:
+      reads : [t.n, t.tag, t.a]
+      calls : [walk]
+    termination:
+      bound : 40
+      decreasing : n
+
+rule drive
+  @intention: "compose"
+  @source: x.intent:1
+  input:
+    t : T
+  output:
+    out : number
+  logic:
+    let p = walk(t)
+    out = p.x * 1000 + p.y
+  proofs:
+    purity:
+      reads : [t]
+      calls : [walk]
+    termination:
+      bound : 10
+"#;
+        let bin = agg_compile(src, "drive", "rec_rsi_clobber").expect("must compile");
+        for (n, want) in [("0", "5003"), ("1", "7003"), ("3", "11003")] {
+            let out = Command::new(&bin).args([n, "abc", "5"]).output().unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                want,
+                "n = {}: with the destination forward dropped this prints 0 at rc 0",
+                n
+            );
+        }
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// agg-1's refusal #1 had a SECOND half that agg-2a also lifts: a
+    /// record-returning rule that is NOT itself in a cycle, sitting on the
+    /// callable path of a program whose ENTRY is recursive. Its destination
+    /// is a `let` slot group in the caller's frame, and a recursive caller
+    /// has one such group PER FRAME by construction — which is why this
+    /// needed no new mechanism at all, only the refusal removed.
+    ///
+    /// Verified to FAIL pre-change: refused with `'mk' returns record 'R' …
+    /// cycle through 'drive'`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_non_recursive_callee_inside_a_recursive_program() {
+        use std::process::Command;
+        let src = agg_probe(
+            "R { x: n.v, y: 2 }",
+            &["let r = mk(n)"],
+            "if n.v == 0 then r.x + r.y else drive(N { v: n.v - 1 })",
+            "number",
+        )
+        .replace(
+            "      reads : [n]\n      calls : [mk]",
+            "      reads : [n, n.v]\n      calls : [mk, drive]",
+        )
+        .replace(
+            "    termination:\n      bound : 20\n",
+            "    termination:\n      bound : 20\n      decreasing : v\n",
+        );
+        let bin = agg_compile(&src, "drive", "rec_nonrec_callee")
+            .expect("a non-recursive record callee inside a recursive program must compile");
+        // Recursion runs v down to 0, where the per-frame `r` is mk(N{v:0}),
+        // i.e. R { x: 0, y: 2 } → 2. A destination shared with an OUTER
+        // frame would report that frame's `x` instead.
+        for v in ["0", "1", "5"] {
+            let out = Command::new(&bin).arg(v).output().unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "2",
+                "at v = {} the base frame's own `r` must be the one read",
+                v
+            );
+        }
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Mutual recursion (slice 5.4) composed with agg-2a: two record-
+    /// returning rules in one SCC, each tail-calling the other, both
+    /// forwarding the SAME destination. In scope because it falls out — the
+    /// forward is a per-callable property, not a per-SCC one — and pinned
+    /// so it cannot silently stop working.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_mutual_recursion_shares_one_destination() {
+        use std::process::Command;
+        let leg = |me: &str, other: &str, dx: &str, dy: &str| {
+            format!(
+                "rule {}\n  @intention: \"l\"\n  @source: x.intent:1\n  input:\n    n : N\n  output:\n    r : R\n  logic:\n    r = if n.v == 0 then R {{ x: {}, y: {} }} else {}(N {{ v: n.v - 1 }})\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : [{}]\n    termination:\n      bound : 20\n      decreasing : v\n\n",
+                me, dx, dy, other, other
+            )
+        };
+        let mut src = String::from(
+            "@verbose 0.1.0\n\n\
+             concept N\n  @intention: \"i\"\n  @source: x.intent:1\n  fields:\n    v : number [0, 10]\n\n\
+             concept R\n  @intention: \"a\"\n  @source: x.intent:1\n  fields:\n    x : number [0, 1000000]\n    y : number [0, 1000000]\n\n",
+        );
+        src.push_str(&leg("ping", "pong", "11", "22"));
+        src.push_str(&leg("pong", "ping", "33", "44"));
+        src.push_str(
+            "rule drive\n  @intention: \"d\"\n  @source: x.intent:1\n  input:\n    n : N\n  output:\n    out : number\n  logic:\n    let r = ping(n)\n    out = r.x * 1000 + r.y\n  proofs:\n    purity:\n      reads : [n]\n      calls : [ping]\n    termination:\n      bound : 20\n",
+        );
+        let bin = agg_compile(&src, "drive", "rec_mutual")
+            .expect("same-concept mutual recursion must compile (slice agg-2a)");
+        // Even v lands in `ping`'s base case (11/22), odd v in `pong`'s
+        // (33/44) — so the answer names WHICH callable wrote the shared
+        // destination, not merely that something did.
+        for (v, want) in [("0", "11022"), ("1", "33044"), ("2", "11022"), ("5", "33044")] {
+            let out = Command::new(&bin).arg(v).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want, "v = {}", v);
+        }
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// The one half of agg-1's refusal #1 that agg-2a does NOT lift, kept
+    /// separate because it is a different §7 row and a different mechanism:
+    /// `emit_self_recursive_program`'s result dispatch ends in
+    /// `emit_itoa_inline`, so a record-output ENTRY would print the
+    /// DESTINATION POINTER as a decimal — the itoa-a-pointer family.
+    ///
+    /// The corrected twin is the flagship above: the same `fib_pair`,
+    /// composed from a number-output caller, compiles and runs.
+    #[test]
+    fn aggregate_return_recursive_record_output_entry_is_refused() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("examples/aggregate_recurse.verbose")).unwrap();
+        let err = agg_compile(&src, "fib_pair", "rec_entry")
+            .expect_err("a RECURSIVE record-output entry must be refused");
+        assert!(err.contains("entry rule 'fib_pair'"), "must name the offender; got: {}", err);
+        assert!(err.contains("itoa the destination pointer"), "must name the mechanism; got: {}", err);
+        assert!(err.contains("slice agg-2c"), "must name the lifting slice; got: {}", err);
+    }
+
     /// §6.4 test 1 — a record-returning rule compiled as the ENTRY still
     /// streams JSON through `emit_record_program`; slice agg-1 must not
     /// hijack it. Pinned at the size measured for the design note.
@@ -54782,37 +55291,37 @@ rule drive
         // (label, source, offender substring, slice substring)
         let mut cases: Vec<(&str, String, &str, &str)> = Vec::new();
 
-        // #1 — recursive record-returning rule.
+        // #1 — LIFTED BY SLICE agg-2a. Both halves of agg-1's refusal #1 (a
+        // record-returning rule in a cycle, and one on the callable path of
+        // a recursive ENTRY) now COMPILE, and are asserted as acceptances by
+        // `aggregate_return_recursive_forwards_one_destination` /
+        // `_non_recursive_callee_inside_a_recursive_program`. What survives
+        // is a record-output ENTRY (a different §7 row, a different
+        // mechanism) — see `_record_output_entry_is_refused`.
+
+        // #1a — a recursive aggregate call in a NON-tail position. This is
+        // the shape that would genuinely need a per-frame destination: each
+        // frame's `t` must be its own record, and (worse) a callable's lets
+        // are evaluated EAGERLY at prologue, so the `n.v == 0` guard in the
+        // body would never stop the recursion.
         cases.push((
-            "recursive",
+            "recursive_nontail",
             agg_probe(
-                "if n.v == 0 then R { x: 1, y: 2 } else mk(N { v: n.v - 1 })",
+                "if n.v == 0 then R { x: 1, y: 2 } else R { x: t.x + 1, y: t.y }",
                 &["let r = mk(n)"],
                 "r.x + r.y",
                 "number",
             )
-            .replace("      calls : []\n    termination:\n      bound : 20\n\nrule drive",
-                     "      calls : [mk]\n    termination:\n      bound : 20\n\nrule drive"),
-            "'mk' returns record 'R'",
-            "slice agg-2",
-        ));
-
-        // #1, second half — the record-returning rule is NOT itself in a
-        // cycle, but the ENTRY is, so it still lands on the callable path of
-        // a recursive program. `compile_native_code:365-368` makes the legacy
-        // record refusal fire for every `scc_rules_owned` member once the
-        // entry is recursive; agg-1 must replace it with a message that names
-        // the actual offender.
-        cases.push((
-            "recursive_entry",
-            agg_probe("R { x: n.v, y: 2 }", &["let r = mk(n)"],
-                      "if n.v == 0 then r.x else drive(N { v: n.v - 1 })", "number")
-                .replace("      reads : [n]\n      calls : [mk]",
-                         "      reads : [n, n.v]\n      calls : [mk, drive]")
-                .replace("    termination:\n      bound : 20\n",
-                         "    termination:\n      bound : 20\n      decreasing : v\n"),
-            "'mk' returns record 'R'",
-            "cycle through 'drive'",
+            .replace(
+                "  logic:\n    r = if n.v == 0",
+                "  logic:\n    let t = mk(N { v: n.v - 1 })\n    r = if n.v == 0",
+            )
+            .replace(
+                "      reads : [n.v]\n      calls : []\n    termination:\n      bound : 20\n\nrule drive",
+                "      reads : [n.v]\n      calls : [mk]\n    termination:\n      bound : 20\n\nrule drive",
+            ),
+            "record-returning rule 'mk' binds record-returning rule 'mk' to a let",
+            "slice agg-2b",
         ));
 
         // #3 — a concept_group (sum-type) return already has a convention:
@@ -54905,8 +55414,33 @@ rule drive
         cases.push((
             "two_hops",
             two_hops,
-            "record-returning rule 'mk' itself calls record-returning rule 'inner'",
-            "slice agg-2",
+            "record-returning rule 'mk' binds record-returning rule 'inner' to a let",
+            "slice agg-2b",
+        ));
+
+        // agg-2a — a tail call whose callee returns a DIFFERENT concept. The
+        // tail forward hands the callee THIS rule's destination, so the two
+        // layouts must be the same; a differing one needs its own.
+        cases.push((
+            "tail_wrong_concept",
+            {
+                let mut s = agg_probe(
+                    "if n.v == 0 then R { x: 1, y: 2 } else other(N { v: n.v - 1 })",
+                    &["let r = mk(n)"],
+                    "r.x + r.y",
+                    "number",
+                );
+                s = s.replace(
+                    "rule mk\n",
+                    "concept R2\n  @intention: \"a\"\n  @source: x.intent:1\n  fields:\n    x : number [0, 1000000]\n    y : number [0, 1000000]\n\nrule other\n  @intention: \"o\"\n  @source: x.intent:1\n  input:\n    n : N\n  output:\n    r : R2\n  logic:\n    r = R2 { x: n.v, y: 1 }\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : []\n    termination:\n      bound : 8\n\nrule mk\n",
+                );
+                s.replace(
+                    "      reads : [n.v]\n      calls : []\n    termination:\n      bound : 20\n\nrule drive",
+                    "      reads : [n.v]\n      calls : [other]\n    termination:\n      bound : 20\n\nrule drive",
+                )
+            },
+            "rule 'mk' returns record 'R' but its tail call to 'other' returns record 'R2'",
+            "slice agg-2b",
         ));
 
         for (label, src, offender, slice) in &cases {

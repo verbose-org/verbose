@@ -40,6 +40,7 @@ ENTRIES=(
   "Record+concat|examples/fullname.verbose|compose_greeting  |Record text field from concat"
   "agg-1   |examples/aggregate_pair.verbose|total            |record return via caller-allocated dest"
   "agg-1-e |examples/aggregate_pair.verbose|swap2            |same record rule as ENTRY (JSON, unchanged)"
+  "agg-2a  |examples/aggregate_recurse.verbose|fib           |RECURSIVE record return (tail forwards one dest)"
 )
 
 printf "╔════════════════════════════════════════════════════════════════════════════╗\n"

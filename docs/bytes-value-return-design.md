@@ -6,6 +6,49 @@ behaviour lives in CLAUDE.md's native-emitter table (row `agg-1`) and in
 `src/native.rs`. Written 2026-08-18, revised the same day after review, against
 `main = 47d7b8d`.
 
+**§7 ROW 1 IS WRONG ABOUT ITS OWN MECHANISM, and slice agg-2a (2026-08-21) is the
+correction.** The row prices "Recursive aggregate return" as *"needs a per-frame
+destination for non-tail calls (`sub rsp, N*8 ; lea rsi, [rsp]` — the input-struct
+pattern mirrored)"*. Measured against the two compilers rather than reasoned about:
+
+- **The shape that matters needs NO per-frame destination.** When the recursive
+  aggregate call is in a record **TAIL** position — the whole value of the body, or of
+  an `if` arm — the callee's result *is* the caller's result, so the callee is handed
+  the pointer the caller was itself handed (`mov rsi, [rbp - sret_slot]`, not `lea`).
+  The whole chain shares ONE destination, the one the outermost non-recursive caller
+  allocated, and only the base case writes it. **Both** X25519 rules are exactly that
+  shape, so this is not a corner case — it is the consumer. Cost: 4 bytes per recursive
+  call site, no frame growth, nothing to free.
+- **The non-tail shape §7 was pricing is currently INEXPRESSIBLE in a terminating
+  way**, which is a stronger statement than "refused". `mk(n).x` does not parse
+  (`expected '}', got '.'`), so the only syntax for a non-tail aggregate call is a
+  `let` — and a callable's lets are evaluated **eagerly at prologue**, so the body's
+  recursion guard never fires. Measured with the refusal removed: the native binary
+  SIGSEGVs (rc 139) on *every* input including the base case, and `--run` on the same
+  source overflows the interpreter's stack. So agg-2b's real blocker is
+  lazy/conditional `let` evaluation, not a destination convention; a per-frame
+  destination alone would buy nothing.
+- **`concept.fields` still does all the work.** Nothing in agg-2a infers a width, a
+  layout or a lifetime; the tail forward is one register move whose only requirement
+  is that the callee's returned concept EQUALS the caller's (checked, breadcrumbed).
+
+- **The prize row is half right, and the wrong half is the CPU half.** §7 row 1 promises
+  *"X25519 in one process and 52 → 1 spawns"*. Measured after building it: X25519 IS
+  computable in one process (a driver doing two aggregate hops reproduces RFC 7748 §6.1
+  byte-exact), but it is **52 → 32, and 32 spawns is SLOWER than 52** — 102.0 ms against
+  91.7 ms, because the driver still returns a *number*, so each of the 32 `which`
+  invocations now recomputes the ladder the shipped path ran only 20 times. One
+  invocation of that binary does the whole computation in 3.0 ms; the ~31× is gated on a
+  caller that can EMIT an aggregate (agg-2c, or the bytes-output caller row), which is a
+  `_start` result-dispatch question and not a call-boundary one. Full figures in
+  CLAUDE.md's "still rejects" bullet.
+
+Read §7 row 1 as *history of what was expected*, and CLAUDE.md's `agg-2a` row for what
+was built. The generalisable half is CLAUDE.md's own standing rule, hit for the fifth
+time: **a "known gap" note is a claim about cost, and it decays** — this one named the
+wrong mechanism (`sub rsp` for a case the language cannot express) and would have had
+an implementer build a per-frame slot group nothing needed.
+
 **Implementation notes — what the build measured that the note could not.** Four
 things, all of them in §6's favour and all worth reading before the next slice:
 

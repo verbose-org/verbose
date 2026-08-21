@@ -54,6 +54,7 @@ If you want to know what a feature *looks like* in source, find it below and rea
 | `compose.verbose` | Phase 2H-b: helper-rule call appears inside a `concat(...)` argument. |
 | `log_via_helper.verbose` | Phase 2H-a: reaction `append_file` content is itself a helper-rule call. |
 | `aggregate_pair.verbose` | Slice agg-1: a rule RETURNS a record to another rule. `swap2` produces `Pair`, `total` binds it with `let p = swap2(i)` and reads `p.x` / `p.y`. The aggregate crosses the call boundary through a destination the caller allocates in its own frame (address in `rsi`); width and field order are the concept's declaration. 793 B for `total`; `swap2` as the ENTRY still streams JSON at 821 B, unchanged. |
+| `aggregate_recurse.verbose` | Slice agg-2a: a RECURSIVE rule returns an aggregate. `fib_pair` steps the Fibonacci recurrence and returns both numbers; `fib` binds it and reads `p.prev` / `p.curr`. The recursive tail call is handed the destination `fib_pair` was itself given, so the whole chain shares the ONE destination `fib` allocated and only the base case writes it — no per-frame destination. 1029 B for `fib` (argv `10 0 1` → `55089`). |
 
 ## Text bindings (Phase 2I family)
 
