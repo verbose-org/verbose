@@ -1,5 +1,44 @@
 use crate::ast::*;
 
+/// Emitted into the generated Rust by `emit_expr`'s unsupported-family arm, and
+/// searched for by `unsupported_expr`. Deliberately not a word that could occur
+/// in a user's text literal.
+const UNSUPPORTED_MARKER: &str = "verbose-unsupported-expr:";
+
+/// Returns the name of the first expression family the Rust backend cannot
+/// lower, or `None` if the whole program is expressible.
+///
+/// Implemented by emitting and grepping rather than by re-walking the AST: the
+/// marker is produced by the same match arm that produces the unusable code, so
+/// the two can never disagree about what is supported.
+pub fn unsupported_expr(program: &Program) -> Option<String> {
+    // Second, independent cause. `emit_rule_fn` types a parameter with
+    // `rust_type`, which maps Text to `&str` and Bytes to `&[u8]` — but the
+    // emitted JSON runtime is `parse_json_object(..) -> HashMap<String, i64>`,
+    // so every value it can actually supply is an i64. Signature and runtime
+    // therefore disagree for any non-numeric field, and rustc reports
+    // `E0308: arguments to this function are incorrect` about generated code.
+    // Refusing on the FIELD TYPE is exact here because the runtime's value type
+    // is a single concrete type, not an inference: nothing but Number and Bool
+    // can ever be produced.
+    for item in &program.items {
+        if let Item::Concept(c) = item {
+            for f in &c.fields {
+                match f.ty {
+                    Type::Text => return Some(format!("a text field ('{}.{}')", c.name, f.name)),
+                    Type::Bytes => return Some(format!("a bytes field ('{}.{}')", c.name, f.name)),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let src = emit_rust(program);
+    let at = src.find(UNSUPPORTED_MARKER)? + UNSUPPORTED_MARKER.len();
+    let rest = &src[at..];
+    let end = rest.find(' ').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
 pub fn emit_rust(program: &Program) -> String {
     let mut out = String::new();
 
@@ -254,7 +293,23 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::ArenaScope(_)
         | Expr::AbortIf(_)
         | Expr::ByteAt(_, _) => {
-            "(/* collection/result/record/variant/match/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at/bytes/le32/le64/fold_bytes op: use --run interpreter or --native */false)".to_string()
+            // The Rust backend has no lowering for these families. It used to
+            // emit the literal `false` here and let rustc fail downstream with
+            // E0308 / E0610 — a compiler emitting source that does not compile
+            // is worse than one that refuses, and the diagnostic pointed at
+            // generated code the author never wrote.
+            //
+            // The marker below is what `unsupported_expr` greps for, and it is
+            // emitted by the SAME arm that produces the unusable code, so the
+            // refusal cannot drift away from the thing it refuses. A second,
+            // hand-maintained list of variant names would be exactly the
+            // two-walk drift this codebase keeps getting bitten by.
+            //
+            // The variant NAME comes from Debug, truncated at the first '(', so
+            // adding a variant to the arm above needs no change here.
+            let variant = format!("{:?}", expr);
+            let variant = variant.split(['(', ' ']).next().unwrap_or("expression").to_string();
+            format!("(/* {}{} */false)", UNSUPPORTED_MARKER, variant)
         }
         Expr::BitAnd(a, b) => format!("({} & {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
         Expr::BitOr(a, b) => format!("({} | {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
@@ -371,6 +426,52 @@ fn parse_json_object(s: &str) -> HashMap<String, i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Rust backend must REFUSE what it cannot lower, never emit source
+    /// that fails inside rustc. Before this, an unsupported expression became
+    /// the literal `false` and a non-numeric field became a `&str` parameter
+    /// fed i64s from the runtime — both surfaced as E0308/E0610 pointing at
+    /// generated code the author never wrote.
+    ///
+    /// Both causes are asserted, plus a NEGATIVE case: a purely numeric,
+    /// fully-lowerable program must still return None, or the refusal would
+    /// be vacuous (it would refuse everything and the sweep would look green).
+    #[test]
+    fn rust_backend_refuses_what_it_cannot_lower() {
+        let parse = |src: &str| -> Program {
+            let toks = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+            crate::parser::Parser::new(toks).parse_program().expect("parse")
+        };
+        let prog = |fields: &str, out_ty: &str, body: &str, extra: &str| -> String {
+            format!(
+                "@verbose 0.1.0\n\nconcept C\n  @intention: \"c\"\n  @source: x.intent:1\n  fields:\n{}\n{}\nrule r\n  @intention: \"r\"\n  @source: x.intent:2\n  input:\n    i : C\n  output:\n    out : {}\n  logic:\n    out = {}\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\n",
+                fields, extra, out_ty, body
+            )
+        };
+
+        // NEGATIVE CONTROL first: a fully-lowerable numeric program.
+        let ok = parse(&prog("    n : number [0, 100]\n", "number", "i.n * 2", ""));
+        assert_eq!(
+            unsupported_expr(&ok), None,
+            "a plain numeric program must still transpile; a refusal here means \
+             the check is vacuous and the corpus sweep proves nothing"
+        );
+
+        // Cause 1 — an expression family `emit_expr` has no lowering for. The
+        // marker is emitted by the SAME match arm that produces the unusable
+        // code, so this cannot drift away from what it refuses.
+        let rec = parse(&format!(
+            "@verbose 0.1.0\n\nconcept C\n  @intention: \"c\"\n  @source: x.intent:1\n  fields:\n    n : number [0, 100]\n\nconcept D\n  @intention: \"d\"\n  @source: x.intent:2\n  fields:\n    m : number [0, 100]\n\nrule r\n  @intention: \"r\"\n  @source: x.intent:3\n  input:\n    i : C\n  output:\n    out : D\n  logic:\n    out = D {{ m : i.n }}\n  proofs:\n    purity:\n      reads : [i.n]\n      calls : []\n    termination:\n      bound : 4\n"
+        ));
+        assert_eq!(unsupported_expr(&rec).as_deref(), Some("Record"));
+
+        // Cause 2 — a field type the emitted JSON runtime cannot produce. The
+        // runtime is `HashMap<String, i64>`, so `rust_type`'s `&str` for Text
+        // is a signature the runtime can never satisfy.
+        let txt = parse(&prog("    n : number [0, 100]\n    s : text [..8]\n", "number", "i.n * 2", ""));
+        let got = unsupported_expr(&txt).expect("a text field must be refused");
+        assert!(got.contains("text field"), "expected a text-field refusal, got {:?}", got);
+    }
 
     #[test]
     fn emit_number() {

@@ -456,9 +456,11 @@ fn real_main() {
             }
         }
     } else if emit_rust {
+        refuse_if_rust_unsupported(&program);
         println!();
         print!("{}", codegen::emit_rust(&program));
     } else if let Some(output) = compile_output {
+        refuse_if_rust_unsupported(&program);
         let rust_source = codegen::emit_rust(&program);
         let tmp = format!("{}.rs", output);
         fs::write(&tmp, &rust_source).unwrap_or_else(|e| {
@@ -843,4 +845,25 @@ fn resolve_imports(mut program: ast::Program, base_dir: &Path) -> ast::Program {
 
     program.uses.clear(); // imports resolved
     program
+}
+
+/// Refuse a `--compile` / `--emit-rust` request the Rust backend cannot honour,
+/// instead of emitting source that fails inside rustc.
+///
+/// Before this, a program using any family `codegen::emit_expr` cannot lower
+/// (records, collections, Result, concat, read, and ~25 others) produced the
+/// literal `false` in place of the expression, and the user saw `E0308` /
+/// `E0610` from rustc pointing at generated code they never wrote. The native
+/// and interpreter backends both handle far more than the transpiler; naming
+/// them in the message is the actionable part.
+fn refuse_if_rust_unsupported(program: &ast::Program) {
+    if let Some(what) = codegen::unsupported_expr(program) {
+        eprintln!(
+            "rust backend: '{}' is not supported by --compile / --emit-rust \
+             (the Rust transpiler is the narrowest backend). Use --native for a \
+             machine-code binary, or --run for the interpreter.",
+            what
+        );
+        process::exit(1);
+    }
 }
