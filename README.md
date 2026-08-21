@@ -147,7 +147,7 @@ The `.intent → .verbose` step is **not** verified by the compiler. That bridge
 compiler verifies                    reads / calls consistency, termination bound,
                                      overflow bounds, @source exists, layer discipline
         │
-compiler emits a binary              interpreter, Rust transpiler, native x86-64, or WASM
+compiler emits a binary              interpreter, native x86-64, or WASM
 ```
 
 ## What the compiler verifies (and what it does not)
@@ -473,7 +473,6 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | Backend | Command | Output |
 |---|---|---|
 | Interpreter | `--run rule --input data.json` | Executes directly on JSON data |
-| Rust transpiler | `--compile output` | Standalone binary via `rustc` |
 | Native x86-64 | `--native output --run rule` | ELF binary, zero dependencies (~400-700 bytes) |
 | WebAssembly | `--wasm output.wasm --run rule` | WASM module for browsers (~60 bytes) |
 
@@ -509,7 +508,6 @@ cargo run -- examples/showcase.verbose --run bonus_rate --input examples/showcas
 
 All backends:
 ```bash
-cargo run -- examples/business.verbose --compile /tmp/business          # Rust
 cargo run -- examples/business.verbose --native /tmp/biz --run total_with_tax  # x86-64
 cargo run -- examples/business.verbose --wasm /tmp/rule.wasm --run total_with_tax  # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice  # compare all

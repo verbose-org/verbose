@@ -4,7 +4,6 @@ use std::path::Path;
 use std::process;
 
 mod ast;
-mod codegen;
 mod interpreter;
 mod lexer;
 mod native;
@@ -34,6 +33,22 @@ fn main() {
 
 fn real_main() {
     let args: Vec<String> = env::args().collect();
+
+    // The Rust transpiler backend was removed. A removed flag must be REFUSED,
+    // not silently ignored: this project's rule is that unknown attributes are
+    // rejected rather than skipped, and a `--compile` that verifies and exits 0
+    // without producing a binary is the worst outcome — it looks like it worked.
+    for flag in ["--compile", "--emit-rust"] {
+        if args.iter().any(|a| a == flag) {
+            eprintln!(
+                "{} is no longer supported: the Rust transpiler backend was removed. \
+                 Use --native for a machine-code binary, --wasm for a portable module, \
+                 or --run for the interpreter.",
+                flag
+            );
+            process::exit(1);
+        }
+    }
 
     if args.iter().any(|a| a == "--version" || a == "-v") {
         println!("verbosec 0.1.0");
@@ -132,8 +147,6 @@ fn real_main() {
         eprintln!();
         eprintln!("options:");
         eprintln!("  --run <rule> --input <data.json>   Interpret a rule on JSON data");
-        eprintln!("  --emit-rust                        Print generated Rust source to stdout");
-        eprintln!("  --compile <output>                 Compile to a standalone binary via rustc");
         eprintln!("  --native <output>                  Compile to native x86-64 ELF (no dependencies)");
         eprintln!("                                       Target: --run <name> (rule or service); defaults to the last");
         eprintln!("                                       declared service, else the last declared rule.");
@@ -211,8 +224,6 @@ fn real_main() {
         println!("optimizations:\n{}", opt_stats);
     }
 
-    let emit_rust = args.iter().any(|a| a == "--emit-rust");
-    let compile_output = find_flag(&args, "--compile");
     let native_output = find_flag(&args, "--native");
     let run_rule = find_flag(&args, "--run");
     let input_path = find_flag(&args, "--input");
@@ -243,23 +254,6 @@ fn real_main() {
             s
         });
 
-        let rust_path = "/tmp/verbose_bench_rust";
-        let rust_source = codegen::emit_rust(&program);
-        let rust_tmp = format!("{}.rs", rust_path);
-        let rust_size = fs::write(&rust_tmp, &rust_source).ok().and_then(|()| {
-            let status = process::Command::new("rustc")
-                .args([&rust_tmp, "-o", rust_path])
-                .stdout(process::Stdio::null())
-                .stderr(process::Stdio::null())
-                .status().ok()?;
-            let _ = fs::remove_file(&rust_tmp);
-            if status.success() {
-                let size = fs::metadata(rust_path).map(|m| m.len()).ok();
-                let _ = fs::remove_file(rust_path);
-                size
-            } else { None }
-        });
-
         let rule = program.items.iter().find_map(|i| match i {
             ast::Item::Rule(r) if r.name == bench_rule => Some(r),
             _ => None,
@@ -278,9 +272,6 @@ fn real_main() {
         }
         if let Some(s) = native_size {
             println!("  Native x86-64     {:>6} B     none (zero)", s);
-        }
-        if let Some(s) = rust_size {
-            println!("  Rust transpiled  {:>6} KB    libc", s / 1024);
         }
         println!();
         if !hints_list.is_empty() {
@@ -455,29 +446,6 @@ fn real_main() {
                 process::exit(1);
             }
         }
-    } else if emit_rust {
-        println!();
-        print!("{}", codegen::emit_rust(&program));
-    } else if let Some(output) = compile_output {
-        let rust_source = codegen::emit_rust(&program);
-        let tmp = format!("{}.rs", output);
-        fs::write(&tmp, &rust_source).unwrap_or_else(|e| {
-            eprintln!("cannot write temp file '{}': {}", tmp, e);
-            process::exit(1);
-        });
-        let status = process::Command::new("rustc")
-            .args([&tmp, "-o", &output])
-            .status()
-            .unwrap_or_else(|e| {
-                eprintln!("failed to run rustc: {}", e);
-                process::exit(1);
-            });
-        let _ = fs::remove_file(&tmp);
-        if !status.success() {
-            eprintln!("rustc compilation failed");
-            process::exit(1);
-        }
-        println!("compiled: {} -> {}", path, output);
     } else if let (Some(rule_name), json_path) = (run_rule, input_path) {
         // Support --stdin as alternative to --input file
         let stdin_mode = args.iter().any(|a| a == "--stdin");
