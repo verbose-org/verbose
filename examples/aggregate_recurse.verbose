@@ -1,0 +1,68 @@
+@verbose 0.1.0
+
+-- Slice agg-2a: a RECURSIVE rule returns an aggregate.
+--
+-- Fibonacci is the canonical reason to want this: the iterative recurrence
+-- carries TWO numbers, so a rule that can only return one scalar cannot
+-- express it without a `which` selector and a second process. `fib_pair`
+-- returns both, and it recurses.
+--
+-- The aggregate crosses the call boundary through a destination the CALLER
+-- allocates in its own frame (slice agg-1's `rsi` convention). What agg-2a
+-- adds is the TAIL FORWARD: the recursive call in the `else` arm is handed
+-- the destination `fib_pair` was ITSELF given, so the whole chain shares ONE
+-- destination — the one `fib` allocated — and only the base case writes it.
+-- No per-frame destination, nothing to free.
+--
+-- Note that FibState and FibPair deliberately share the field names `prev`
+-- and `curr`: native field lookup is keyed by bare name, so this exercises
+-- agg-1's `__agg_<let>_<field>` composite keying through the recursive path.
+
+concept FibState
+  @intention: "how many steps remain, and the two Fibonacci numbers to step from"
+  @source: aggregate_recurse.intent:1
+  fields:
+    n : number [0, 20]
+    prev : number [0, 100000]
+    curr : number [0, 100000]
+
+concept FibPair
+  @intention: "two consecutive Fibonacci numbers, returned as one aggregate"
+  @source: aggregate_recurse.intent:2
+  fields:
+    prev : number [0, 100000]
+    curr : number [0, 100000]
+
+rule fib_pair
+  @intention: "step the Fibonacci recurrence n times and return both numbers"
+  @source: aggregate_recurse.intent:3
+  input:
+    s : FibState
+  output:
+    p : FibPair
+  logic:
+    p = if s.n == 0 then FibPair { prev : s.prev, curr : s.curr } else fib_pair(FibState { n : s.n - 1, prev : s.curr, curr : s.prev + s.curr })
+  proofs:
+    purity:
+      reads : [s.n, s.prev, s.curr]
+      calls : [fib_pair]
+    termination:
+      bound : 24
+      decreasing : n
+
+rule fib
+  @intention: "compose: bind the recursive aggregate and read both of its fields"
+  @source: aggregate_recurse.intent:4
+  input:
+    s : FibState
+  output:
+    out : number
+  logic:
+    let p = fib_pair(s)
+    out = p.prev * 1000 + p.curr
+  proofs:
+    purity:
+      reads : [s]
+      calls : [fib_pair]
+    termination:
+      bound : 10
