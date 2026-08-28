@@ -1,0 +1,6 @@
+1. Take a step count and the two Fibonacci numbers to start from.
+2. Produce those two numbers, as one aggregate value.
+3. The stepper: if no steps remain, return the pair as it stands; otherwise
+   advance one step and return whatever the remaining steps produce.
+4. The driver: bind the stepper's aggregate, then EMIT a fresh pair built
+   from its fields — the whole answer leaves in one invocation.

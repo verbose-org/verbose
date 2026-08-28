@@ -1,0 +1,69 @@
+@verbose 0.1.0
+
+-- Slice agg-2c: a record-output rule BINDS an aggregate and EMITS it.
+--
+-- agg-1 let a rule return a record to a number-output caller; agg-2a let the
+-- returning rule recurse. Both left the EMISSION gap open: a caller that
+-- binds an aggregate had to hand its answer back as a single number, so a
+-- 32-byte result still cost 32 invocations. agg-2c closes it — `driver`'s
+-- own output is the record, so the whole answer leaves in ONE invocation.
+--
+-- `driver` is the first rule that holds BOTH halves of the destination
+-- convention at once: it RECEIVES a destination (from `_start`, which
+-- allocates it below rsp and serialises it as JSON after the call) and it
+-- PROVIDES one to `step` (its `let p` slot group, `SretDest::Frame`). The
+-- two never alias: the incoming pointer lives in the callable's sret slot,
+-- the bound aggregate in its own let slots.
+--
+-- The record constructor at the end is a real construction, not a
+-- pass-through: `driver` may reorder, drop, or derive fields from `p`
+-- (pinned by tests); the identity copy here is just the simplest shape.
+
+concept FibState
+  @intention: "how many steps remain, and the two Fibonacci numbers to step from"
+  @source: aggregate_emit.intent:1
+  fields:
+    n : number [0, 20]
+    prev : number [0, 100000]
+    curr : number [0, 100000]
+
+concept FibPair
+  @intention: "two consecutive Fibonacci numbers, returned as one aggregate"
+  @source: aggregate_emit.intent:2
+  fields:
+    prev : number [0, 100000]
+    curr : number [0, 100000]
+
+rule step
+  @intention: "step the Fibonacci recurrence n times and return both numbers"
+  @source: aggregate_emit.intent:3
+  input:
+    s : FibState
+  output:
+    p : FibPair
+  logic:
+    p = if s.n == 0 then FibPair { prev : s.prev, curr : s.curr } else step(FibState { n : s.n - 1, prev : s.curr, curr : s.prev + s.curr })
+  proofs:
+    purity:
+      reads : [s.n, s.prev, s.curr]
+      calls : [step]
+    termination:
+      bound : 24
+      decreasing : n
+
+rule driver
+  @intention: "bind the recursive aggregate and emit it as this rule's own record output"
+  @source: aggregate_emit.intent:4
+  input:
+    s : FibState
+  output:
+    p2 : FibPair
+  logic:
+    let p = step(s)
+    p2 = FibPair { prev : p.prev, curr : p.curr }
+  proofs:
+    purity:
+      reads : [s]
+      calls : [step]
+    termination:
+      bound : 10
