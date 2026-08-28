@@ -288,20 +288,39 @@ fn compile_native_code(
             .collect()
     };
     let has_record_callee = !record_returning_callees.is_empty();
-    // Refusal #7 (§6.2) — the CALLER's output must be Number or Bool.
-    // `emit_self_recursive_program`'s result dispatch ends in
-    // `emit_itoa_inline`, so a record / text / bytes caller would print
-    // the DESTINATION POINTER as a decimal: the itoa-a-pointer family
-    // CLAUDE.md spends five gen0 slices closing, reproduced in verbosec.
-    if has_record_callee && !matches!(&rule.output_ty, Type::Number | Type::Bool) {
+    // Refusal #7 (§6.2), as narrowed by slice agg-2c — the CALLER's output
+    // must be Number, Bool, or a plain record concept. The original refusal
+    // existed because `emit_self_recursive_program`'s result dispatch ended
+    // in `emit_itoa_inline`, so any non-scalar caller would print the
+    // DESTINATION POINTER as a decimal: the itoa-a-pointer family CLAUDE.md
+    // spends five gen0 slices closing, reproduced in verbosec. Slice agg-2c
+    // adds a record arm to that dispatch (the `_start` loop allocates the
+    // outermost destination below rsp and serialises it as JSON), so a
+    // record-output caller is now served. Text and Bytes callers stay
+    // refused: each needs its own result-arm interaction analysed (text
+    // returns (rax, rdx); bytes streams during the walk), and neither has a
+    // consumer yet.
+    let entry_returns_record = plain_record_concept(&rule.output_ty, &concepts).is_some();
+    if has_record_callee
+        && !matches!(&rule.output_ty, Type::Number | Type::Bool)
+        && !entry_returns_record
+    {
         return Err(NativeError {
             message: format!(
-                "aggregate return: rule '{}' calls record-returning rule '{}', but {}'s own output is '{:?}'; slice agg-1 requires a number or bool caller, because _start's result dispatch would itoa the destination pointer. A record-output rule is already served by emit_record_program.",
+                "aggregate return: rule '{}' calls record-returning rule '{}', but {}'s own output is '{:?}'; a caller that binds an aggregate must have number, bool, or plain-record output (the record result arm is slice agg-2c) — a text or bytes caller needs its own _start result arm and is a later slice.",
                 rule.name, record_returning_callees[0], rule.name, rule.output_ty
             ),
         });
     }
-    if has_record_callee {
+    // Slice agg-2c — a record-output ENTRY that reaches the callable path
+    // (via a record callee, or by being recursive itself) must pass the same
+    // §6.1 shape checks as any other aggregate program: refusal #2 (Number
+    // fields only — the _start record arm serialises via itoa), the tail-
+    // concept equality, and the eager-let recursion guard all live there.
+    // A record entry with NO record callee and NO recursion never routes to
+    // the callable path (it is served by emit_record_program, which handles
+    // text fields), so it must NOT be walked here.
+    if has_record_callee || (entry_returns_record && recursion_witness.is_some()) {
         check_aggregate_shape(rule, &rules, &concepts)?;
     }
     // Also route through the callable path if any transitively-reachable
@@ -408,26 +427,15 @@ fn compile_native_code(
             // destination the caller already owns, so the whole chain shares
             // ONE destination and only the base case writes it.
             //
-            // What survives is the ENTRY case, which is a DIFFERENT row of §7
-            // ("a record-output CALLER") and a different mechanism entirely:
-            // this emitter's result dispatch below ends in `emit_itoa_inline`,
-            // so a record-output entry would print the DESTINATION POINTER as
-            // a decimal — the itoa-a-pointer family, reproduced in verbosec.
-            // A non-recursive record-output entry never reaches here; it is
-            // served by `emit_record_program` (JSON to stdout).
-            if let Some(rc) = plain_record_concept(&r.output_ty, &concepts) {
-                if r.name == rule.name {
-                    let witness = recursion_witness
-                        .clone()
-                        .unwrap_or_else(|| rule.name.clone());
-                    return Err(NativeError {
-                        message: format!(
-                            "aggregate return: entry rule '{}' returns record '{}' and is on the callable path of a recursive program (cycle through '{}'); _start's result dispatch would itoa the destination pointer, so a record-output ENTRY needs its own result arm (slice agg-2c). Compose it from a number-output caller, or use --run.",
-                            r.name, rc.name, witness
-                        ),
-                    });
-                }
-            }
+            // Slice agg-2c lifts the last surviving half: a record-output
+            // ENTRY on the callable path. `emit_self_recursive_program`'s
+            // result dispatch now has a record arm — the `_start` loop
+            // allocates the outermost destination below rsp, passes it in
+            // rsi, and serialises the returned slots as one JSON object per
+            // record (the same format `emit_record_program` emits) — so the
+            // itoa-a-pointer hazard the old refusal named cannot fire. The
+            // §6.1 shape checks for such an entry ran above, in the
+            // `check_aggregate_shape` gate.
             if !entry_is_recursive {
                 // No cycle: only the inlining-correctness extension; skip
                 // recursion-specific constraints.
@@ -1749,6 +1757,24 @@ fn collect_scc_containing(
 
 /// DFS helper for `collect_scc_containing`: true iff `target` is
 /// reachable from `from` via Call edges in `all_rules`.
+/// Slice agg-2c — is `r` itself a member of a call cycle? True iff some
+/// callee of `r` (direct or transitive) reaches `r` again. This is NOT
+/// `detect_native_recursion`, which reports any cycle REACHABLE FROM a rule
+/// — a rule that merely calls into someone else's cycle is not in one.
+/// Refusal #8's eager-let hazard only exists for a rule whose own lets run
+/// again on every frame, i.e. a rule in a cycle.
+fn rule_is_in_cycle(r: &Rule, all_rules: &HashMap<&str, &Rule>) -> bool {
+    let mut callees: Vec<String> = Vec::new();
+    for (_, e) in &r.logic.bindings {
+        collect_native_callees(e, &mut callees);
+    }
+    collect_native_callees(&r.logic.value, &mut callees);
+    callees.iter().any(|c| {
+        let mut visited = std::collections::HashSet::new();
+        reaches_target(c, &r.name, all_rules, &mut visited)
+    })
+}
+
 fn reaches_target(
     from: &str,
     target: &str,
@@ -2328,24 +2354,31 @@ fn check_aggregate_shape(
                     });
                 }
             }
-            // Refusal #8 — one aggregate hop per slice, EXCEPT the agg-2a
-            // tail position, which reuses this rule's own destination instead
-            // of allocating a second one. A `let` RHS aggregate call inside a
-            // record-returning rule is still refused: it needs a destination
-            // whose lifetime is scoped to the expression, and (in a recursive
-            // rule) the callable's lets are evaluated EAGERLY at prologue, so
-            // a recursion guard in the body would never fire.
-            let mut inner: Vec<String> = Vec::new();
-            for (_, e) in &r.logic.bindings {
-                collect_native_callees(e, &mut inner);
-            }
-            if let Some(r2) = inner.into_iter().find(|c| record_rules.contains(c.as_str())) {
-                return Err(NativeError {
-                    message: format!(
-                        "aggregate return: record-returning rule '{}' binds record-returning rule '{}' to a let; slice agg-1/agg-2a allow one aggregate hop plus a tail forward, because a second destination needs a nested slot group with expression-scoped lifetime (slice agg-2b).",
-                        r.name, r2
-                    ),
-                });
+            // Refusal #8, as narrowed by slice agg-2c — a record-returning
+            // rule that is IN A CYCLE may not bind an aggregate to a let: a
+            // callable's lets are evaluated EAGERLY at prologue, so a
+            // recursion guard in the body would never fire (measured in
+            // agg-2a: SIGSEGV on every input natively, stack overflow under
+            // --run). Lazy let evaluation is agg-2b's real blocker.
+            //
+            // A record-returning rule that is NOT in a cycle binding an
+            // aggregate is slice agg-2c's shape and is legal: the incoming
+            // destination lives in its sret slot, the bound aggregate in its
+            // own let slot group, and the two never alias — the exact
+            // composition `emit_callable_into` has carried since agg-1.
+            if rule_is_in_cycle(r, all_rules) {
+                let mut inner: Vec<String> = Vec::new();
+                for (_, e) in &r.logic.bindings {
+                    collect_native_callees(e, &mut inner);
+                }
+                if let Some(r2) = inner.into_iter().find(|c| record_rules.contains(c.as_str())) {
+                    return Err(NativeError {
+                        message: format!(
+                            "aggregate return: record-returning rule '{}' binds record-returning rule '{}' to a let while in a cycle; a callable's lets are evaluated eagerly, so the recursion guard would never fire — lazy let evaluation with a per-frame destination is slice agg-2b.",
+                            r.name, r2
+                        ),
+                    });
+                }
             }
         }
         // Per-rule: classify the let bindings, then check every use.
@@ -4953,6 +4986,16 @@ fn emit_self_recursive_program<'a>(
             record_returns.insert(r.name.as_str(), record_return_layout(rc));
         }
     }
+    // Slice agg-2c — a record-output ENTRY. `_start` owns the OUTERMOST
+    // destination: it is allocated below rsp per record-loop iteration,
+    // handed to the entry callable in rsi (the same convention every other
+    // caller uses), and serialised as one JSON object per record after the
+    // call returns — the same `{"field":value,...}` format
+    // `emit_record_program` emits for a non-recursive record entry, so one
+    // shape has one rendering whichever emitter serves it.
+    let entry_sret_layout: Option<Vec<(String, i32)>> = record_returns
+        .get(entry_rule.name.as_str())
+        .cloned();
     let placeholder_labels: HashMap<&str, i32> = scc_rules.iter()
         .map(|r| (r.name.as_str(), 0_i32))
         .collect();
@@ -5007,6 +5050,24 @@ fn emit_self_recursive_program<'a>(
         // one, so it needs none.
         false,
     )?;
+    // Slice agg-2c — allocate the outermost destination FIRST, so that after
+    // the (optional) input-struct `sub rsp` it sits at a compile-time-
+    // constant offset from rsp: `rsp + in_frame_bytes` for a multi-field
+    // entry, `rsp` otherwise. Freed by the matching `add rsp` after the
+    // record is serialised, so the loop stays rsp-balanced per iteration.
+    let dest_bytes: i32 = entry_sret_layout
+        .as_ref()
+        .map(|l| (l.len() * 8) as i32)
+        .unwrap_or(0);
+    if dest_bytes > 0 {
+        if dest_bytes <= 127 {
+            code.extend_from_slice(&[0x48, 0x83, 0xEC]); // sub rsp, imm8
+            code.push(dest_bytes as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, imm32
+            code.extend_from_slice(&dest_bytes.to_le_bytes());
+        }
+    }
     if entry_is_group {
         // Single i64 — load from the synthetic slot keyed by input_name.
         let field_slot = ctx.binding_offsets[entry_rule.input_name.as_str()];
@@ -5059,6 +5120,25 @@ fn emit_self_recursive_program<'a>(
         // mov rdi, rsp
         code.extend_from_slice(&[0x48, 0x89, 0xE7]);
     }
+    // Slice agg-2c — hand the entry callable its destination. LAST, right
+    // before the `call`, for agg-1's reason: the multi-field marshalling
+    // above clobbers rsi (`mov rsi, rax` + `emit_strlen` per text field),
+    // so an earlier `lea` would be gone by the time `call` executes and the
+    // callee would store the record through a string length. rsp is stable
+    // between the (optional) input-struct `sub rsp` and the `call`, so the
+    // destination's rsp-relative offset is a compile-time constant.
+    if dest_bytes > 0 {
+        let disp: i32 = if is_multi_field { frame_bytes } else { 0 };
+        if disp == 0 {
+            code.extend_from_slice(&[0x48, 0x8D, 0x34, 0x24]); // lea rsi, [rsp]
+        } else if disp <= 127 {
+            code.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24]); // lea rsi, [rsp+disp8]
+            code.push(disp as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x8D, 0xB4, 0x24]); // lea rsi, [rsp+disp32]
+            code.extend_from_slice(&disp.to_le_bytes());
+        }
+    }
     code.push(0xE8);                                       // call rel32
     let call_end = (code.len() + 4) as i32;
     let rel32 = entry_label - call_end;
@@ -5074,7 +5154,40 @@ fn emit_self_recursive_program<'a>(
     }
 
     // Print result — mirrors emit_full_program / emit_text_program.
-    if is_bool {
+    if let Some(layout) = &entry_sret_layout {
+        // Slice agg-2c — the record result arm. The callable wrote every
+        // field into the destination `_start` allocated below rsp (freed
+        // right after this, so the loop is rsp-balanced). Serialise it as
+        // one JSON object per record, byte-for-byte the format
+        // `emit_record_as_json` produces for a Number field: `{"name":` /
+        // `,"name":` prefixes, itoa'd values, `}\n` tail. Field order is
+        // the concept declaration order, from `record_return_layout` — a
+        // Vec, never a HashMap walk. The interleaved writes are safe
+        // because both serialisation helpers are rsp-balanced (see
+        // `emit_load_rax_from_rsp`), so `[rsp + off]` still names the
+        // destination between fields.
+        for (i, (fname, off)) in layout.iter().enumerate() {
+            let mut prefix = String::new();
+            prefix.push(if i == 0 { '{' } else { ',' });
+            prefix.push('"');
+            prefix.push_str(fname);
+            prefix.push('"');
+            prefix.push(':');
+            emit_write_static_to_fd(&mut code, prefix.as_bytes(), 1);
+            emit_load_rax_from_rsp(&mut code, *off);
+            emit_itoa_to_stdout_no_newline(&mut code);
+        }
+        emit_write_static_to_fd(&mut code, b"}\n", 1);
+        // Free the destination — the counterpart of the loop body's
+        // `sub rsp, dest_bytes`.
+        if dest_bytes <= 127 {
+            code.extend_from_slice(&[0x48, 0x83, 0xC4]); // add rsp, imm8
+            code.push(dest_bytes as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
+            code.extend_from_slice(&dest_bytes.to_le_bytes());
+        }
+    } else if is_bool {
         code.extend_from_slice(&[0x84, 0xC0]); // test al, al
         emit_bool_arms(&mut code, BoolExitFlag::Slot(ctx.exit_flag_slot));
     } else if is_bytes {
@@ -13412,6 +13525,24 @@ fn emit_store_rax_to_rsp(code: &mut Vec<u8>, rsp_off: i32) {
         code.push(rsp_off as u8);
     } else {
         code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
+        code.extend_from_slice(&rsp_off.to_le_bytes());
+    }
+}
+
+/// Slice agg-2c — `mov rax, [rsp + off]`, the load twin of
+/// `emit_store_rax_to_rsp`. Used by the `_start` record result arm to read
+/// each field of the destination it allocated below rsp, between the
+/// serialisation syscalls (which are rsp-balanced:
+/// `emit_write_static_to_fd` never touches rsp, and
+/// `emit_itoa_to_stdout_no_newline` subs 24 and adds 24 back).
+fn emit_load_rax_from_rsp(code: &mut Vec<u8>, rsp_off: i32) {
+    if rsp_off == 0 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]);
+    } else if rsp_off <= 127 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24]);
+        code.push(rsp_off as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x84, 0x24]);
         code.extend_from_slice(&rsp_off.to_le_bytes());
     }
 }
@@ -49272,6 +49403,11 @@ rule pick
         //     already-tracked `input_type_unsupported` class — "gen0 mirrors
         //     none of verbosec's EMIT-time refusal surface" — a GAP, not an
         //     INVERSE, and no new negative fixture is warranted for it.
+        //     (CLOSED BY SLICE agg-2c: verbosec grew the record result arm,
+        //     so `fib_pair` as the entry now compiles to 1157 B printing the
+        //     SAME bytes gen0 prints — the one cell where gen0 led verbosec
+        //     is agreement now. Pinned by
+        //     `aggregate_return_recursive_record_output_entry_serialises_the_destination`.)
         //
         //   declared entry (index 1, `fib`): gen0 emits **rc 0, a 1200-byte
         //     ELF that exits 133 (SIGTRAP) with no output**, where verbosec
@@ -49284,8 +49420,30 @@ rule pick
         // So the 95th acceptance is honest about `fib_pair` and says nothing
         // about `fib`, and the +1 is arguably generous: verbosec refuses the
         // rule gen0 accepted. Quote as "95/153 at rule #0".
-        const EXPECTED_ACCEPTED: usize = 95;
-        const EXPECTED_TOTAL: usize = 153;
+        //
+        // 95 -> 96, 153 -> 154 (slice agg-2c adds
+        // `examples/aggregate_emit.verbose`). Same split as the two agg rows
+        // above, with ONE half improved. Measured:
+        //
+        //   rule #0 (`step`, the recursive record-returning rule): gen0
+        //     ACCEPTS at 3859 B and prints `{"prev":55,"curr":89}` for argv
+        //     `10 0 1` — and this time verbosec AGREES: agg-2c's record
+        //     result arm compiles the same entry to 1157 B printing the
+        //     identical bytes. The fib_pair cell where gen0 led verbosec
+        //     (the parenthetical in the agg-2a row above) is closed, so the
+        //     96th acceptance is the first agg rule-#0 credit that is
+        //     honest AND matched by the reference.
+        //
+        //   declared entry (index 1, `driver`): gen0 emits **rc 0, a
+        //     3859-byte ELF that exits 133 (SIGTRAP) with no output**, where
+        //     verbosec emits 1270 bytes printing `{"prev":55,"curr":89}`.
+        //     Third file with the `aggregate_pair::total` gaps-table
+        //     signature (accept-what-you-cannot-emit on a record-let
+        //     entry); the existing row covers it, no new row.
+        //
+        // Quote as "96/154 at rule #0".
+        const EXPECTED_ACCEPTED: usize = 96;
+        const EXPECTED_TOTAL: usize = 154;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
@@ -55022,23 +55180,458 @@ rule drive
         let _ = std::fs::remove_file(&bin);
     }
 
-    /// The one half of agg-1's refusal #1 that agg-2a does NOT lift, kept
-    /// separate because it is a different §7 row and a different mechanism:
-    /// `emit_self_recursive_program`'s result dispatch ends in
-    /// `emit_itoa_inline`, so a record-output ENTRY would print the
-    /// DESTINATION POINTER as a decimal — the itoa-a-pointer family.
+    /// Slice agg-2c FLIPS the refusal that used to be pinned here (`a
+    /// RECORD-output ENTRY on the callable path is refused, slice agg-2c`)
+    /// into the capability: `_start` grew a record result arm, so a
+    /// RECURSIVE record-output entry now allocates the outermost destination
+    /// itself and serialises what the chain wrote into it — the same JSON
+    /// `emit_record_program` emits for a non-recursive record entry, so one
+    /// shape has one rendering whichever emitter serves it.
     ///
-    /// The corrected twin is the flagship above: the same `fib_pair`,
-    /// composed from a number-output caller, compiles and runs.
+    /// This also closes the gen0-vs-verbosec disagreement CLAUDE.md's gaps
+    /// table records for exactly this entry: gen0 already accepted
+    /// `fib_pair` at index 0 and printed `{"prev":55,"curr":89}` while
+    /// verbosec refused. The two now AGREE on the output bytes.
     #[test]
-    fn aggregate_return_recursive_record_output_entry_is_refused() {
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_recursive_record_output_entry_serialises_the_destination() {
+        use std::process::Command;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = std::fs::read_to_string(root.join("examples/aggregate_recurse.verbose")).unwrap();
-        let err = agg_compile(&src, "fib_pair", "rec_entry")
-            .expect_err("a RECURSIVE record-output entry must be refused");
-        assert!(err.contains("entry rule 'fib_pair'"), "must name the offender; got: {}", err);
-        assert!(err.contains("itoa the destination pointer"), "must name the mechanism; got: {}", err);
-        assert!(err.contains("slice agg-2c"), "must name the lifting slice; got: {}", err);
+        let bin = agg_compile(&src, "fib_pair", "rec_entry")
+            .expect("a RECURSIVE record-output entry must compile (slice agg-2c)");
+        for (n, want) in [
+            ("0", r#"{"prev":0,"curr":1}"#),
+            ("1", r#"{"prev":1,"curr":1}"#),
+            ("10", r#"{"prev":55,"curr":89}"#),
+            ("20", r#"{"prev":6765,"curr":10946}"#),
+        ] {
+            let out = Command::new(&bin).args([n, "0", "1"]).output().unwrap();
+            assert!(out.status.success(), "n = {} must exit 0; got {:?}", n, out.status);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                want,
+                "the destination _start allocated must carry the BASE CASE's pair at n = {}",
+                n
+            );
+        }
+        // The declared bound still fail-closes before any frame is pushed.
+        let over = Command::new(&bin).args(["21", "0", "1"]).output().unwrap();
+        assert_eq!(over.status.code(), Some(1), "n = 21 exceeds `n : number [0, 20]`");
+        assert!(over.stdout.is_empty(), "a fail-closed abort writes nothing to stdout");
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    // =====================================================================
+    // Slice agg-2c — a record-output rule BINDS an aggregate and EMITS it.
+    // docs/bytes-value-return-design.md §7, "A record-output CALLER".
+    //
+    // The composition halves (receive a destination in the sret slot,
+    // provide one per record `let` via SretDest::Frame) have shipped inside
+    // `emit_callable_into` since agg-1 — they simply coexisted behind
+    // refusals and had never been exercised together. What agg-2c BUILDS is
+    // the emission: `_start`'s result dispatch grows a record arm that
+    // allocates the outermost destination below rsp, hands it to the entry
+    // callable in rsi (LAST, after the input marshalling — agg-1's hazard
+    // #1 applies to _start too, see the rsi-clobber test), and serialises
+    // the returned slots as one JSON object per record.
+    // =====================================================================
+
+    /// THE MILESTONE for agg-2c. Verified to FAIL pre-change: on `6f94e5c`
+    /// this program is refused with `aggregate return: rule 'driver' calls
+    /// record-returning rule 'step', but driver's own output is
+    /// 'Named("Pair")'; slice agg-1 requires a number or bool caller …` and
+    /// zero bytes.
+    ///
+    /// `driver` receives a destination from `_start` AND provides one to
+    /// `step` in the same frame — the first program to exercise both halves
+    /// of the destination convention in one callable. The output record is
+    /// a REAL construction (`p.prev`/`p.curr` are ordinary composite-keyed
+    /// slot reads), asserted against the interpreter at every depth.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_record_output_caller_binds_and_emits() {
+        use std::process::Command;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("examples/aggregate_emit.verbose"))
+            .expect("examples/aggregate_emit.verbose");
+        let bin = agg_compile(&src, "driver", "emit_driver")
+            .expect("a record-output caller that binds an aggregate must compile (slice agg-2c)");
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
+        let rules: Vec<&Rule> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rule(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let driver = rules.iter().find(|r| r.name == "driver").unwrap();
+
+        for (n, want) in [
+            (0i64, r#"{"prev":0,"curr":1}"#),
+            (1, r#"{"prev":1,"curr":1}"#),
+            (10, r#"{"prev":55,"curr":89}"#),
+            (20, r#"{"prev":6765,"curr":10946}"#),
+        ] {
+            let out = Command::new(&bin)
+                .args([n.to_string(), "0".into(), "1".into()])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "driver {} must exit 0; got {:?}", n, out.status);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                want,
+                "driver({}, 0, 1) — the emitted record must be the one `step` wrote",
+                n
+            );
+
+            // Interpreter agreement, field by field (its Display order is
+            // HashMap-random, so compare values rather than bytes).
+            let mut input = std::collections::HashMap::new();
+            input.insert("n".to_string(), crate::interpreter::Value::Number(n));
+            input.insert("prev".to_string(), crate::interpreter::Value::Number(0));
+            input.insert("curr".to_string(), crate::interpreter::Value::Number(1));
+            let interp = crate::interpreter::eval_rule(driver, &rules, &concepts, &input)
+                .expect("interpreter must evaluate driver");
+            match interp {
+                crate::interpreter::Value::Record(fields) => {
+                    let native: std::collections::HashMap<String, i64> =
+                        String::from_utf8_lossy(&out.stdout)
+                            .trim()
+                            .trim_matches(|c| c == '{' || c == '}')
+                            .split(',')
+                            .map(|kv| {
+                                let (k, v) = kv.split_once(':').unwrap();
+                                (k.trim_matches('"').to_string(), v.parse().unwrap())
+                            })
+                            .collect();
+                    for (k, v) in &fields {
+                        match v {
+                            crate::interpreter::Value::Number(x) => {
+                                assert_eq!(native.get(k.as_str()), Some(x), "field {} at n={}", k, n)
+                            }
+                            other => panic!("unexpected field value {:?}", other),
+                        }
+                    }
+                    assert_eq!(fields.len(), native.len(), "field COUNT must agree at n={}", n);
+                }
+                other => panic!("driver must produce a record; got {:?}", other),
+            }
+        }
+
+        // The declared bound still fail-closes at field-load.
+        let over = Command::new(&bin).args(["21", "0", "1"]).output().unwrap();
+        assert_eq!(over.status.code(), Some(1), "n = 21 exceeds `n : number [0, 20]`");
+        assert!(over.stdout.is_empty(), "a fail-closed abort writes nothing to stdout");
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// The GENERAL case, which the flagship's identity copy cannot pin: the
+    /// driver's output record REORDERS the bound aggregate's fields, and a
+    /// second variant DERIVES one field and reads the input in another. If
+    /// `_start`'s record arm were a forward of the incoming destination
+    /// (the tempting zero-copy special case), the reorder would read and
+    /// write the same slots in place and corrupt: `prev` would be
+    /// overwritten before `curr` read it. There is deliberately NO identity
+    /// special case — every driver goes through its own let slot group.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_record_entry_reorders_and_derives_fields() {
+        use std::process::Command;
+        let step = "rule step\n  @intention: \"s\"\n  @source: x.intent:1\n  input:\n    s : S\n  output:\n    p : Pair\n  logic:\n    p = if s.n == 0 then Pair { prev : s.prev, curr : s.curr } else step(S { n : s.n - 1, prev : s.curr, curr : s.prev + s.curr })\n  proofs:\n    purity:\n      reads : [s.n, s.prev, s.curr]\n      calls : [step]\n    termination:\n      bound : 24\n      decreasing : n\n\n";
+        let head = "@verbose 0.1.0\n\n\
+             concept S\n  @intention: \"i\"\n  @source: x.intent:1\n  fields:\n    n : number [0, 20]\n    prev : number [0, 100000]\n    curr : number [0, 100000]\n\n\
+             concept Pair\n  @intention: \"a\"\n  @source: x.intent:1\n  fields:\n    prev : number [0, 100000]\n    curr : number [0, 100000]\n\n";
+        let driver = |body: &str, reads: &str| {
+            format!(
+                "rule driver\n  @intention: \"d\"\n  @source: x.intent:1\n  input:\n    s : S\n  output:\n    p2 : Pair\n  logic:\n    let p = step(s)\n    p2 = {}\n  proofs:\n    purity:\n      reads : [{}]\n      calls : [step]\n    termination:\n      bound : 10\n",
+                body, reads
+            )
+        };
+
+        // step(10, 0, 1) = (prev 55, curr 89).
+        let reorder = format!("{}{}{}", head, step, driver("Pair { prev : p.curr, curr : p.prev }", "s"));
+        let bin = agg_compile(&reorder, "driver", "emit_reorder").expect("reorder must compile");
+        let out = Command::new(&bin).args(["10", "0", "1"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            r#"{"prev":89,"curr":55}"#,
+            "swapped emission — an in-place forward would corrupt one field"
+        );
+        let _ = std::fs::remove_file(&bin);
+
+        let derive = format!(
+            "{}{}{}",
+            head,
+            step,
+            driver("Pair { prev : p.curr + 1, curr : s.n }", "s, s.n")
+        );
+        let bin = agg_compile(&derive, "driver", "emit_derive").expect("derive must compile");
+        let out = Command::new(&bin).args(["10", "0", "1"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            r#"{"prev":90,"curr":10}"#,
+            "a derived field and an input read must both resolve (composite keys vs input slots)"
+        );
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// NEGATIVE CONTROL NC-A, mechanised — `_start`'s `lea rsi` must come
+    /// AFTER the input marshalling, and proving that needs a fixture whose
+    /// marshalling clobbers rsi. The flagship cannot be it: an all-number
+    /// input marshals via rbp loads and never touches rsi, so the broken
+    /// build passes on it (measured — the same vacuous-on-the-flagship trap
+    /// as agg-1's NC-2 and agg-2a's NC-4).
+    ///
+    /// A TEXT input field marshals via `mov rsi, rax` + `emit_strlen`.
+    /// Verified by hand with the `lea rsi, [rsp]` moved BEFORE the
+    /// marshalling: this fixture prints `{"x":0,"y":140720364978897}` at
+    /// rc 0 — the y value is 0x7ffc…, a live STACK ADDRESS, so the slip is
+    /// simultaneously a silent wrong answer AND an ASLR disclosure.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_record_entry_survives_rsi_clobbering_marshalling() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "state carrying a text field"
+  @source: x.intent:1
+  fields:
+    n : number [0, 10]
+    tag : text [..8]
+    a : number [0, 100000]
+
+concept R
+  @intention: "pair"
+  @source: x.intent:1
+  fields:
+    x : number [0, 1000000]
+    y : number [0, 1000000]
+
+rule walk
+  @intention: "recurse with a text predicate in the call argument"
+  @source: x.intent:1
+  input:
+    t : T
+  output:
+    o : R
+  logic:
+    o = if t.n == 0 then R { x : t.a, y : length(t.tag) } else walk(T { n : t.n - 1, tag : t.tag, a : t.a + (if starts_with(t.tag, "a") then 2 else 1) })
+  proofs:
+    purity:
+      reads : [t.n, t.tag, t.a]
+      calls : [walk]
+    termination:
+      bound : 40
+      decreasing : n
+
+rule driver
+  @intention: "record-output caller whose OWN input has a text field"
+  @source: x.intent:1
+  input:
+    t : T
+  output:
+    o2 : R
+  logic:
+    let p = walk(t)
+    o2 = R { x : p.y, y : p.x }
+  proofs:
+    purity:
+      reads : [t]
+      calls : [walk]
+    termination:
+      bound : 10
+"#;
+        let bin = agg_compile(src, "driver", "emit_rsi_clobber").expect("must compile");
+        // "abc" starts with "a", so a grows by 2 per step: 5 + 2*3 = 11.
+        for (n, want) in [("0", r#"{"x":3,"y":5}"#), ("3", r#"{"x":3,"y":11}"#)] {
+            let out = Command::new(&bin).args([n, "abc", "5"]).output().unwrap();
+            assert!(out.status.success(), "n = {} must exit 0; got {:?}", n, out.status);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                want,
+                "n = {}: with the lea early this leaks a stack address at rc 0",
+                n
+            );
+        }
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A record ENTRY whose body TAIL-FORWARDS (no `let` at all): the whole
+    /// body is `if base then Record{…} else step(s)`, so `_start`'s
+    /// destination is handed straight down the agg-2a chain and only the
+    /// base case — in whichever callable it lives — writes it.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_record_entry_tail_forwards_without_a_let() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept S
+  @intention: "i"
+  @source: x.intent:1
+  fields:
+    n : number [0, 20]
+    prev : number [0, 100000]
+    curr : number [0, 100000]
+
+concept Pair
+  @intention: "a"
+  @source: x.intent:1
+  fields:
+    prev : number [0, 100000]
+    curr : number [0, 100000]
+
+rule step
+  @intention: "s"
+  @source: x.intent:1
+  input:
+    s : S
+  output:
+    p : Pair
+  logic:
+    p = if s.n == 0 then Pair { prev : s.prev, curr : s.curr } else step(S { n : s.n - 1, prev : s.curr, curr : s.prev + s.curr })
+  proofs:
+    purity:
+      reads : [s.n, s.prev, s.curr]
+      calls : [step]
+    termination:
+      bound : 24
+      decreasing : n
+
+rule driver
+  @intention: "record entry with a tail forward and a local record arm"
+  @source: x.intent:1
+  input:
+    s : S
+  output:
+    p2 : Pair
+  logic:
+    p2 = if s.n == 0 then Pair { prev : 111, curr : 222 } else step(s)
+  proofs:
+    purity:
+      reads : [s, s.n]
+      calls : [step]
+    termination:
+      bound : 12
+"#;
+        let bin = agg_compile(src, "driver", "emit_tailfwd").expect("must compile");
+        for (args, want) in [
+            (["0", "4", "9"], r#"{"prev":111,"curr":222}"#),
+            (["3", "0", "1"], r#"{"prev":2,"curr":3}"#),
+            (["10", "0", "1"], r#"{"prev":55,"curr":89}"#),
+        ] {
+            let out = Command::new(&bin).args(args).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want, "args {:?}", args);
+        }
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Refusal #8's narrowing, acceptance half: TWO aggregate hops through
+    /// NON-recursive record rules now compile — `driver → mid → inner`,
+    /// where `mid` is a record-returning rule that BINDS `inner`'s record
+    /// and emits its own. Each callable holds an incoming destination (sret
+    /// slot) and an owned one (let slot group) simultaneously; the values
+    /// pin that neither hop's fields bled into the other's.
+    ///
+    /// Verified to FAIL pre-change: refused with `record-returning rule
+    /// 'mid' binds record-returning rule 'inner' to a let; slice agg-1/
+    /// agg-2a allow one aggregate hop …`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn aggregate_return_two_hops_compose() {
+        use std::process::Command;
+        let head = "@verbose 0.1.0\n\n\
+             concept S\n  @intention: \"i\"\n  @source: x.intent:1\n  fields:\n    n : number [0, 20]\n    prev : number [0, 100000]\n    curr : number [0, 100000]\n\n\
+             concept Pair\n  @intention: \"a\"\n  @source: x.intent:1\n  fields:\n    prev : number [0, 100000]\n    curr : number [0, 100000]\n\n\
+             rule inner\n  @intention: \"h1\"\n  @source: x.intent:1\n  input:\n    s : S\n  output:\n    p : Pair\n  logic:\n    p = Pair { prev : s.prev * 2, curr : s.curr * 3 }\n  proofs:\n    purity:\n      reads : [s.prev, s.curr]\n      calls : []\n    termination:\n      bound : 8\n\n\
+             rule mid\n  @intention: \"h2\"\n  @source: x.intent:1\n  input:\n    s : S\n  output:\n    p : Pair\n  logic:\n    let q = inner(s)\n    p = Pair { prev : q.curr, curr : q.prev + 5 }\n  proofs:\n    purity:\n      reads : [s]\n      calls : [inner]\n    termination:\n      bound : 12\n\n";
+        // Number-output driver over the two-hop chain: inner(10,20) =
+        // (20,60); mid = (60,25); 60*1000 + 25.
+        let number_driver = format!(
+            "{}rule driver\n  @intention: \"d\"\n  @source: x.intent:1\n  input:\n    s : S\n  output:\n    out : number\n  logic:\n    let p = mid(s)\n    out = p.prev * 1000 + p.curr\n  proofs:\n    purity:\n      reads : [s]\n      calls : [mid]\n    termination:\n      bound : 12\n",
+            head
+        );
+        let bin = agg_compile(&number_driver, "driver", "twohop_num")
+            .expect("two non-recursive aggregate hops must compile (slice agg-2c)");
+        let out = Command::new(&bin).args(["3", "10", "20"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "60025");
+        let _ = std::fs::remove_file(&bin);
+
+        // Record-output driver over the same chain: three destinations live
+        // in one program (driver's from _start, mid's from driver, inner's
+        // from mid).
+        let record_driver = format!(
+            "{}rule driver\n  @intention: \"d\"\n  @source: x.intent:1\n  input:\n    s : S\n  output:\n    p2 : Pair\n  logic:\n    let p = mid(s)\n    p2 = Pair {{ prev : p.prev + 7, curr : p.curr }}\n  proofs:\n    purity:\n      reads : [s]\n      calls : [mid]\n    termination:\n      bound : 12\n",
+            head
+        );
+        let bin = agg_compile(&record_driver, "driver", "twohop_rec")
+            .expect("a record driver over two hops must compile (slice agg-2c)");
+        let out = Command::new(&bin).args(["3", "10", "20"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            r#"{"prev":67,"curr":25}"#
+        );
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// The gate that keeps agg-2b refused now that the ENTRY may return a
+    /// record: a record-output entry IN A CYCLE that BINDS its own
+    /// aggregate. `record_returning_callees` excludes the entry by name, so
+    /// `has_record_callee` is FALSE here — the shape only reaches
+    /// `check_aggregate_shape` through the `entry_returns_record &&
+    /// recursion` half of the gate, which is exactly what this pins.
+    /// (Eager lets: the recursion guard in the body would never fire;
+    /// measured in agg-2a as SIGSEGV native / stack overflow --run.)
+    #[test]
+    fn aggregate_return_recursive_record_entry_that_binds_is_still_refused() {
+        let src = r#"@verbose 0.1.0
+
+concept S
+  @intention: "i"
+  @source: x.intent:1
+  fields:
+    n : number [0, 20]
+    prev : number [0, 100000]
+    curr : number [0, 100000]
+
+concept Pair
+  @intention: "a"
+  @source: x.intent:1
+  fields:
+    prev : number [0, 100000]
+    curr : number [0, 100000]
+
+rule driver
+  @intention: "record entry that binds ITSELF — the eager-let recursion hazard"
+  @source: x.intent:1
+  input:
+    s : S
+  output:
+    p2 : Pair
+  logic:
+    let p = driver(s)
+    p2 = if s.n == 0 then Pair { prev : s.prev, curr : s.curr } else Pair { prev : p.prev, curr : p.curr }
+  proofs:
+    purity:
+      reads : [s, s.n, s.prev, s.curr]
+      calls : [driver]
+    termination:
+      bound : 12
+"#;
+        let err = agg_compile(src, "driver", "emit_cyclic_bind")
+            .expect_err("a cyclic record entry that binds an aggregate must be refused");
+        assert!(
+            err.contains("binds record-returning rule 'driver' to a let while in a cycle"),
+            "must name the offender and the cycle; got: {}",
+            err
+        );
+        assert!(err.contains("slice agg-2b"), "must name the lifting slice; got: {}", err);
     }
 
     /// §6.4 test 1 — a record-returning rule compiled as the ENTRY still
@@ -55383,7 +55976,10 @@ rule drive
             "slice agg-2",
         ));
 
-        // #7 — the CALLER's output is not Number/Bool.
+        // #7, as narrowed by slice agg-2c — a TEXT (or Bytes) caller is
+        // still refused: `_start` grew a RECORD result arm, not a text one,
+        // and a text caller's (rax, rdx) return has no analysed interaction
+        // with a live destination slot group.
         cases.push((
             "text_caller",
             agg_probe(
@@ -55393,30 +55989,15 @@ rule drive
                 "text",
             ),
             "rule 'drive' calls record-returning rule 'mk'",
-            "slice agg-1 requires a number or bool caller",
+            "a text or bytes caller needs its own _start result arm",
         ));
 
-        // #8 — the record-returning callee itself calls a record-returning
-        // rule (one aggregate hop per slice).
-        let two_hops = {
-            let mut s = agg_probe("R { x: t.x, y: 2 }", &["let r = mk(n)"], "r.x + r.y", "number");
-            // Give `mk` its own record-returning callee `inner`.
-            s = s.replace(
-                "rule mk\n",
-                "rule inner\n  @intention: \"i\"\n  @source: x.intent:1\n  input:\n    n : N\n  output:\n    s : R\n  logic:\n    s = R { x: n.v, y: 1 }\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : []\n    termination:\n      bound : 8\n\nrule mk\n",
-            );
-            s = s.replace(
-                "  logic:\n    r = R { x: t.x, y: 2 }\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : []",
-                "  logic:\n    let t = inner(n)\n    r = R { x: t.x, y: 2 }\n  proofs:\n    purity:\n      reads : [n]\n      calls : [inner]",
-            );
-            s
-        };
-        cases.push((
-            "two_hops",
-            two_hops,
-            "record-returning rule 'mk' binds record-returning rule 'inner' to a let",
-            "slice agg-2b",
-        ));
+        // #8, as narrowed by slice agg-2c — TWO HOPS through NON-recursive
+        // record rules is now legal (see `aggregate_return_two_hops_compose`
+        // for the acceptance). What stays refused is a record-returning rule
+        // IN A CYCLE binding an aggregate to a let: a callable's lets are
+        // eager, so the recursion guard would never fire — that is
+        // `recursive_nontail` above, which binds `mk` to itself.
 
         // agg-2a — a tail call whose callee returns a DIFFERENT concept. The
         // tail forward hands the callee THIS rule's destination, so the two

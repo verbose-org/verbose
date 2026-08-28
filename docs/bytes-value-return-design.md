@@ -49,6 +49,30 @@ time: **a "known gap" note is a claim about cost, and it decays** — this one n
 wrong mechanism (`sub rsp` for a case the language cannot express) and would have had
 an implementer build a per-frame slot group nothing needed.
 
+**§7's "A record-output CALLER" row SHIPPED 2026-08-28 as slice agg-2c, and the
+between-slices re-framing of it was wrong in the direction that made the slice look
+bigger.** The agg-2c brief re-read the refusal as *"about COMPOSITION: driver must
+simultaneously receive a destination AND provide one to step … the refusal exists
+because no path does both at once"*. Checked against the code before building: **that
+is not why the refusal existed.** Both composition halves have shipped inside
+`emit_callable_into` since agg-1 — a record-output callable spills its incoming `rsi`
+to the sret slot, and a record `let` in the same frame gets its own slot group via
+`SretDest::Frame`; the two coexisted behind the refusals as never-exercised code and
+worked the first time they were reached. This note's own framing (*"a `_start`
+result-dispatch question and not a call-boundary one"*, above) was the right one. What
+agg-2c BUILT is exactly that dispatch arm, ~60 lines: `_start` allocates the outermost
+destination below rsp, hands it to the entry callable in `rsi` (LAST, after the input
+marshalling — §3.3's hazard verbatim, reproduced in `_start`: with the `lea` early, a
+text-field entry prints a live stack address at rc 0, and the all-number flagship
+PASSES, the same vacuous-on-the-flagship trap as NC-2/NC-4), and serialises the
+returned slots as `emit_record_as_json`'s exact JSON. Plus three refusal narrowings:
+#7 to Text/Bytes callers, #8 to record rules in a CYCLE (the eager-let hazard is
+recursion's, not composition's), and the agg-2a entry-refusal deleted outright — which
+also closed the one cell where gen0 was MORE capable than verbosec (`fib_pair` as
+entry: gen0 printed `{"prev":55,"curr":89}` where verbosec refused; they now agree).
+Worked example `examples/aggregate_emit.verbose` (driver 1270 B); the measured X25519
+consequence lives in CLAUDE.md's "still rejects" bullet.
+
 **Implementation notes — what the build measured that the note could not.** Four
 things, all of them in §6's favour and all worth reading before the next slice:
 
@@ -1200,7 +1224,7 @@ or refuse.
 | **Aggregate in a nested position** (`f(g(x))`, an `if` arm, a call argument) | needs a temporary destination with expression-scoped lifetime | agg-2 |
 | **A record-returning callee that itself calls a record-returning rule** | second destination, nested lifetime — refusal #8 | agg-2 |
 | **Passing a whole record as a call argument** (`f(p)` rather than `f(C { a: p.a, … })`) | a struct-to-struct copy; mechanically easy, but a distinct capability deserving its own refusal-lift | agg-2 |
-| **A record-output CALLER** | `_start`'s result dispatch would itoa the destination pointer (§6.1, refusal #7); needs a record arm in `emit_self_recursive_program`'s printing, or the entry to stay on `emit_record_program` | agg-2 |
+| **A record-output CALLER** | **SHIPPED 2026-08-28 (slice agg-2c)** — and the row's "or" was the wrong framing: the shipped answer is BOTH. A record entry with no aggregate reachable STAYS on `emit_record_program` (byte-identical, text fields included); one on the callable path gets a record arm in `_start`'s result dispatch: the destination is allocated below rsp per record-loop iteration, handed to the entry callable in `rsi` LAST after the input marshalling (§3.3's hazard applies to `_start` too — measured with the `lea` early, a text-field entry prints a live 0x7ffc… STACK ADDRESS at rc 0), and serialised as `emit_record_as_json`'s exact `{"f":v,…}` format from `[rsp + off]` between rsp-balanced write/itoa helpers. Refusal #7 narrows to Text/Bytes callers; refusal #8 narrows to record rules IN A CYCLE (the eager-let hazard is recursion-only), so two non-recursive aggregate hops and a record-output driver binding TWO aggregates both compile. See the header correction note. | **agg-2c — shipped** |
 | **`concat(le64(p.w0), …)` in a bytes-output caller** | routes the whole SCC through `emit_streaming_bytes_body`'s streaming ABI with its `push r11` discipline; interaction with a destination slot group is unanalysed (§5.1) | agg-2 |
 | **`Type::Bool` and `Type::Text` record fields** | Bool does not emit in `emit_record_as_json` today at all; Text needs the `(ptr, len)` pair to point somewhere that outlives the callee's frame | agg-3 |
 | **`Result(Named(C), E)` return** | tag + payload; composes with the shipped `match_result` slot machinery but is its own convention | agg-4 |
