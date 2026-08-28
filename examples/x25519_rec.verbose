@@ -1,7 +1,7 @@
 @verbose 0.1.0
 
 concept X25519RecState
-  @intention: "X25519 inverse-chain state: running accumulator t (10 limbs) + 8 saved intermediates (z2, z9, z11, z2_5_0, z2_10_0, z2_20_0, z2_50_0, z2_100_0; 10 limbs each) + inputs z and x2 (10 limbs each) + step counter j (265..0) + which output byte (0..31)"
+  @intention: "X25519 inverse-chain state: running accumulator t (10 limbs) + 8 saved intermediates (z2, z9, z11, z2_5_0, z2_10_0, z2_20_0, z2_50_0, z2_100_0; 10 limbs each) + inputs z and x2 (10 limbs each) + step counter j (265..0)"
   @source: invoices.intent:1
   fields:
     t_0 : number [0, 67108863]
@@ -115,16 +115,53 @@ concept X25519RecState
     x2_8 : number [0, 67108863]
     x2_9 : number [0, 33554431]
     j : number [0, 265]
-    which : number [0, 31]
+
+
+concept Digest
+  @intention: "the 32 little-endian output bytes of an X25519 evaluation, returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+    b16 : number [0, 255]
+    b17 : number [0, 255]
+    b18 : number [0, 255]
+    b19 : number [0, 255]
+    b20 : number [0, 255]
+    b21 : number [0, 255]
+    b22 : number [0, 255]
+    b23 : number [0, 255]
+    b24 : number [0, 255]
+    b25 : number [0, 255]
+    b26 : number [0, 255]
+    b27 : number [0, 255]
+    b28 : number [0, 255]
+    b29 : number [0, 255]
+    b30 : number [0, 255]
+    b31 : number [0, 255]
 
 
 rule x25519_finish
-  @intention: "X25519 finish via the curve25519 Fermat inverse addition chain, recursive: EXACTLY ONE conditional field multiply per frame (operand muxed by step counter — square or junction, never both), 265 step-frames (decreasing j); base case multiplies x2 by z^(p-2), little-endian encodes, returns byte which. Same algorithm and same 266-fmul count as the unrolled emit_finv; bit-for-bit identical result, zero extra field multiplies."
+  @intention: "X25519 finish via the curve25519 Fermat inverse addition chain, recursive: EXACTLY ONE conditional field multiply per frame (operand muxed by step counter — square or junction, never both), 265 step-frames (decreasing j); base case multiplies x2 by z^(p-2), little-endian encodes, returns ALL 32 output bytes as one Digest record. Same algorithm and same 266-fmul count as the unrolled emit_finv; bit-for-bit identical result, zero extra field multiplies."
   @source: invoices.intent:1
   input:
     s : X25519RecState
   output:
-    out : number
+    out : Digest
   logic:
     let op_0 = if (265 - s.j) == 3 then s.z_0 else if (265 - s.j) == 4 then s.z2_0 else if (265 - s.j) == 6 then s.z9_0 else if (265 - s.j) == 12 then s.z2_5_0_0 else if (265 - s.j) == 23 then s.z2_10_0_0 else if (265 - s.j) == 44 then s.z2_20_0_0 else if (265 - s.j) == 55 then s.z2_10_0_0 else if (265 - s.j) == 106 then s.z2_50_0_0 else if (265 - s.j) == 207 then s.z2_100_0_0 else if (265 - s.j) == 258 then s.z2_50_0_0 else if (265 - s.j) == 264 then s.z11_0 else s.t_0
     let op_1 = if (265 - s.j) == 3 then s.z_1 else if (265 - s.j) == 4 then s.z2_1 else if (265 - s.j) == 6 then s.z9_1 else if (265 - s.j) == 12 then s.z2_5_0_1 else if (265 - s.j) == 23 then s.z2_10_0_1 else if (265 - s.j) == 44 then s.z2_20_0_1 else if (265 - s.j) == 55 then s.z2_10_0_1 else if (265 - s.j) == 106 then s.z2_50_0_1 else if (265 - s.j) == 207 then s.z2_100_0_1 else if (265 - s.j) == 258 then s.z2_50_0_1 else if (265 - s.j) == 264 then s.z11_1 else s.t_1
@@ -388,10 +425,10 @@ rule x25519_finish
     let enc_ob29 = band(shr(fin_lo1_9, 2), 255)
     let enc_ob30 = band(shr(fin_lo1_9, 10), 255)
     let enc_ob31 = band(shr(fin_lo1_9, 18), 255)
-    out = if s.j == 0 then if s.which == 0 then enc_ob0 else if s.which == 1 then enc_ob1 else if s.which == 2 then enc_ob2 else if s.which == 3 then enc_ob3 else if s.which == 4 then enc_ob4 else if s.which == 5 then enc_ob5 else if s.which == 6 then enc_ob6 else if s.which == 7 then enc_ob7 else if s.which == 8 then enc_ob8 else if s.which == 9 then enc_ob9 else if s.which == 10 then enc_ob10 else if s.which == 11 then enc_ob11 else if s.which == 12 then enc_ob12 else if s.which == 13 then enc_ob13 else if s.which == 14 then enc_ob14 else if s.which == 15 then enc_ob15 else if s.which == 16 then enc_ob16 else if s.which == 17 then enc_ob17 else if s.which == 18 then enc_ob18 else if s.which == 19 then enc_ob19 else if s.which == 20 then enc_ob20 else if s.which == 21 then enc_ob21 else if s.which == 22 then enc_ob22 else if s.which == 23 then enc_ob23 else if s.which == 24 then enc_ob24 else if s.which == 25 then enc_ob25 else if s.which == 26 then enc_ob26 else if s.which == 27 then enc_ob27 else if s.which == 28 then enc_ob28 else if s.which == 29 then enc_ob29 else if s.which == 30 then enc_ob30 else enc_ob31 else x25519_finish(X25519RecState { t_0: nt_w1, t_1: nt_lo1_1, t_2: nt_lo1_2, t_3: nt_lo1_3, t_4: nt_lo1_4, t_5: nt_lo1_5, t_6: nt_lo1_6, t_7: nt_lo1_7, t_8: nt_lo1_8, t_9: nt_lo1_9, z2_0: ns_z2_0, z2_1: ns_z2_1, z2_2: ns_z2_2, z2_3: ns_z2_3, z2_4: ns_z2_4, z2_5: ns_z2_5, z2_6: ns_z2_6, z2_7: ns_z2_7, z2_8: ns_z2_8, z2_9: ns_z2_9, z9_0: ns_z9_0, z9_1: ns_z9_1, z9_2: ns_z9_2, z9_3: ns_z9_3, z9_4: ns_z9_4, z9_5: ns_z9_5, z9_6: ns_z9_6, z9_7: ns_z9_7, z9_8: ns_z9_8, z9_9: ns_z9_9, z11_0: ns_z11_0, z11_1: ns_z11_1, z11_2: ns_z11_2, z11_3: ns_z11_3, z11_4: ns_z11_4, z11_5: ns_z11_5, z11_6: ns_z11_6, z11_7: ns_z11_7, z11_8: ns_z11_8, z11_9: ns_z11_9, z2_5_0_0: ns_z2_5_0_0, z2_5_0_1: ns_z2_5_0_1, z2_5_0_2: ns_z2_5_0_2, z2_5_0_3: ns_z2_5_0_3, z2_5_0_4: ns_z2_5_0_4, z2_5_0_5: ns_z2_5_0_5, z2_5_0_6: ns_z2_5_0_6, z2_5_0_7: ns_z2_5_0_7, z2_5_0_8: ns_z2_5_0_8, z2_5_0_9: ns_z2_5_0_9, z2_10_0_0: ns_z2_10_0_0, z2_10_0_1: ns_z2_10_0_1, z2_10_0_2: ns_z2_10_0_2, z2_10_0_3: ns_z2_10_0_3, z2_10_0_4: ns_z2_10_0_4, z2_10_0_5: ns_z2_10_0_5, z2_10_0_6: ns_z2_10_0_6, z2_10_0_7: ns_z2_10_0_7, z2_10_0_8: ns_z2_10_0_8, z2_10_0_9: ns_z2_10_0_9, z2_20_0_0: ns_z2_20_0_0, z2_20_0_1: ns_z2_20_0_1, z2_20_0_2: ns_z2_20_0_2, z2_20_0_3: ns_z2_20_0_3, z2_20_0_4: ns_z2_20_0_4, z2_20_0_5: ns_z2_20_0_5, z2_20_0_6: ns_z2_20_0_6, z2_20_0_7: ns_z2_20_0_7, z2_20_0_8: ns_z2_20_0_8, z2_20_0_9: ns_z2_20_0_9, z2_50_0_0: ns_z2_50_0_0, z2_50_0_1: ns_z2_50_0_1, z2_50_0_2: ns_z2_50_0_2, z2_50_0_3: ns_z2_50_0_3, z2_50_0_4: ns_z2_50_0_4, z2_50_0_5: ns_z2_50_0_5, z2_50_0_6: ns_z2_50_0_6, z2_50_0_7: ns_z2_50_0_7, z2_50_0_8: ns_z2_50_0_8, z2_50_0_9: ns_z2_50_0_9, z2_100_0_0: ns_z2_100_0_0, z2_100_0_1: ns_z2_100_0_1, z2_100_0_2: ns_z2_100_0_2, z2_100_0_3: ns_z2_100_0_3, z2_100_0_4: ns_z2_100_0_4, z2_100_0_5: ns_z2_100_0_5, z2_100_0_6: ns_z2_100_0_6, z2_100_0_7: ns_z2_100_0_7, z2_100_0_8: ns_z2_100_0_8, z2_100_0_9: ns_z2_100_0_9, z_0: s.z_0, z_1: s.z_1, z_2: s.z_2, z_3: s.z_3, z_4: s.z_4, z_5: s.z_5, z_6: s.z_6, z_7: s.z_7, z_8: s.z_8, z_9: s.z_9, x2_0: s.x2_0, x2_1: s.x2_1, x2_2: s.x2_2, x2_3: s.x2_3, x2_4: s.x2_4, x2_5: s.x2_5, x2_6: s.x2_6, x2_7: s.x2_7, x2_8: s.x2_8, x2_9: s.x2_9, j: s.j - 1, which: s.which })
+    out = if s.j == 0 then Digest { b0: enc_ob0, b1: enc_ob1, b2: enc_ob2, b3: enc_ob3, b4: enc_ob4, b5: enc_ob5, b6: enc_ob6, b7: enc_ob7, b8: enc_ob8, b9: enc_ob9, b10: enc_ob10, b11: enc_ob11, b12: enc_ob12, b13: enc_ob13, b14: enc_ob14, b15: enc_ob15, b16: enc_ob16, b17: enc_ob17, b18: enc_ob18, b19: enc_ob19, b20: enc_ob20, b21: enc_ob21, b22: enc_ob22, b23: enc_ob23, b24: enc_ob24, b25: enc_ob25, b26: enc_ob26, b27: enc_ob27, b28: enc_ob28, b29: enc_ob29, b30: enc_ob30, b31: enc_ob31 } else x25519_finish(X25519RecState { t_0: nt_w1, t_1: nt_lo1_1, t_2: nt_lo1_2, t_3: nt_lo1_3, t_4: nt_lo1_4, t_5: nt_lo1_5, t_6: nt_lo1_6, t_7: nt_lo1_7, t_8: nt_lo1_8, t_9: nt_lo1_9, z2_0: ns_z2_0, z2_1: ns_z2_1, z2_2: ns_z2_2, z2_3: ns_z2_3, z2_4: ns_z2_4, z2_5: ns_z2_5, z2_6: ns_z2_6, z2_7: ns_z2_7, z2_8: ns_z2_8, z2_9: ns_z2_9, z9_0: ns_z9_0, z9_1: ns_z9_1, z9_2: ns_z9_2, z9_3: ns_z9_3, z9_4: ns_z9_4, z9_5: ns_z9_5, z9_6: ns_z9_6, z9_7: ns_z9_7, z9_8: ns_z9_8, z9_9: ns_z9_9, z11_0: ns_z11_0, z11_1: ns_z11_1, z11_2: ns_z11_2, z11_3: ns_z11_3, z11_4: ns_z11_4, z11_5: ns_z11_5, z11_6: ns_z11_6, z11_7: ns_z11_7, z11_8: ns_z11_8, z11_9: ns_z11_9, z2_5_0_0: ns_z2_5_0_0, z2_5_0_1: ns_z2_5_0_1, z2_5_0_2: ns_z2_5_0_2, z2_5_0_3: ns_z2_5_0_3, z2_5_0_4: ns_z2_5_0_4, z2_5_0_5: ns_z2_5_0_5, z2_5_0_6: ns_z2_5_0_6, z2_5_0_7: ns_z2_5_0_7, z2_5_0_8: ns_z2_5_0_8, z2_5_0_9: ns_z2_5_0_9, z2_10_0_0: ns_z2_10_0_0, z2_10_0_1: ns_z2_10_0_1, z2_10_0_2: ns_z2_10_0_2, z2_10_0_3: ns_z2_10_0_3, z2_10_0_4: ns_z2_10_0_4, z2_10_0_5: ns_z2_10_0_5, z2_10_0_6: ns_z2_10_0_6, z2_10_0_7: ns_z2_10_0_7, z2_10_0_8: ns_z2_10_0_8, z2_10_0_9: ns_z2_10_0_9, z2_20_0_0: ns_z2_20_0_0, z2_20_0_1: ns_z2_20_0_1, z2_20_0_2: ns_z2_20_0_2, z2_20_0_3: ns_z2_20_0_3, z2_20_0_4: ns_z2_20_0_4, z2_20_0_5: ns_z2_20_0_5, z2_20_0_6: ns_z2_20_0_6, z2_20_0_7: ns_z2_20_0_7, z2_20_0_8: ns_z2_20_0_8, z2_20_0_9: ns_z2_20_0_9, z2_50_0_0: ns_z2_50_0_0, z2_50_0_1: ns_z2_50_0_1, z2_50_0_2: ns_z2_50_0_2, z2_50_0_3: ns_z2_50_0_3, z2_50_0_4: ns_z2_50_0_4, z2_50_0_5: ns_z2_50_0_5, z2_50_0_6: ns_z2_50_0_6, z2_50_0_7: ns_z2_50_0_7, z2_50_0_8: ns_z2_50_0_8, z2_50_0_9: ns_z2_50_0_9, z2_100_0_0: ns_z2_100_0_0, z2_100_0_1: ns_z2_100_0_1, z2_100_0_2: ns_z2_100_0_2, z2_100_0_3: ns_z2_100_0_3, z2_100_0_4: ns_z2_100_0_4, z2_100_0_5: ns_z2_100_0_5, z2_100_0_6: ns_z2_100_0_6, z2_100_0_7: ns_z2_100_0_7, z2_100_0_8: ns_z2_100_0_8, z2_100_0_9: ns_z2_100_0_9, z_0: s.z_0, z_1: s.z_1, z_2: s.z_2, z_3: s.z_3, z_4: s.z_4, z_5: s.z_5, z_6: s.z_6, z_7: s.z_7, z_8: s.z_8, z_9: s.z_9, x2_0: s.x2_0, x2_1: s.x2_1, x2_2: s.x2_2, x2_3: s.x2_3, x2_4: s.x2_4, x2_5: s.x2_5, x2_6: s.x2_6, x2_7: s.x2_7, x2_8: s.x2_8, x2_9: s.x2_9, j: s.j - 1 })
   proofs:
     purity:
-      reads : [s.t_0, s.t_1, s.t_2, s.t_3, s.t_4, s.t_5, s.t_6, s.t_7, s.t_8, s.t_9, s.z2_0, s.z2_1, s.z2_2, s.z2_3, s.z2_4, s.z2_5, s.z2_6, s.z2_7, s.z2_8, s.z2_9, s.z9_0, s.z9_1, s.z9_2, s.z9_3, s.z9_4, s.z9_5, s.z9_6, s.z9_7, s.z9_8, s.z9_9, s.z11_0, s.z11_1, s.z11_2, s.z11_3, s.z11_4, s.z11_5, s.z11_6, s.z11_7, s.z11_8, s.z11_9, s.z2_5_0_0, s.z2_5_0_1, s.z2_5_0_2, s.z2_5_0_3, s.z2_5_0_4, s.z2_5_0_5, s.z2_5_0_6, s.z2_5_0_7, s.z2_5_0_8, s.z2_5_0_9, s.z2_10_0_0, s.z2_10_0_1, s.z2_10_0_2, s.z2_10_0_3, s.z2_10_0_4, s.z2_10_0_5, s.z2_10_0_6, s.z2_10_0_7, s.z2_10_0_8, s.z2_10_0_9, s.z2_20_0_0, s.z2_20_0_1, s.z2_20_0_2, s.z2_20_0_3, s.z2_20_0_4, s.z2_20_0_5, s.z2_20_0_6, s.z2_20_0_7, s.z2_20_0_8, s.z2_20_0_9, s.z2_50_0_0, s.z2_50_0_1, s.z2_50_0_2, s.z2_50_0_3, s.z2_50_0_4, s.z2_50_0_5, s.z2_50_0_6, s.z2_50_0_7, s.z2_50_0_8, s.z2_50_0_9, s.z2_100_0_0, s.z2_100_0_1, s.z2_100_0_2, s.z2_100_0_3, s.z2_100_0_4, s.z2_100_0_5, s.z2_100_0_6, s.z2_100_0_7, s.z2_100_0_8, s.z2_100_0_9, s.z_0, s.z_1, s.z_2, s.z_3, s.z_4, s.z_5, s.z_6, s.z_7, s.z_8, s.z_9, s.x2_0, s.x2_1, s.x2_2, s.x2_3, s.x2_4, s.x2_5, s.x2_6, s.x2_7, s.x2_8, s.x2_9, s.j, s.which]
+      reads : [s.t_0, s.t_1, s.t_2, s.t_3, s.t_4, s.t_5, s.t_6, s.t_7, s.t_8, s.t_9, s.z2_0, s.z2_1, s.z2_2, s.z2_3, s.z2_4, s.z2_5, s.z2_6, s.z2_7, s.z2_8, s.z2_9, s.z9_0, s.z9_1, s.z9_2, s.z9_3, s.z9_4, s.z9_5, s.z9_6, s.z9_7, s.z9_8, s.z9_9, s.z11_0, s.z11_1, s.z11_2, s.z11_3, s.z11_4, s.z11_5, s.z11_6, s.z11_7, s.z11_8, s.z11_9, s.z2_5_0_0, s.z2_5_0_1, s.z2_5_0_2, s.z2_5_0_3, s.z2_5_0_4, s.z2_5_0_5, s.z2_5_0_6, s.z2_5_0_7, s.z2_5_0_8, s.z2_5_0_9, s.z2_10_0_0, s.z2_10_0_1, s.z2_10_0_2, s.z2_10_0_3, s.z2_10_0_4, s.z2_10_0_5, s.z2_10_0_6, s.z2_10_0_7, s.z2_10_0_8, s.z2_10_0_9, s.z2_20_0_0, s.z2_20_0_1, s.z2_20_0_2, s.z2_20_0_3, s.z2_20_0_4, s.z2_20_0_5, s.z2_20_0_6, s.z2_20_0_7, s.z2_20_0_8, s.z2_20_0_9, s.z2_50_0_0, s.z2_50_0_1, s.z2_50_0_2, s.z2_50_0_3, s.z2_50_0_4, s.z2_50_0_5, s.z2_50_0_6, s.z2_50_0_7, s.z2_50_0_8, s.z2_50_0_9, s.z2_100_0_0, s.z2_100_0_1, s.z2_100_0_2, s.z2_100_0_3, s.z2_100_0_4, s.z2_100_0_5, s.z2_100_0_6, s.z2_100_0_7, s.z2_100_0_8, s.z2_100_0_9, s.z_0, s.z_1, s.z_2, s.z_3, s.z_4, s.z_5, s.z_6, s.z_7, s.z_8, s.z_9, s.x2_0, s.x2_1, s.x2_2, s.x2_3, s.x2_4, s.x2_5, s.x2_6, s.x2_7, s.x2_8, s.x2_9, s.j]
       calls : [x25519_finish]
     termination:
       bound : 2000000

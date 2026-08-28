@@ -43831,16 +43831,15 @@ rule do_shl
     #[test]
     fn x25519_ladder_recursive_matches_rfc7748() {
         // The full 255-step Montgomery ladder as a recursive callable, validated
-        // against RFC 7748 section 5.2 vector 1. The expected final (x2,z2) limbs
-        // below were produced by the field/ladder reference that reproduces the
-        // published X25519 output exactly (see the live end-to-end check). Only a
-        // few output limbs are checked here because each native invocation re-runs
-        // the entire ladder; the full 20-limb + inversion + RFC sweep is
-        // covered by the out-of-band validation. (This comment said "(~5s)"
-        // until 2026-08-18. Unmeasured and wrong by ~2 orders of magnitude:
-        // tools/tls_gen/vcrypto.py reports a FULL X25519 — 52 spawns — at 0.1 s.
-        // Sampling a few limbs is still the right call for test wall-clock, but
-        // for the real reason, not an invented one.)
+        // against RFC 7748 section 5.2 vector 1. Since the record conversion
+        // (aggregate-return arc, slices agg-1/agg-2a/agg-2c) `ladder` returns a
+        // 20-field LadderLimbs record, so ONE invocation yields ALL 20 final
+        // limbs as one JSON object — this test asserts every one of them, where
+        // the pre-conversion `which` interface made it sample 4 (each sampled
+        // limb re-ran the whole ladder). The expected limbs were captured from
+        // the shipped which-form binary before the conversion and are the same
+        // values x25519_finish_test_body feeds the inversion; the record form
+        // reproduces them field-for-field (measured, 3 RFC vectors).
         let h = std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(x25519_ladder_recursive_test_body)
@@ -43861,18 +43860,22 @@ rule do_shl
           let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
         let init: [i64; 50] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 57203686, 792089, 42384230, 19211788, 32603844, 2385522, 47813494, 19007334, 17457210, 19952303, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 57203686, 792089, 42384230, 19211788, 32603844, 2385522, 47813494, 19007334, 17457210, 19952303];
         let sc_hex = "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4";
-        let run = |w: u8| -> i64 {
-            let mut cmd = std::process::Command::new(&out);
-            for v in init.iter() { cmd.arg(v.to_string()); }
-            cmd.arg("0").arg("255").arg(w.to_string()).arg(sc_hex); // swap=0, i=255, which, scalar
-            let o = cmd.output().expect("run ladder");
-            String::from_utf8_lossy(&o.stdout).trim().parse()
-                .unwrap_or_else(|_| panic!("parse which={}", w))
-        };
-        assert_eq!(run(0), 4861533, "ladder limb 0 (RFC 7748 v1) mismatch");
-        assert_eq!(run(9), 23600082, "ladder limb 9 (RFC 7748 v1) mismatch");
-        assert_eq!(run(10), 55039015, "ladder limb 10 (RFC 7748 v1) mismatch");
-        assert_eq!(run(19), 1108949, "ladder limb 19 (RFC 7748 v1) mismatch");
+        let mut cmd = std::process::Command::new(&out);
+        for v in init.iter() { cmd.arg(v.to_string()); }
+        cmd.arg("0").arg("255").arg(sc_hex); // swap=0, i=255, scalar (no `which` since the record conversion)
+        let o = cmd.output().expect("run ladder");
+        assert_eq!(o.status.code(), Some(0), "ladder must exit 0; stderr: {}",
+                   String::from_utf8_lossy(&o.stderr));
+        // The exact JSON record, field order = LadderLimbs declaration order.
+        // Asserting the whole line pins all 20 limbs AND the serialisation.
+        let expected = concat!(
+            "{\"x2_0\":4861533,\"x2_1\":29360812,\"x2_2\":23747794,\"x2_3\":7458816,",
+            "\"x2_4\":17373659,\"x2_5\":27174613,\"x2_6\":29321228,\"x2_7\":11092345,",
+            "\"x2_8\":67059997,\"x2_9\":23600082,\"z2_0\":55039015,\"z2_1\":8692074,",
+            "\"z2_2\":36030384,\"z2_3\":26461211,\"z2_4\":32572828,\"z2_5\":28261139,",
+            "\"z2_6\":46857341,\"z2_7\":2893566,\"z2_8\":682381,\"z2_9\":1108949}");
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), expected,
+                   "ladder LadderLimbs record (RFC 7748 v1) mismatch");
         let _ = std::fs::remove_file(&out);
     }
 

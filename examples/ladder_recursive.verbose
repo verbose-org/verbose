@@ -56,17 +56,42 @@ concept LadderState
     x1_9 : number [0, 67108863]
     swap : number [0, 1]
     i : number [0, 255]
-    which : number [0, 19]
     scalar : text
 
 
+concept LadderLimbs
+  @intention: "the Montgomery ladder's final (x2, z2) limbs — 20 field limbs returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    x2_0 : number [0, 67108863]
+    x2_1 : number [0, 67108863]
+    x2_2 : number [0, 67108863]
+    x2_3 : number [0, 67108863]
+    x2_4 : number [0, 67108863]
+    x2_5 : number [0, 67108863]
+    x2_6 : number [0, 67108863]
+    x2_7 : number [0, 67108863]
+    x2_8 : number [0, 67108863]
+    x2_9 : number [0, 67108863]
+    z2_0 : number [0, 67108863]
+    z2_1 : number [0, 67108863]
+    z2_2 : number [0, 67108863]
+    z2_3 : number [0, 67108863]
+    z2_4 : number [0, 67108863]
+    z2_5 : number [0, 67108863]
+    z2_6 : number [0, 67108863]
+    z2_7 : number [0, 67108863]
+    z2_8 : number [0, 67108863]
+    z2_9 : number [0, 67108863]
+
+
 rule ladder
-  @intention: "X25519 Montgomery ladder: 255 recursive steps with cswap + clamped scalar bit; returns limb which of final (x2|z2)"
+  @intention: "X25519 Montgomery ladder: 255 recursive steps with cswap + clamped scalar bit; returns ALL 20 final limbs (x2|z2) together as one LadderLimbs record"
   @source: invoices.intent:1
   input:
     s : LadderState
   output:
-    out : number
+    out : LadderLimbs
   logic:
     let idx = if s.i == 0 then 0 else s.i - 1
     let b_B = shr(idx, 3)
@@ -1463,10 +1488,10 @@ rule ladder
     let fsz_t9 = band(fsz_mask, bxor(s.z2_9, s.z3_9))
     let fsz_a9 = bxor(s.z2_9, fsz_t9)
     let fsz_b9 = bxor(s.z3_9, fsz_t9)
-    out = if s.i == 0 then if s.which == 0 then fsx_a0 else if s.which == 1 then fsx_a1 else if s.which == 2 then fsx_a2 else if s.which == 3 then fsx_a3 else if s.which == 4 then fsx_a4 else if s.which == 5 then fsx_a5 else if s.which == 6 then fsx_a6 else if s.which == 7 then fsx_a7 else if s.which == 8 then fsx_a8 else if s.which == 9 then fsx_a9 else if s.which == 10 then fsz_a0 else if s.which == 11 then fsz_a1 else if s.which == 12 then fsz_a2 else if s.which == 13 then fsz_a3 else if s.which == 14 then fsz_a4 else if s.which == 15 then fsz_a5 else if s.which == 16 then fsz_a6 else if s.which == 17 then fsz_a7 else if s.which == 18 then fsz_a8 else fsz_a9 else ladder(LadderState { x2_0: x2n_w1, x2_1: x2n_lo1_1, x2_2: x2n_lo1_2, x2_3: x2n_lo1_3, x2_4: x2n_lo1_4, x2_5: x2n_lo1_5, x2_6: x2n_lo1_6, x2_7: x2n_lo1_7, x2_8: x2n_lo1_8, x2_9: x2n_lo1_9, z2_0: z2n_w1, z2_1: z2n_lo1_1, z2_2: z2n_lo1_2, z2_3: z2n_lo1_3, z2_4: z2n_lo1_4, z2_5: z2n_lo1_5, z2_6: z2n_lo1_6, z2_7: z2n_lo1_7, z2_8: z2n_lo1_8, z2_9: z2n_lo1_9, x3_0: x3n_w1, x3_1: x3n_lo1_1, x3_2: x3n_lo1_2, x3_3: x3n_lo1_3, x3_4: x3n_lo1_4, x3_5: x3n_lo1_5, x3_6: x3n_lo1_6, x3_7: x3n_lo1_7, x3_8: x3n_lo1_8, x3_9: x3n_lo1_9, z3_0: z3n_w1, z3_1: z3n_lo1_1, z3_2: z3n_lo1_2, z3_3: z3n_lo1_3, z3_4: z3n_lo1_4, z3_5: z3n_lo1_5, z3_6: z3n_lo1_6, z3_7: z3n_lo1_7, z3_8: z3n_lo1_8, z3_9: z3n_lo1_9, x1_0: s.x1_0, x1_1: s.x1_1, x1_2: s.x1_2, x1_3: s.x1_3, x1_4: s.x1_4, x1_5: s.x1_5, x1_6: s.x1_6, x1_7: s.x1_7, x1_8: s.x1_8, x1_9: s.x1_9, swap: b_bit, i: s.i - 1, which: s.which, scalar: s.scalar })
+    out = if s.i == 0 then LadderLimbs { x2_0: fsx_a0, x2_1: fsx_a1, x2_2: fsx_a2, x2_3: fsx_a3, x2_4: fsx_a4, x2_5: fsx_a5, x2_6: fsx_a6, x2_7: fsx_a7, x2_8: fsx_a8, x2_9: fsx_a9, z2_0: fsz_a0, z2_1: fsz_a1, z2_2: fsz_a2, z2_3: fsz_a3, z2_4: fsz_a4, z2_5: fsz_a5, z2_6: fsz_a6, z2_7: fsz_a7, z2_8: fsz_a8, z2_9: fsz_a9 } else ladder(LadderState { x2_0: x2n_w1, x2_1: x2n_lo1_1, x2_2: x2n_lo1_2, x2_3: x2n_lo1_3, x2_4: x2n_lo1_4, x2_5: x2n_lo1_5, x2_6: x2n_lo1_6, x2_7: x2n_lo1_7, x2_8: x2n_lo1_8, x2_9: x2n_lo1_9, z2_0: z2n_w1, z2_1: z2n_lo1_1, z2_2: z2n_lo1_2, z2_3: z2n_lo1_3, z2_4: z2n_lo1_4, z2_5: z2n_lo1_5, z2_6: z2n_lo1_6, z2_7: z2n_lo1_7, z2_8: z2n_lo1_8, z2_9: z2n_lo1_9, x3_0: x3n_w1, x3_1: x3n_lo1_1, x3_2: x3n_lo1_2, x3_3: x3n_lo1_3, x3_4: x3n_lo1_4, x3_5: x3n_lo1_5, x3_6: x3n_lo1_6, x3_7: x3n_lo1_7, x3_8: x3n_lo1_8, x3_9: x3n_lo1_9, z3_0: z3n_w1, z3_1: z3n_lo1_1, z3_2: z3n_lo1_2, z3_3: z3n_lo1_3, z3_4: z3n_lo1_4, z3_5: z3n_lo1_5, z3_6: z3n_lo1_6, z3_7: z3n_lo1_7, z3_8: z3n_lo1_8, z3_9: z3n_lo1_9, x1_0: s.x1_0, x1_1: s.x1_1, x1_2: s.x1_2, x1_3: s.x1_3, x1_4: s.x1_4, x1_5: s.x1_5, x1_6: s.x1_6, x1_7: s.x1_7, x1_8: s.x1_8, x1_9: s.x1_9, swap: b_bit, i: s.i - 1, scalar: s.scalar })
   proofs:
     purity:
-      reads : [s.x2_0, s.x2_1, s.x2_2, s.x2_3, s.x2_4, s.x2_5, s.x2_6, s.x2_7, s.x2_8, s.x2_9, s.z2_0, s.z2_1, s.z2_2, s.z2_3, s.z2_4, s.z2_5, s.z2_6, s.z2_7, s.z2_8, s.z2_9, s.x3_0, s.x3_1, s.x3_2, s.x3_3, s.x3_4, s.x3_5, s.x3_6, s.x3_7, s.x3_8, s.x3_9, s.z3_0, s.z3_1, s.z3_2, s.z3_3, s.z3_4, s.z3_5, s.z3_6, s.z3_7, s.z3_8, s.z3_9, s.x1_0, s.x1_1, s.x1_2, s.x1_3, s.x1_4, s.x1_5, s.x1_6, s.x1_7, s.x1_8, s.x1_9, s.swap, s.i, s.which, s.scalar]
+      reads : [s.x2_0, s.x2_1, s.x2_2, s.x2_3, s.x2_4, s.x2_5, s.x2_6, s.x2_7, s.x2_8, s.x2_9, s.z2_0, s.z2_1, s.z2_2, s.z2_3, s.z2_4, s.z2_5, s.z2_6, s.z2_7, s.z2_8, s.z2_9, s.x3_0, s.x3_1, s.x3_2, s.x3_3, s.x3_4, s.x3_5, s.x3_6, s.x3_7, s.x3_8, s.x3_9, s.z3_0, s.z3_1, s.z3_2, s.z3_3, s.z3_4, s.z3_5, s.z3_6, s.z3_7, s.z3_8, s.z3_9, s.x1_0, s.x1_1, s.x1_2, s.x1_3, s.x1_4, s.x1_5, s.x1_6, s.x1_7, s.x1_8, s.x1_9, s.swap, s.i, s.scalar]
       calls : [ladder]
     termination:
       bound : 200000
