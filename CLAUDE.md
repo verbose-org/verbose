@@ -905,6 +905,31 @@ Tracking what native emits today, what it still rejects, and the design rules th
 
   **THE EMISSION GAP CLOSED, AND THE WIN IS DELIVERED AND MEASURED (2026-08-28, slice agg-2c).** The same scratchpad conversion (deliberately still NOT in the repo — the two crypto files have no generator, and converting them is its own follow-up), driven by a `Digest`-output driver: `let lim = ladder(s)` then `let dig = x25519_finish(X25519RecState { … lim.l0 … })` then `out = Digest { b0: dig.b0, … b31: dig.b31 }` — 110655 B, **one invocation, all 32 bytes as one JSON object, byte-exact against RFC 7748 §6.1** (`c3da5537…a28552`), and both converted rules byte-identical to the shipped per-spawn binaries on all 20+32 outputs first. Measured on this host (WSL2, Ryzen 7 5800X, hyperfine -N): **one process = 3.16 ms ± 0.62 (median 3.19, 50 runs)** against the shipped 52-spawn sequential chain re-measured at **93.1 ms ± 3.3 (10 runs)** — **~29×**, with per-spawn components floor 0.22 ms / ladder 2.94 ms / finish 0.98 ms (arithmetic 90.1 ms, agreeing with the measured chain). So agg-2a's projected "3.0 ms / ~31×" is CONFIRMED within noise — and the honest sequence over the arc is: shipped 52 spawns 93.1 ms → agg-2a's 32 spawns **102 ms (a regression)** → agg-2c's 1 invocation **3.2 ms**. The remaining `concat(le64(…))`-in-a-bytes-caller row of §7 is now about BYTE-STREAM output (for piping into a non-Verbose consumer), not about the CPU win — a TLS-stage consumer reads `dig.b0…b31` straight from the record already.
 
+  **THE CONVERSION IS IN THE REPO, AND vcrypto IS 2 SPAWNS (2026-08-28, the follow-up the
+  paragraph above names).** `examples/ladder_recursive.verbose` (hand-edited — it has no
+  generator) and `examples/x25519_rec.verbose` (REGENERATED — the paragraph above says "the
+  two crypto files have no generator", and that is half wrong: `tools/tls_gen/x25519rec_gen.py`
+  writes x25519_rec and was verified to reproduce the shipped file byte-for-byte BEFORE being
+  edited) now return records: `ladder` → a 20-field `LadderLimbs` (x2_0..x2_9, z2_0..z2_9),
+  `x25519_finish` → a 32-field `Digest` (b0..b31). The `which` field is GONE from both input
+  concepts, so one invocation yields the whole aggregate as one JSON object. Byte-exactness
+  measured, not argued: the shipped which-form binaries' outputs were captured FIRST (all 20
+  limbs + all 32 bytes, THREE RFC 7748 vectors — §5.2 v1, §6.1 public-key, §6.1 shared
+  secret), and the record binaries reproduce every value exactly; the interpreter agrees on
+  all values for both rules. `tools/tls_gen/vcrypto.py::x25519()` collapsed from 52 pooled
+  spawns to 2 sequential ones parsing the record JSON — measured on this host (WSL2, Ryzen 7
+  5800X, time.perf_counter over 20 calls): **38.7 ms median (52 parallel spawns, 64-thread
+  pool) → 2.44 ms median (2 spawns)**, ~16× against the POOLED path (the pool was already
+  hiding the 93 ms sequential cost; the honest ladder of figures is 93.1 sequential → 38.7
+  pooled → 2.44). The self-test prints `x25519=0.003s`, was `0.1s`. The thread pool STAYS —
+  sha256 / key-schedule / gctr / ghash `which`-loops still need it; X25519 no longer touches
+  it. gen0's verdict IMPROVED, not regressed: it accepts both converted files at rule #0
+  (their only rule) and its emitted binaries agree with verbosec's **byte-for-byte on
+  stdout** (the `fib_pair`-at-rule-#0 agreement cell, not the record-let SIGTRAP class —
+  neither file joins the `aggregate_pair::total` gaps-table row). The native pin
+  `x25519_ladder_recursive_matches_rfc7748` got STRONGER: it asserts the exact 20-limb JSON
+  record from ONE run, where the which form sampled 4 limbs at one full ladder each.
+
 ### Register conventions across emitters
 
 Emitters that span multiple syscalls or phases share a register layout. Adding a new cross-phase register use requires either claiming a currently-unused register or saving/restoring on the stack — do not casually reassign any of these without auditing every caller.

@@ -2,17 +2,23 @@
 
 Every cryptographic transformation here is computed by Verbose-emitted machine
 code (compiled from examples/*.verbose). The host (this file) only spawns those
-binaries and shuttles bytes. To beat the one-byte-per-process-run cost, every
-`which`-loop is spawned IN PARALLEL (all output bytes concurrently), which turns
-the ladder's per-limb cost from sum into max — making a handshake tractable
-without any change to the native backend.
+binaries and shuttles bytes.
+
+X25519 (ladder + finish) returns RECORDS since the aggregate-return arc
+(slices agg-1/agg-2a/agg-2c, 2026-08): one spawn yields all 20 ladder limbs
+as a LadderLimbs JSON object and one spawn yields all 32 output bytes as a
+Digest JSON object — 2 spawns per X25519 instead of 52. The remaining
+primitives (SHA-256, key schedule, AES/GCM/GHASH) still return one byte per
+`which` invocation, so their loops are spawned IN PARALLEL (all output bytes
+concurrently), which turns the per-byte cost from sum into max — the thread
+pool below exists solely for them.
 
 Honest scope (per docs/tls-io-statemachine-design.md §7): the cryptographic
 PRIMITIVES (X25519, key schedule, SHA-256, AES/GCM/GHASH) are pure Verbose.
 Byte repacking (bytes<->limbs), AEAD framing (nonce/AAD/J0/tag-XOR), and
 randomness are host glue, clearly separated below.
 """
-import subprocess, os, sys, concurrent.futures as cf
+import subprocess, os, sys, json, concurrent.futures as cf
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = {}
@@ -53,21 +59,22 @@ def to_limbs(x):
     x &= (1<<255)-1
     return [(x>>OFF[i]) & ((1<<W[i])-1) for i in range(10)]
 
-# ---- X25519 (pure Verbose: ladder + finish) ----
+# ---- X25519 (pure Verbose: ladder + finish; record output, 2 spawns) ----
+def _run_record(rule, args):
+    """One spawn of a record-output binary; parse its JSON object from stdout."""
+    r = subprocess.run([BIN[rule]]+args, capture_output=True, text=True, timeout=600)
+    s = r.stdout.strip()
+    if s == "": raise RuntimeError(f"{BIN[rule]} empty (rc={r.returncode}) {r.stderr[-200:]}")
+    return json.loads(s)
+
 def x25519(scalar32: bytes, u32: bytes) -> bytes:
     u_int = int.from_bytes(u32,'little') & ((1<<255)-1)
     ul = to_limbs(u_int)
     init = to_limbs(1)+to_limbs(0)+list(ul)+to_limbs(1)+list(ul)
     sc_hex = scalar32.hex()
-    ladder_args = [str(v) for v in init] + ["0","255","__W__", sc_hex]
-    # ladder returns 20 limbs (x2|z2); run which 0..19 in parallel
-    binp = BIN["ladder"]
-    def lad(w):
-        a = [str(v) for v in init] + ["0","255",str(w),sc_hex]
-        return _one(binp, a, w) if False else int(subprocess.run([binp]+a,capture_output=True,text=True,timeout=600).stdout.strip())
-    futs = {w:_POOL.submit(lad,w) for w in range(20)}
-    limbs = [futs[w].result() for w in range(20)]
-    x2 = limbs[0:10]; z2 = limbs[10:20]
+    # ONE spawn: the ladder returns all 20 limbs as a LadderLimbs record.
+    rec = _run_record("ladder", [str(v) for v in init] + ["0","255",sc_hex])  # swap=0, i=255, scalar
+    x2 = [rec[f"x2_{i}"] for i in range(10)]; z2 = [rec[f"z2_{i}"] for i in range(10)]
     # Recursive finish (x25519_rec.verbose): state seeded by the host —
     # t = z = z2, the 8 saved-intermediate slots = 0, x2 = ladder numerator,
     # j = 265. Same 266 field-muls as the unrolled finish, 31x smaller binary.
@@ -88,7 +95,9 @@ def x25519(scalar32: bytes, u32: bytes) -> bytes:
         + [str(v) for v in x2]        # x2
         + ["265"]                     # j
     )
-    return run_bytes("x25519_finish", fin_state, 32)
+    # ONE spawn: the finish returns all 32 output bytes as a Digest record.
+    dig = _run_record("x25519_finish", fin_state)
+    return bytes(dig[f"b{i}"] for i in range(32))
 
 # ---- SHA-256 (pure Verbose) of arbitrary bytes ----
 H0=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]
@@ -217,4 +226,4 @@ if __name__ == "__main__":
     rec=aead_encrypt(rk,riv,0,b"hello world",0x17)
     ct,pt=aead_decrypt(rk,riv,0,rec)
     assert ct==0x17 and pt==b"hello world", (ct,pt)
-    print(f"VCRYPTO_OK  x25519={t_x:.1f}s  aead_roundtrip=ok  (parallel which-spawn)")
+    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  aead_roundtrip=ok  (x25519: 2 record spawns; other which-loops parallel)")

@@ -27,7 +27,8 @@ Per recursive frame (pc = 265 - s.j, frames for s.j = 265..1):
                                                             -- 8 limb-group muxes, NO fmul
   4) recurse with j-1, t:=nt, saved slots updated, inputs unchanged.
 Base case (s.j == 0): t holds z^(p-2). Compute x2*t (the final fmul, matching
-the unrolled m266 = x2*zinv), little-endian encode, return byte `which`.
+the unrolled m266 = x2*zinv), little-endian encode, return ALL 32 bytes as one
+Digest record (b0..b31).
 
 CPU OVERHEAD vs unrolled: identical 266 fmul. The ONLY extra work is the muxes:
 1 operand mux (10 per-limb selects) + 8 save muxes (80 per-limb selects) = ~90
@@ -35,17 +36,23 @@ per-limb selects/frame. One fmul expands to ~100 multiply-terms across 10 limbs
 + a 2-pass carry reduce, so the mux overhead is well under one fmul's worth of
 arithmetic and adds NO second multiply. This is the negligible overhead approved.
 
-SHAPE — whole-chain single recursive rule (NOT per-block calls): Verbose/native
-rules return a SINGLE scalar (selected by `which` at the base case); a rule
-cannot return 10 field limbs to a caller, so per-block "call fsq_pow2" is not
-expressible. The state record carries the ENTIRE machine state.
+SHAPE — whole-chain single recursive rule (NOT per-block calls). This file
+predates aggregate return; since slices agg-1/agg-2a/agg-2c (2026-08) the rule
+returns a 32-field Digest RECORD instead of one byte selected by `which`: the
+recursive call sits in record TAIL position, so every frame forwards the ONE
+destination the outermost caller allocated, and only the base case writes it.
+One invocation therefore yields all 32 bytes (as `{"b0":...,...,"b31":...}`
+JSON when the rule is the entry). Per-block "call fsq_pow2" composition would
+now be EXPRESSIBLE via record-returning helpers (agg-1), but the whole-chain
+shape is kept: it is the measured-correct form and the state record already
+carries the ENTIRE machine state.
 
-HOST GLUE: the recursive state is seeded by the host (vcrypto.x25519_rec_finish):
+HOST GLUE: the recursive state is seeded by the host (vcrypto.x25519):
   t := z2  (the value to invert)
   z := z2  (input copy; junctions at pc=3 read it)
   all 8 saved slots := 0  (filled at their save steps before first read)
   x2 := x2 ladder numerator
-  j := 265 ; which := 0..31
+  j := 265
 Arg order = field declaration order in the concept.
 """
 import sys, os, random
@@ -179,15 +186,14 @@ for slot in SAVED:
     SAVE_NEW[slot] = grp
 
 # (d) base case: final fmul x2 * t (= x2 * zinv), then little-endian encode.
+#     All 32 encoded bytes are returned TOGETHER as one Digest record (slice
+#     agg-2a: the recursive call is in record TAIL position, so the whole chain
+#     shares the single destination the outermost caller allocated; slice
+#     agg-2c serialises it as JSON when this rule is the entry).
 X2 = [f"s.x2_{i}" for i in range(10)]
 FINAL = fe.emit_fmul(lets, "fin", X2, T)     # the 266th fmul, only live at base case
 obytes = fe.emit_encode(lets, "enc", FINAL)
-def nest_which(names):
-    expr = names[-1]
-    for i in range(len(names) - 2, -1, -1):
-        expr = f"if s.which == {i} then {names[i]} else {expr}"
-    return expr
-finalize = nest_which(obytes)
+finalize = "Digest { " + ", ".join(f"b{i}: {obytes[i]}" for i in range(32)) + " }"
 
 # (e) recursive record
 rf = []
@@ -196,13 +202,13 @@ for slot in SAVED:
     for i in range(10): rf.append(f"{slot}_{i}: {SAVE_NEW[slot][i]}")
 for inp in INPUTS:
     for i in range(10): rf.append(f"{inp}_{i}: s.{inp}_{i}")
-rf += ["j: s.j - 1", "which: s.which"]
+rf += ["j: s.j - 1"]
 rec = "x25519_finish(X25519RecState { " + ", ".join(rf) + " })"
 body = f"if s.j == 0 then {finalize} else {rec}"
 
 # ---- assemble .verbose text ----
 L = ["@verbose 0.1.0", "", "concept X25519RecState",
-     '  @intention: "X25519 inverse-chain state: running accumulator t (10 limbs) + 8 saved intermediates (z2, z9, z11, z2_5_0, z2_10_0, z2_20_0, z2_50_0, z2_100_0; 10 limbs each) + inputs z and x2 (10 limbs each) + step counter j (265..0) + which output byte (0..31)"',
+     '  @intention: "X25519 inverse-chain state: running accumulator t (10 limbs) + 8 saved intermediates (z2, z9, z11, z2_5_0, z2_10_0, z2_20_0, z2_50_0, z2_100_0; 10 limbs each) + inputs z and x2 (10 limbs each) + step counter j (265..0)"',
      "  @source: invoices.intent:1", "  fields:"]
 def decl_group(name):
     for i in range(10):
@@ -210,19 +216,24 @@ def decl_group(name):
 for slot in ALL_SLOTS:
     decl_group(slot)
 L.append(f"    j : number [0, {NSTEPS}]")
-L.append("    which : number [0, 31]")
+
+L += ["", "", "concept Digest",
+      '  @intention: "the 32 little-endian output bytes of an X25519 evaluation, returned together as one record"',
+      "  @source: invoices.intent:1", "  fields:"]
+for i in range(32):
+    L.append(f"    b{i} : number [0, 255]")
 
 L += ["", "", "rule x25519_finish",
-      '  @intention: "X25519 finish via the curve25519 Fermat inverse addition chain, recursive: EXACTLY ONE conditional field multiply per frame (operand muxed by step counter — square or junction, never both), 265 step-frames (decreasing j); base case multiplies x2 by z^(p-2), little-endian encodes, returns byte which. Same algorithm and same 266-fmul count as the unrolled emit_finv; bit-for-bit identical result, zero extra field multiplies."',
+      '  @intention: "X25519 finish via the curve25519 Fermat inverse addition chain, recursive: EXACTLY ONE conditional field multiply per frame (operand muxed by step counter — square or junction, never both), 265 step-frames (decreasing j); base case multiplies x2 by z^(p-2), little-endian encodes, returns ALL 32 output bytes as one Digest record. Same algorithm and same 266-fmul count as the unrolled emit_finv; bit-for-bit identical result, zero extra field multiplies."',
       "  @source: invoices.intent:1", "  input:", "    s : X25519RecState",
-      "  output:", "    out : number", "  logic:"]
+      "  output:", "    out : Digest", "  logic:"]
 for nm, e in lets:
     L.append(f"    let {nm} = {e}")
 L.append(f"    out = {body}")
 reads = []
 for slot in ALL_SLOTS:
     reads += [f"s.{slot}_{i}" for i in range(10)]
-reads += ["s.j", "s.which"]
+reads += ["s.j"]
 L += ["  proofs:", "    purity:", f"      reads : [{', '.join(reads)}]",
       "      calls : [x25519_finish]",
       "    termination:", "      bound : 2000000", "      decreasing : j"]
@@ -241,4 +252,4 @@ print(f"OP_TABLE={dict(sorted(OP_TABLE.items()))}")
 print(f"SAVE_AT={dict(sorted(SAVE_AT.items()))}")
 print(f"emit_fmul_in_body={n_body_fmul_emit} (nt=per-frame square-or-junction, fin=base x2*zinv)")
 print(f"runtime_fmul = {NSTEPS} frames * 1 + 1 final = {NSTEPS+1}  (== unrolled 266)")
-print(f"lets {len(lets)} ; fields {len(ALL_SLOTS)*10+2}")
+print(f"lets {len(lets)} ; fields {len(ALL_SLOTS)*10+1}")
