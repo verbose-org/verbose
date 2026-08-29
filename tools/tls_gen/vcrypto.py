@@ -14,11 +14,14 @@ expand_key and expand_iv each return ALL their output bytes as one record
 (hs -> s_hs -> key + iv) is 4 spawns instead of 92. The six
 tls_schedule.verbose rules followed the same day (tranche 3): _sched is ONE
 record spawn, so the derived/master/traffic/finished leg is 6 spawns
-instead of 192 pooled ones. The remaining primitives (SHA-256,
-AES/GCM/GHASH) still return one byte per `which` invocation, so their
-loops are spawned IN PARALLEL (all output bytes concurrently), which turns
-the per-byte cost from sum into max — the thread pool below exists solely
-for them.
+instead of 192 pooled ones. SHA-256 followed (tranche 4): sha256_fold is a
+RECURSIVE record-output rule (agg-2a tail recursion + agg-2c record entry),
+so one spawn folds every block and returns all 32 digest bytes as one Digest
+JSON object instead of 32 parallel `which` spawns. The remaining primitives
+(AES/GCM/GHASH) still return one byte per `which` invocation, so their loops
+are spawned IN PARALLEL (all output bytes concurrently), which turns the
+per-byte cost from sum into max — the thread pool below exists solely for
+them.
 
 Honest scope (per docs/tls-io-statemachine-design.md §7): the cryptographic
 PRIMITIVES (X25519, key schedule, SHA-256, AES/GCM/GHASH) are pure Verbose.
@@ -112,17 +115,19 @@ def x25519(scalar32: bytes, u32: bytes) -> bytes:
     return bytes(dig[f"b{i}"] for i in range(32))
 
 # ---- SHA-256 (pure Verbose) of arbitrary bytes ----
+# sha256_fold returns a Digest RECORD (one spawn, all 32 bytes as one
+# {"b0":...,...,"b31":...} JSON object) since 2026-08-29 — it is a RECURSIVE
+# record-output rule (agg-2a tail recursion folds every block; agg-2c serves
+# the record entry), so the old `which`-per-byte interface's 32 parallel spawns
+# collapse to one sequential spawn.
 H0=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]
 def sha256(msg: bytes) -> bytes:
     padded=bytearray(msg); L=len(msg); padded.append(0x80)
     while len(padded)%64!=56: padded.append(0)
     padded += (L*8).to_bytes(8,'big')
     nb=len(padded)//64
-    args=[str(w) for w in H0]+[str(nb),str(nb)]
-    binp=BIN["sha256_fold"]; hexd=bytes(padded).hex()
-    def one(w): return int(subprocess.run([binp]+args+[str(w),hexd],capture_output=True,text=True,timeout=600).stdout.strip())
-    futs={w:_POOL.submit(one,w) for w in range(32)}
-    return bytes(futs[w].result() for w in range(32))
+    # ONE spawn: h0..h7, nblocks, i, data(hex) — no `which`; returns 32 bytes.
+    return _record_bytes("sha256_fold",[str(w) for w in H0]+[str(nb),str(nb),bytes(padded).hex()],32)
 
 # ---- key schedule (pure Verbose) ----
 # EVERY key-schedule rule returns a RECORD (one spawn, all output bytes as one
@@ -224,8 +229,15 @@ if __name__ == "__main__":
                  bytes.fromhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"))
     assert out.hex()=="c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552", out.hex()
     t_x = time.time()-t
-    # 2) SHA-256 vs hashlib
+    # 2) SHA-256 vs hashlib — sha256_fold is ONE record spawn since 2026-08-29
+    # (tranche 4): a recursive record-output rule folds every block and returns
+    # all 32 digest bytes as a Digest JSON object. Vectors: empty (1 block),
+    # "abc" (1 block, FIPS-180), and a 4-block message (exercises the recursion).
+    t=time.time()
+    assert sha256(b"")==hashlib.sha256(b"").digest()
     assert sha256(b"abc")==hashlib.sha256(b"abc").digest()
+    assert sha256(bytes(range(200)))==hashlib.sha256(bytes(range(200))).digest()
+    t_sha = time.time()-t
     # 3) full key schedule chain sanity (handshake_secret -> s_hs -> key/iv)
     import hmac as H
     def el(s,l,c,n): return H.new(s,n.to_bytes(2,'big')+bytes([len(b"tls13 "+l)])+b"tls13 "+l+bytes([len(c)])+c+b'\x01',hashlib.sha256).digest()[:n]
@@ -262,4 +274,4 @@ if __name__ == "__main__":
     rec=aead_encrypt(rk,riv,0,b"hello world",0x17)
     ct,pt=aead_decrypt(rk,riv,0,rec)
     assert ct==0x17 and pt==b"hello world", (ct,pt)
-    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  aead_roundtrip=ok  (x25519 + full key schedule: record spawns; sha256/AES/GCM which-loops parallel)")
+    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  sha256={t_sha:.3f}s  aead_roundtrip=ok  (x25519 + full key schedule + sha256: record spawns; AES/GCM which-loops parallel)")
