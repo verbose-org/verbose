@@ -312,33 +312,31 @@ fn compile_native_code(
             ),
         });
     }
-    // Slice agg-2c — a record-output ENTRY that reaches the callable path
-    // (via a record callee, or by being recursive itself) must pass the same
-    // §6.1 shape checks as any other aggregate program: refusal #2 (Number
-    // fields only — the _start record arm serialises via itoa), the tail-
-    // concept equality, and the eager-let recursion guard all live there.
-    // A record entry with NO record callee and NO recursion never routes to
-    // the callable path (it is served by emit_record_program, which handles
-    // text fields), so it must NOT be walked here.
-    if has_record_callee || (entry_returns_record && recursion_witness.is_some()) {
-        check_aggregate_shape(rule, &rules, &concepts)?;
-    }
-    // Also route through the callable path if any transitively-reachable
+    // Route through the callable path if any transitively-reachable
     // callee has a different input concept than the entry — the inline
     // path shares the caller's offsets map, which has the wrong fields
     // for a cross-concept call.
-    let needs_callable_path = recursion_witness.is_some() || has_record_callee || {
-        // Cross-concept callee detection only applies for scalar-output
-        // entry rules. Result/Collection/Record output rules have their
-        // own specialized emit paths that handle cross-concept calls
-        // (e.g. emit_result_program's match_result inline path).
-        let entry_scalar = matches!(&rule.input_ty, Type::Named(_))
-            && matches!(&rule.output_ty, Type::Number | Type::Bool | Type::Text);
+    let cross_concept_callee = {
+        // Cross-concept callee detection applies for scalar-output entry
+        // rules AND (aggregate cash-in tranche 5) for plain-record-output
+        // entries: emit_record_program's Call inline shares the caller's
+        // offsets map exactly like the scalar path did, so a record entry
+        // that calls e.g. `aes_sbox(Byte { b: ... })` fails there with
+        // "unknown field" and must be emitted as a real callable — the
+        // combination is served since slice agg-2c gave `_start` a record
+        // result arm (the entry callable writes its fields through the
+        // caller-allocated destination in rsi, exactly agg-1's callee
+        // shape). Result/Collection outputs keep their own specialized
+        // emit paths that handle cross-concept calls (e.g.
+        // emit_result_program's match_result inline path).
+        let entry_routable = matches!(&rule.input_ty, Type::Named(_))
+            && (matches!(&rule.output_ty, Type::Number | Type::Bool | Type::Text)
+                || entry_returns_record);
         let entry_input = match &rule.input_ty {
             Type::Named(n) => Some(n.as_str()),
             _ => None,
         };
-        entry_scalar && {
+        entry_routable && {
             let reachable = collect_transitive_recursive_callees(rule, &rules, &concepts);
             reachable.iter().any(|name| {
                 rules.get(name.as_str()).map_or(false, |r| {
@@ -351,6 +349,23 @@ fn compile_native_code(
             })
         }
     };
+    // Slice agg-2c — a record-output ENTRY that reaches the callable path
+    // (via a record callee, by being recursive itself, or — tranche 5 —
+    // via a cross-concept callee) must pass the same §6.1 shape checks as
+    // any other aggregate program: refusal #2 (Number fields only — the
+    // _start record arm serialises via itoa), the tail-concept equality,
+    // and the eager-let recursion guard all live there.
+    // A record entry with NO record callee, NO recursion and NO
+    // cross-concept callee never routes to the callable path (it is served
+    // by emit_record_program, which handles text fields), so it must NOT
+    // be walked here.
+    if has_record_callee
+        || (entry_returns_record && (recursion_witness.is_some() || cross_concept_callee))
+    {
+        check_aggregate_shape(rule, &rules, &concepts)?;
+    }
+    let needs_callable_path =
+        recursion_witness.is_some() || has_record_callee || cross_concept_callee;
     let mut scc_rules_owned: Vec<&Rule> = Vec::new();
     if needs_callable_path {
         // Build the initial SCC. With recursion: the strongly-connected
@@ -42484,15 +42499,22 @@ rule do_shl
     ///    it — it is what makes a future single-file edit fail loudly instead
     ///    of producing an AES that is self-consistent and not AES.
     ///
-    /// 3. **The `which`-dispatch chains SURVIVE.** This is the non-vacuity
-    ///    guard, and it is the assertion most worth having. The conversion is
-    ///    "replace one 254-branch chain per file"; every other long chain in
-    ///    these files selects among COMPUTED values (`round_key`'s 174-way
-    ///    pick over `b0..b175`, the 14-way `which` dispatches, `gcm_encrypt`'s
-    ///    30-way C||T pick) and can never become a table. A form check that
+    /// 3. **The `which`-dispatch chains SURVIVE — or, where the aggregate
+    ///    cash-in (tranche 5, 2026-08-30) replaced a dispatch with a RECORD
+    ///    constructor, the constructor survives.** This is the non-vacuity
+    ///    guard, and it is the assertion most worth having. The table
+    ///    conversion was "replace one 254-branch chain per file"; every other
+    ///    long chain in these files selects among COMPUTED values
+    ///    (`round_key`'s 174-way pick over `b0..b175`, the 14-way `which`
+    ///    dispatches, `gcm_encrypt`'s 30-way C||T pick). A form check that
     ///    only asserted "few `else if` remain" would go green if someone
     ///    deleted those chains, so each file asserts a FLOOR on the branches
-    ///    it must still have.
+    ///    it must still have — EXCEPT `aes_encrypt` and `aes_gctr`, whose
+    ///    16-way `which` dispatches legitimately became `CipherBlock { b0:
+    ///    ..., b15: ... }` constructors over the same computed lets; for
+    ///    those two the guard is the constructor's presence with all 16
+    ///    fields, and the branch UPPER bound still catches a re-unrolled
+    ///    254-branch S-box chain.
     #[test]
     fn aes_family_declared_sbox_tables_match_fips197_oracle() {
         let handle = std::thread::Builder::new()
@@ -42505,14 +42527,16 @@ rule do_shl
     fn aes_family_declared_tables_body() {
         let oracle = derive_aes_sbox();
 
-        // (file, minimum surviving `else if` count — the DISPATCH chains)
-        let family: [(&str, usize); 6] = [
-            ("aes_key_expansion", 174), // round_key: 176 bytes over 11 rounds
-            ("aes_transforms", 56),     // 4 transforms x 14-way `which`
-            ("aes_encrypt", 14),        // encrypt: 16-way `which`
-            ("aes_ctr", 14),            // ctr_block: 16-way `which`
-            ("aes_gctr", 14),           // gctr: 16-way `which`
-            ("aes_gcm", 30),            // gcm_encrypt: 32-way C||T pick
+        // (file, minimum surviving `else if` count — the DISPATCH chains —
+        //  and, for the tranche-5 record-output files, the constructor
+        //  marker that replaced the dispatch)
+        let family: [(&str, usize, Option<&str>); 6] = [
+            ("aes_key_expansion", 174, None), // round_key: 176 bytes over 11 rounds
+            ("aes_transforms", 56, None),     // 4 transforms x 14-way `which`
+            ("aes_encrypt", 0, Some("out = CipherBlock { b0: st10_0")), // record since tranche 5
+            ("aes_ctr", 14, None),            // ctr_block: 16-way `which`
+            ("aes_gctr", 0, Some("out = CipherBlock { b0: band(bxor(ks_s10_0, pt0), 255)")), // record since tranche 5
+            ("aes_gcm", 30, None),            // gcm_encrypt: 32-way C||T pick
         ];
 
         // The reference literal is the one PR #173 shipped; every family file
@@ -42529,7 +42553,7 @@ rule do_shl
             "the reference table must itself match the GF(2^8) derivation"
         );
 
-        for (name, min_dispatch_branches) in family {
+        for (name, min_dispatch_branches, record_ctor) in family {
             let path = format!("examples/{name}.verbose");
             let src = std::fs::read_to_string(&path)
                 .unwrap_or_else(|_| panic!("{path} must exist"));
@@ -42542,6 +42566,9 @@ rule do_shl
 
             // NON-VACUITY: the `which`-dispatch chains are NOT tables and must
             // still be here. Only the 254-branch S-box chain was removed.
+            // For the tranche-5 record files the dispatch became a record
+            // constructor over the SAME computed lets — assert the
+            // constructor with all 16 fields instead of a branch floor.
             let branches = src.matches("else if").count();
             assert!(
                 branches >= min_dispatch_branches,
@@ -42555,6 +42582,20 @@ rule do_shl
                  S-box chain: {branches} `else if` against a dispatch floor \
                  of {min_dispatch_branches}"
             );
+            if let Some(marker) = record_ctor {
+                assert!(
+                    src.contains(marker),
+                    "{name} must keep its CipherBlock record constructor \
+                     (the tranche-5 replacement of the 16-way `which` \
+                     dispatch); marker not found: {marker}"
+                );
+                for i in 0..16 {
+                    assert!(
+                        src.contains(&format!("b{i}:")),
+                        "{name}'s record constructor must carry field b{i}"
+                    );
+                }
+            }
 
             // VALUES: this file's own table, byte for byte.
             let table = extract_declared_byte_table(&src);
@@ -42879,13 +42920,26 @@ rule do_shl
         let _ = std::fs::remove_file(&out);
     }
 
+    /// Render the exact JSON line a 16-field CipherBlock/GhashOut record
+    /// binary prints for the given bytes. Field order is declaration order
+    /// (b0..b15) and the emitter's record serialisation is deterministic, so
+    /// an EXACT-STRING assert is both the value check and the field-count
+    /// check at once — stronger than the per-`which` integer parses the
+    /// which-form tests did (tranche 5, 2026-08-30).
+    fn record16_json(bytes: &[u8; 16]) -> String {
+        let fields: Vec<String> =
+            (0..16).map(|i| format!("\"b{}\":{}", i, bytes[i])).collect();
+        format!("{{{}}}", fields.join(","))
+    }
+
     #[test]
     fn aes128_encrypt_matches_fips197_and_nist() {
         // Full AES-128 single-block ECB encrypt in pure Verbose. The encrypt
         // rule composes the inline key schedule + 10 rounds of SubBytes /
         // ShiftRows / MixColumns / AddRoundKey as a straight-line let chain,
-        // then dispatches on `which` (0..15) for the output byte. Validated
-        // against two canonical vectors:
+        // then returns all 16 ciphertext bytes as ONE CipherBlock record
+        // (tranche 5 of the aggregate cash-in; was a 16-way `which`
+        // dispatch). Validated against two canonical vectors:
         //   - FIPS-197 Appendix C.1
         //   - NIST SP 800-38A F.1.1 block 1
         let handle = std::thread::Builder::new()
@@ -42909,33 +42963,29 @@ rule do_shl
             let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
         }
 
-        let encrypt_block = |pt: &[u8; 16], key: &[u8; 16]| -> [u8; 16] {
-            let mut ct = [0u8; 16];
-            for w in 0u8..16 {
-                let mut args: Vec<u8> = pt.to_vec();
-                args.extend_from_slice(key);
-                args.push(w);
-                let mut cmd = std::process::Command::new(&out);
-                for a in &args { cmd.arg(a.to_string()); }
-                let output = cmd.output().expect("native binary must run");
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                ct[w as usize] = stdout.trim().parse::<u32>()
-                    .unwrap_or_else(|_| panic!("parse which={}: {:?}", w, stdout)) as u8;
-            }
-            ct
+        // ONE spawn per vector; the full 16-byte ciphertext arrives as one
+        // JSON record, asserted as an exact string (values + field count).
+        let encrypt_json = |pt: &[u8; 16], key: &[u8; 16]| -> String {
+            let mut cmd = std::process::Command::new(&out);
+            for a in pt.iter().chain(key.iter()) { cmd.arg(a.to_string()); }
+            let output = cmd.output().expect("native binary must run");
+            assert!(output.status.success(), "encrypt must exit 0");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
 
         // FIPS-197 Appendix C.1
         let pt1: [u8; 16]  = [0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff];
         let key1: [u8; 16] = [0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f];
         let exp1: [u8; 16] = [0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a];
-        assert_eq!(encrypt_block(&pt1, &key1), exp1, "FIPS-197 Appendix C.1 ciphertext mismatch");
+        assert_eq!(encrypt_json(&pt1, &key1), record16_json(&exp1),
+                   "FIPS-197 Appendix C.1 ciphertext mismatch");
 
         // NIST SP 800-38A F.1.1 block 1
         let pt2: [u8; 16]  = [0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a];
         let key2: [u8; 16] = [0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c];
         let exp2: [u8; 16] = [0x3a,0xd7,0x7b,0xb4,0x0d,0x7a,0x36,0x60,0xa8,0x9e,0xca,0xf3,0x24,0x66,0xef,0x97];
-        assert_eq!(encrypt_block(&pt2, &key2), exp2, "NIST SP 800-38A F.1.1 block 1 ciphertext mismatch");
+        assert_eq!(encrypt_json(&pt2, &key2), record16_json(&exp2),
+                   "NIST SP 800-38A F.1.1 block 1 ciphertext mismatch");
 
         let _ = std::fs::remove_file(&out);
     }
@@ -43929,8 +43979,12 @@ rule do_shl
     #[test]
     fn ghash_nblocks_matches_reference() {
         // GHASH over N 16-byte blocks via the recursive fold (Y=(Y^B)*H per
-        // block). Validated against the GCM GHASH reference: GCM test-case-2
-        // (2 blocks, f38cbb..) and a 4-block deterministic case.
+        // block), returning ALL 16 accumulator bytes as ONE GhashOut record
+        // (tranche 5; was one byte per `which` spawn — 16 spawns, each
+        // re-running the whole fold). Validated against the GCM GHASH
+        // reference: GCM test-case-2 (2 blocks, f38cbb..) and a 4-block
+        // deterministic case, each as an exact-JSON assert (values + field
+        // count in one comparison).
         let h = std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(ghash_nblocks_test_body)
@@ -43950,37 +44004,34 @@ rule do_shl
         { use std::os::unix::fs::PermissionsExt;
           let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
 
-        // case 1: N=2
+        let ghash_json = |h: &[i64; 16], nb: u8, hexdata: &str| -> String {
+            let mut cmd = std::process::Command::new(&out);
+            for _ in 0..16 { cmd.arg("0"); }            // Y = 0
+            for v in h.iter() { cmd.arg(v.to_string()); }
+            cmd.arg(nb.to_string()).arg(nb.to_string()).arg(hexdata);
+            let o = cmd.output().expect("run");
+            assert!(o.status.success(), "ghash_fold must exit 0");
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        // case 1: N=2 — GCM test-case 2 (C block + length block); the
+        // expected bytes are TC2's published GHASH output S = f38cbb1a...
         {
             let h: [i64;16] = [102, 233, 75, 212, 239, 138, 44, 59, 136, 76, 250, 89, 202, 52, 43, 46];
             let exp: [u8;16] = [243, 140, 187, 26, 214, 146, 35, 220, 195, 69, 122, 229, 182, 176, 248, 133];
             let hexdata = "0388dace60b6a392f328c2b971b2fe7800000000000000000000000000000080";
-            for w in 0..16u8 {
-                let mut cmd = std::process::Command::new(&out);
-                for _ in 0..16 { cmd.arg("0"); }            // Y = 0
-                for v in h.iter() { cmd.arg(v.to_string()); }
-                cmd.arg("2").arg("2").arg(w.to_string()).arg(hexdata);
-                let o = cmd.output().expect("run");
-                let got: u8 = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
-                    .unwrap_or_else(|_| panic!("parse w={}", w)) as u8;
-                assert_eq!(got, exp[w as usize], "GHASH-N case 1 byte {} mismatch", w);
-            }
+            assert_eq!(ghash_json(&h, 2, hexdata), record16_json(&exp),
+                       "GHASH-N case 1 (GCM TC2) record mismatch");
         }
-        // case 2: N=4
+        // case 2: N=4 — deterministic 4-block case (exercises the recursion
+        // depth; the record travels through agg-2a's forwarded destination
+        // across all four frames).
         {
             let h: [i64;16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
             let exp: [u8;16] = [197, 38, 75, 164, 160, 209, 4, 130, 239, 237, 48, 82, 58, 8, 104, 184];
             let hexdata = "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3ba";
-            for w in 0..16u8 {
-                let mut cmd = std::process::Command::new(&out);
-                for _ in 0..16 { cmd.arg("0"); }            // Y = 0
-                for v in h.iter() { cmd.arg(v.to_string()); }
-                cmd.arg("4").arg("4").arg(w.to_string()).arg(hexdata);
-                let o = cmd.output().expect("run");
-                let got: u8 = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
-                    .unwrap_or_else(|_| panic!("parse w={}", w)) as u8;
-                assert_eq!(got, exp[w as usize], "GHASH-N case 2 byte {} mismatch", w);
-            }
+            assert_eq!(ghash_json(&h, 4, hexdata), record16_json(&exp),
+                       "GHASH-N case 2 (4-block) record mismatch");
         }
         let _ = std::fs::remove_file(&out);
     }
@@ -43988,9 +44039,16 @@ rule do_shl
 
     #[test]
     fn aes_gctr_matches_reference() {
-        // AES-128 GCTR (GCM counter mode): ct[b] = pt[b] ^ AES(IV||(b/16 + 2))[b%16].
-        // Validated against the FIPS-checked aes128_ref (also matches openssl
-        // aes-128-ctr with iv = IV||00000002 — verified out-of-band).
+        // AES-128 GCTR (GCM counter mode), PER-BLOCK record interface since
+        // tranche 5: `which` is a block index and one spawn returns block
+        // `which`'s 16 ciphertext bytes (pt XOR AES(IV||(which + 2))) as one
+        // CipherBlock record — nb spawns for nb blocks, instead of one spawn
+        // per DATA BYTE. Validated against the FIPS-checked aes128_ref (also
+        // matches openssl aes-128-ctr with iv = IV||00000002 — verified
+        // out-of-band), on a 3-full-block message AND on a 20-byte message
+        // whose tail block the HOST pads to 32 hex chars and truncates after
+        // unpacking — the vcrypto._gctr framing contract, exercised here so
+        // the pad-then-truncate shape has a compiler-side pin.
         let h = std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(aes_gctr_test_body)
@@ -44011,27 +44069,62 @@ rule do_shl
           let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
         let key: [u8;16] = [165, 77, 202, 24, 37, 48, 187, 29, 109, 19, 44, 222, 214, 35, 123, 46];
         let iv:  [u8;12] = [217, 30, 63, 114, 31, 203, 25, 113, 23, 68, 148, 214];
-        let pt = "493c9d5c3460be31201e69fedaa0eee8b9997f5c7c2999fdafe593253cd654af4dfad71427a0aeb3fee9232f8af2211f";
-        let ptb: Vec<u8> = (0..48).map(|i| u8::from_str_radix(&pt[i*2..i*2+2],16).unwrap()).collect();
-        let nb = (ptb.len()/16).to_string();
-        let expect = |w: usize| -> u8 {
-            let bidx = (w/16) as u32;
-            let ctr = bidx + 2;
+
+        // keystream block for counter value bidx+2
+        let ks_block = |bidx: u32| -> [u8; 16] {
             let mut cb = [0u8;16];
             cb[..12].copy_from_slice(&iv);
-            cb[12..16].copy_from_slice(&ctr.to_be_bytes());
-            let ksb = aes128_ref(&key, &cb);
-            ptb[w] ^ ksb[w%16]
+            cb[12..16].copy_from_slice(&(bidx + 2).to_be_bytes());
+            aes128_ref(&key, &cb)
         };
-        for w in 0..ptb.len() {
+        // one per-block record spawn against the padded hex
+        let gctr_block_json = |nb: usize, w: usize, hexdata: &str| -> String {
             let mut cmd = std::process::Command::new(&out);
             for v in key.iter() { cmd.arg(v.to_string()); }
             for v in iv.iter() { cmd.arg(v.to_string()); }
-            cmd.arg(&nb).arg(w.to_string()).arg(pt);
+            cmd.arg(nb.to_string()).arg(w.to_string()).arg(hexdata);
             let o = cmd.output().expect("run");
-            let got: u8 = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
-                .unwrap_or_else(|_| panic!("parse w={}", w)) as u8;
-            assert_eq!(got, expect(w), "gctr byte {} mismatch", w);
+            assert!(o.status.success(), "gctr block {} must exit 0", w);
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        // Case 1: 48 bytes = 3 FULL blocks, no padding involved.
+        let pt = "493c9d5c3460be31201e69fedaa0eee8b9997f5c7c2999fdafe593253cd654af4dfad71427a0aeb3fee9232f8af2211f";
+        let ptb: Vec<u8> = (0..48).map(|i| u8::from_str_radix(&pt[i*2..i*2+2],16).unwrap()).collect();
+        for w in 0..3usize {
+            let ksb = ks_block(w as u32);
+            let mut exp = [0u8; 16];
+            for i in 0..16 { exp[i] = ptb[w*16 + i] ^ ksb[i]; }
+            assert_eq!(gctr_block_json(3, w, pt), record16_json(&exp),
+                       "gctr block {} record mismatch", w);
+        }
+
+        // Case 2: 20 bytes — a partial tail block. The host contract: pad
+        // the hex to nb*32 chars with zeros, spawn per block, keep only the
+        // first len(data) bytes. Block 1's record therefore carries the
+        // keystream XOR zero-padding in bytes 4..15; the host discards them.
+        let ptb2: Vec<u8> = ptb[..20].to_vec();
+        let mut padded = ptb2.clone();
+        padded.resize(32, 0);
+        let hex2: String = padded.iter().map(|b| format!("{:02x}", b)).collect();
+        let mut got = Vec::new();
+        for w in 0..2usize {
+            let ksb = ks_block(w as u32);
+            let mut exp = [0u8; 16];
+            for i in 0..16 { exp[i] = padded[w*16 + i] ^ ksb[i]; }
+            let json = gctr_block_json(2, w, &hex2);
+            assert_eq!(json, record16_json(&exp),
+                       "gctr tail-case block {} record mismatch", w);
+            // unpack the record like the host does
+            for i in 0..16 { got.push(exp[i]); }
+        }
+        got.truncate(20);
+        // the truncated 20 bytes must equal the per-byte reference on the
+        // ORIGINAL (unpadded) data — the whole point of the framing glue.
+        for w in 0..20usize {
+            let ksb = ks_block((w / 16) as u32);
+            assert_eq!(got[w], ptb2[w] ^ ksb[w % 16],
+                       "gctr tail-case truncated byte {} mismatch", w);
         }
         let _ = std::fs::remove_file(&out);
     }

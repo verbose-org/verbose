@@ -1075,6 +1075,109 @@ Tracking what native emits today, what it still rejects, and the design rules th
   `examples/sha256_fold.verbose` and the two `tools/tls_gen/` files differ — so
   "everything else byte-identical" is both measured and structural.
 
+  **AES/GCM/GHASH FOLLOWED (2026-08-30, tranche 5) — the LAST tranche of the
+  aggregate cash-in: NOTHING vcrypto compiles spawns per-`which` any more.
+  THE POOL DOES NOT DIE, and the reason is the finding.** The finish line
+  this arc aimed at was deleting vcrypto's 64-thread pool once AES/GCM/GHASH
+  converted — and its premise ("the thread pool below exists solely for
+  them", the module docstring) was ALREADY false when tranche 5 started:
+  `run_bytes` has EIGHT external call sites in FIVE files driving still-
+  which-form rules — `hkdf_extract` (tls_server.py, tls_cert_server.py,
+  tls_browser_server.py, tls_browser_p256_server.py) and `psk_early_secret`
+  / `psk_ext_binder_key` (tls_server.py, verify_binder.py). So the pool
+  STAYS, its docstring now names its real users, and the oracle line's
+  parenthetical says "the pool serves only external run_bytes callers —
+  hkdf_extract + psk_*". Convert `hkdf_extract.verbose` +
+  `psk_schedule.verbose` (outside this tranche's three-file scope) and the
+  pool dies for real.
+  NO GENERATOR EXISTS for any of the three files — the first tranche that is
+  entirely hand-edited (tranches 2-4 were generator-driven; the x25519
+  tranche was half-and-half). Verified by grep over `tools/`: no `*_gen.py`
+  writes aes_encrypt / aes_gctr / ghash_nblocks.
+  THE SHAPES, per file. `examples/aes_encrypt.verbose::encrypt` → a 16-field
+  `CipherBlock` (b0..b15): the 16-way `which` dispatch became a constructor
+  over the same `st10_*` lets, `which` gone from `EncryptInput` and the
+  `reads:` proof (39915 → 41756 B). `examples/ghash_nblocks.verbose::
+  ghash_fold` → a 16-field `GhashOut`: RECURSIVE, sha256_fold's exact shape
+  (agg-2a tail forward + agg-2c record entry) — base case's dispatch became
+  the constructor, the recursive tail constructor dropped `which:` (271435 →
+  273269 B). `examples/aes_gctr.verbose::gctr` → a PER-BLOCK `CipherBlock`:
+  a fixed-width record cannot cover variable-length data, so `which` becomes
+  a BLOCK index (`[0, 63]`, was data-byte `[0, 1023]`), the counter is
+  `s.which + 2` directly, and the rule decodes all 16 of its block's hex
+  byte-pairs and XORs them with the keystream lets (40297 → 48637 B). The
+  HOST loop over blocks STAYS — `_gctr` spawns once per block (nb spawns,
+  16× fewer than per-byte), PADS the tail block's hex to 32 chars and
+  truncates after unpacking. The padding is LOAD-BEARING, not cosmetic:
+  `byte_at`'s fail-closed bounds mean an unpadded short tail ABORTS the
+  binary — the record form reads all 16 pairs where the which form only ever
+  read the bytes the host asked for.
+  **ONE COMPILER CHANGE, the first in any cash-in tranche, and it is a
+  ROUTING widening, not an emitter.** encrypt/gctr are record-output entries
+  with CROSS-CONCEPT callees (`aes_sbox(Byte { b: ... })` / `xtime`), a
+  combination no prior tranche hit (sha256_fold/ghash_fold call only
+  themselves; the schedule rules call nothing). `emit_record_program`'s Call
+  inline shares the caller's offsets map — measured, the converted encrypt
+  failed there with `unknown field 'b'` — while the WHICH forms had always
+  routed through the CALLABLE path via `compile_native_code`'s cross-concept
+  detector, whose entry gate was `Number | Bool | Text`. The gate now also
+  admits a plain-record-output entry (`entry_routable`), landing it on
+  agg-2c's `_start` record arm with agg-1's callee-side field writes — both
+  halves already shipped; the tranche connected them. Such an entry is also
+  walked by `check_aggregate_shape` (same gate as the other record-entry
+  routes). Additive BY MEASUREMENT: corpus sweep over all 154 examples ×
+  every rule/reaction/service (1375 unique targets), baseline `f99eedb` vs
+  branch, baseline-vs-baseline control EMPTY first — **exactly the THREE
+  converted rule-binaries change, 1372 byte-identical by size + sha256, 0
+  status changes, 0 same-size-different-bytes, refused set 558 → 558.**
+  Byte-exactness measured FIRST, oracle-anchored twice over: the shipped
+  which-form binaries' outputs captured on TEN vectors — FIPS-197 C.1 and
+  NIST SP 800-38A F.1.1 for encrypt, NIST GCM Test Case 2 for gctr (C =
+  0388dace…) and for ghash (S = f38cbb1a…), the src/native.rs 48-byte
+  3-block gctr vector and 4-block ghash vector, plus the vcrypto self-test's
+  H / EJ0 / gctr / ghash values — every capture validated against an
+  INDEPENDENT Python FIPS-197/SP-800-38D reference before any edit, the
+  published vectors matching where one exists. The record binaries reproduce
+  all ten exactly AND the interpreter agrees on all ten (20/20 cells).
+  Reproducible emit: each converted rule compiled twice, byte-identical.
+  `tools/tls_gen/vcrypto.py`: `_aes_block` 16 pooled spawns → ONE record
+  spawn; `_ghash` 16 pooled spawns → ONE (the recursive fold walks every
+  block in-process); `_gctr` len(data) pooled spawns → nb sequential record
+  spawns. The AEAD roundtrip (encrypt+decrypt, 11-byte payload) measured on
+  this host (WSL2, Ryzen 7 5800X, perf_counter, N=10): **140.9 ms median
+  (which, pooled) → 3.6 ms median (record), ~39×**. The self-test grew a
+  NIST-anchored AES/GCM leg (FIPS-197 C.1 through `_aes_block`, GCM TC2
+  through `_gctr` AND `_ghash`) and a timed AEAD leg: VCRYPTO_OK prints
+  `aead=0.004s` beside the other legs, roundtrip green.
+  CONSUMERS, enumerated: `vcrypto.py` (converted); `tls_record_check.py`,
+  the only OTHER which-interface driver (`/tmp/tr_*` binaries), converted to
+  the record interface with the same pad-and-truncate contract —
+  TLS_RECORD_OK re-verified over its 3 random records (5/17/40-byte
+  payloads, so the tail truncation is exercised) against its own Python GCM
+  reference. The TLS servers (`tls_server.py`, both browser servers,
+  `tls_cert_server.py`) drive AEAD exclusively through the vcrypto wrappers
+  (`aead_encrypt`/`aead_decrypt`) — confirmed by grep, no direct spawn
+  sites. `src/native.rs`: the three runtime pins moved to EXACT-JSON record
+  asserts (values + field count in one comparison, stronger than the
+  per-`which` integer parses), `aes_gctr_matches_reference` grew the
+  pad-then-truncate tail case (20-byte message), and
+  `aes_family_declared_sbox_tables_match_fips197_oracle`'s two floor rows
+  for aes_encrypt/aes_gctr became record-constructor asserts (the 16-way
+  dispatches legitimately became constructors; the branch UPPER bound still
+  catches a re-unrolled S-box chain). Clean negative otherwise: no other
+  test consumed the which interface.
+  gen0's verdicts, at BOTH indices per the metric discipline (rule #0 in the
+  two AES files IS `aes_sbox` — the gaps-table trap): aes_encrypt and
+  aes_gctr are REFUSED at rule #0 AND at the declared entry (index 2), in
+  BOTH forms — the pre-existing `bytelit_operands` refusal (declared S-box
+  table), so the conversion moves nothing and EXPECTED_ACCEPTED stays
+  96/154. `ghash_nblocks` (single rule, so the two indices coincide) is
+  ACCEPTED in both forms (549567 → 550791 B), and the record-form gen0
+  binary AGREES with verbosec **byte-for-byte on stdout + exit code** on
+  both GHASH vectors — the sha256_fold/fib_pair agreement cell: gen0's
+  recursive record emit serialises the arena node its own walk produces, and
+  it matches verbosec's record arm.
+
 ### Register conventions across emitters
 
 Emitters that span multiple syscalls or phases share a register layout. Adding a new cross-phase register use requires either claiming a currently-unused register or saving/restoring on the stack — do not casually reassign any of these without auditing every caller.

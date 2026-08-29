@@ -1,7 +1,7 @@
 @verbose 0.1.0
 
 concept GhashState
-  @intention: "GHASH fold state: accumulator Y + subkey H (16 bytes each) + block count, counter, which, hex data"
+  @intention: "GHASH fold state: accumulator Y + subkey H (16 bytes each) + block count, counter, hex data"
   @source: invoices.intent:1
   fields:
     y0 : number [0, 255]
@@ -38,17 +38,38 @@ concept GhashState
     h15 : number [0, 255]
     nblocks : number [0, 64]
     i : number [0, 64]
-    which : number [0, 15]
     data : text
 
 
+concept GhashOut
+  @intention: "the 16 bytes of the GHASH accumulator Y, returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+
+
 rule ghash_fold
-  @intention: "GHASH over N 16-byte blocks (hex data): Y=0; for each block B: Y=(Y xor B)*H. Returns byte which of Y"
+  @intention: "GHASH over N 16-byte blocks (hex data): Y=0; for each block B: Y=(Y xor B)*H. Returns the 16-byte Y as one GhashOut record"
   @source: invoices.intent:1
   input:
     s : GhashState
   output:
-    out : number
+    out : GhashOut
   logic:
     let bidx = if s.i == 0 then 0 else s.nblocks - s.i
     let off = bidx * 32
@@ -4628,10 +4649,10 @@ rule ghash_fold
     let g_v127_13 = bor(shr(g_v126_13, 1), shl(band(g_v126_12, 1), 7))
     let g_v127_14 = bor(shr(g_v126_14, 1), shl(band(g_v126_13, 1), 7))
     let g_v127_15 = bor(shr(g_v126_15, 1), shl(band(g_v126_14, 1), 7))
-    out = if s.i == 0 then if s.which == 0 then s.y0 else if s.which == 1 then s.y1 else if s.which == 2 then s.y2 else if s.which == 3 then s.y3 else if s.which == 4 then s.y4 else if s.which == 5 then s.y5 else if s.which == 6 then s.y6 else if s.which == 7 then s.y7 else if s.which == 8 then s.y8 else if s.which == 9 then s.y9 else if s.which == 10 then s.y10 else if s.which == 11 then s.y11 else if s.which == 12 then s.y12 else if s.which == 13 then s.y13 else if s.which == 14 then s.y14 else s.y15 else ghash_fold(GhashState { y0: g_z127_0, y1: g_z127_1, y2: g_z127_2, y3: g_z127_3, y4: g_z127_4, y5: g_z127_5, y6: g_z127_6, y7: g_z127_7, y8: g_z127_8, y9: g_z127_9, y10: g_z127_10, y11: g_z127_11, y12: g_z127_12, y13: g_z127_13, y14: g_z127_14, y15: g_z127_15, h0: s.h0, h1: s.h1, h2: s.h2, h3: s.h3, h4: s.h4, h5: s.h5, h6: s.h6, h7: s.h7, h8: s.h8, h9: s.h9, h10: s.h10, h11: s.h11, h12: s.h12, h13: s.h13, h14: s.h14, h15: s.h15, nblocks: s.nblocks, i: s.i - 1, which: s.which, data: s.data })
+    out = if s.i == 0 then GhashOut { b0: s.y0, b1: s.y1, b2: s.y2, b3: s.y3, b4: s.y4, b5: s.y5, b6: s.y6, b7: s.y7, b8: s.y8, b9: s.y9, b10: s.y10, b11: s.y11, b12: s.y12, b13: s.y13, b14: s.y14, b15: s.y15 } else ghash_fold(GhashState { y0: g_z127_0, y1: g_z127_1, y2: g_z127_2, y3: g_z127_3, y4: g_z127_4, y5: g_z127_5, y6: g_z127_6, y7: g_z127_7, y8: g_z127_8, y9: g_z127_9, y10: g_z127_10, y11: g_z127_11, y12: g_z127_12, y13: g_z127_13, y14: g_z127_14, y15: g_z127_15, h0: s.h0, h1: s.h1, h2: s.h2, h3: s.h3, h4: s.h4, h5: s.h5, h6: s.h6, h7: s.h7, h8: s.h8, h9: s.h9, h10: s.h10, h11: s.h11, h12: s.h12, h13: s.h13, h14: s.h14, h15: s.h15, nblocks: s.nblocks, i: s.i - 1, data: s.data })
   proofs:
     purity:
-      reads : [s.y0, s.y1, s.y2, s.y3, s.y4, s.y5, s.y6, s.y7, s.y8, s.y9, s.y10, s.y11, s.y12, s.y13, s.y14, s.y15, s.h0, s.h1, s.h2, s.h3, s.h4, s.h5, s.h6, s.h7, s.h8, s.h9, s.h10, s.h11, s.h12, s.h13, s.h14, s.h15, s.nblocks, s.i, s.which, s.data]
+      reads : [s.y0, s.y1, s.y2, s.y3, s.y4, s.y5, s.y6, s.y7, s.y8, s.y9, s.y10, s.y11, s.y12, s.y13, s.y14, s.y15, s.h0, s.h1, s.h2, s.h3, s.h4, s.h5, s.h6, s.h7, s.h8, s.h9, s.h10, s.h11, s.h12, s.h13, s.h14, s.h15, s.nblocks, s.i, s.data]
       calls : [ghash_fold]
     termination:
       bound : 400000

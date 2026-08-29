@@ -63,15 +63,28 @@ def tls_record_ref(key, iv, seq, plaintext, ctype=0x17):
     return bytes(aad)+C+tag
 
 # --- Verbose orchestration (existing committed bricks) ---
+# Record interface since tranche 5 (2026-08-30): each spawn prints one JSON
+# object {"b0":...,...}. encrypt/ghash_fold are ONE spawn; gctr is one spawn
+# per 16-byte block (`which` = block index, tail block hex padded by the
+# host and truncated after unpacking — same framing glue as vcrypto._gctr).
+import json as _json
+def _rec(cmd, n):
+    r=subprocess.run(cmd,capture_output=True,text=True)
+    o=_json.loads(r.stdout.strip())
+    assert len(o)==n, f"{cmd[0]}: field count {len(o)} != {n}"
+    return bytes(o[f"b{i}"] for i in range(n))
 def venc(key, block):
     args=[str(b) for b in block]+[str(b) for b in key]
-    return bytes(int(subprocess.run(["/tmp/tr_aes"]+args+[str(w)],capture_output=True,text=True).stdout.strip()) for w in range(16))
+    return _rec(["/tmp/tr_aes"]+args, 16)
 def vgctr(key, nonce, pt):
-    nb=(len(pt)+15)//16; hexpt=bytes(pt).hex(); base=[str(b) for b in key]+[str(b) for b in nonce]+[str(nb)]
-    return bytes(int(subprocess.run(["/tmp/tr_gctr"]+base+[str(w),hexpt],capture_output=True,text=True).stdout.strip()) for w in range(len(pt)))
+    nb=(len(pt)+15)//16; padded=bytes(pt)+bytes((-len(pt))%16); hexpt=padded.hex()
+    base=[str(b) for b in key]+[str(b) for b in nonce]+[str(nb)]
+    out=b"".join(_rec(["/tmp/tr_gctr"]+base+[str(w),hexpt], 16) for w in range(nb))
+    return out[:len(pt)]
 def vghash(H, data):
-    nb=len(data)//16; hexd=bytes(data).hex(); args=[str(b) for b in [0]*16]+[str(b) for b in H]+[str(nb),str(nb)]
-    return bytes(int(subprocess.run(["/tmp/tr_ghash"]+args+[str(w),hexd],capture_output=True,text=True).stdout.strip()) for w in range(16))
+    nb=len(data)//16; hexd=bytes(data).hex()
+    args=[str(b) for b in [0]*16]+[str(b) for b in H]+[str(nb),str(nb),hexd]
+    return _rec(["/tmp/tr_ghash"]+args, 16)
 def v_tls_record(key, iv, seq, plaintext, ctype=0x17):
     nonce=bytearray(iv); seqb=seq.to_bytes(8,'big')
     for j in range(8): nonce[4+j]^=seqb[j]

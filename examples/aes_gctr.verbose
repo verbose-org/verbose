@@ -7,7 +7,7 @@ concept Byte
     b : number [0, 255]
 
 concept CtrInput
-  @intention: "AES-128 key + 12-byte IV + plaintext hex + nblocks + which output byte"
+  @intention: "AES-128 key + 12-byte IV + plaintext hex (padded to full blocks) + nblocks + which block index"
   @source: invoices.intent:1
   fields:
     k0 : number [0, 255]
@@ -39,8 +39,30 @@ concept CtrInput
     iv10 : number [0, 255]
     iv11 : number [0, 255]
     nblocks : number [0, 64]
-    which : number [0, 1023]
+    which : number [0, 63]
     data : text
+
+
+concept CipherBlock
+  @intention: "the 16 ciphertext bytes of one GCTR block, returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
 
 
 -- The FIPS-197 forward S-box as a DECLARED CONSTANT TABLE.
@@ -95,12 +117,12 @@ rule xtime
 
 
 rule gctr
-  @intention: "AES-128 GCTR (GCM counter mode): byte which of plaintext XOR AES(IV||(which/16 + 2))"
+  @intention: "AES-128 GCTR (GCM counter mode): block `which` of plaintext XOR AES(IV||(which + 2)), all 16 bytes as one CipherBlock record"
   @source: invoices.intent:1
   input:
     s : CtrInput
   output:
-    out : number
+    out : CipherBlock
   logic:
     let sched_ks0 = s.k0
     let sched_ks1 = s.k1
@@ -278,8 +300,7 @@ rule gctr
     let sched_ks173 = band(bxor(sched_ks157, sched_ks169), 255)
     let sched_ks174 = band(bxor(sched_ks158, sched_ks170), 255)
     let sched_ks175 = band(bxor(sched_ks159, sched_ks171), 255)
-    let bidx = shr(s.which, 4)
-    let ctrv = bidx + 2
+    let ctrv = s.which + 2
     let cb12 = band(shr(ctrv, 24), 255)
     let cb13 = band(shr(ctrv, 16), 255)
     let cb14 = band(shr(ctrv, 8), 255)
@@ -764,15 +785,88 @@ rule gctr
     let ks_s10_13 = band(bxor(ks_sub10_1, sched_ks173), 255)
     let ks_s10_14 = band(bxor(ks_sub10_6, sched_ks174), 255)
     let ks_s10_15 = band(bxor(ks_sub10_11, sched_ks175), 255)
-    let selb = band(s.which, 15)
-    let ksbyte = if selb == 0 then ks_s10_0 else if selb == 1 then ks_s10_1 else if selb == 2 then ks_s10_2 else if selb == 3 then ks_s10_3 else if selb == 4 then ks_s10_4 else if selb == 5 then ks_s10_5 else if selb == 6 then ks_s10_6 else if selb == 7 then ks_s10_7 else if selb == 8 then ks_s10_8 else if selb == 9 then ks_s10_9 else if selb == 10 then ks_s10_10 else if selb == 11 then ks_s10_11 else if selb == 12 then ks_s10_12 else if selb == 13 then ks_s10_13 else if selb == 14 then ks_s10_14 else ks_s10_15
-    let pos = s.which * 2
-    let phi = byte_at(s.data, pos)
-    let plo = byte_at(s.data, pos + 1)
-    let pvh = if phi <= 57 then phi - 48 else bor(phi, 32) - 87
-    let pvl = if plo <= 57 then plo - 48 else bor(plo, 32) - 87
-    let ptbyte = 16 * pvh + pvl
-    out = band(bxor(ksbyte, ptbyte), 255)
+    let base = s.which * 32
+    let phi0 = byte_at(s.data, base + 0)
+    let plo0 = byte_at(s.data, base + 1)
+    let pvh0 = if phi0 <= 57 then phi0 - 48 else bor(phi0, 32) - 87
+    let pvl0 = if plo0 <= 57 then plo0 - 48 else bor(plo0, 32) - 87
+    let pt0 = 16 * pvh0 + pvl0
+    let phi1 = byte_at(s.data, base + 2)
+    let plo1 = byte_at(s.data, base + 3)
+    let pvh1 = if phi1 <= 57 then phi1 - 48 else bor(phi1, 32) - 87
+    let pvl1 = if plo1 <= 57 then plo1 - 48 else bor(plo1, 32) - 87
+    let pt1 = 16 * pvh1 + pvl1
+    let phi2 = byte_at(s.data, base + 4)
+    let plo2 = byte_at(s.data, base + 5)
+    let pvh2 = if phi2 <= 57 then phi2 - 48 else bor(phi2, 32) - 87
+    let pvl2 = if plo2 <= 57 then plo2 - 48 else bor(plo2, 32) - 87
+    let pt2 = 16 * pvh2 + pvl2
+    let phi3 = byte_at(s.data, base + 6)
+    let plo3 = byte_at(s.data, base + 7)
+    let pvh3 = if phi3 <= 57 then phi3 - 48 else bor(phi3, 32) - 87
+    let pvl3 = if plo3 <= 57 then plo3 - 48 else bor(plo3, 32) - 87
+    let pt3 = 16 * pvh3 + pvl3
+    let phi4 = byte_at(s.data, base + 8)
+    let plo4 = byte_at(s.data, base + 9)
+    let pvh4 = if phi4 <= 57 then phi4 - 48 else bor(phi4, 32) - 87
+    let pvl4 = if plo4 <= 57 then plo4 - 48 else bor(plo4, 32) - 87
+    let pt4 = 16 * pvh4 + pvl4
+    let phi5 = byte_at(s.data, base + 10)
+    let plo5 = byte_at(s.data, base + 11)
+    let pvh5 = if phi5 <= 57 then phi5 - 48 else bor(phi5, 32) - 87
+    let pvl5 = if plo5 <= 57 then plo5 - 48 else bor(plo5, 32) - 87
+    let pt5 = 16 * pvh5 + pvl5
+    let phi6 = byte_at(s.data, base + 12)
+    let plo6 = byte_at(s.data, base + 13)
+    let pvh6 = if phi6 <= 57 then phi6 - 48 else bor(phi6, 32) - 87
+    let pvl6 = if plo6 <= 57 then plo6 - 48 else bor(plo6, 32) - 87
+    let pt6 = 16 * pvh6 + pvl6
+    let phi7 = byte_at(s.data, base + 14)
+    let plo7 = byte_at(s.data, base + 15)
+    let pvh7 = if phi7 <= 57 then phi7 - 48 else bor(phi7, 32) - 87
+    let pvl7 = if plo7 <= 57 then plo7 - 48 else bor(plo7, 32) - 87
+    let pt7 = 16 * pvh7 + pvl7
+    let phi8 = byte_at(s.data, base + 16)
+    let plo8 = byte_at(s.data, base + 17)
+    let pvh8 = if phi8 <= 57 then phi8 - 48 else bor(phi8, 32) - 87
+    let pvl8 = if plo8 <= 57 then plo8 - 48 else bor(plo8, 32) - 87
+    let pt8 = 16 * pvh8 + pvl8
+    let phi9 = byte_at(s.data, base + 18)
+    let plo9 = byte_at(s.data, base + 19)
+    let pvh9 = if phi9 <= 57 then phi9 - 48 else bor(phi9, 32) - 87
+    let pvl9 = if plo9 <= 57 then plo9 - 48 else bor(plo9, 32) - 87
+    let pt9 = 16 * pvh9 + pvl9
+    let phi10 = byte_at(s.data, base + 20)
+    let plo10 = byte_at(s.data, base + 21)
+    let pvh10 = if phi10 <= 57 then phi10 - 48 else bor(phi10, 32) - 87
+    let pvl10 = if plo10 <= 57 then plo10 - 48 else bor(plo10, 32) - 87
+    let pt10 = 16 * pvh10 + pvl10
+    let phi11 = byte_at(s.data, base + 22)
+    let plo11 = byte_at(s.data, base + 23)
+    let pvh11 = if phi11 <= 57 then phi11 - 48 else bor(phi11, 32) - 87
+    let pvl11 = if plo11 <= 57 then plo11 - 48 else bor(plo11, 32) - 87
+    let pt11 = 16 * pvh11 + pvl11
+    let phi12 = byte_at(s.data, base + 24)
+    let plo12 = byte_at(s.data, base + 25)
+    let pvh12 = if phi12 <= 57 then phi12 - 48 else bor(phi12, 32) - 87
+    let pvl12 = if plo12 <= 57 then plo12 - 48 else bor(plo12, 32) - 87
+    let pt12 = 16 * pvh12 + pvl12
+    let phi13 = byte_at(s.data, base + 26)
+    let plo13 = byte_at(s.data, base + 27)
+    let pvh13 = if phi13 <= 57 then phi13 - 48 else bor(phi13, 32) - 87
+    let pvl13 = if plo13 <= 57 then plo13 - 48 else bor(plo13, 32) - 87
+    let pt13 = 16 * pvh13 + pvl13
+    let phi14 = byte_at(s.data, base + 28)
+    let plo14 = byte_at(s.data, base + 29)
+    let pvh14 = if phi14 <= 57 then phi14 - 48 else bor(phi14, 32) - 87
+    let pvl14 = if plo14 <= 57 then plo14 - 48 else bor(plo14, 32) - 87
+    let pt14 = 16 * pvh14 + pvl14
+    let phi15 = byte_at(s.data, base + 30)
+    let plo15 = byte_at(s.data, base + 31)
+    let pvh15 = if phi15 <= 57 then phi15 - 48 else bor(phi15, 32) - 87
+    let pvl15 = if plo15 <= 57 then plo15 - 48 else bor(plo15, 32) - 87
+    let pt15 = 16 * pvh15 + pvl15
+    out = CipherBlock { b0: band(bxor(ks_s10_0, pt0), 255), b1: band(bxor(ks_s10_1, pt1), 255), b2: band(bxor(ks_s10_2, pt2), 255), b3: band(bxor(ks_s10_3, pt3), 255), b4: band(bxor(ks_s10_4, pt4), 255), b5: band(bxor(ks_s10_5, pt5), 255), b6: band(bxor(ks_s10_6, pt6), 255), b7: band(bxor(ks_s10_7, pt7), 255), b8: band(bxor(ks_s10_8, pt8), 255), b9: band(bxor(ks_s10_9, pt9), 255), b10: band(bxor(ks_s10_10, pt10), 255), b11: band(bxor(ks_s10_11, pt11), 255), b12: band(bxor(ks_s10_12, pt12), 255), b13: band(bxor(ks_s10_13, pt13), 255), b14: band(bxor(ks_s10_14, pt14), 255), b15: band(bxor(ks_s10_15, pt15), 255) }
   proofs:
     purity:
       reads : [s.k0, s.k1, s.k2, s.k3, s.k4, s.k5, s.k6, s.k7, s.k8, s.k9, s.k10, s.k11, s.k12, s.k13, s.k14, s.k15, s.iv0, s.iv1, s.iv2, s.iv3, s.iv4, s.iv5, s.iv6, s.iv7, s.iv8, s.iv9, s.iv10, s.iv11, s.which, s.data]
