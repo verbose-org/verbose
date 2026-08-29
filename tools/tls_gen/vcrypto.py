@@ -11,11 +11,14 @@ Digest JSON object — 2 spawns per X25519 instead of 52. The HKDF-expand
 family followed (2026-08-29): handshake_secret, derive_s_hs_traffic,
 expand_key and expand_iv each return ALL their output bytes as one record
 (Digest / KeyBytes / IvBytes JSON), so a full server key-schedule leg
-(hs -> s_hs -> key + iv) is 4 spawns instead of 92. The remaining
-primitives (SHA-256, the six tls_schedule rules, AES/GCM/GHASH) still
-return one byte per `which` invocation, so their loops are spawned IN
-PARALLEL (all output bytes concurrently), which turns the per-byte cost
-from sum into max — the thread pool below exists solely for them.
+(hs -> s_hs -> key + iv) is 4 spawns instead of 92. The six
+tls_schedule.verbose rules followed the same day (tranche 3): _sched is ONE
+record spawn, so the derived/master/traffic/finished leg is 6 spawns
+instead of 192 pooled ones. The remaining primitives (SHA-256,
+AES/GCM/GHASH) still return one byte per `which` invocation, so their
+loops are spawned IN PARALLEL (all output bytes concurrently), which turns
+the per-byte cost from sum into max — the thread pool below exists solely
+for them.
 
 Honest scope (per docs/tls-io-statemachine-design.md §7): the cryptographic
 PRIMITIVES (X25519, key schedule, SHA-256, AES/GCM/GHASH) are pure Verbose.
@@ -122,13 +125,12 @@ def sha256(msg: bytes) -> bytes:
     return bytes(futs[w].result() for w in range(32))
 
 # ---- key schedule (pure Verbose) ----
-# handshake_secret / derive_s_hs_traffic / expand_key / expand_iv return
-# RECORDS (one spawn each, all output bytes as one JSON object) since
-# 2026-08-29. The six tls_schedule.verbose rules below still use the
-# `which`-per-byte interface through _sched's parallel run_bytes loop.
+# EVERY key-schedule rule returns a RECORD (one spawn, all output bytes as one
+# {"b0":...,...} JSON object) since 2026-08-29 — the four HKDF-expand-family
+# rules in tranche 2, the six tls_schedule.verbose rules (all via _sched) in
+# tranche 3.
 def _sched(rule, secret32, thash32):
-    args=[str(b) for b in secret32]+[str(b) for b in thash32]
-    return run_bytes(rule, args, 32)
+    return _record_bytes(rule, [str(b) for b in secret32]+[str(b) for b in thash32], 32)
 def handshake_secret(ecdhe32): return _record_bytes("handshake_secret",[str(b) for b in ecdhe32],32)
 def derive_derived(secret32): return _sched("derive_derived", secret32, bytes(32))
 def master_secret(derived32): return _sched("master_secret", derived32, bytes(32))
@@ -239,9 +241,25 @@ if __name__ == "__main__":
     assert shs==el(hs,b"s hs traffic",thash,32)
     assert k==el(shs,b"key",b"",16)
     assert iv==el(shs,b"iv",b"",12)
+    # 3b) the six tls_schedule rules (record spawns since 2026-08-29, tranche 3):
+    # derived -> master -> traffic secrets -> finished_key, all vs the oracle
+    t=time.time()
+    dd=derive_derived(hs)
+    ms=master_secret(dd)
+    chs=derive_c_hs(hs,thash)
+    sap=derive_s_ap(ms,thash)
+    cap_=derive_c_ap(ms,thash)
+    fk=finished_key(shs)
+    t_sc = time.time()-t
+    assert dd==el(hs,b"derived",hashlib.sha256(b"").digest(),32)
+    assert ms==H.new(dd,b'\x00'*32,hashlib.sha256).digest()
+    assert chs==el(hs,b"c hs traffic",thash,32)
+    assert sap==el(ms,b"s ap traffic",thash,32)
+    assert cap_==el(ms,b"c ap traffic",thash,32)
+    assert fk==el(shs,b"finished",b"",32)
     # 4) AEAD record round-trip (encrypt then decrypt)
     rk=bytes(range(1,17)); riv=bytes(range(17,29))
     rec=aead_encrypt(rk,riv,0,b"hello world",0x17)
     ct,pt=aead_decrypt(rk,riv,0,rec)
     assert ct==0x17 and pt==b"hello world", (ct,pt)
-    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  aead_roundtrip=ok  (x25519 + hkdf-expand family: record spawns; other which-loops parallel)")
+    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  aead_roundtrip=ok  (x25519 + full key schedule: record spawns; sha256/AES/GCM which-loops parallel)")

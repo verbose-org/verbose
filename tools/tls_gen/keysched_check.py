@@ -10,10 +10,19 @@ def ref(ecdhe, thash):
     derived = expand_label(early, b"derived", hashlib.sha256(b"").digest(), 32)
     hs = extract(derived, ecdhe)
     s_hs = expand_label(hs, b"s hs traffic", thash, 32)
-    return hs, s_hs, expand_label(s_hs, b"key", b"", 16), expand_label(s_hs, b"iv", b"", 12)
+    # the six tls_schedule rules, chained the way tls_server chains them
+    dd2 = expand_label(hs, b"derived", hashlib.sha256(b"").digest(), 32)
+    master = extract(dd2, b'\x00'*32)
+    return (hs, s_hs,
+            expand_label(s_hs, b"key", b"", 16), expand_label(s_hs, b"iv", b"", 12),
+            dd2, master,
+            expand_label(hs, b"c hs traffic", thash, 32),
+            expand_label(master, b"s ap traffic", thash, 32),
+            expand_label(master, b"c ap traffic", thash, 32),
+            expand_label(s_hs, b"finished", b"", 32))
 
 def run(binp, args, n):
-    # All four rules return RECORDS since 2026-08-29 (aggregate-return arc):
+    # All ten rules return RECORDS since 2026-08-29 (aggregate-return arc):
     # ONE spawn yields every output byte as {"b0":...,...,"b(n-1)":...} JSON,
     # where the old `which` interface took n spawns of one byte each.
     r=subprocess.run([binp]+args,capture_output=True,text=True,timeout=600)
@@ -24,9 +33,20 @@ def run(binp, args, n):
     return bytes(rec[f"b{i}"] for i in range(n))
 
 def vrun(ecdhe, thash):
+    zero=[str(0)]*32
     hs   = run("/tmp/ks_hs", [str(b) for b in ecdhe], 32)
     s_hs = run("/tmp/ks_ds", [str(b) for b in hs]+[str(b) for b in thash], 32)
-    return hs, s_hs, run("/tmp/ks_ek", [str(b) for b in s_hs], 16), run("/tmp/ks_ei", [str(b) for b in s_hs], 12)
+    ek   = run("/tmp/ks_ek", [str(b) for b in s_hs], 16)
+    ei   = run("/tmp/ks_ei", [str(b) for b in s_hs], 12)
+    # the six tls_schedule rules (record spawns since 2026-08-29, tranche 3);
+    # every upstream value below is the VERBOSE-computed one, so the chain is honest
+    dd2    = run("/tmp/ks_dd", [str(b) for b in hs]+zero, 32)
+    master = run("/tmp/ks_ms", [str(b) for b in dd2]+zero, 32)
+    c_hs   = run("/tmp/ks_ch", [str(b) for b in hs]+[str(b) for b in thash], 32)
+    s_ap   = run("/tmp/ks_sa", [str(b) for b in master]+[str(b) for b in thash], 32)
+    c_ap   = run("/tmp/ks_ca", [str(b) for b in master]+[str(b) for b in thash], 32)
+    fk     = run("/tmp/ks_fk", [str(b) for b in s_hs]+zero, 32)
+    return hs, s_hs, ek, ei, dd2, master, c_hs, s_ap, c_ap, fk
 
 random.seed(91)
 for _ in range(3):

@@ -1,31 +1,22 @@
-import subprocess, sys, random, hmac, hashlib
+import subprocess, sys, random, hmac, hashlib, json
 
 def expand_label(secret, label, ctx, length):
     info = length.to_bytes(2,'big')+bytes([len(b"tls13 "+label)])+b"tls13 "+label+bytes([len(ctx)])+ctx
     return hmac.new(secret, info+b'\x01', hashlib.sha256).digest()[:length]
 def extract(salt, ikm): return hmac.new(salt, ikm, hashlib.sha256).digest()
 
-def run(rule, secret, thash, n=32):
-    out=[]
-    for w in range(n):
-        args=[str(b) for b in secret]+[str(b) for b in thash]+[str(w)]
-        r=subprocess.run(["/tmp/sched"]+[rule]+args, capture_output=True, text=True, timeout=600)
-        # placeholder; replaced below by per-rule binaries
-        s=r.stdout.strip()
-        if s=="": sys.exit(3)
-        out.append(int(s))
-    return bytes(out)
-
-# Each rule compiled to its own binary path /tmp/sc_<rule>
+# Each rule compiled to its own binary path /tmp/sc_<rule>.
+# All six rules return RECORDS since 2026-08-29 (aggregate-return arc):
+# ONE spawn yields all n output bytes as {"b0":...,...,"b(n-1)":...} JSON,
+# where the old `which` interface took n spawns of one byte each.
 def runb(rule, secret, thash, n=32):
-    out=[]
-    for w in range(n):
-        args=[str(b) for b in secret]+[str(b) for b in thash]+[str(w)]
-        r=subprocess.run(["/tmp/sc_"+rule]+args, capture_output=True, text=True, timeout=600)
-        s=r.stdout.strip()
-        if s=="": sys.exit(3)
-        out.append(int(s))
-    return bytes(out)
+    args=[str(b) for b in secret]+[str(b) for b in thash]
+    r=subprocess.run(["/tmp/sc_"+rule]+args, capture_output=True, text=True, timeout=600)
+    s=r.stdout.strip()
+    if s=="": sys.exit(3)
+    rec=json.loads(s)
+    if len(rec)!=n: sys.exit(3)
+    return bytes(rec[f"b{i}"] for i in range(n))
 
 random.seed(131)
 zero=bytes(32)

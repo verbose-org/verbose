@@ -971,6 +971,47 @@ Tracking what native emits today, what it still rejects, and the design rules th
   converted rule-binaries change (hs 323008 → 326332 B, ds 326384 → 329708 B, ek 322256 →
   323836 B, ei 322080 → 323224 B), every other binary byte-identical by size + sha256.
 
+  **THE SIX tls_schedule RULES FOLLOWED (2026-08-29, tranche 3) — the full TLS 1.3 key
+  schedule is now record spawns, and the thread pool serves only sha256 and the
+  AES/GCM/GHASH loops.** `examples/tls_schedule.verbose` (`tools/tls_gen/schedule_gen.py`,
+  generator-driven like tranche 2: the generator was verified byte-in-sync with the
+  committed file BEFORE being edited — regenerate → `git status` clean) declares SIX rules
+  of one shape (`derive_derived` / `master_secret` / `derive_c_hs_traffic` /
+  `derive_s_ap_traffic` / `derive_c_ap_traffic` / `finished_key`), and all six now return
+  ONE 32-field `Digest` record (b0..b31) — one concept serves all six because they share
+  the output WIDTH, the same argument that forced tranche 2's two-rule file into two
+  concepts pointing the other way. The `which` field is GONE from `SecretCtx` and from
+  every `reads:` proof. Byte-exactness measured FIRST, oracle-anchored: the shipped
+  which-form outputs captured on SIX vectors per rule (schedule_check.py's two seed-131
+  direct pairs + keysched_check.py's three seed-91 chained vectors + the vcrypto self-test
+  vector), every capture validated against the independent Python hmac/hashlib reference
+  before any edit; the record binaries reproduce all 36 rule-invocations exactly, and the
+  interpreter agrees on all 36. `tools/tls_gen/vcrypto.py::_sched` is ONE record spawn, so
+  the derived/master/traffic/finished leg is **6 sequential spawns instead of 192 pooled
+  ones** — measured on this host (WSL2, Ryzen 7 5800X, perf_counter, median of 20):
+  **150.7 ms (pooled which) → 3.2 ms (record), ~48×**; the self-test grew the six-rule leg
+  with per-rule oracle asserts and prints `sched=0.003s` beside `x25519=` / `keysched=`,
+  AEAD roundtrip green. Consumers: keysched_check.py now chains ALL TEN record rules with
+  Verbose-computed upstream values (KEYSCHED_ASSEMBLY_OK); schedule_check.py parses the
+  record JSON and asserts the field COUNT (TLS_SCHEDULE_OK; its dead `/tmp/sched`
+  placeholder runner deleted); tls_server.py's five remaining direct sites route through
+  the vcrypto wrappers; verify_binder.py's finished_key likewise. Clean negative: NO src/
+  test consumed these rules' which interface (zero greps outside tools/). gen0's verdict is
+  REFUSAL at every index, and it is PRE-EXISTING and FORM-INDEPENDENT — the `f547537`
+  which-form file ALREADY refused at rule #0 and at the declared entry (rc 1, zero bytes),
+  so tls_schedule was never in the 96/154 and the conversion moves nothing: measured by
+  truncated subsets, gen0 accepts the FIRST 1 or 2 rules of EITHER form (which-form 319473
+  / 630291 B, record form 801614 / 1576636 B) and refuses at 3+ rules — a cumulative
+  per-file budget on this ~3.0 MB six-rule source, not a record-shape gap, and NOT the
+  `aggregate_pair::total` SIGTRAP class (gen0 emits zero bytes, the safe direction).
+  EXPECTED_ACCEPTED stays 96/154; no gaps-table row moves. Corpus sweep over all 154
+  examples × every rule/reaction/service (1375 unique rule-binaries; the sweep's 1376
+  declaration rows include `vexprparse::arg_list_len`, which is declared TWICE — lines
+  18514 and 29770, a pre-existing duplicate verbosec accepts silently, noted here so it
+  stops surprising sweep authors), baseline `f547537` vs branch, baseline-vs-baseline
+  control EMPTY first: exactly the SIX converted rule-binaries change (each 326384 →
+  329708 B), every other binary byte-identical by size + sha256.
+
 ### Register conventions across emitters
 
 Emitters that span multiple syscalls or phases share a register layout. Adding a new cross-phase register use requires either claiming a currently-unused register or saving/restoring on the stack — do not casually reassign any of these without auditing every caller.

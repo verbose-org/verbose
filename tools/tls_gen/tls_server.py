@@ -24,7 +24,7 @@ def record(ct, payload): return bytes([ct]) + b"\x03\x03" + b16(len(payload)) + 
 def hkdf_extract(salt, ikm):
     return V.run_bytes("hkdf_extract", [str(b) for b in salt]+[str(b) for b in ikm], 32)
 def finished_key(secret):
-    return V.run_bytes("finished_key", [str(b) for b in secret]+[str(b) for b in bytes(32)], 32)
+    return V.finished_key(secret)   # record spawn (Digest JSON) since 2026-08-29
 
 def serve(conn):
     # 1. read ClientHello record
@@ -67,11 +67,11 @@ def serve(conn):
     transcript = ch_hs + sh_hs
 
     # 6. key schedule (PSK-DHE)
-    derived = V.run_bytes("derive_derived",[str(b) for b in early]+[str(b) for b in bytes(32)],32)
+    derived = V.derive_derived(early)          # record spawn (Digest JSON) since 2026-08-29
     handshake = hkdf_extract(derived, ecdhe)
     th_chsh = V.sha256(transcript)
     s_hs = V.derive_s_hs(handshake, th_chsh)   # record spawn (Digest JSON) since 2026-08-29
-    c_hs = V.run_bytes("derive_c_hs_traffic",[str(b) for b in handshake]+[str(b) for b in th_chsh],32)
+    c_hs = V.derive_c_hs(handshake, th_chsh)   # record spawn (Digest JSON) since 2026-08-29
     s_key=V.expand_key(s_hs); s_iv=V.expand_iv(s_hs)   # record spawns (KeyBytes / IvBytes JSON)
     c_key=V.expand_key(c_hs); c_iv=V.expand_iv(c_hs)
 
@@ -107,10 +107,10 @@ def serve(conn):
         dec=V.aead_decrypt(c_key, c_iv, 0, rec)
         print("client finished decrypt:", "ok" if dec else "FAIL", dec[0] if dec else "")
     # 10. application data: master + app traffic secrets, respond "hello world"
-    derived2 = V.run_bytes("derive_derived",[str(b) for b in handshake]+[str(b) for b in bytes(32)],32)
+    derived2 = V.derive_derived(handshake)     # record spawn (Digest JSON) since 2026-08-29
     master = hkdf_extract(derived2, bytes(32))
     th_full = V.sha256(transcript)
-    s_ap = V.run_bytes("derive_s_ap_traffic",[str(b) for b in master]+[str(b) for b in th_full],32)
+    s_ap = V.derive_s_ap(master, th_full)      # record spawn (Digest JSON) since 2026-08-29
     s_ak=V.expand_key(s_ap); s_aiv=V.expand_iv(s_ap)   # record spawns (KeyBytes / IvBytes JSON)
     http=b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nhello world"
     conn.sendall(V.aead_encrypt(s_ak, s_aiv, 0, http, 0x17))  # aead_encrypt already returns a full record
