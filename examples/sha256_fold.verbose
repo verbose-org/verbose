@@ -1,7 +1,7 @@
 @verbose 0.1.0
 
 concept ShaState
-  @intention: "SHA-256 fold state: 8 hash words + block count, counter, which, hex pre-padded data"
+  @intention: "SHA-256 fold state: 8 hash words + block count, counter, hex pre-padded data"
   @source: invoices.intent:1
   fields:
     h0 : number [0, 4294967295]
@@ -14,17 +14,54 @@ concept ShaState
     h7 : number [0, 4294967295]
     nblocks : number [0, 64]
     i : number [0, 64]
-    which : number [0, 31]
     data : text
 
 
+concept Digest
+  @intention: "the 32 output bytes of a SHA-256 digest, returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+    b16 : number [0, 255]
+    b17 : number [0, 255]
+    b18 : number [0, 255]
+    b19 : number [0, 255]
+    b20 : number [0, 255]
+    b21 : number [0, 255]
+    b22 : number [0, 255]
+    b23 : number [0, 255]
+    b24 : number [0, 255]
+    b25 : number [0, 255]
+    b26 : number [0, 255]
+    b27 : number [0, 255]
+    b28 : number [0, 255]
+    b29 : number [0, 255]
+    b30 : number [0, 255]
+    b31 : number [0, 255]
+
+
 rule sha256_fold
-  @intention: "SHA-256 over N pre-padded 64-byte blocks (hex): state=IV; per block state=compress(state,block); returns digest byte which"
+  @intention: "SHA-256 over N pre-padded 64-byte blocks (hex): state=IV; per block state=compress(state,block); returns the 32-byte digest as one Digest record"
   @source: invoices.intent:1
   input:
     s : ShaState
   output:
-    out : number
+    out : Digest
   logic:
     let bidx = if s.i == 0 then 0 else s.nblocks - s.i
     let boff = bidx * 128
@@ -676,10 +713,10 @@ rule sha256_fold
     let c_h5 = band(s.h5 + c_e62, 4294967295)
     let c_h6 = band(s.h6 + c_e61, 4294967295)
     let c_h7 = band(s.h7 + c_e60, 4294967295)
-    out = if s.i == 0 then if s.which == 0 then band(shr(s.h0, 24), 255) else if s.which == 1 then band(shr(s.h0, 16), 255) else if s.which == 2 then band(shr(s.h0, 8), 255) else if s.which == 3 then band(shr(s.h0, 0), 255) else if s.which == 4 then band(shr(s.h1, 24), 255) else if s.which == 5 then band(shr(s.h1, 16), 255) else if s.which == 6 then band(shr(s.h1, 8), 255) else if s.which == 7 then band(shr(s.h1, 0), 255) else if s.which == 8 then band(shr(s.h2, 24), 255) else if s.which == 9 then band(shr(s.h2, 16), 255) else if s.which == 10 then band(shr(s.h2, 8), 255) else if s.which == 11 then band(shr(s.h2, 0), 255) else if s.which == 12 then band(shr(s.h3, 24), 255) else if s.which == 13 then band(shr(s.h3, 16), 255) else if s.which == 14 then band(shr(s.h3, 8), 255) else if s.which == 15 then band(shr(s.h3, 0), 255) else if s.which == 16 then band(shr(s.h4, 24), 255) else if s.which == 17 then band(shr(s.h4, 16), 255) else if s.which == 18 then band(shr(s.h4, 8), 255) else if s.which == 19 then band(shr(s.h4, 0), 255) else if s.which == 20 then band(shr(s.h5, 24), 255) else if s.which == 21 then band(shr(s.h5, 16), 255) else if s.which == 22 then band(shr(s.h5, 8), 255) else if s.which == 23 then band(shr(s.h5, 0), 255) else if s.which == 24 then band(shr(s.h6, 24), 255) else if s.which == 25 then band(shr(s.h6, 16), 255) else if s.which == 26 then band(shr(s.h6, 8), 255) else if s.which == 27 then band(shr(s.h6, 0), 255) else if s.which == 28 then band(shr(s.h7, 24), 255) else if s.which == 29 then band(shr(s.h7, 16), 255) else if s.which == 30 then band(shr(s.h7, 8), 255) else band(shr(s.h7, 0), 255) else sha256_fold(ShaState { h0: c_h0, h1: c_h1, h2: c_h2, h3: c_h3, h4: c_h4, h5: c_h5, h6: c_h6, h7: c_h7, nblocks: s.nblocks, i: s.i - 1, which: s.which, data: s.data })
+    out = if s.i == 0 then Digest { b0: band(shr(s.h0, 24), 255), b1: band(shr(s.h0, 16), 255), b2: band(shr(s.h0, 8), 255), b3: band(shr(s.h0, 0), 255), b4: band(shr(s.h1, 24), 255), b5: band(shr(s.h1, 16), 255), b6: band(shr(s.h1, 8), 255), b7: band(shr(s.h1, 0), 255), b8: band(shr(s.h2, 24), 255), b9: band(shr(s.h2, 16), 255), b10: band(shr(s.h2, 8), 255), b11: band(shr(s.h2, 0), 255), b12: band(shr(s.h3, 24), 255), b13: band(shr(s.h3, 16), 255), b14: band(shr(s.h3, 8), 255), b15: band(shr(s.h3, 0), 255), b16: band(shr(s.h4, 24), 255), b17: band(shr(s.h4, 16), 255), b18: band(shr(s.h4, 8), 255), b19: band(shr(s.h4, 0), 255), b20: band(shr(s.h5, 24), 255), b21: band(shr(s.h5, 16), 255), b22: band(shr(s.h5, 8), 255), b23: band(shr(s.h5, 0), 255), b24: band(shr(s.h6, 24), 255), b25: band(shr(s.h6, 16), 255), b26: band(shr(s.h6, 8), 255), b27: band(shr(s.h6, 0), 255), b28: band(shr(s.h7, 24), 255), b29: band(shr(s.h7, 16), 255), b30: band(shr(s.h7, 8), 255), b31: band(shr(s.h7, 0), 255) } else sha256_fold(ShaState { h0: c_h0, h1: c_h1, h2: c_h2, h3: c_h3, h4: c_h4, h5: c_h5, h6: c_h6, h7: c_h7, nblocks: s.nblocks, i: s.i - 1, data: s.data })
   proofs:
     purity:
-      reads : [s.h0, s.h1, s.h2, s.h3, s.h4, s.h5, s.h6, s.h7, s.nblocks, s.i, s.which, s.data]
+      reads : [s.h0, s.h1, s.h2, s.h3, s.h4, s.h5, s.h6, s.h7, s.nblocks, s.i, s.data]
       calls : [sha256_fold]
     termination:
       bound : 400000

@@ -1013,6 +1013,68 @@ Tracking what native emits today, what it still rejects, and the design rules th
   control EMPTY first: exactly the SIX converted rule-binaries change (each 326384 →
   329708 B), every other binary byte-identical by size + sha256.
 
+  **SHA-256 FOLLOWED (2026-08-29, tranche 4) — and it is the FIRST tranche
+  whose converted rule is RECURSIVE, so it exercises agg-2a (tail recursion)
+  AND agg-2c (record-output entry) rather than agg-1 alone.**
+  `examples/sha256_fold.verbose` (`tools/tls_gen/sha256n_gen.py`,
+  generator-driven and verified byte-in-sync with the committed file BEFORE
+  editing — regenerate → `git status` clean) declares ONE rule `sha256_fold`
+  that RECURSES over N pre-padded 64-byte blocks (`decreasing : i`) and at the
+  base case now returns all 32 digest bytes as one `Digest` record (b0..b31)
+  instead of one byte per `which` spawn. Two edits: the base case's 32-branch
+  `if s.which == k` dispatch became a `Digest { b0: band(shr(s.h0,24),255),
+  … b31: band(shr(s.h7,0),255) }` constructor — the recursion sits in a record
+  TAIL position (the whole value of the `else` arm), so agg-2a's forward hands
+  the ONE caller-allocated destination down every frame and only the base case
+  writes it — and the recursive tail call dropped `which: s.which`; the `which`
+  field is gone from `ShaState` and from the `reads:` proof. 106230 → 110256 B
+  native.
+  Byte-exactness measured FIRST, oracle-anchored: the shipped which-form
+  outputs were captured on FOUR vectors — empty → `e3b0c442…`, `"abc"` →
+  `ba7816bf…` (FIPS-180), the 448-bit 2-block vector → `248d6a61…`, and a
+  200-byte 4-block message (exercises the recursion depth) — each validated
+  against the published SHA-256 vector AND Python `hashlib` before any edit;
+  the record binary reproduces all four exactly, and the interpreter agrees on
+  all four. Reproducible emit: compiled twice, byte-identical.
+  `tools/tls_gen/vcrypto.py::sha256()` collapsed from 32 parallel `which`
+  spawns (64-thread pool) to ONE record spawn via `_record_bytes` — measured
+  on this host (WSL2, Ryzen 7 5800X, perf_counter, median of 20, on the
+  200-byte 4-block message): **25.6 ms → 0.35 ms, ~73×**; the self-test grew a
+  timed three-vector sha256 leg (empty / abc / 4-block, each vs hashlib) and
+  prints `sha256=0.001s` beside `x25519=` / `keysched=` / `sched=`, AEAD
+  roundtrip green. The thread pool STAYS — AES/GCM/GHASH still spawn one byte
+  per `which`; those are the final tranche.
+  CONSUMERS: five files reference `sha256_fold`. `vcrypto.py` is the ONLY
+  which-spawn site and is converted; `sha256n_gen.py` is the generator
+  (updated). The three P-256 files (`make_cert_p256.py`, `ecdsa_p256.py`,
+  `tls_browser_p256_server.py`) only `ensure`-compile the binary and hash via
+  `V.sha256()`, so they need NO interface change (nor do `tls_server.py`,
+  `tls_browser_server.py`, `verify_binder.py`, which likewise route through the
+  wrapper). P-256 exercised: `ecdsa_p256.py`'s RFC 6979 Appendix A.2.5 vectors
+  (messages `"sample"` and `"test"`) produce the EXACT published (k, r, s)
+  through the record-form `sha256()` (its `__main__` PEM tail needs the absent
+  `cryptography` module — unrelated to this change). Clean negative: NO
+  `src/native.rs` test consumed this rule's which interface (the only
+  `sha256_fold` grep in `src/` is a comment in the corpus-sweep doc block), so
+  nothing grew into the hole.
+  gen0's verdict is the AGREEMENT cell, and it is the FIRST converted crypto
+  file gen0 leads INTO agreement rather than refusing (tranche 3's tls_schedule
+  refused at every index): `sha256_fold` is a single rule, so rule #0 == the
+  declared entry, and gen0 ACCEPTS the record form (199940 → 202260 B), its
+  emitted binary agreeing with verbosec byte-for-byte on stdout + exit code
+  across all three vectors (all == hashlib). Same shape as `fib_pair`
+  post-agg-2c: gen0's recursive record emit serialises the arena node its own
+  walk produces, and here it matches verbosec's record arm. EXPECTED_ACCEPTED
+  is unchanged (sha256_fold was accepted in BOTH forms); no gaps-table row
+  moves.
+  Corpus sweep over all 154 examples × every rule/reaction/service (1375
+  unique rule-binaries), baseline `4e17c06` vs branch, baseline-vs-baseline
+  control EMPTY first: exactly the ONE converted rule-binary changes
+  (sha256_fold 106230 → 110256 B), every other binary byte-identical by size +
+  sha256. The compiler (`src/`) is UNCHANGED — only
+  `examples/sha256_fold.verbose` and the two `tools/tls_gen/` files differ — so
+  "everything else byte-identical" is both measured and structural.
+
 ### Register conventions across emitters
 
 Emitters that span multiple syscalls or phases share a register layout. Adding a new cross-phase register use requires either claiming a currently-unused register or saving/restoring on the stack — do not casually reassign any of these without auditing every caller.

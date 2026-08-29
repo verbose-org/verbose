@@ -35,32 +35,40 @@ for t in range(16):
     lets.append((wn, f"band(bor(bor(bor(shl({bytenames[0]}, 24), shl({bytenames[1]}, 16)), shl({bytenames[2]}, 8)), {bytenames[3]}), {Mb})"))
     bw.append(wn)
 newstate = emit_compress(lets, "c", state, bw)
-fparts=[]
+# All 32 output bytes are returned TOGETHER as one Digest record (aggregate-
+# return arc, slice agg-2a: a RECURSIVE rule returns an aggregate in a record
+# TAIL position) instead of one byte per `which` spawn. ONE invocation yields
+# the whole digest as {"b0":...,...,"b31":...} JSON. Field names stay b0..b31
+# so the host unpacks every record with the same `rec[f"b{i}"]` loop as the
+# tranche-2 (hsecret/expand) and tranche-3 (tls_schedule) rules. The `which`
+# field is gone from ShaState and from the reads: proof; the base case's
+# 32-branch dispatch chain became a record constructor over the same bytes,
+# and the recursive tail call drops `which: s.which`.
+dfields=[]
 for wd in range(8):
     for j in range(4):
-        idx=wd*4+j; expr=f"band(shr(s.h{wd}, {24-8*j}), 255)"
-        if idx==0: fparts.append(f"if s.which == 0 then {expr}")
-        elif idx<31: fparts.append(f"if s.which == {idx} then {expr}")
-        else: fparts.append(expr)
-def nest(p):
-    e=p[-1]
-    for x in reversed(p[:-1]): e=f"{x} else {e}"
-    return e
-finalize=nest(fparts)
-rf=[f"h{k}: {newstate[k]}" for k in range(8)] + ["nblocks: s.nblocks","i: s.i - 1","which: s.which","data: s.data"]
+        idx=wd*4+j
+        dfields.append(f"b{idx}: band(shr(s.h{wd}, {24-8*j}), 255)")
+finalize="Digest { " + ", ".join(dfields) + " }"
+rf=[f"h{k}: {newstate[k]}" for k in range(8)] + ["nblocks: s.nblocks","i: s.i - 1","data: s.data"]
 rec="sha256_fold(ShaState { " + ", ".join(rf) + " })"
 body=f"if s.i == 0 then {finalize} else {rec}"
 lines=["@verbose 0.1.0","","concept ShaState",
-       '  @intention: "SHA-256 fold state: 8 hash words + block count, counter, which, hex pre-padded data"',
+       '  @intention: "SHA-256 fold state: 8 hash words + block count, counter, hex pre-padded data"',
        "  @source: invoices.intent:1","  fields:"]
 for k in range(8): lines.append(f"    h{k} : number [0, 4294967295]")
-lines += ["    nblocks : number [0, 64]","    i : number [0, 64]","    which : number [0, 31]","    data : text","","",
+lines += ["    nblocks : number [0, 64]","    i : number [0, 64]","    data : text","","",
+          "concept Digest",
+          '  @intention: "the 32 output bytes of a SHA-256 digest, returned together as one record"',
+          "  @source: invoices.intent:1","  fields:"]
+for i in range(32): lines.append(f"    b{i} : number [0, 255]")
+lines += ["","",
           "rule sha256_fold",
-          '  @intention: "SHA-256 over N pre-padded 64-byte blocks (hex): state=IV; per block state=compress(state,block); returns digest byte which"',
-          "  @source: invoices.intent:1","  input:","    s : ShaState","  output:","    out : number","  logic:"]
+          '  @intention: "SHA-256 over N pre-padded 64-byte blocks (hex): state=IV; per block state=compress(state,block); returns the 32-byte digest as one Digest record"',
+          "  @source: invoices.intent:1","  input:","    s : ShaState","  output:","    out : Digest","  logic:"]
 for n,e in lets: lines.append(f"    let {n} = {e}")
 lines.append(f"    out = {body}")
-reads=", ".join([f"s.h{k}" for k in range(8)]+["s.nblocks","s.i","s.which","s.data"])
+reads=", ".join([f"s.h{k}" for k in range(8)]+["s.nblocks","s.i","s.data"])
 lines += ["  proofs:","    purity:",f"      reads : [{reads}]","      calls : [sha256_fold]",
           "    termination:","      bound : 400000","      decreasing : i",""]
 open("examples/sha256_fold.verbose","w").write("\n".join(lines))
