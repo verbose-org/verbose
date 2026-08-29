@@ -1,7 +1,7 @@
 @verbose 0.1.0
 
 concept Secret
-  @intention: "32-byte HKDF secret + which output byte"
+  @intention: "32-byte HKDF secret"
   @source: invoices.intent:1
   fields:
     s0 : number [0, 255]
@@ -36,16 +36,55 @@ concept Secret
     s29 : number [0, 255]
     s30 : number [0, 255]
     s31 : number [0, 255]
-    which : number [0, 15]
+
+
+concept KeyBytes
+  @intention: "the 16 output bytes of HKDF-Expand-Label(secret, key, empty, 16), returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+
+
+concept IvBytes
+  @intention: "the 12 output bytes of HKDF-Expand-Label(secret, iv, empty, 12), returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
 
 
 rule expand_key
-  @intention: "HKDF-Expand-Label(secret, key, empty, 16) per RFC 8446 7.1 (TLS record key)"
+  @intention: "HKDF-Expand-Label(secret, key, empty, 16) per RFC 8446 7.1 (TLS record key); all 16 bytes as one KeyBytes record"
   @source: invoices.intent:1
   input:
     s : Secret
   output:
-    out : number
+    out : KeyBytes
   logic:
     let expand_key_ip0 = bxor(s.s0, 54)
     let expand_key_op0 = bxor(s.s0, 92)
@@ -1567,37 +1606,22 @@ rule expand_key
     let expand_key_ou_ob7_1 = band(shr(expand_key_ou_h7_1, 16), 255)
     let expand_key_ou_ob7_2 = band(shr(expand_key_ou_h7_1, 8), 255)
     let expand_key_ou_ob7_3 = band(shr(expand_key_ou_h7_1, 0), 255)
-    out = if s.which == 0 then expand_key_ou_ob0_0
-      else if s.which == 1 then expand_key_ou_ob0_1
-      else if s.which == 2 then expand_key_ou_ob0_2
-      else if s.which == 3 then expand_key_ou_ob0_3
-      else if s.which == 4 then expand_key_ou_ob1_0
-      else if s.which == 5 then expand_key_ou_ob1_1
-      else if s.which == 6 then expand_key_ou_ob1_2
-      else if s.which == 7 then expand_key_ou_ob1_3
-      else if s.which == 8 then expand_key_ou_ob2_0
-      else if s.which == 9 then expand_key_ou_ob2_1
-      else if s.which == 10 then expand_key_ou_ob2_2
-      else if s.which == 11 then expand_key_ou_ob2_3
-      else if s.which == 12 then expand_key_ou_ob3_0
-      else if s.which == 13 then expand_key_ou_ob3_1
-      else if s.which == 14 then expand_key_ou_ob3_2
-      else expand_key_ou_ob3_3
+    out = KeyBytes { b0: expand_key_ou_ob0_0, b1: expand_key_ou_ob0_1, b2: expand_key_ou_ob0_2, b3: expand_key_ou_ob0_3, b4: expand_key_ou_ob1_0, b5: expand_key_ou_ob1_1, b6: expand_key_ou_ob1_2, b7: expand_key_ou_ob1_3, b8: expand_key_ou_ob2_0, b9: expand_key_ou_ob2_1, b10: expand_key_ou_ob2_2, b11: expand_key_ou_ob2_3, b12: expand_key_ou_ob3_0, b13: expand_key_ou_ob3_1, b14: expand_key_ou_ob3_2, b15: expand_key_ou_ob3_3 }
   proofs:
     purity:
-      reads : [s.s0, s.s1, s.s2, s.s3, s.s4, s.s5, s.s6, s.s7, s.s8, s.s9, s.s10, s.s11, s.s12, s.s13, s.s14, s.s15, s.s16, s.s17, s.s18, s.s19, s.s20, s.s21, s.s22, s.s23, s.s24, s.s25, s.s26, s.s27, s.s28, s.s29, s.s30, s.s31, s.which]
+      reads : [s.s0, s.s1, s.s2, s.s3, s.s4, s.s5, s.s6, s.s7, s.s8, s.s9, s.s10, s.s11, s.s12, s.s13, s.s14, s.s15, s.s16, s.s17, s.s18, s.s19, s.s20, s.s21, s.s22, s.s23, s.s24, s.s25, s.s26, s.s27, s.s28, s.s29, s.s30, s.s31]
       calls : []
     termination:
       bound : 400000
 
 
 rule expand_iv
-  @intention: "HKDF-Expand-Label(secret, iv, empty, 12) per RFC 8446 7.1 (TLS record IV)"
+  @intention: "HKDF-Expand-Label(secret, iv, empty, 12) per RFC 8446 7.1 (TLS record IV); all 12 bytes as one IvBytes record"
   @source: invoices.intent:1
   input:
     s : Secret
   output:
-    out : number
+    out : IvBytes
   logic:
     let expand_iv_ip0 = bxor(s.s0, 54)
     let expand_iv_op0 = bxor(s.s0, 92)
@@ -3119,21 +3143,10 @@ rule expand_iv
     let expand_iv_ou_ob7_1 = band(shr(expand_iv_ou_h7_1, 16), 255)
     let expand_iv_ou_ob7_2 = band(shr(expand_iv_ou_h7_1, 8), 255)
     let expand_iv_ou_ob7_3 = band(shr(expand_iv_ou_h7_1, 0), 255)
-    out = if s.which == 0 then expand_iv_ou_ob0_0
-      else if s.which == 1 then expand_iv_ou_ob0_1
-      else if s.which == 2 then expand_iv_ou_ob0_2
-      else if s.which == 3 then expand_iv_ou_ob0_3
-      else if s.which == 4 then expand_iv_ou_ob1_0
-      else if s.which == 5 then expand_iv_ou_ob1_1
-      else if s.which == 6 then expand_iv_ou_ob1_2
-      else if s.which == 7 then expand_iv_ou_ob1_3
-      else if s.which == 8 then expand_iv_ou_ob2_0
-      else if s.which == 9 then expand_iv_ou_ob2_1
-      else if s.which == 10 then expand_iv_ou_ob2_2
-      else expand_iv_ou_ob2_3
+    out = IvBytes { b0: expand_iv_ou_ob0_0, b1: expand_iv_ou_ob0_1, b2: expand_iv_ou_ob0_2, b3: expand_iv_ou_ob0_3, b4: expand_iv_ou_ob1_0, b5: expand_iv_ou_ob1_1, b6: expand_iv_ou_ob1_2, b7: expand_iv_ou_ob1_3, b8: expand_iv_ou_ob2_0, b9: expand_iv_ou_ob2_1, b10: expand_iv_ou_ob2_2, b11: expand_iv_ou_ob2_3 }
   proofs:
     purity:
-      reads : [s.s0, s.s1, s.s2, s.s3, s.s4, s.s5, s.s6, s.s7, s.s8, s.s9, s.s10, s.s11, s.s12, s.s13, s.s14, s.s15, s.s16, s.s17, s.s18, s.s19, s.s20, s.s21, s.s22, s.s23, s.s24, s.s25, s.s26, s.s27, s.s28, s.s29, s.s30, s.s31, s.which]
+      reads : [s.s0, s.s1, s.s2, s.s3, s.s4, s.s5, s.s6, s.s7, s.s8, s.s9, s.s10, s.s11, s.s12, s.s13, s.s14, s.s15, s.s16, s.s17, s.s18, s.s19, s.s20, s.s21, s.s22, s.s23, s.s24, s.s25, s.s26, s.s27, s.s28, s.s29, s.s30, s.s31]
       calls : []
     termination:
       bound : 400000

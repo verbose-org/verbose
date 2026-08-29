@@ -12,22 +12,24 @@ lets = []
 key64 = [str(b) for b in derived] + ["0"]*32
 msg = [f"s.e{i}" for i in range(32)]
 mac = emit_hmac(lets, "hs", key64, msg)
-disp = []
-for i in range(32):
-    if i == 0: disp.append(f"    out = if s.which == 0 then {mac[0]}")
-    elif i < 31: disp.append(f"      else if s.which == {i} then {mac[i]}")
-    else: disp.append(f"      else {mac[31]}")
+# All 32 output bytes are returned TOGETHER as one Digest record (aggregate-
+# return arc, slices agg-1/agg-2c 2026-08): one invocation yields the whole
+# secret as {"b0":...,...,"b31":...} JSON instead of one byte per `which` spawn.
+finalize = "Digest { " + ", ".join(f"b{i}: {mac[i]}" for i in range(32)) + " }"
 lines = ["@verbose 0.1.0","","concept Ecdhe",
-         '  @intention: "32-byte ECDHE shared secret (X25519 output) + which output byte"',
+         '  @intention: "32-byte ECDHE shared secret (X25519 output)"',
          "  @source: invoices.intent:1","  fields:"]
 for i in range(32): lines.append(f"    e{i} : number [0, 255]")
-lines.append("    which : number [0, 31]")
+lines += ["","","concept Digest",
+          '  @intention: "the 32 output bytes of the TLS 1.3 Handshake Secret, returned together as one record"',
+          "  @source: invoices.intent:1","  fields:"]
+for i in range(32): lines.append(f"    b{i} : number [0, 255]")
 lines += ["","","rule handshake_secret",
-          '  @intention: "TLS 1.3 Handshake Secret = HKDF-Extract(Derive-Secret(Early,derived,empty), ECDHE); byte which (RFC 8446 7.1)"',
-          "  @source: invoices.intent:1","  input:","    s : Ecdhe","  output:","    out : number","  logic:"]
+          '  @intention: "TLS 1.3 Handshake Secret = HKDF-Extract(Derive-Secret(Early,derived,empty), ECDHE); all 32 bytes as one Digest record (RFC 8446 7.1)"',
+          "  @source: invoices.intent:1","  input:","    s : Ecdhe","  output:","    out : Digest","  logic:"]
 for n,e in lets: lines.append(f"    let {n} = {e}")
-lines.extend(disp)
-reads = ", ".join([f"s.e{i}" for i in range(32)] + ["s.which"])
+lines.append(f"    out = {finalize}")
+reads = ", ".join([f"s.e{i}" for i in range(32)])
 lines += ["  proofs:","    purity:",f"      reads : [{reads}]","      calls : []",
           "    termination:","      bound : 400000",""]
 open("examples/handshake_secret.verbose","w").write("\n".join(lines))
