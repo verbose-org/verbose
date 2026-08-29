@@ -1,4 +1,4 @@
-import subprocess, sys, random, hmac, hashlib
+import subprocess, sys, random, hmac, hashlib, json
 
 def expand_label(secret, label, ctx, length):
     info = length.to_bytes(2,'big')+bytes([len(b"tls13 "+label)])+b"tls13 "+label+bytes([len(ctx)])+ctx
@@ -13,13 +13,15 @@ def ref(ecdhe, thash):
     return hs, s_hs, expand_label(s_hs, b"key", b"", 16), expand_label(s_hs, b"iv", b"", 12)
 
 def run(binp, args, n):
-    out=[]
-    for w in range(n):
-        r=subprocess.run([binp]+args+[str(w)],capture_output=True,text=True,timeout=600)
-        s=r.stdout.strip()
-        if s=="": sys.exit(2)
-        out.append(int(s))
-    return bytes(out)
+    # All four rules return RECORDS since 2026-08-29 (aggregate-return arc):
+    # ONE spawn yields every output byte as {"b0":...,...,"b(n-1)":...} JSON,
+    # where the old `which` interface took n spawns of one byte each.
+    r=subprocess.run([binp]+args,capture_output=True,text=True,timeout=600)
+    s=r.stdout.strip()
+    if s=="": sys.exit(2)
+    rec=json.loads(s)
+    if len(rec)!=n: sys.exit(2)
+    return bytes(rec[f"b{i}"] for i in range(n))
 
 def vrun(ecdhe, thash):
     hs   = run("/tmp/ks_hs", [str(b) for b in ecdhe], 32)

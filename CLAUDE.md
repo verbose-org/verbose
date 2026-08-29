@@ -930,6 +930,47 @@ Tracking what native emits today, what it still rejects, and the design rules th
   `x25519_ladder_recursive_matches_rfc7748` got STRONGER: it asserts the exact 20-limb JSON
   record from ONE run, where the which form sampled 4 limbs at one full ladder each.
 
+  **THE HKDF-EXPAND FAMILY FOLLOWED (2026-08-29), AND THIS TRANCHE IS GENERATOR-DRIVEN — not
+  one hand-edited line in the three `.verbose` files.** `examples/handshake_secret.verbose`
+  (`tools/tls_gen/hsecret_gen.py`), `examples/derive_secret.verbose` (`derivesec_gen.py`) and
+  `examples/hkdf_expand_label.verbose` (`expand_gen.py`) now return records: `handshake_secret`
+  and `derive_s_hs_traffic` → a 32-field `Digest` (b0..b31) each, `expand_key` → a 16-field
+  `KeyBytes`, `expand_iv` → a 12-field `IvBytes` — one concept PER RULE in the two-rule file,
+  because the rules' output WIDTHS differ (16 vs 12) and a record's width is its concept
+  declaration; the field names stay `b0..bN-1` in all four so the host unpacks every record
+  with one `rec[f"b{i}"]` loop. Each generator was verified byte-in-sync with its committed
+  `.verbose` BEFORE being edited (regenerate → `git status` clean), then edited and re-run —
+  the `which` field is GONE from `Ecdhe` / `DeriveInput` / `Secret` and from every `reads:`
+  proof, and the 32/16/12-branch dispatch chains became record constructors over the same
+  let-bound values. Byte-exactness measured FIRST, oracle-anchored: the shipped which-form
+  binaries' outputs were captured on FOUR vectors (keysched_check.py's three seed-91 chained
+  vectors + the vcrypto self-test vector), each capture validated against the independent
+  Python hmac/hashlib reference before any edit; the record binaries reproduce all 16
+  rule-invocations exactly, and the interpreter agrees on all four rules.
+  `tools/tls_gen/vcrypto.py`: `handshake_secret` / `derive_s_hs` / `expand_key` / `expand_iv`
+  are one record spawn each, so a server key-schedule leg (hs → s_hs → key + iv) is **4
+  sequential spawns instead of 92 pooled ones** — measured on this host (WSL2, Ryzen 7 5800X,
+  perf_counter, median of 20): **70.3 ms (pooled which) → 1.24 ms (record), ~57×**; the
+  self-test prints `keysched=0.011s` alongside the unchanged `x25519=0.010s` and the AEAD
+  roundtrip stays green. The thread pool STAYS — sha256, the SIX tls_schedule.verbose rules
+  (`derive_derived` / `master_secret` / `derive_c_hs_traffic` / `derive_s_ap_traffic` /
+  `derive_c_ap_traffic` / `finished_key`), and the AES/GCM/GHASH loops still spawn one byte
+  per `which`; those are the next tranches. Consumers updated: `keysched_check.py` parses the
+  record JSON (and now asserts the field COUNT, which the which-loop never could) —
+  KEYSCHED_ASSEMBLY_OK; `tls_server.py`'s five direct `run_bytes` sites for these rules route
+  through the vcrypto wrappers; the browser/cert servers already did. Clean negative: NO
+  `src/native.rs` test consumed these rules' which interface (the only greps are the
+  historical 33-file list in the corpus sweep's doc comment), so nothing grew into the hole.
+  gen0's verdict is the AGREEMENT cell on all four entries — probed at rule #0 AND at the
+  declared entry (`hkdf_expand_label` at BOTH indices, since `expand_key` is #0 and
+  `expand_iv` is #1): rc 0 in every cell, and the emitted binaries agree with verbosec's
+  **byte-for-byte on stdout + exit code** on the self-test vector. None of the three joins
+  the `aggregate_pair::total` record-let SIGTRAP row; EXPECTED_ACCEPTED stays 96/154.
+  Corpus sweep over all 154 examples × every rule/reaction/service (1375 rule-binaries),
+  baseline `e3b19d9` vs branch, baseline-vs-baseline control EMPTY first: exactly the FOUR
+  converted rule-binaries change (hs 323008 → 326332 B, ds 326384 → 329708 B, ek 322256 →
+  323836 B, ei 322080 → 323224 B), every other binary byte-identical by size + sha256.
+
 ### Register conventions across emitters
 
 Emitters that span multiple syscalls or phases share a register layout. Adding a new cross-phase register use requires either claiming a currently-unused register or saving/restoring on the stack — do not casually reassign any of these without auditing every caller.
