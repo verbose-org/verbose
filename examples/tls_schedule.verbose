@@ -1,7 +1,7 @@
 @verbose 0.1.0
 
 concept SecretCtx
-  @intention: "32-byte secret + 32-byte transcript context (used only by transcript rules) + which output byte"
+  @intention: "32-byte secret + 32-byte transcript context (used only by transcript rules)"
   @source: invoices.intent:1
   fields:
     s0 : number [0, 255]
@@ -68,16 +68,53 @@ concept SecretCtx
     t29 : number [0, 255]
     t30 : number [0, 255]
     t31 : number [0, 255]
-    which : number [0, 31]
+
+
+concept Digest
+  @intention: "the 32 output bytes of a TLS 1.3 key-schedule derivation, returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+    b16 : number [0, 255]
+    b17 : number [0, 255]
+    b18 : number [0, 255]
+    b19 : number [0, 255]
+    b20 : number [0, 255]
+    b21 : number [0, 255]
+    b22 : number [0, 255]
+    b23 : number [0, 255]
+    b24 : number [0, 255]
+    b25 : number [0, 255]
+    b26 : number [0, 255]
+    b27 : number [0, 255]
+    b28 : number [0, 255]
+    b29 : number [0, 255]
+    b30 : number [0, 255]
+    b31 : number [0, 255]
 
 
 rule derive_derived
-  @intention: "Derive-Secret(secret, derived, empty) = HKDF-Expand-Label(secret, derived, SHA256(empty), 32)"
+  @intention: "Derive-Secret(secret, derived, empty) = HKDF-Expand-Label(secret, derived, SHA256(empty), 32); all 32 bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : SecretCtx
   output:
-    out : number
+    out : Digest
   logic:
     let derive_derived_ip0 = bxor(g.s0, 54)
     let derive_derived_op0 = bxor(g.s0, 92)
@@ -1599,53 +1636,22 @@ rule derive_derived
     let derive_derived_ou_ob7_1 = band(shr(derive_derived_ou_h7_1, 16), 255)
     let derive_derived_ou_ob7_2 = band(shr(derive_derived_ou_h7_1, 8), 255)
     let derive_derived_ou_ob7_3 = band(shr(derive_derived_ou_h7_1, 0), 255)
-    out = if g.which == 0 then derive_derived_ou_ob0_0
-      else if g.which == 1 then derive_derived_ou_ob0_1
-      else if g.which == 2 then derive_derived_ou_ob0_2
-      else if g.which == 3 then derive_derived_ou_ob0_3
-      else if g.which == 4 then derive_derived_ou_ob1_0
-      else if g.which == 5 then derive_derived_ou_ob1_1
-      else if g.which == 6 then derive_derived_ou_ob1_2
-      else if g.which == 7 then derive_derived_ou_ob1_3
-      else if g.which == 8 then derive_derived_ou_ob2_0
-      else if g.which == 9 then derive_derived_ou_ob2_1
-      else if g.which == 10 then derive_derived_ou_ob2_2
-      else if g.which == 11 then derive_derived_ou_ob2_3
-      else if g.which == 12 then derive_derived_ou_ob3_0
-      else if g.which == 13 then derive_derived_ou_ob3_1
-      else if g.which == 14 then derive_derived_ou_ob3_2
-      else if g.which == 15 then derive_derived_ou_ob3_3
-      else if g.which == 16 then derive_derived_ou_ob4_0
-      else if g.which == 17 then derive_derived_ou_ob4_1
-      else if g.which == 18 then derive_derived_ou_ob4_2
-      else if g.which == 19 then derive_derived_ou_ob4_3
-      else if g.which == 20 then derive_derived_ou_ob5_0
-      else if g.which == 21 then derive_derived_ou_ob5_1
-      else if g.which == 22 then derive_derived_ou_ob5_2
-      else if g.which == 23 then derive_derived_ou_ob5_3
-      else if g.which == 24 then derive_derived_ou_ob6_0
-      else if g.which == 25 then derive_derived_ou_ob6_1
-      else if g.which == 26 then derive_derived_ou_ob6_2
-      else if g.which == 27 then derive_derived_ou_ob6_3
-      else if g.which == 28 then derive_derived_ou_ob7_0
-      else if g.which == 29 then derive_derived_ou_ob7_1
-      else if g.which == 30 then derive_derived_ou_ob7_2
-      else derive_derived_ou_ob7_3
+    out = Digest { b0: derive_derived_ou_ob0_0, b1: derive_derived_ou_ob0_1, b2: derive_derived_ou_ob0_2, b3: derive_derived_ou_ob0_3, b4: derive_derived_ou_ob1_0, b5: derive_derived_ou_ob1_1, b6: derive_derived_ou_ob1_2, b7: derive_derived_ou_ob1_3, b8: derive_derived_ou_ob2_0, b9: derive_derived_ou_ob2_1, b10: derive_derived_ou_ob2_2, b11: derive_derived_ou_ob2_3, b12: derive_derived_ou_ob3_0, b13: derive_derived_ou_ob3_1, b14: derive_derived_ou_ob3_2, b15: derive_derived_ou_ob3_3, b16: derive_derived_ou_ob4_0, b17: derive_derived_ou_ob4_1, b18: derive_derived_ou_ob4_2, b19: derive_derived_ou_ob4_3, b20: derive_derived_ou_ob5_0, b21: derive_derived_ou_ob5_1, b22: derive_derived_ou_ob5_2, b23: derive_derived_ou_ob5_3, b24: derive_derived_ou_ob6_0, b25: derive_derived_ou_ob6_1, b26: derive_derived_ou_ob6_2, b27: derive_derived_ou_ob6_3, b28: derive_derived_ou_ob7_0, b29: derive_derived_ou_ob7_1, b30: derive_derived_ou_ob7_2, b31: derive_derived_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.which]
+      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31]
       calls : []
     termination:
       bound : 400000
 
 
 rule master_secret
-  @intention: "Master Secret = HKDF-Extract(derived, 0^32) = HMAC(derived, zero) (RFC 8446 7.1)"
+  @intention: "Master Secret = HKDF-Extract(derived, 0^32) = HMAC(derived, zero) (RFC 8446 7.1); all 32 bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : SecretCtx
   output:
-    out : number
+    out : Digest
   logic:
     let master_secret_ip0 = bxor(g.s0, 54)
     let master_secret_op0 = bxor(g.s0, 92)
@@ -3167,53 +3173,22 @@ rule master_secret
     let master_secret_ou_ob7_1 = band(shr(master_secret_ou_h7_1, 16), 255)
     let master_secret_ou_ob7_2 = band(shr(master_secret_ou_h7_1, 8), 255)
     let master_secret_ou_ob7_3 = band(shr(master_secret_ou_h7_1, 0), 255)
-    out = if g.which == 0 then master_secret_ou_ob0_0
-      else if g.which == 1 then master_secret_ou_ob0_1
-      else if g.which == 2 then master_secret_ou_ob0_2
-      else if g.which == 3 then master_secret_ou_ob0_3
-      else if g.which == 4 then master_secret_ou_ob1_0
-      else if g.which == 5 then master_secret_ou_ob1_1
-      else if g.which == 6 then master_secret_ou_ob1_2
-      else if g.which == 7 then master_secret_ou_ob1_3
-      else if g.which == 8 then master_secret_ou_ob2_0
-      else if g.which == 9 then master_secret_ou_ob2_1
-      else if g.which == 10 then master_secret_ou_ob2_2
-      else if g.which == 11 then master_secret_ou_ob2_3
-      else if g.which == 12 then master_secret_ou_ob3_0
-      else if g.which == 13 then master_secret_ou_ob3_1
-      else if g.which == 14 then master_secret_ou_ob3_2
-      else if g.which == 15 then master_secret_ou_ob3_3
-      else if g.which == 16 then master_secret_ou_ob4_0
-      else if g.which == 17 then master_secret_ou_ob4_1
-      else if g.which == 18 then master_secret_ou_ob4_2
-      else if g.which == 19 then master_secret_ou_ob4_3
-      else if g.which == 20 then master_secret_ou_ob5_0
-      else if g.which == 21 then master_secret_ou_ob5_1
-      else if g.which == 22 then master_secret_ou_ob5_2
-      else if g.which == 23 then master_secret_ou_ob5_3
-      else if g.which == 24 then master_secret_ou_ob6_0
-      else if g.which == 25 then master_secret_ou_ob6_1
-      else if g.which == 26 then master_secret_ou_ob6_2
-      else if g.which == 27 then master_secret_ou_ob6_3
-      else if g.which == 28 then master_secret_ou_ob7_0
-      else if g.which == 29 then master_secret_ou_ob7_1
-      else if g.which == 30 then master_secret_ou_ob7_2
-      else master_secret_ou_ob7_3
+    out = Digest { b0: master_secret_ou_ob0_0, b1: master_secret_ou_ob0_1, b2: master_secret_ou_ob0_2, b3: master_secret_ou_ob0_3, b4: master_secret_ou_ob1_0, b5: master_secret_ou_ob1_1, b6: master_secret_ou_ob1_2, b7: master_secret_ou_ob1_3, b8: master_secret_ou_ob2_0, b9: master_secret_ou_ob2_1, b10: master_secret_ou_ob2_2, b11: master_secret_ou_ob2_3, b12: master_secret_ou_ob3_0, b13: master_secret_ou_ob3_1, b14: master_secret_ou_ob3_2, b15: master_secret_ou_ob3_3, b16: master_secret_ou_ob4_0, b17: master_secret_ou_ob4_1, b18: master_secret_ou_ob4_2, b19: master_secret_ou_ob4_3, b20: master_secret_ou_ob5_0, b21: master_secret_ou_ob5_1, b22: master_secret_ou_ob5_2, b23: master_secret_ou_ob5_3, b24: master_secret_ou_ob6_0, b25: master_secret_ou_ob6_1, b26: master_secret_ou_ob6_2, b27: master_secret_ou_ob6_3, b28: master_secret_ou_ob7_0, b29: master_secret_ou_ob7_1, b30: master_secret_ou_ob7_2, b31: master_secret_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.which]
+      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31]
       calls : []
     termination:
       bound : 400000
 
 
 rule derive_c_hs_traffic
-  @intention: "Derive-Secret(secret, c hs traffic, transcript) [RFC 8446 7.1] -> client handshake traffic secret"
+  @intention: "Derive-Secret(secret, c hs traffic, transcript) [RFC 8446 7.1] -> client handshake traffic secret; all 32 bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : SecretCtx
   output:
-    out : number
+    out : Digest
   logic:
     let derive_c_hs_traffic_ip0 = bxor(g.s0, 54)
     let derive_c_hs_traffic_op0 = bxor(g.s0, 92)
@@ -4735,53 +4710,22 @@ rule derive_c_hs_traffic
     let derive_c_hs_traffic_ou_ob7_1 = band(shr(derive_c_hs_traffic_ou_h7_1, 16), 255)
     let derive_c_hs_traffic_ou_ob7_2 = band(shr(derive_c_hs_traffic_ou_h7_1, 8), 255)
     let derive_c_hs_traffic_ou_ob7_3 = band(shr(derive_c_hs_traffic_ou_h7_1, 0), 255)
-    out = if g.which == 0 then derive_c_hs_traffic_ou_ob0_0
-      else if g.which == 1 then derive_c_hs_traffic_ou_ob0_1
-      else if g.which == 2 then derive_c_hs_traffic_ou_ob0_2
-      else if g.which == 3 then derive_c_hs_traffic_ou_ob0_3
-      else if g.which == 4 then derive_c_hs_traffic_ou_ob1_0
-      else if g.which == 5 then derive_c_hs_traffic_ou_ob1_1
-      else if g.which == 6 then derive_c_hs_traffic_ou_ob1_2
-      else if g.which == 7 then derive_c_hs_traffic_ou_ob1_3
-      else if g.which == 8 then derive_c_hs_traffic_ou_ob2_0
-      else if g.which == 9 then derive_c_hs_traffic_ou_ob2_1
-      else if g.which == 10 then derive_c_hs_traffic_ou_ob2_2
-      else if g.which == 11 then derive_c_hs_traffic_ou_ob2_3
-      else if g.which == 12 then derive_c_hs_traffic_ou_ob3_0
-      else if g.which == 13 then derive_c_hs_traffic_ou_ob3_1
-      else if g.which == 14 then derive_c_hs_traffic_ou_ob3_2
-      else if g.which == 15 then derive_c_hs_traffic_ou_ob3_3
-      else if g.which == 16 then derive_c_hs_traffic_ou_ob4_0
-      else if g.which == 17 then derive_c_hs_traffic_ou_ob4_1
-      else if g.which == 18 then derive_c_hs_traffic_ou_ob4_2
-      else if g.which == 19 then derive_c_hs_traffic_ou_ob4_3
-      else if g.which == 20 then derive_c_hs_traffic_ou_ob5_0
-      else if g.which == 21 then derive_c_hs_traffic_ou_ob5_1
-      else if g.which == 22 then derive_c_hs_traffic_ou_ob5_2
-      else if g.which == 23 then derive_c_hs_traffic_ou_ob5_3
-      else if g.which == 24 then derive_c_hs_traffic_ou_ob6_0
-      else if g.which == 25 then derive_c_hs_traffic_ou_ob6_1
-      else if g.which == 26 then derive_c_hs_traffic_ou_ob6_2
-      else if g.which == 27 then derive_c_hs_traffic_ou_ob6_3
-      else if g.which == 28 then derive_c_hs_traffic_ou_ob7_0
-      else if g.which == 29 then derive_c_hs_traffic_ou_ob7_1
-      else if g.which == 30 then derive_c_hs_traffic_ou_ob7_2
-      else derive_c_hs_traffic_ou_ob7_3
+    out = Digest { b0: derive_c_hs_traffic_ou_ob0_0, b1: derive_c_hs_traffic_ou_ob0_1, b2: derive_c_hs_traffic_ou_ob0_2, b3: derive_c_hs_traffic_ou_ob0_3, b4: derive_c_hs_traffic_ou_ob1_0, b5: derive_c_hs_traffic_ou_ob1_1, b6: derive_c_hs_traffic_ou_ob1_2, b7: derive_c_hs_traffic_ou_ob1_3, b8: derive_c_hs_traffic_ou_ob2_0, b9: derive_c_hs_traffic_ou_ob2_1, b10: derive_c_hs_traffic_ou_ob2_2, b11: derive_c_hs_traffic_ou_ob2_3, b12: derive_c_hs_traffic_ou_ob3_0, b13: derive_c_hs_traffic_ou_ob3_1, b14: derive_c_hs_traffic_ou_ob3_2, b15: derive_c_hs_traffic_ou_ob3_3, b16: derive_c_hs_traffic_ou_ob4_0, b17: derive_c_hs_traffic_ou_ob4_1, b18: derive_c_hs_traffic_ou_ob4_2, b19: derive_c_hs_traffic_ou_ob4_3, b20: derive_c_hs_traffic_ou_ob5_0, b21: derive_c_hs_traffic_ou_ob5_1, b22: derive_c_hs_traffic_ou_ob5_2, b23: derive_c_hs_traffic_ou_ob5_3, b24: derive_c_hs_traffic_ou_ob6_0, b25: derive_c_hs_traffic_ou_ob6_1, b26: derive_c_hs_traffic_ou_ob6_2, b27: derive_c_hs_traffic_ou_ob6_3, b28: derive_c_hs_traffic_ou_ob7_0, b29: derive_c_hs_traffic_ou_ob7_1, b30: derive_c_hs_traffic_ou_ob7_2, b31: derive_c_hs_traffic_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.t0, g.t1, g.t2, g.t3, g.t4, g.t5, g.t6, g.t7, g.t8, g.t9, g.t10, g.t11, g.t12, g.t13, g.t14, g.t15, g.t16, g.t17, g.t18, g.t19, g.t20, g.t21, g.t22, g.t23, g.t24, g.t25, g.t26, g.t27, g.t28, g.t29, g.t30, g.t31, g.which]
+      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.t0, g.t1, g.t2, g.t3, g.t4, g.t5, g.t6, g.t7, g.t8, g.t9, g.t10, g.t11, g.t12, g.t13, g.t14, g.t15, g.t16, g.t17, g.t18, g.t19, g.t20, g.t21, g.t22, g.t23, g.t24, g.t25, g.t26, g.t27, g.t28, g.t29, g.t30, g.t31]
       calls : []
     termination:
       bound : 400000
 
 
 rule derive_s_ap_traffic
-  @intention: "Derive-Secret(secret, s ap traffic, transcript) [RFC 8446 7.1] -> server application traffic secret"
+  @intention: "Derive-Secret(secret, s ap traffic, transcript) [RFC 8446 7.1] -> server application traffic secret; all 32 bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : SecretCtx
   output:
-    out : number
+    out : Digest
   logic:
     let derive_s_ap_traffic_ip0 = bxor(g.s0, 54)
     let derive_s_ap_traffic_op0 = bxor(g.s0, 92)
@@ -6303,53 +6247,22 @@ rule derive_s_ap_traffic
     let derive_s_ap_traffic_ou_ob7_1 = band(shr(derive_s_ap_traffic_ou_h7_1, 16), 255)
     let derive_s_ap_traffic_ou_ob7_2 = band(shr(derive_s_ap_traffic_ou_h7_1, 8), 255)
     let derive_s_ap_traffic_ou_ob7_3 = band(shr(derive_s_ap_traffic_ou_h7_1, 0), 255)
-    out = if g.which == 0 then derive_s_ap_traffic_ou_ob0_0
-      else if g.which == 1 then derive_s_ap_traffic_ou_ob0_1
-      else if g.which == 2 then derive_s_ap_traffic_ou_ob0_2
-      else if g.which == 3 then derive_s_ap_traffic_ou_ob0_3
-      else if g.which == 4 then derive_s_ap_traffic_ou_ob1_0
-      else if g.which == 5 then derive_s_ap_traffic_ou_ob1_1
-      else if g.which == 6 then derive_s_ap_traffic_ou_ob1_2
-      else if g.which == 7 then derive_s_ap_traffic_ou_ob1_3
-      else if g.which == 8 then derive_s_ap_traffic_ou_ob2_0
-      else if g.which == 9 then derive_s_ap_traffic_ou_ob2_1
-      else if g.which == 10 then derive_s_ap_traffic_ou_ob2_2
-      else if g.which == 11 then derive_s_ap_traffic_ou_ob2_3
-      else if g.which == 12 then derive_s_ap_traffic_ou_ob3_0
-      else if g.which == 13 then derive_s_ap_traffic_ou_ob3_1
-      else if g.which == 14 then derive_s_ap_traffic_ou_ob3_2
-      else if g.which == 15 then derive_s_ap_traffic_ou_ob3_3
-      else if g.which == 16 then derive_s_ap_traffic_ou_ob4_0
-      else if g.which == 17 then derive_s_ap_traffic_ou_ob4_1
-      else if g.which == 18 then derive_s_ap_traffic_ou_ob4_2
-      else if g.which == 19 then derive_s_ap_traffic_ou_ob4_3
-      else if g.which == 20 then derive_s_ap_traffic_ou_ob5_0
-      else if g.which == 21 then derive_s_ap_traffic_ou_ob5_1
-      else if g.which == 22 then derive_s_ap_traffic_ou_ob5_2
-      else if g.which == 23 then derive_s_ap_traffic_ou_ob5_3
-      else if g.which == 24 then derive_s_ap_traffic_ou_ob6_0
-      else if g.which == 25 then derive_s_ap_traffic_ou_ob6_1
-      else if g.which == 26 then derive_s_ap_traffic_ou_ob6_2
-      else if g.which == 27 then derive_s_ap_traffic_ou_ob6_3
-      else if g.which == 28 then derive_s_ap_traffic_ou_ob7_0
-      else if g.which == 29 then derive_s_ap_traffic_ou_ob7_1
-      else if g.which == 30 then derive_s_ap_traffic_ou_ob7_2
-      else derive_s_ap_traffic_ou_ob7_3
+    out = Digest { b0: derive_s_ap_traffic_ou_ob0_0, b1: derive_s_ap_traffic_ou_ob0_1, b2: derive_s_ap_traffic_ou_ob0_2, b3: derive_s_ap_traffic_ou_ob0_3, b4: derive_s_ap_traffic_ou_ob1_0, b5: derive_s_ap_traffic_ou_ob1_1, b6: derive_s_ap_traffic_ou_ob1_2, b7: derive_s_ap_traffic_ou_ob1_3, b8: derive_s_ap_traffic_ou_ob2_0, b9: derive_s_ap_traffic_ou_ob2_1, b10: derive_s_ap_traffic_ou_ob2_2, b11: derive_s_ap_traffic_ou_ob2_3, b12: derive_s_ap_traffic_ou_ob3_0, b13: derive_s_ap_traffic_ou_ob3_1, b14: derive_s_ap_traffic_ou_ob3_2, b15: derive_s_ap_traffic_ou_ob3_3, b16: derive_s_ap_traffic_ou_ob4_0, b17: derive_s_ap_traffic_ou_ob4_1, b18: derive_s_ap_traffic_ou_ob4_2, b19: derive_s_ap_traffic_ou_ob4_3, b20: derive_s_ap_traffic_ou_ob5_0, b21: derive_s_ap_traffic_ou_ob5_1, b22: derive_s_ap_traffic_ou_ob5_2, b23: derive_s_ap_traffic_ou_ob5_3, b24: derive_s_ap_traffic_ou_ob6_0, b25: derive_s_ap_traffic_ou_ob6_1, b26: derive_s_ap_traffic_ou_ob6_2, b27: derive_s_ap_traffic_ou_ob6_3, b28: derive_s_ap_traffic_ou_ob7_0, b29: derive_s_ap_traffic_ou_ob7_1, b30: derive_s_ap_traffic_ou_ob7_2, b31: derive_s_ap_traffic_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.t0, g.t1, g.t2, g.t3, g.t4, g.t5, g.t6, g.t7, g.t8, g.t9, g.t10, g.t11, g.t12, g.t13, g.t14, g.t15, g.t16, g.t17, g.t18, g.t19, g.t20, g.t21, g.t22, g.t23, g.t24, g.t25, g.t26, g.t27, g.t28, g.t29, g.t30, g.t31, g.which]
+      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.t0, g.t1, g.t2, g.t3, g.t4, g.t5, g.t6, g.t7, g.t8, g.t9, g.t10, g.t11, g.t12, g.t13, g.t14, g.t15, g.t16, g.t17, g.t18, g.t19, g.t20, g.t21, g.t22, g.t23, g.t24, g.t25, g.t26, g.t27, g.t28, g.t29, g.t30, g.t31]
       calls : []
     termination:
       bound : 400000
 
 
 rule derive_c_ap_traffic
-  @intention: "Derive-Secret(secret, c ap traffic, transcript) [RFC 8446 7.1] -> client application traffic secret"
+  @intention: "Derive-Secret(secret, c ap traffic, transcript) [RFC 8446 7.1] -> client application traffic secret; all 32 bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : SecretCtx
   output:
-    out : number
+    out : Digest
   logic:
     let derive_c_ap_traffic_ip0 = bxor(g.s0, 54)
     let derive_c_ap_traffic_op0 = bxor(g.s0, 92)
@@ -7871,53 +7784,22 @@ rule derive_c_ap_traffic
     let derive_c_ap_traffic_ou_ob7_1 = band(shr(derive_c_ap_traffic_ou_h7_1, 16), 255)
     let derive_c_ap_traffic_ou_ob7_2 = band(shr(derive_c_ap_traffic_ou_h7_1, 8), 255)
     let derive_c_ap_traffic_ou_ob7_3 = band(shr(derive_c_ap_traffic_ou_h7_1, 0), 255)
-    out = if g.which == 0 then derive_c_ap_traffic_ou_ob0_0
-      else if g.which == 1 then derive_c_ap_traffic_ou_ob0_1
-      else if g.which == 2 then derive_c_ap_traffic_ou_ob0_2
-      else if g.which == 3 then derive_c_ap_traffic_ou_ob0_3
-      else if g.which == 4 then derive_c_ap_traffic_ou_ob1_0
-      else if g.which == 5 then derive_c_ap_traffic_ou_ob1_1
-      else if g.which == 6 then derive_c_ap_traffic_ou_ob1_2
-      else if g.which == 7 then derive_c_ap_traffic_ou_ob1_3
-      else if g.which == 8 then derive_c_ap_traffic_ou_ob2_0
-      else if g.which == 9 then derive_c_ap_traffic_ou_ob2_1
-      else if g.which == 10 then derive_c_ap_traffic_ou_ob2_2
-      else if g.which == 11 then derive_c_ap_traffic_ou_ob2_3
-      else if g.which == 12 then derive_c_ap_traffic_ou_ob3_0
-      else if g.which == 13 then derive_c_ap_traffic_ou_ob3_1
-      else if g.which == 14 then derive_c_ap_traffic_ou_ob3_2
-      else if g.which == 15 then derive_c_ap_traffic_ou_ob3_3
-      else if g.which == 16 then derive_c_ap_traffic_ou_ob4_0
-      else if g.which == 17 then derive_c_ap_traffic_ou_ob4_1
-      else if g.which == 18 then derive_c_ap_traffic_ou_ob4_2
-      else if g.which == 19 then derive_c_ap_traffic_ou_ob4_3
-      else if g.which == 20 then derive_c_ap_traffic_ou_ob5_0
-      else if g.which == 21 then derive_c_ap_traffic_ou_ob5_1
-      else if g.which == 22 then derive_c_ap_traffic_ou_ob5_2
-      else if g.which == 23 then derive_c_ap_traffic_ou_ob5_3
-      else if g.which == 24 then derive_c_ap_traffic_ou_ob6_0
-      else if g.which == 25 then derive_c_ap_traffic_ou_ob6_1
-      else if g.which == 26 then derive_c_ap_traffic_ou_ob6_2
-      else if g.which == 27 then derive_c_ap_traffic_ou_ob6_3
-      else if g.which == 28 then derive_c_ap_traffic_ou_ob7_0
-      else if g.which == 29 then derive_c_ap_traffic_ou_ob7_1
-      else if g.which == 30 then derive_c_ap_traffic_ou_ob7_2
-      else derive_c_ap_traffic_ou_ob7_3
+    out = Digest { b0: derive_c_ap_traffic_ou_ob0_0, b1: derive_c_ap_traffic_ou_ob0_1, b2: derive_c_ap_traffic_ou_ob0_2, b3: derive_c_ap_traffic_ou_ob0_3, b4: derive_c_ap_traffic_ou_ob1_0, b5: derive_c_ap_traffic_ou_ob1_1, b6: derive_c_ap_traffic_ou_ob1_2, b7: derive_c_ap_traffic_ou_ob1_3, b8: derive_c_ap_traffic_ou_ob2_0, b9: derive_c_ap_traffic_ou_ob2_1, b10: derive_c_ap_traffic_ou_ob2_2, b11: derive_c_ap_traffic_ou_ob2_3, b12: derive_c_ap_traffic_ou_ob3_0, b13: derive_c_ap_traffic_ou_ob3_1, b14: derive_c_ap_traffic_ou_ob3_2, b15: derive_c_ap_traffic_ou_ob3_3, b16: derive_c_ap_traffic_ou_ob4_0, b17: derive_c_ap_traffic_ou_ob4_1, b18: derive_c_ap_traffic_ou_ob4_2, b19: derive_c_ap_traffic_ou_ob4_3, b20: derive_c_ap_traffic_ou_ob5_0, b21: derive_c_ap_traffic_ou_ob5_1, b22: derive_c_ap_traffic_ou_ob5_2, b23: derive_c_ap_traffic_ou_ob5_3, b24: derive_c_ap_traffic_ou_ob6_0, b25: derive_c_ap_traffic_ou_ob6_1, b26: derive_c_ap_traffic_ou_ob6_2, b27: derive_c_ap_traffic_ou_ob6_3, b28: derive_c_ap_traffic_ou_ob7_0, b29: derive_c_ap_traffic_ou_ob7_1, b30: derive_c_ap_traffic_ou_ob7_2, b31: derive_c_ap_traffic_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.t0, g.t1, g.t2, g.t3, g.t4, g.t5, g.t6, g.t7, g.t8, g.t9, g.t10, g.t11, g.t12, g.t13, g.t14, g.t15, g.t16, g.t17, g.t18, g.t19, g.t20, g.t21, g.t22, g.t23, g.t24, g.t25, g.t26, g.t27, g.t28, g.t29, g.t30, g.t31, g.which]
+      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.t0, g.t1, g.t2, g.t3, g.t4, g.t5, g.t6, g.t7, g.t8, g.t9, g.t10, g.t11, g.t12, g.t13, g.t14, g.t15, g.t16, g.t17, g.t18, g.t19, g.t20, g.t21, g.t22, g.t23, g.t24, g.t25, g.t26, g.t27, g.t28, g.t29, g.t30, g.t31]
       calls : []
     termination:
       bound : 400000
 
 
 rule finished_key
-  @intention: "finished_key = HKDF-Expand-Label(secret, finished, empty, 32) (RFC 8446 4.4.4)"
+  @intention: "finished_key = HKDF-Expand-Label(secret, finished, empty, 32) (RFC 8446 4.4.4); all 32 bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : SecretCtx
   output:
-    out : number
+    out : Digest
   logic:
     let finished_key_ip0 = bxor(g.s0, 54)
     let finished_key_op0 = bxor(g.s0, 92)
@@ -9439,41 +9321,10 @@ rule finished_key
     let finished_key_ou_ob7_1 = band(shr(finished_key_ou_h7_1, 16), 255)
     let finished_key_ou_ob7_2 = band(shr(finished_key_ou_h7_1, 8), 255)
     let finished_key_ou_ob7_3 = band(shr(finished_key_ou_h7_1, 0), 255)
-    out = if g.which == 0 then finished_key_ou_ob0_0
-      else if g.which == 1 then finished_key_ou_ob0_1
-      else if g.which == 2 then finished_key_ou_ob0_2
-      else if g.which == 3 then finished_key_ou_ob0_3
-      else if g.which == 4 then finished_key_ou_ob1_0
-      else if g.which == 5 then finished_key_ou_ob1_1
-      else if g.which == 6 then finished_key_ou_ob1_2
-      else if g.which == 7 then finished_key_ou_ob1_3
-      else if g.which == 8 then finished_key_ou_ob2_0
-      else if g.which == 9 then finished_key_ou_ob2_1
-      else if g.which == 10 then finished_key_ou_ob2_2
-      else if g.which == 11 then finished_key_ou_ob2_3
-      else if g.which == 12 then finished_key_ou_ob3_0
-      else if g.which == 13 then finished_key_ou_ob3_1
-      else if g.which == 14 then finished_key_ou_ob3_2
-      else if g.which == 15 then finished_key_ou_ob3_3
-      else if g.which == 16 then finished_key_ou_ob4_0
-      else if g.which == 17 then finished_key_ou_ob4_1
-      else if g.which == 18 then finished_key_ou_ob4_2
-      else if g.which == 19 then finished_key_ou_ob4_3
-      else if g.which == 20 then finished_key_ou_ob5_0
-      else if g.which == 21 then finished_key_ou_ob5_1
-      else if g.which == 22 then finished_key_ou_ob5_2
-      else if g.which == 23 then finished_key_ou_ob5_3
-      else if g.which == 24 then finished_key_ou_ob6_0
-      else if g.which == 25 then finished_key_ou_ob6_1
-      else if g.which == 26 then finished_key_ou_ob6_2
-      else if g.which == 27 then finished_key_ou_ob6_3
-      else if g.which == 28 then finished_key_ou_ob7_0
-      else if g.which == 29 then finished_key_ou_ob7_1
-      else if g.which == 30 then finished_key_ou_ob7_2
-      else finished_key_ou_ob7_3
+    out = Digest { b0: finished_key_ou_ob0_0, b1: finished_key_ou_ob0_1, b2: finished_key_ou_ob0_2, b3: finished_key_ou_ob0_3, b4: finished_key_ou_ob1_0, b5: finished_key_ou_ob1_1, b6: finished_key_ou_ob1_2, b7: finished_key_ou_ob1_3, b8: finished_key_ou_ob2_0, b9: finished_key_ou_ob2_1, b10: finished_key_ou_ob2_2, b11: finished_key_ou_ob2_3, b12: finished_key_ou_ob3_0, b13: finished_key_ou_ob3_1, b14: finished_key_ou_ob3_2, b15: finished_key_ou_ob3_3, b16: finished_key_ou_ob4_0, b17: finished_key_ou_ob4_1, b18: finished_key_ou_ob4_2, b19: finished_key_ou_ob4_3, b20: finished_key_ou_ob5_0, b21: finished_key_ou_ob5_1, b22: finished_key_ou_ob5_2, b23: finished_key_ou_ob5_3, b24: finished_key_ou_ob6_0, b25: finished_key_ou_ob6_1, b26: finished_key_ou_ob6_2, b27: finished_key_ou_ob6_3, b28: finished_key_ou_ob7_0, b29: finished_key_ou_ob7_1, b30: finished_key_ou_ob7_2, b31: finished_key_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.which]
+      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31]
       calls : []
     termination:
       bound : 400000

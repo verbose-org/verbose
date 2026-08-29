@@ -4,14 +4,14 @@ from sha2_emit import hmac as emit_hmac
 # Full TLS 1.3 key-schedule rules (RFC 8446 7.1) as baked-label rules, one file.
 # reads: declares g.t* ONLY when the rule's message actually uses the transcript
 # context (verifier rejects declared-but-unused reads).
-
-def dispatch(mac, n):
-    d=[]
-    for i in range(n):
-        if i==0: d.append(f"    out = if g.which == 0 then {mac[0]}")
-        elif i<n-1: d.append(f"      else if g.which == {i} then {mac[i]}")
-        else: d.append(f"      else {mac[n-1]}")
-    return d
+#
+# All six rules return their 32 output bytes TOGETHER as one Digest record
+# (aggregate-return arc, slices agg-1/agg-2c 2026-08): one invocation yields the
+# whole derived secret as {"b0":...,...,"b31":...} JSON instead of one byte per
+# `which` spawn. ONE output concept serves all six rules because they share the
+# output WIDTH (32) — a record's width is its concept declaration; field names
+# stay b0..b31 so the host unpacks every record with the same `rec[f"b{i}"]`
+# loop as the tranche-2 (hsecret/derivesec/expand) rules.
 
 def hkdf_prefix(label, length, ctxlen):
     full=b"tls13 "+label
@@ -21,13 +21,13 @@ def make_rule(name, intent, msg_tokens, uses_thash):
     lets=[]
     key64=[f"g.s{i}" for i in range(32)]+["0"]*32
     mac=emit_hmac(lets,name,key64,msg_tokens)
-    out=[f"rule {name}",f'  @intention: "{intent}"',"  @source: invoices.intent:1",
-         "  input:","    g : SecretCtx","  output:","    out : number","  logic:"]
+    finalize = "Digest { " + ", ".join(f"b{i}: {mac[i]}" for i in range(32)) + " }"
+    out=[f"rule {name}",f'  @intention: "{intent}; all 32 bytes as one Digest record"',"  @source: invoices.intent:1",
+         "  input:","    g : SecretCtx","  output:","    out : Digest","  logic:"]
     for n,e in lets: out.append(f"    let {n} = {e}")
-    out += dispatch(mac,32)
+    out.append(f"    out = {finalize}")
     reads_list=[f"g.s{i}" for i in range(32)]
     if uses_thash: reads_list += [f"g.t{i}" for i in range(32)]
-    reads_list += ["g.which"]
     out += ["  proofs:","    purity:",f"      reads : [{', '.join(reads_list)}]","      calls : []",
             "    termination:","      bound : 400000"]
     return "\n".join(out)
@@ -58,11 +58,14 @@ rules.append(make_rule("finished_key",
     [str(b) for b in hkdf_prefix(b"finished",32,0)] + ["1"], False))
 
 lines=["@verbose 0.1.0","","concept SecretCtx",
-       '  @intention: "32-byte secret + 32-byte transcript context (used only by transcript rules) + which output byte"',
+       '  @intention: "32-byte secret + 32-byte transcript context (used only by transcript rules)"',
        "  @source: invoices.intent:1","  fields:"]
 for i in range(32): lines.append(f"    s{i} : number [0, 255]")
 for i in range(32): lines.append(f"    t{i} : number [0, 255]")
-lines.append("    which : number [0, 31]")
+lines += ["","","concept Digest",
+          '  @intention: "the 32 output bytes of a TLS 1.3 key-schedule derivation, returned together as one record"',
+          "  @source: invoices.intent:1","  fields:"]
+for i in range(32): lines.append(f"    b{i} : number [0, 255]")
 lines += ["",""]
 lines.append("\n\n\n".join(rules))
 lines.append("")

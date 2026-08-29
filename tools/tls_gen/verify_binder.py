@@ -15,7 +15,7 @@ from tlswire import ClientHello
 PSK = bytes.fromhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")  # 32-byte PSK matching the Verbose rule
 
 def verbose_finished_key(secret32):
-    return V.run_bytes("finished_key", [str(b) for b in secret32]+[str(b) for b in bytes(32)], 32)
+    return V.finished_key(secret32)   # record spawn (Digest JSON) since 2026-08-29
 
 def main():
     V.ensure(V.ALL_RULES + [("psk_early_secret","psk_schedule.verbose"),
