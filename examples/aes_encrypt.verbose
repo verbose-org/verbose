@@ -7,7 +7,7 @@ concept Byte
     b : number [0, 255]
 
 concept EncryptInput
-  @intention: "16-byte plaintext block + 16-byte AES-128 key + which output byte"
+  @intention: "16-byte plaintext block + 16-byte AES-128 key"
   @source: aes_encrypt.intent:1
   fields:
     p0 : number [0, 255]
@@ -42,7 +42,28 @@ concept EncryptInput
     k13 : number [0, 255]
     k14 : number [0, 255]
     k15 : number [0, 255]
-    which : number [0, 15]
+
+
+concept CipherBlock
+  @intention: "the 16 output bytes of an AES-128 block encryption, returned together as one record"
+  @source: aes_encrypt.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
 
 
 -- The FIPS-197 forward S-box as a DECLARED CONSTANT TABLE.
@@ -97,12 +118,12 @@ rule xtime
 
 
 rule encrypt
-  @intention: "AES-128 single-block ECB encrypt: returns byte `which` of the ciphertext"
+  @intention: "AES-128 single-block ECB encrypt: returns the 16-byte ciphertext as one CipherBlock record"
   @source: aes_encrypt.intent:4
   input:
     e : EncryptInput
   output:
-    out : number
+    out : CipherBlock
   logic:
     let ks0 = e.k0
     let ks1 = e.k1
@@ -760,25 +781,10 @@ rule encrypt
     let st10_13 = band(bxor(sub10_1, ks173), 255)
     let st10_14 = band(bxor(sub10_6, ks174), 255)
     let st10_15 = band(bxor(sub10_11, ks175), 255)
-    out = if e.which == 0 then st10_0
-      else if e.which == 1 then st10_1
-      else if e.which == 2 then st10_2
-      else if e.which == 3 then st10_3
-      else if e.which == 4 then st10_4
-      else if e.which == 5 then st10_5
-      else if e.which == 6 then st10_6
-      else if e.which == 7 then st10_7
-      else if e.which == 8 then st10_8
-      else if e.which == 9 then st10_9
-      else if e.which == 10 then st10_10
-      else if e.which == 11 then st10_11
-      else if e.which == 12 then st10_12
-      else if e.which == 13 then st10_13
-      else if e.which == 14 then st10_14
-      else st10_15
+    out = CipherBlock { b0: st10_0, b1: st10_1, b2: st10_2, b3: st10_3, b4: st10_4, b5: st10_5, b6: st10_6, b7: st10_7, b8: st10_8, b9: st10_9, b10: st10_10, b11: st10_11, b12: st10_12, b13: st10_13, b14: st10_14, b15: st10_15 }
   proofs:
     purity:
-      reads : [e.p0, e.p1, e.p2, e.p3, e.p4, e.p5, e.p6, e.p7, e.p8, e.p9, e.p10, e.p11, e.p12, e.p13, e.p14, e.p15, e.k0, e.k1, e.k2, e.k3, e.k4, e.k5, e.k6, e.k7, e.k8, e.k9, e.k10, e.k11, e.k12, e.k13, e.k14, e.k15, e.which]
+      reads : [e.p0, e.p1, e.p2, e.p3, e.p4, e.p5, e.p6, e.p7, e.p8, e.p9, e.p10, e.p11, e.p12, e.p13, e.p14, e.p15, e.k0, e.k1, e.k2, e.k3, e.k4, e.k5, e.k6, e.k7, e.k8, e.k9, e.k10, e.k11, e.k12, e.k13, e.k14, e.k15]
       calls : [aes_sbox, xtime]
     termination:
       bound : 20000

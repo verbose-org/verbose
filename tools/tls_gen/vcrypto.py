@@ -17,11 +17,17 @@ record spawn, so the derived/master/traffic/finished leg is 6 spawns
 instead of 192 pooled ones. SHA-256 followed (tranche 4): sha256_fold is a
 RECURSIVE record-output rule (agg-2a tail recursion + agg-2c record entry),
 so one spawn folds every block and returns all 32 digest bytes as one Digest
-JSON object instead of 32 parallel `which` spawns. The remaining primitives
-(AES/GCM/GHASH) still return one byte per `which` invocation, so their loops
-are spawned IN PARALLEL (all output bytes concurrently), which turns the
-per-byte cost from sum into max — the thread pool below exists solely for
-them.
+JSON object instead of 32 parallel `which` spawns. AES/GCM/GHASH followed
+(tranche 5, 2026-08-30): `encrypt` returns one 16-field CipherBlock record
+per spawn, `ghash_fold` (recursive, like sha256_fold) returns the whole
+16-byte GHASH accumulator in one spawn, and `gctr` returns one PER-BLOCK
+CipherBlock record — the host loop spawns once per 16-byte block instead of
+once per data byte (framing glue: pad the tail block's hex, truncate after
+unpacking). NOTHING in this module spawns per-`which` any more; the thread
+pool below survives ONLY for run_bytes' external callers — the still-
+which-form `hkdf_extract` (tls_server.py, tls_cert_server.py, both browser
+servers) and `psk_early_secret` / `psk_ext_binder_key` (tls_server.py,
+verify_binder.py) loops. Convert those and the pool dies.
 
 Honest scope (per docs/tls-io-statemachine-design.md §7): the cryptographic
 PRIMITIVES (X25519, key schedule, SHA-256, AES/GCM/GHASH) are pure Verbose.
@@ -58,7 +64,15 @@ def _one(binp, args, w):
     return int(s)
 
 def run_bytes(rule, args, n):
-    """Spawn all n `which` values in parallel; return bytes."""
+    """Spawn all n `which` values in parallel; return bytes.
+
+    No rule COMPILED BY THIS MODULE uses the which interface any more
+    (tranche 5 converted the last three: encrypt / gctr / ghash_fold).
+    This helper and _POOL stay for the external callers still driving
+    which-form rules: hkdf_extract (tls_server.py, tls_cert_server.py,
+    tls_browser_server.py, tls_browser_p256_server.py) and
+    psk_early_secret / psk_ext_binder_key (tls_server.py, verify_binder.py).
+    """
     binp = BIN[rule]
     futs = {w: _POOL.submit(_one, binp, args, w) for w in range(n)}
     return bytes(futs[w].result() for w in range(n))
@@ -149,23 +163,29 @@ def expand_key(secret32): return _record_bytes("expand_key",[str(b) for b in sec
 def expand_iv(secret32):  return _record_bytes("expand_iv",[str(b) for b in secret32],12)
 
 # ---- AES-GCM AEAD record protection (primitives pure Verbose; framing host) ----
+# All three primitives are RECORD spawns since tranche 5 (2026-08-30):
+#   encrypt    — ONE spawn, all 16 ciphertext bytes as a CipherBlock record
+#   gctr       — one spawn PER 16-BYTE BLOCK (nb spawns, not len(data)); the
+#                host pads the tail block's hex to a full 32 chars and
+#                truncates after unpacking — framing glue by design.
+#                byte_at's fail-closed bounds make the padding load-bearing:
+#                an unpadded short tail would abort the binary.
+#   ghash_fold — ONE spawn; the recursive fold walks every block in-process
+#                and returns the 16-byte accumulator as a GhashOut record.
 def _aes_block(key16, block16):
-    return run_bytes("encrypt", [str(b) for b in block16]+[str(b) for b in key16], 16)
+    return _record_bytes("encrypt", [str(b) for b in block16]+[str(b) for b in key16], 16)
 def _gctr(key16, nonce12, data):
     nb=(len(data)+15)//16
     if nb==0: return b""
+    padded=bytes(data)+bytes((-len(data))%16)
     args=[str(b) for b in key16]+[str(b) for b in nonce12]+[str(nb)]
-    binp=BIN["gctr"]; hexd=bytes(data).hex()
-    def one(w): return int(subprocess.run([binp]+args+[str(w),hexd],capture_output=True,text=True,timeout=600).stdout.strip())
-    futs={w:_POOL.submit(one,w) for w in range(len(data))}
-    return bytes(futs[w].result() for w in range(len(data)))
+    hexd=padded.hex()
+    out=b"".join(_record_bytes("gctr", args+[str(w), hexd], 16) for w in range(nb))
+    return out[:len(data)]
 def _ghash(h16, data):
     nb=len(data)//16
-    args=[str(b) for b in [0]*16]+[str(b) for b in h16]+[str(nb),str(nb)]
-    binp=BIN["ghash_fold"]; hexd=bytes(data).hex()
-    def one(w): return int(subprocess.run([binp]+args+[str(w),hexd],capture_output=True,text=True,timeout=600).stdout.strip())
-    futs={w:_POOL.submit(one,w) for w in range(16)}
-    return bytes(futs[w].result() for w in range(16))
+    args=[str(b) for b in [0]*16]+[str(b) for b in h16]+[str(nb),str(nb),bytes(data).hex()]
+    return _record_bytes("ghash_fold", args, 16)
 
 def _gcm(key16, nonce12, pt, aad):
     H=_aes_block(key16, [0]*16)
@@ -269,9 +289,25 @@ if __name__ == "__main__":
     assert sap==el(ms,b"s ap traffic",thash,32)
     assert cap_==el(ms,b"c ap traffic",thash,32)
     assert fk==el(shs,b"finished",b"",32)
-    # 4) AEAD record round-trip (encrypt then decrypt)
+    # 4) AES/GCM/GHASH vs the published NIST vectors — record spawns since
+    # tranche 5 (2026-08-30). FIPS-197 Appendix C.1 through `encrypt` (one
+    # CipherBlock spawn), NIST GCM Test Case 2 through `gctr` (one per-block
+    # spawn) and through `ghash_fold` (one recursive-fold spawn).
+    assert _aes_block(bytes.fromhex("000102030405060708090a0b0c0d0e0f"),
+                      bytes.fromhex("00112233445566778899aabbccddeeff")) \
+        == bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a")          # FIPS-197 C.1
+    assert _gctr(bytes(16), bytes(12), bytes(16)) \
+        == bytes.fromhex("0388dace60b6a392f328c2b971b2fe78")          # GCM TC2 C
+    _h_tc2=_aes_block(bytes(16), bytes(16))
+    assert _h_tc2==bytes.fromhex("66e94bd4ef8a2c3b884cfa59ca342b2e")  # GCM TC2 H
+    assert _ghash(_h_tc2, bytes.fromhex("0388dace60b6a392f328c2b971b2fe78")
+                          +(0).to_bytes(8,'big')+(128).to_bytes(8,'big')) \
+        == bytes.fromhex("f38cbb1ad69223dcc3457ae5b6b0f885")          # GCM TC2 GHASH
+    # 5) AEAD record round-trip (encrypt then decrypt), timed
     rk=bytes(range(1,17)); riv=bytes(range(17,29))
+    t=time.time()
     rec=aead_encrypt(rk,riv,0,b"hello world",0x17)
     ct,pt=aead_decrypt(rk,riv,0,rec)
+    t_ae = time.time()-t
     assert ct==0x17 and pt==b"hello world", (ct,pt)
-    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  sha256={t_sha:.3f}s  aead_roundtrip=ok  (x25519 + full key schedule + sha256: record spawns; AES/GCM which-loops parallel)")
+    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  sha256={t_sha:.3f}s  aead={t_ae:.3f}s  aead_roundtrip=ok  (every primitive this module spawns: record spawns; the pool serves only external run_bytes callers — hkdf_extract + psk_*)")
