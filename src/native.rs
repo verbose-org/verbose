@@ -54823,6 +54823,152 @@ bound : 8\n",
         Ok(out)
     }
 
+    /// Two rules with the same name: the hazard, and the fix.
+    ///
+    /// A program declaring `rule f` twice is the sharpest case of the
+    /// verifier certifying a program its executors mishandle. The native
+    /// emitter resolves calls through `HashMap<name, &Rule>` (this file,
+    /// ~line 186) whose `insert` overwrites, so it binds the LAST `f`; the
+    /// interpreter resolves with `all_rules.iter().find` and binds the FIRST.
+    /// So `--run` and `--native` compute DIFFERENT answers from the same
+    /// source, both at exit 0.
+    ///
+    /// This test pins BOTH halves:
+    ///   (a) THE HAZARD — bypassing the verifier, native and interpreter
+    ///       genuinely disagree (105 vs 6). This is what makes the check
+    ///       load-bearing rather than cosmetic; if the two backends ever
+    ///       converged on their own, this assertion would tell us.
+    ///   (b) THE FIX — `verify_program` now REFUSES the duplicate, naming the
+    ///       offender, so main.rs never reaches a backend at all. Verified to
+    ///       FAIL against f2e9a0e, where verify returned zero errors.
+    /// Plus the renamed twin agreeing across both backends (6 == 6), so the
+    /// refusal is attributable to the duplication.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn duplicate_rule_name_hazard_is_closed_at_verify() {
+        use std::process::Command;
+        let dup = r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: invoices.intent:1
+  fields:
+    v : number
+
+rule f
+  @intention: "first f: v + 1"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v + 1
+  proofs:
+    purity:
+      reads   : [n.v]
+      calls   : []
+    termination:
+      bound : 1
+
+rule caller
+  @intention: "calls f"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = f(n)
+  proofs:
+    purity:
+      reads   : [n]
+      calls   : [f]
+    termination:
+      bound : 1
+
+rule f
+  @intention: "second f: v + 100"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v + 100
+  proofs:
+    purity:
+      reads   : [n.v]
+      calls   : []
+    termination:
+      bound : 1
+"#;
+        let parse = |s: &str| {
+            let tokens = crate::lexer::Lexer::new(s).tokenize().unwrap();
+            crate::parser::Parser::new(tokens).parse_program().unwrap()
+        };
+        let program = parse(dup);
+
+        // (a) THE HAZARD, demonstrated by bypassing the verifier: the two
+        // backends disagree on the SAME source.
+        let concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
+        let rules: Vec<&Rule> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rule(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let caller = rules.iter().find(|r| r.name == "caller").unwrap();
+        let mut input = std::collections::HashMap::new();
+        input.insert("v".to_string(), crate::interpreter::Value::Number(5));
+        let interp = crate::interpreter::eval_rule(caller, &rules, &concepts, &input)
+            .expect("interpreter must evaluate caller");
+        assert_eq!(
+            format!("{}", interp),
+            "6",
+            "interpreter binds the FIRST f (v+1): caller(5) = 6"
+        );
+        let nbin = std::env::temp_dir().join("verbosec_dup_hazard_native");
+        let _ = std::fs::remove_file(&nbin);
+        compile_native(&program, "caller", nbin.to_str().unwrap(), false, false)
+            .expect("native must emit (bypassing verify) to demonstrate the hazard");
+        let out = Command::new(&nbin).arg("5").output().expect("run native caller");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "105",
+            "native binds the LAST f (v+100): caller(5) = 105 — the disagreement"
+        );
+        let _ = std::fs::remove_file(&nbin);
+
+        // (b) THE FIX: the verifier refuses the duplicate, so main.rs never
+        // reaches a backend. (Verified to FAIL against f2e9a0e — zero errors.)
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(
+            errs.iter().any(|e| e.message.contains("duplicate rule name 'f'")),
+            "verify_program must refuse the duplicate, naming 'f'; got {:#?}",
+            errs
+        );
+
+        // The renamed twin: both backends agree (6 == 6), and it verifies.
+        let twin = dup.replacen("rule f\n  @intention: \"second f: v + 100\"", "rule g\n  @intention: \"second g: v + 100\"", 1);
+        let tp = parse(&twin);
+        let terrs = crate::verifier::verify_program(&tp, std::path::Path::new("examples"));
+        assert!(terrs.is_empty(), "renamed twin must verify clean; got {:#?}", terrs);
+        let tbin = std::env::temp_dir().join("verbosec_dup_hazard_twin");
+        let _ = std::fs::remove_file(&tbin);
+        compile_native(&tp, "caller", tbin.to_str().unwrap(), false, false)
+            .expect("twin must emit");
+        let out = Command::new(&tbin).arg("5").output().expect("run twin");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "6",
+            "renamed twin: caller still calls the FIRST rule (f, v+1) — 6 on both backends"
+        );
+        let _ = std::fs::remove_file(&tbin);
+    }
+
     /// §6.4 test 5 — THE MILESTONE. Verified to FAIL pre-change: on `main`
     /// this program is refused with `rich operations (collection/result/
     /// record/concat) not supported in native backend` and zero bytes.

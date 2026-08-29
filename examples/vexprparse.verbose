@@ -29765,28 +29765,6 @@ rule x86_args
       bound : 8000
 
 
--- arg_list_len: the number of arguments in a call's ArgList (cons-walk like
--- param_list_len). Used to size the caller's `add rsp, 8*N` arg cleanup.
-rule arg_list_len
-  @intention: "Number of arguments in a call's argument list"
-  @source: vexprparse.intent:56
-  input:
-    al : ArgList
-  output:
-    out : number
-  logic:
-    out = match al:
-      ArgCons(head, tail) => 1 + arg_list_len(tail)
-      ArgNil => 0
-  proofs:
-    purity:
-      reads : [al]
-      calls : [arg_list_len]
-    termination:
-      bound : 512
-      structural : al
-
-
 -- x86_proc: one rule -> one machine-code proc. prologue (push rbp ; mov rbp, rsp)
 -- + the body result expr lowered at off+4 (the body begins 4 bytes into the proc,
 -- after the prologue) with the rule's own params + the program + epilogue

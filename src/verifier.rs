@@ -136,6 +136,68 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
         }
     }
 
+    // A named top-level item may not be declared twice within its kind.
+    //
+    // Without this check the two backends SILENTLY DISAGREE about which
+    // definition wins. Rule resolution is the sharpest case: the interpreter
+    // resolves a call with `all_rules.iter().find(|r| r.name == name)` — the
+    // FIRST match — while the native emitter builds `HashMap<name, &Rule>`
+    // (native.rs) whose `insert` OVERWRITES on collision, so the LAST match
+    // wins. So `rule f` declared twice makes `--run` and `--native` compute
+    // DIFFERENT answers from the same source, both exiting 0, with the
+    // verifier reporting `all proofs check out`. Measured on a 3-rule probe
+    // (`f` returns v+1, `caller` calls `f`, second `f` returns v+100):
+    // `--run caller` on v=5 gives 6, `--native` gives 105.
+    //
+    // The verifier itself is not immune: its own `all_rules` is a Vec walked
+    // with `.find` (first-match, like the interpreter) while its `concepts`
+    // HashMap keeps the LAST — so a "verified" program can carry two
+    // meanings. That is the project's central thesis (the verifier is the
+    // durable artifact) failing outright, and it is the same family as the
+    // arity check (PR #163), the record-`.field` type check (PR #178) and
+    // the text-in-arithmetic operand check (PR #182): the verifier certifies
+    // a program its executors mishandle. Refuse at the declaration, where
+    // the name is — same discipline as the reserved-primitive-name and
+    // reserved-`HttpRequest`/`HttpResponse` checks above.
+    //
+    // Resources and connections already have their own duplicate check
+    // below (they share one namespace, and a connection may not collide with
+    // a resource). This pass covers the remaining named top-level kinds:
+    // rules, top-level concepts, reactions, services, and concept groups.
+    // Concept names declared INSIDE a `concept_group` are checked against the
+    // shared concept namespace separately (above), so two group concepts of
+    // the same name, or a group concept colliding with a top-level concept,
+    // are already refused — this pass adds the top-level-vs-top-level concept
+    // case and the group-NAME case those checks do not reach.
+    {
+        let mut seen_rules: HashSet<&str> = HashSet::new();
+        let mut seen_concepts: HashSet<&str> = HashSet::new();
+        let mut seen_reactions: HashSet<&str> = HashSet::new();
+        let mut seen_services: HashSet<&str> = HashSet::new();
+        let mut seen_groups: HashSet<&str> = HashSet::new();
+        for item in &program.items {
+            let (set, kind, name): (&mut HashSet<&str>, &str, &str) = match item {
+                Item::Rule(r) => (&mut seen_rules, "rule", r.name.as_str()),
+                Item::Concept(c) => (&mut seen_concepts, "concept", c.name.as_str()),
+                Item::Reaction(rx) => (&mut seen_reactions, "reaction", rx.name.as_str()),
+                Item::Service(s) => (&mut seen_services, "service", s.name.as_str()),
+                Item::ConceptGroup(g) => (&mut seen_groups, "concept_group", g.name.as_str()),
+                _ => continue,
+            };
+            if !set.insert(name) {
+                errors.push(VerifyError {
+                    context: format!("{} '{}'", kind, name),
+                    message: format!(
+                        "duplicate {kind} name '{name}' (already declared earlier); {kind} names \
+                         must be unique — the interpreter binds the first definition and the native \
+                         emitter binds the last, so a duplicate makes the two backends disagree",
+                        kind = kind, name = name
+                    ),
+                });
+            }
+        }
+    }
+
     // Phase 9 slice 1: collect declared resource names for cross-checking
     // every `read(name)` reference. Duplicate resource names also rejected
     // here (resource namespace is global at the program level).
@@ -7410,6 +7472,245 @@ rule test
         assert!(
             errs.iter().any(|e| e.message.contains("duplicate resource name 'dup'")),
             "expected duplicate-resource error, got: {:#?}",
+            errs
+        );
+    }
+
+    /// A named top-level item declared twice is REFUSED, with the offender
+    /// named — and the correct-arity-style TWIN (one copy renamed) verifies
+    /// clean, so the refusal is attributable to the duplication and nothing
+    /// else.
+    ///
+    /// Verified to FAIL against f2e9a0e: before this check, `verify_program`
+    /// returned zero errors for every one of these programs ("all proofs
+    /// check out"), and the two backends then silently DISAGREED about which
+    /// definition wins — `--run` binds the first (`all_rules.iter().find`),
+    /// `--native` binds the last (`HashMap<name, &Rule>` overwrites). Measured
+    /// on the rule case: 6 vs 105 from the same source, both at exit 0. Same
+    /// family as the arity check (PR #163): the verifier certifying a program
+    /// its executors mishandle.
+    #[test]
+    fn duplicate_top_level_item_name_rejected_at_verify_time() {
+        // THE HEADLINE: two `rule f`, with a caller in between. `{SECOND}` is
+        // the only thing that varies — `rule f` (duplicate) vs `rule g`
+        // (renamed twin).
+        let rule_program = |second_name: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: invoices.intent:1
+  fields:
+    v : number
+
+rule f
+  @intention: "first f: v + 1"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v + 1
+  proofs:
+    purity:
+      reads   : [n.v]
+      calls   : []
+    termination:
+      bound : 1
+
+rule caller
+  @intention: "calls f"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = f(n)
+  proofs:
+    purity:
+      reads   : [n]
+      calls   : [f]
+    termination:
+      bound : 1
+
+rule {second_name}
+  @intention: "second: v + 100"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v + 100
+  proofs:
+    purity:
+      reads   : [n.v]
+      calls   : []
+    termination:
+      bound : 1
+"#,
+                second_name = second_name
+            )
+        };
+
+        let errs = verify_str(&rule_program("f"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("rule 'f'")
+                && e.message.contains("duplicate rule name 'f'")),
+            "expected a duplicate-rule refusal naming 'f'; got {:#?}",
+            errs
+        );
+
+        // THE TWIN: rename the second copy to `g`. Otherwise byte-identical.
+        // Must verify clean, or the refusal above is not attributable to the
+        // duplication.
+        let errs = verify_str(&rule_program("g"));
+        assert!(
+            errs.is_empty(),
+            "the renamed twin must verify clean; got {:#?}",
+            errs
+        );
+
+        // The family, one probe per remaining silently-overwritten kind:
+        // top-level concept, reaction, service, concept_group. (Resources and
+        // connections already had their own duplicate check — covered by
+        // phase9_rejects_duplicate_resource_name and the connection tests.)
+        let dup_concept = r#"@verbose 0.1.0
+
+concept C
+  @intention: "first C"
+  @source: invoices.intent:1
+  fields:
+    v : number
+
+concept C
+  @intention: "second C"
+  @source: invoices.intent:1
+  fields:
+    v : number
+"#;
+        let errs = verify_str(dup_concept);
+        assert!(
+            errs.iter().any(|e| e.message.contains("duplicate concept name 'C'")),
+            "expected a duplicate-concept refusal naming 'C'; got {:#?}",
+            errs
+        );
+
+        let dup_reaction = r#"@verbose 0.1.0
+
+concept P
+  @intention: "p"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule is_big
+  @intention: "big"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    big : bool
+  logic:
+    big = p.amount > 100
+  proofs:
+    purity:
+      reads   : [p.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+reaction log_it
+  @intention: "first"
+  @source: invoices.intent:1
+  trigger: is_big
+  effects:
+    append_file "/tmp/verbose_dup_rx.log" "A\n"
+
+reaction log_it
+  @intention: "second"
+  @source: invoices.intent:1
+  trigger: is_big
+  effects:
+    append_file "/tmp/verbose_dup_rx.log" "B\n"
+"#;
+        let errs = verify_str(dup_reaction);
+        assert!(
+            errs.iter().any(|e| e.message.contains("duplicate reaction name 'log_it'")),
+            "expected a duplicate-reaction refusal naming 'log_it'; got {:#?}",
+            errs
+        );
+
+        let dup_service = r#"@verbose 0.1.0
+
+rule handler_a
+  @intention: "a"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: "A" }
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service api
+  @intention: "first"
+  @source: invoices.intent:1
+  listen:
+    protocol    : http_1_0
+    port        : 18999
+    max_request : 1024
+  handler: handler_a
+
+service api
+  @intention: "second"
+  @source: invoices.intent:1
+  listen:
+    protocol    : http_1_0
+    port        : 19000
+    max_request : 1024
+  handler: handler_a
+"#;
+        let errs = verify_str(dup_service);
+        assert!(
+            errs.iter().any(|e| e.message.contains("duplicate service name 'api'")),
+            "expected a duplicate-service refusal naming 'api'; got {:#?}",
+            errs
+        );
+
+        let dup_group = r#"@verbose 0.1.0
+
+concept_group G [max_depth: 10, max_nodes: 100]
+  @intention: "first G"
+  @source: invoices.intent:1
+  concept E1
+    @intention: "e1"
+    @source: invoices.intent:1
+    variants:
+      A of (v: number)
+
+concept_group G [max_depth: 20, max_nodes: 200]
+  @intention: "second G"
+  @source: invoices.intent:1
+  concept E2
+    @intention: "e2"
+    @source: invoices.intent:1
+    variants:
+      B of (w: number)
+"#;
+        let errs = verify_str(dup_group);
+        assert!(
+            errs.iter().any(|e| e.message.contains("duplicate concept_group name 'G'")),
+            "expected a duplicate-concept_group refusal naming 'G'; got {:#?}",
             errs
         );
     }
