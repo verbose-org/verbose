@@ -1,0 +1,5 @@
+1. Accept HTTP requests on port 18952
+2. Remember the path of the PREVIOUS request, starting from "none"
+3. Return that remembered path in the response body
+4. After the response is written, remember this request's path for the next one
+5. Declare the service with a text-typed mutable state field bounded at 256 bytes

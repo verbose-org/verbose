@@ -7695,10 +7695,16 @@ fn classify_concat_arg(
                     _ => None,
                 }
             } else if matches!(base.as_ref(), Expr::Ident(n) if n == "state") {
-                // state.field — Number-only in this slice. The offsets map
-                // contains "__state_<field_name>" so emit_eval_expr resolves
-                // it; classify as Number for concat sizing/fill.
-                Some(ConcatArgKind::Number)
+                // state.field. A TEXT field is registered in text_bindings
+                // under the COMPOSITE key (slice text-state-1), so probe that
+                // first; a Number field resolves through the offsets map's
+                // "__state_<field_name>" entry and classifies as Number for
+                // concat sizing/fill, exactly as before.
+                if text_bindings.contains_key(format!("__state_{}", field_name).as_str()) {
+                    Some(ConcatArgKind::BoundText)
+                } else {
+                    Some(ConcatArgKind::Number)
+                }
             } else {
                 None
             }
@@ -8090,16 +8096,17 @@ fn emit_concat_to_buffer_impl(
                 // count their runtime length so the buffer is large enough,
                 // otherwise the fill pass overruns into adjacent slots.
                 let bound_name = match arg {
-                    Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
+                    Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.clone()),
                     // A text input field whose name is registered in
                     // text_bindings is a BoundText source (e.g. req.body
                     // in HTTP services — the parser stores ptr+len at
                     // dedicated slots, NOT a NUL-terminated argv pointer).
-                    Expr::Field(_, n) => Some(n.as_str()),
+                    // BASE-AWARE: `state.<f>` keys as `__state_<f>`.
+                    Expr::Field(b, n) => Some(bound_text_field_key(b, n)),
                     _ => None,
                 };
                 if let Some(name) = bound_name {
-                    let (_, len_slot) = *text_bindings.get(name).expect("classified as BoundText so present in bindings");
+                    let (_, len_slot) = *text_bindings.get(name.as_str()).expect("classified as BoundText so present in bindings");
                     if len_slot >= -128 {
                         code.extend_from_slice(&[0x48, 0x03, 0x45]);
                         code.push(len_slot as u8);
@@ -8451,6 +8458,24 @@ fn emit_text_produce_ptrlen(
             code.extend_from_slice(&n.to_le_bytes());
             Ok(())
         }
+        // Slice `text-state-1`: `state.<f>` on a TEXT state field is a
+        // BoundText — its (ptr, len) live in the persistent slot pair the
+        // service prologue allocated, keyed by the COMPOSITE name.
+        Expr::Field(base, field_name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "state")
+                && text_bindings.contains_key(format!("__state_{}", field_name).as_str()) =>
+        {
+            let (ptr_slot, len_slot) = text_bindings[format!("__state_{}", field_name).as_str()];
+            load_rax_from_rbp(code, ptr_slot);
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
         Expr::Field(base, field_name)
             if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
         {
@@ -8468,6 +8493,26 @@ fn emit_text_produce_ptrlen(
                         field_name
                     ),
                 });
+            }
+            // A text input field with NO rbp slot of its own but a (ptr, len)
+            // pair in text_bindings is `req.body` in an HTTP service: it is
+            // not a NUL-terminated argv pointer, so the strlen path below
+            // cannot serve it. Guarded on the offsets map MISSING the name,
+            // so this fires only where the code previously panicked on the
+            // `offsets[...]` index — strictly additive, zero byte change for
+            // every program that compiled before.
+            if !offsets.contains_key(field_name.as_str()) {
+                if let Some(&(ptr_slot, len_slot)) = text_bindings.get(field_name.as_str()) {
+                    load_rax_from_rbp(code, ptr_slot);
+                    if len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                        code.push(len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                        code.extend_from_slice(&len_slot.to_le_bytes());
+                    }
+                    return Ok(());
+                }
             }
             let offset = offsets[field_name.as_str()];
             // mov rax, [rbp + offset]  (ptr)
@@ -8674,15 +8719,16 @@ fn emit_concat_fill(
                 // basis — the connection's response (ptr, len) lives in
                 // the bound text slot the prologue allocated.
                 let bound_name = match arg {
-                    Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
+                    Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.clone()),
                     // Field whose name is in text_bindings (e.g. req.body)
                     // is a BoundText source — same (ptr, len) shape.
-                    Expr::Field(_, n) => Some(n.as_str()),
+                    // BASE-AWARE: `state.<f>` keys as `__state_<f>`.
+                    Expr::Field(b, n) => Some(bound_text_field_key(b, n)),
                     _ => None,
                 };
                 if let Some(name) = bound_name {
                     let (ptr_slot, len_slot) = *text_bindings
-                        .get(name)
+                        .get(name.as_str())
                         .expect("classified as BoundText so present in bindings");
                     // mov rsi, [rbp + ptr_slot]
                     if ptr_slot >= -128 {
@@ -9555,14 +9601,15 @@ fn emit_text_write_to_fd(
     // request bytes Expr inside the Fetch is consumed by the prologue;
     // here we only consult the connection name.
     let bound_name = match text_expr {
-        Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
+        Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.clone()),
         // Field whose name is in text_bindings (e.g. req.body in HTTP
         // services) routes through the BoundText (ptr, len) path.
-        Expr::Field(_, n) => Some(n.as_str()),
+        // BASE-AWARE: `state.<f>` keys as `__state_<f>`.
+        Expr::Field(b, n) => Some(bound_text_field_key(b, n)),
         _ => None,
     };
     if let Some(name) = bound_name {
-        if let Some(&(ptr_slot, len_slot)) = text_bindings.get(name) {
+        if let Some(&(ptr_slot, len_slot)) = text_bindings.get(name.as_str()) {
             // mov rsi, [rbp + ptr_slot]
             if ptr_slot >= -128 {
                 code.extend_from_slice(&[0x48, 0x8B, 0x75]);
@@ -16979,6 +17026,24 @@ fn emit_length(
             emit_mov_rax_imm(code, b.len() as i64);
             Ok(())
         }
+        // Slice `text-state-1`: `length(state.<f>)` on a TEXT state field is a
+        // zero-scan slot load — the length is already stored, and it is the
+        // length the `set` copy wrote, not a strlen over a buffer that may
+        // hold longer stale bytes from a previous request.
+        Expr::Field(base, fname)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "state")
+                && text_bindings.contains_key(format!("__state_{}", fname).as_str()) =>
+        {
+            let (_ptr_slot, len_slot) = text_bindings[format!("__state_{}", fname).as_str()];
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
         Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) => {
             // BoundText path takes precedence: a field whose name is in
             // text_bindings has its length at the registered len_slot
@@ -19856,8 +19921,18 @@ pub fn compile_service(
         // path) which only exist once the HTTP parser has run — and the
         // constant path does not emit the parser. The dynamic path handles
         // pure-literal Record leaves correctly, so no expressive loss.
+        // An `after:` block forces the dynamic path for the same reason a
+        // handler `let` does (see `analyze_http10_handler_shape`): the
+        // constant fast path emits no state init and no after block, so the
+        // mutation would be SILENTLY DROPPED. Byte-neutral over the corpus —
+        // the only service with an `after:` block today has a `concat` body
+        // and was already Dynamic — but a constant-bodied stateful service is
+        // expressible, and "the declaration compiled to nothing" is the false
+        // explicitation this project forbids by name.
         return match analyze_http10_handler_shape(handler) {
-            Http10HandlerShape::Constant if service.logs.is_empty() => {
+            Http10HandlerShape::Constant
+                if service.logs.is_empty() && service.after_sets.is_empty() =>
+            {
                 compile_http10_constant_service(program, service, output_path)
             }
             Http10HandlerShape::Constant | Http10HandlerShape::Dynamic => {
@@ -20388,6 +20463,69 @@ fn http_request_builtin_concept_native(max_request: u32) -> Concept {
     }
 }
 
+/// Slice `text-state-1`: the declared `[..N]` of a TEXT state field.
+///
+/// A hard error rather than an `unwrap()` because the soundness of every
+/// buffer-sizing calculation downstream rests on it: the parser makes the
+/// bound mandatory for text and the verifier range-checks it, so reaching
+/// here without one means those two moved and this is the site that must
+/// notice.
+fn state_text_bound(sf: &StateField) -> Result<i32, NativeError> {
+    match sf.max_bytes {
+        Some(n) if (1..=65536).contains(&n) => Ok(n as i32),
+        other => Err(NativeError {
+            message: format!(
+                "state field '{}': a text state field needs a [..N] bound in 1..=65536 \
+                 (got {:?}); the buffer is allocated once in the service prologue, so its \
+                 size must be a compile-time constant (verifier should have caught this)",
+                sf.name, other
+            ),
+        }),
+    }
+}
+
+/// The state buffer's byte footprint: the declared bound rounded up to 8, the
+/// same padding `compute_resource_extra_bytes` applies to a resource buffer.
+fn state_text_padded_bytes(sf: &StateField) -> Result<i32, NativeError> {
+    Ok((state_text_bound(sf)? + 7) & !7)
+}
+
+/// `lea rax, [rbp + disp]`.
+fn emit_lea_rax_rbp(code: &mut Vec<u8>, disp: i32) {
+    if disp >= -128 && disp <= 127 {
+        code.extend_from_slice(&[0x48, 0x8D, 0x45]);
+        code.push(disp as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8D, 0x85]);
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+/// `lea rdi, [rbp + disp]`.
+fn emit_lea_rdi_rbp(code: &mut Vec<u8>, disp: i32) {
+    if disp >= -128 && disp <= 127 {
+        code.extend_from_slice(&[0x48, 0x8D, 0x7D]);
+        code.push(disp as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8D, 0xBD]);
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+/// The `text_bindings` key a BoundText field expression resolves under.
+///
+/// `state.<f>` uses the composite `__state_<f>`; every other base keeps the
+/// bare field name. **Base-awareness is what stops `state.body` resolving to
+/// `req.body`'s slots** — `emit_http10_dynamic_bytes` registers req.body under
+/// the bare name "body", and the three call sites of this helper used to match
+/// `Expr::Field(_, n)` discarding the base entirely.
+fn bound_text_field_key(base: &Expr, field_name: &str) -> String {
+    match base {
+        Expr::Ident(b) if b == "state" => format!("__state_{}", field_name),
+        _ => field_name.to_string(),
+    }
+}
+
 fn emit_http10_dynamic_bytes(
     service: &Service,
     handler: &Rule,
@@ -20506,8 +20644,22 @@ fn emit_http10_dynamic_bytes(
         .iter()
         .map(|t| if *t { 16i32 } else { 8 })
         .sum();
-    // Mutable state: one 8-byte slot per Number-typed state field.
-    let state_slots_bytes: i32 = (service.state_fields.len() as i32) * 8;
+    // Mutable state (slice `text-state-1`): a Number field gets one 8-byte
+    // slot, exactly as before; a Text field gets the SAME triple a resource
+    // and a connection already get in this frame — 16 bytes for (ptr, len)
+    // plus an N-byte buffer padded to 8. A Number-only service therefore
+    // contributes the same `8` per field in the same order and its whole
+    // frame is byte-identical.
+    let state_slots_bytes: i32 = {
+        let mut total: i32 = 0;
+        for sf in &service.state_fields {
+            total += match sf.ty {
+                Type::Text => 16 + state_text_padded_bytes(sf)?,
+                _ => 8,
+            };
+        }
+        total
+    };
     // Pre-body fixed offset: where the optional timestamp lives.
     let body_pre_offset: i32 = if uses_timestamp { 56 } else { 48 };
     let body_extra_bytes: i32 = if uses_body { 16 } else { 0 };
@@ -20515,17 +20667,41 @@ fn emit_http10_dynamic_bytes(
     let body_ptr_slot: i32 = if uses_body { -(body_pre_offset + 8) } else { 0 };
     let body_len_slot: i32 = if uses_body { -(body_pre_offset + 16) } else { 0 };
     let frame_base_fixed: i32 = body_pre_offset + body_extra_bytes + handler_let_slots_bytes + state_slots_bytes;
-    // Build state offsets map: each state field gets a dedicated rbp slot
-    // below the handler let slots. These slots survive per-iteration rsp
-    // reset because they're within the rbp-relative frame.
+    // Build state offsets: each state field gets dedicated rbp slots below
+    // the handler let slots. These slots survive the per-iteration rsp reset
+    // because they're within the rbp-relative frame — which is exactly what
+    // a persistent text buffer needs too, at no new cost.
+    //
+    // A DESCENDING CURSOR over `service.state_fields`, a Vec. Never a HashMap
+    // walk: the offsets it produces reach emitted bytes, and Rust's default
+    // hasher is randomly seeded (CLAUDE.md "Reproducible emit").
     let mut state_offsets: HashMap<&str, i32> = HashMap::new();
+    let mut state_text_slots: Vec<(&str, i32, i32, i32)> = Vec::new(); // (name, ptr, len, buf)
     {
-        let state_block_start: i32 = -(body_pre_offset + body_extra_bytes + handler_let_slots_bytes);
-        for (i, sf) in service.state_fields.iter().enumerate() {
-            let slot = state_block_start - 8 * (i as i32 + 1);
-            state_offsets.insert(sf.name.as_str(), slot);
+        let mut cursor: i32 = -(body_pre_offset + body_extra_bytes + handler_let_slots_bytes);
+        for sf in &service.state_fields {
+            match sf.ty {
+                Type::Text => {
+                    let padded = state_text_padded_bytes(sf)?;
+                    let ptr_slot = cursor - 8;
+                    let len_slot = cursor - 16;
+                    let buf_off = cursor - 16 - padded;
+                    cursor -= 16 + padded;
+                    state_text_slots.push((sf.name.as_str(), ptr_slot, len_slot, buf_off));
+                }
+                _ => {
+                    cursor -= 8;
+                    state_offsets.insert(sf.name.as_str(), cursor);
+                }
+            }
         }
     }
+    // Owned composite keys for the state fields. Declared HERE — above
+    // `http_text_bindings` — because a TEXT state field registers into that
+    // map by reference, so the Vec has to outlive it.
+    let state_composite_keys: Vec<String> = service.state_fields.iter()
+        .map(|sf| format!("__state_{}", sf.name))
+        .collect();
     let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes;
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
@@ -20549,10 +20725,56 @@ fn emit_http10_dynamic_bytes(
     // These slots persist across accept iterations because they're within
     // the rbp-relative frame (lea rsp, [rbp - frame_size] restores rsp
     // below them but never overwrites the slots themselves).
+    // Slice `text-state-1`: a Text field's init points its ptr slot at the
+    // persistent buffer (an address that never changes for the process's
+    // life), stores the literal's length, and copies the literal bytes in.
+    // The literal is inlined via the same jmp-over-data shape every other
+    // text literal in this emitter uses, so `strings <binary>` still shows
+    // the whole state block — the audit contract in docs/effect-model.md.
     for sf in &service.state_fields {
-        let slot = state_offsets[sf.name.as_str()];
-        // mov qword [rbp + slot], initial_value
-        emit_mov_rbp_slot_imm(&mut code, slot, sf.initial_value);
+        match &sf.init {
+            StateInit::Number(v) => {
+                let slot = state_offsets[sf.name.as_str()];
+                // mov qword [rbp + slot], initial_value
+                emit_mov_rbp_slot_imm(&mut code, slot, *v);
+            }
+            StateInit::Text(lit) => {
+                let (_, ptr_slot, len_slot, buf_off) = *state_text_slots
+                    .iter()
+                    .find(|(n, ..)| *n == sf.name.as_str())
+                    .expect("text state field has a slot triple");
+                emit_lea_rax_rbp(&mut code, buf_off);
+                store_rax_at_rbp(&mut code, ptr_slot);
+                emit_mov_rbp_slot_imm(&mut code, len_slot, lit.as_bytes().len() as i64);
+                let bytes = lit.as_bytes();
+                if !bytes.is_empty() {
+                    let n = bytes.len() as i32;
+                    // jmp over the inline data (rel8 when it fits, else rel32)
+                    if n <= 127 {
+                        code.push(0xEB);
+                        code.push(n as u8);
+                    } else {
+                        code.push(0xE9);
+                        code.extend_from_slice(&n.to_le_bytes());
+                    }
+                    let data_addr = code.len();
+                    code.extend_from_slice(bytes);
+                    // lea rsi, [rip + rel32]
+                    let after = code.len() + 7;
+                    let rel = data_addr as i32 - after as i32;
+                    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+                    code.extend_from_slice(&rel.to_le_bytes());
+                    // lea rdi, [rbp + buf_off]
+                    emit_lea_rdi_rbp(&mut code, buf_off);
+                    // mov rcx, n
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+                    code.extend_from_slice(&n.to_le_bytes());
+                    // cld ; rep movsb
+                    code.push(0xFC);
+                    code.extend_from_slice(&[0xF3, 0xA4]);
+                }
+            }
+        }
     }
 
     // ═══ SOCKET ════════════════════════════════════════════════
@@ -20976,18 +21198,34 @@ fn emit_http10_dynamic_bytes(
     // The slot range is reserved by `handler_let_slots_bytes` added into
     // frame_base_fixed above, so it never collides with the resource or
     // connection blocks below.
-    // Build owned composite keys for state fields. These must outlive
-    // handler_offsets, which borrows &str from them. POC-level allocation
-    // (one String per state field, once per compile).
-    let state_composite_keys: Vec<String> = service.state_fields.iter()
-        .map(|sf| format!("__state_{}", sf.name))
-        .collect();
+    // `state_composite_keys` is built with the frame layout above, because a
+    // TEXT state field registers into `http_text_bindings` by reference and
+    // that map is declared earlier in this function.
     let mut handler_offsets: HashMap<&str, i32> = offsets.clone();
     // Register state field offsets under composite keys so emit_eval_expr's
     // Field(Ident("state"), name) arm resolves them via "__state_<name>".
+    //
+    // THE COMPOSITE KEY IS MANDATORY, not stylistic. `req.body` is registered
+    // in `http_text_bindings` under the BARE name "body" a few hundred lines
+    // above, and three BoundText key extractions match `Expr::Field(_, n)`
+    // ignoring the base — so a service declaring `body : text [..64] = ""`
+    // would have `state.body` silently resolve to `req.body`'s slots: a
+    // plausible value, rc 0, no diagnostic. Same hazard `__agg_<let>_<field>`
+    // records for the aggregate arc.
     for (i, sf) in service.state_fields.iter().enumerate() {
-        let slot = state_offsets[sf.name.as_str()];
-        handler_offsets.insert(&state_composite_keys[i], slot);
+        match sf.ty {
+            Type::Text => {
+                let (_, ptr_slot, len_slot, _) = *state_text_slots
+                    .iter()
+                    .find(|(n, ..)| *n == sf.name.as_str())
+                    .expect("text state field has a slot triple");
+                http_text_bindings.insert(&state_composite_keys[i], (ptr_slot, len_slot));
+            }
+            _ => {
+                let slot = state_offsets[sf.name.as_str()];
+                handler_offsets.insert(&state_composite_keys[i], slot);
+            }
+        }
     }
     {
         let let_block_start: i32 = -(body_pre_offset + body_extra_bytes);
@@ -21129,26 +21367,97 @@ fn emit_http10_dynamic_bytes(
     // evaluates its value expression (can reference state.*, req.* fields)
     // and stores the result into the corresponding state slot.
     for aset in &service.after_sets {
-        let state_slot = state_offsets.get(aset.field_name.as_str())
-            .copied()
+        let sf = service.state_fields.iter()
+            .find(|sf| sf.name == aset.field_name)
             .ok_or_else(|| NativeError {
                 message: format!(
                     "after block references unknown state field '{}' (verifier should have caught this)",
                     aset.field_name
                 ),
             })?;
-        emit_eval_expr(
-            &mut code,
-            &aset.value,
-            &handler.input_name,
-            &handler_offsets,
-            all_rules,
-            field_ranges,
-            &http_text_bindings,
-            None,
-            None,
-        )?;
-        store_rax_at_rbp(&mut code, state_slot);
+        match sf.ty {
+            Type::Text => {
+                // Slice `text-state-1`: COPY the bytes into the persistent
+                // buffer. Never store the source pointer — an alias works for
+                // a text literal (which lives in the code region forever) and
+                // for the FIRST request of anything else, then silently
+                // returns the NEXT request's bytes, because every transient
+                // source here (the HTTP read buffer, a concat buffer, a
+                // resource buffer) is reused or freed at the iteration tail.
+                let (_, _ptr_slot, len_slot, buf_off) = *state_text_slots
+                    .iter()
+                    .find(|(n, ..)| *n == aset.field_name.as_str())
+                    .expect("text state field has a slot triple");
+                let n = state_text_bound(sf)?;
+                // Every transient the source may live in is STILL LIVE here:
+                // the after block runs before the iteration tail's
+                // `lea rsp, [rbp - frame_size]`. That ordering is the
+                // invariant this whole copy rests on — see the comment at the
+                // ITERATION TAIL below.
+                emit_text_produce_ptrlen(
+                    &mut code,
+                    &aset.value,
+                    &handler.input_name,
+                    &http_request_concept_for_lets,
+                    all_rules,
+                    &handler_offsets,
+                    field_ranges,
+                    &http_text_bindings,
+                )?;
+                // BACKSTOP, 13 bytes: cmp rdx, N ; ja abort.
+                //
+                // UNREACHABLE BY CONSTRUCTION — the verifier proved
+                // worst_case(source) <= N from declarations before this
+                // compiled. It is kept because the compile-time gate is a
+                // piece of REASONING, and this repository's 2026-08-05 scar
+                // is a correct-looking static size defended by an argument
+                // with a hole in it. Thirteen bytes turns "a future widening
+                // of the source table becomes a remote stack overflow" into
+                // "a future widening becomes an exit(1)". It creates no DoS
+                // path precisely because nothing can drive the process to it.
+                code.extend_from_slice(&[0x48, 0x81, 0xFA]); // cmp rdx, imm32
+                code.extend_from_slice(&n.to_le_bytes());
+                code.extend_from_slice(&[0x0F, 0x87]);       // ja rel32
+                abort_patches.push(code.len());
+                code.extend_from_slice(&[0, 0, 0, 0]);
+                // mov rsi, rax
+                code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+                // lea rdi, [rbp + buf_off]   — computed LAST, right before
+                // the copy: the producer above is free to clobber rdi/rsi.
+                emit_lea_rdi_rbp(&mut code, buf_off);
+                // mov rcx, rdx
+                code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+                // cld ; rep movsb   — DF is not assumed to be 0, same
+                // discipline as emit_text_bound_check's own cld.
+                code.push(0xFC);
+                code.extend_from_slice(&[0xF3, 0xA4]);
+                // mov [rbp + len_slot], rdx  — the ptr slot is NOT rewritten:
+                // the buffer address is constant, which is what lets every
+                // BoundText reader work unmodified.
+                if len_slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                    code.push(len_slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                    code.extend_from_slice(&len_slot.to_le_bytes());
+                }
+            }
+            _ => {
+                let state_slot = state_offsets[aset.field_name.as_str()];
+                emit_eval_expr(
+                    &mut code,
+                    &aset.value,
+                    &handler.input_name,
+                    &handler_offsets,
+                    all_rules,
+                    field_ranges,
+                    &http_text_bindings,
+                    None,
+                    None,
+                )?;
+                store_rax_at_rbp(&mut code, state_slot);
+            }
+        }
     }
 
     // ═══ CLOSE + LOOP ══════════════════════════════════════════
@@ -21167,6 +21476,14 @@ fn emit_http10_dynamic_bytes(
     // Sequential mode: the standard slice 3d epilogue — restore rsp to
     // the post-prologue invariant (frees any handler-allocated concat
     // buffer in one instruction) and jump back to accept_top.
+    //
+    // INVARIANT (slice `text-state-1`): this `lea rsp` runs AFTER the after
+    // block. Every transient a `set` may copy FROM — a handler concat buffer,
+    // a resource buffer, a fetch response, the HTTP read buffer itself — is
+    // still live at the copy point precisely because of that ordering, and
+    // the text-state copy is expressible for no other reason. A future slice
+    // that moves the free earlier, or the after block later, breaks it
+    // silently: the copy would read freed stack.
     //
     // Forked mode: control reached here only inside the child process
     // (the parent took the close + jmp accept_top path inside the fork
@@ -21465,6 +21782,22 @@ fn emit_handler_to_slots(
                     // mov qword [rbp-40], len (as i32)
                     code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xD8]);    // -40 = 0xD8
                     code.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
+                }
+                // Slice `text-state-1`: `body: state.<f>` directly. The
+                // persistent (ptr, len) copy straight into the body slots —
+                // same shape as the Read / Fetch arms below.
+                Expr::Field(base, fname)
+                    if matches!(base.as_ref(), Expr::Ident(n) if n == "state")
+                        && text_bindings.contains_key(format!("__state_{}", fname).as_str()) =>
+                {
+                    let (ptr_slot, len_slot) =
+                        text_bindings[format!("__state_{}", fname).as_str()];
+                    load_rax_from_rbp(code, ptr_slot);
+                    // mov [rbp-32], rax (body ptr)
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE0]);
+                    load_rax_from_rbp(code, len_slot);
+                    // mov [rbp-40], rax (body len)
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xD8]);
                 }
                 Expr::Field(base, fname)
                     if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
@@ -39975,6 +40308,451 @@ rule scalar
         let _ = std::fs::remove_file(&out);
     }
 
+    // ── Slice `text-state-1`: text-typed service state ──────────────────
+    //
+    // Design: docs/text-state-fields-design.md. A `state:` field may be
+    // `<name> : text [..N] = "<literal>"`; it gets a (ptr, len) slot pair plus
+    // an N-byte buffer in the service's rbp frame, `set` COPIES bytes into it
+    // with `rep movsb`, and the overflow gate is a COMPILE-TIME proof that
+    // `worst_case(source) <= N` rather than a runtime check inside a listener.
+
+    /// Compile a service source string and drive a sequence of `GET <path>`
+    /// requests against it on an ephemeral port, returning each response body.
+    ///
+    /// The port is ephemeral (`TcpListener::bind(("127.0.0.1", 0))`, then
+    /// dropped) rather than a hardcoded constant: `service_mutable_state_counter`
+    /// above substitutes `18950` for `18950`, i.e. a no-op, and is genuinely
+    /// collision-prone under a parallel harness.
+    #[cfg(test)]
+    fn text_state_drive(
+        src_template: &str,
+        service_name: &str,
+        tag: &str,
+        paths: &[&str],
+    ) -> Vec<String> {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            l.local_addr().unwrap().port()
+        };
+        let src = src_template.replace("__PORT__", &port.to_string());
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join(format!("verbosec_test_textstate_{}", tag));
+        compile_service(&program, service_name, out.to_str().unwrap())
+            .expect("service should compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut bound = false;
+        for _ in 0..100 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "service never bound on port {}", port);
+
+        let mut bodies = Vec::new();
+        for path in paths {
+            let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(format!("GET {} HTTP/1.0\r\n\r\n", path).as_bytes())
+                .expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let response = String::from_utf8_lossy(&buf).to_string();
+            let body = match response.find("\r\n\r\n") {
+                Some(i) => response[i + 4..].to_string(),
+                None => response.clone(),
+            };
+            bodies.push(body);
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&out);
+        bodies
+    }
+
+    /// The whole slice, end to end: `examples/last_path_service.verbose` over
+    /// THREE real TCP requests.
+    ///
+    /// Each row proves a different thing, and the fixture's source is
+    /// `req.path` for a reason stated in the file itself: a LITERAL-sourced
+    /// fixture passes even against an implementation that ALIASES the source
+    /// pointer instead of copying, because a literal lives in the code region
+    /// forever. `req.path` points into the HTTP read buffer, which the next
+    /// request overwrites.
+    ///
+    ///   row 1  prev:none    — the initial literal reached the buffer, AND the
+    ///                         mutation is not visible to its own request
+    ///   row 2  prev:/alpha  — the value survived the iteration tail's
+    ///                         `lea rsp`, and it was COPIED
+    ///   row 3  prev:/beta   — a live cell, not a one-shot
+    #[test]
+    fn service_text_state_persists_across_requests() {
+        let src = std::fs::read_to_string("examples/last_path_service.verbose")
+            .expect("examples/last_path_service.verbose");
+        let src = src.replace("18952", "__PORT__");
+        let bodies = text_state_drive(&src, "memo", "persist", &["/alpha", "/beta", "/gamma"]);
+        assert_eq!(
+            bodies,
+            vec![
+                "prev:none".to_string(),
+                "prev:/alpha".to_string(),
+                "prev:/beta".to_string()
+            ],
+            "text state must persist ACROSS requests and be copied, not aliased"
+        );
+    }
+
+    /// Row 1 alone, asserted separately so a regression in the INIT sequence
+    /// is distinguishable from a regression in the COPY. A single combined
+    /// test that failed would not say which half broke.
+    #[test]
+    fn service_text_state_initial_literal_visible_on_first_request() {
+        let src = std::fs::read_to_string("examples/last_path_service.verbose")
+            .expect("examples/last_path_service.verbose");
+        let src = src.replace("18952", "__PORT__");
+        let bodies = text_state_drive(&src, "memo", "init", &["/alpha"]);
+        assert_eq!(bodies, vec!["prev:none".to_string()]);
+    }
+
+    /// **The composite-key control, and the fixture choice is the test.**
+    ///
+    /// `emit_http10_dynamic_bytes` registers `req.body` in `http_text_bindings`
+    /// under the BARE name `"body"`, and three BoundText key extractions used
+    /// to match `Expr::Field(_, n)` discarding the base. So a state field named
+    /// anything BUT `body` passes under bare-name registration too — a fixture
+    /// called `last` proves nothing about keying. This one is named `body`, and
+    /// the response prints both `state.body` and `req.body` so a collision is
+    /// visible as two identical values rather than as a crash.
+    #[test]
+    fn service_text_state_composite_key_does_not_shadow_req_body() {
+        let src = r#"@verbose 0.1.0
+
+rule echo
+  @intention: "Echo the request body and the remembered one"
+  @source: counter_service.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: concat("s=", state.body, " r=", req.body) }
+
+  proofs:
+    purity:
+      reads : [state.body, req.body]
+      calls : []
+    termination:
+      bound : 5
+
+service shadow
+  @intention: "State field deliberately named after req.body"
+  @source: counter_service.intent:2
+
+  listen:
+    protocol    : http_1_0
+    port        : __PORT__
+    max_request : 4096
+
+  handler: echo
+
+  state:
+    body : text [..64] = "seed"
+
+  after:
+    set body = req.path
+"#;
+        let bodies = text_state_drive(src, "shadow", "shadow", &["/one", "/two"]);
+        // Request 1: state.body is the initial literal; req.body is empty
+        // (a GET with no payload). Under BARE-name registration state.body
+        // would resolve to req.body's slots and print "s= r=".
+        assert_eq!(bodies[0], "s=seed r=", "state.body must not resolve to req.body");
+        // Request 2: state.body now holds the previous path, req.body is
+        // still empty — the two are visibly different values.
+        assert_eq!(bodies[1], "s=/one r=");
+    }
+
+    /// Refusal #6 — the append-accumulator — with a CORRECTED TWIN.
+    ///
+    /// The message must name both numbers (320 and 64) and must say
+    /// explicitly that append-accumulation can never satisfy the gate, so a
+    /// reader is not left thinking the bound is merely too small.
+    ///
+    /// **The design note's suggested twin (`[..512]`) does not work, and that
+    /// is the point of the refusal rather than a defect in it.** Widening the
+    /// state field's own bound also widens the accumulator's worst case —
+    /// 512 + 256 = 768 — so no bound satisfies the gate: `worst_case = N + 256`
+    /// exceeds `N` for every N. The twin therefore changes the SHAPE while
+    /// KEEPING `concat`, which is what makes the refusal attributable to the
+    /// self-reference and not to `concat` in general.
+    #[test]
+    fn service_text_state_refuses_unbounded_accumulator() {
+        let verify = |s: &str| -> Vec<String> {
+            let tokens = crate::lexer::Lexer::new(s).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            crate::verifier::verify_program(&program, std::path::Path::new("examples/negative"))
+                .iter()
+                .map(|e| e.to_string())
+                .collect()
+        };
+        let src = std::fs::read_to_string("examples/negative/state_text_accumulator.verbose")
+            .expect("examples/negative/state_text_accumulator.verbose");
+        let joined = verify(&src).join("\n");
+        assert!(
+            joined.contains("worst case 320 bytes exceeds the declared bound 64"),
+            "expected refusal #6 naming both numbers, got: {}",
+            joined
+        );
+        assert!(
+            joined.contains("Append-accumulation"),
+            "the refusal must name the accumulator shape, got: {}",
+            joined
+        );
+
+        // Widening the bound does NOT fix it — asserted, because the obvious
+        // reading of "worst case 320 exceeds 64" is "declare 512".
+        let widened = src.replace("last : text [..64]", "last : text [..512]");
+        assert!(
+            verify(&widened).join("\n").contains("worst case 768 bytes exceeds the declared bound 512"),
+            "widening the bound must not satisfy the gate"
+        );
+
+        // CORRECTED TWIN: still a `concat`, but no longer self-referential —
+        // worst case 5 + 256 = 261 <= 512. It must verify AND run.
+        let fixed = widened.replace(
+            "set last = concat(state.last, req.path)",
+            "set last = concat(\"path:\", req.path)",
+        );
+        let errs = verify(&fixed);
+        assert!(errs.is_empty(), "corrected twin must verify, got: {:?}", errs);
+        let fixed = fixed.replace("18953", "__PORT__");
+        let bodies = text_state_drive(&fixed, "memo", "accum", &["/a", "/bb"]);
+        assert_eq!(bodies, vec!["seen:".to_string(), "seen:path:/a".to_string()]);
+    }
+
+    /// Refusal #5 — a source shape with no compile-time byte bound. The
+    /// message names the offending shape AND enumerates what the slice does
+    /// accept, and the corrected twin uses one of the enumerated shapes.
+    #[test]
+    fn service_text_state_refuses_unbounded_source_shape() {
+        let base = TEXT_STATE_SERVICE_TEMPLATE;
+        // `now_unix()` is a Number-producing shape with no text bound.
+        let src = base.replace("__SET__", "set last = now_unix()");
+        let errs = verify_source_for_test(&src);
+        let joined = errs.join("\n");
+        assert!(
+            joined.contains("has no compile-time byte bound"),
+            "expected refusal #5, got: {}",
+            joined
+        );
+        assert!(
+            joined.contains("now_unix()"),
+            "the refusal must name the offending shape, got: {}",
+            joined
+        );
+        // CORRECTED TWIN: one of the enumerated shapes.
+        let fixed = base.replace("__SET__", "set last = req.path");
+        assert!(
+            verify_source_for_test(&fixed).is_empty(),
+            "corrected twin must verify"
+        );
+    }
+
+    /// Refusal #7 is ALREADY SHIPPED (PR #194) and keyed on `after_sets`, not
+    /// on `state_fields`. This asserts a TEXT state field INHERITS it rather
+    /// than needing its own gate, plus the sequential twin that still works.
+    #[test]
+    fn service_text_state_inherits_the_forked_refusal() {
+        let base = TEXT_STATE_SERVICE_TEMPLATE.replace("__SET__", "set last = req.path");
+        let forked = base.replace("  handler: echo", "  concurrency: forked\n\n  handler: echo");
+        let errs = verify_source_for_test(&forked);
+        let joined = errs.join("\n");
+        assert!(
+            joined.contains("concurrency: forked"),
+            "text state must inherit the forked refusal, got: {}",
+            joined
+        );
+        // Sequential twin still verifies (guards the over-strict direction).
+        assert!(verify_source_for_test(&base).is_empty());
+    }
+
+    /// Refusals #8 and #9 — the read positions this slice has NOT wired.
+    /// One cell per primitive, each with a twin that binds the state field to
+    /// a handler `let` first and must verify.
+    ///
+    /// These exist so the refusal is ATTRIBUTABLE. Without them the program
+    /// would still be rejected, but by a generic emitter "shape not supported"
+    /// message naming neither the offender nor the slice that lifts it.
+    #[test]
+    fn service_text_state_refuses_unwired_read_positions() {
+        let cells: &[(&str, &str)] = &[
+            ("starts_with(state.last, \"/a\")", "starts_with"),
+            ("ends_with(state.last, \"/a\")", "ends_with"),
+            ("contains(state.last, \"/a\")", "contains"),
+            ("length(substring(state.last, 0, 1)) > 0", "substring"),
+            ("length(json_escape(state.last)) > 0", "json_escape"),
+            ("parse_int(state.last) > 0", "parse_int"),
+            ("state.last == \"/a\"", "text equality"),
+        ];
+        for (cond, primitive) in cells {
+            let src = TEXT_STATE_SERVICE_TEMPLATE
+                .replace("__SET__", "set last = req.path")
+                .replace(
+                    "status: 200",
+                    &format!("status: if {} then 200 else 404", cond),
+                );
+            let errs = verify_source_for_test(&src);
+            let joined = errs.join("\n");
+            assert!(
+                joined.contains(primitive) && joined.contains("text state field"),
+                "expected refusal #8/#9 naming '{}', got: {}",
+                primitive,
+                joined
+            );
+            assert!(
+                joined.contains("text-state-2"),
+                "the refusal must name the lifting slice, got: {}",
+                joined
+            );
+        }
+        // CORRECTED TWIN, once: the same predicate over a handler `let` that
+        // binds the state field first is accepted — the refusal is about the
+        // primitive's field arm, not about reading state at all.
+        let twin = TEXT_STATE_SERVICE_TEMPLATE
+            .replace("__SET__", "set last = req.path")
+            .replace(
+                "  logic:\n",
+                "  logic:\n    let seen = state.last\n",
+            )
+            .replace("status: 200", "status: if starts_with(seen, \"/a\") then 200 else 404");
+        let errs = verify_source_for_test(&twin);
+        assert!(
+            errs.is_empty(),
+            "binding to a handler let first must verify, got: {:?}",
+            errs
+        );
+    }
+
+    /// Refusals #2 and #3 — the numeric checks on the declaration itself.
+    #[test]
+    fn service_text_state_declaration_bounds_are_checked() {
+        let base = TEXT_STATE_SERVICE_TEMPLATE.replace("__SET__", "set last = req.path");
+        // #2: bound out of range.
+        for bad in ["[..0]", "[..65537]"] {
+            let src = base.replace("[..256]", bad);
+            let joined = verify_source_for_test(&src).join("\n");
+            assert!(
+                joined.contains("must be in 1..=65536"),
+                "expected refusal #2 for {}, got: {}",
+                bad,
+                joined
+            );
+        }
+        // The boundary values themselves are ACCEPTED — an off-by-one in the
+        // range check is the likeliest defect and nothing else would see it.
+        for ok in ["[..1]", "[..65536]"] {
+            let src = base.replace("[..256]", ok).replace("= \"none\"", "= \"\"");
+            let joined = verify_source_for_test(&src).join("\n");
+            assert!(
+                !joined.contains("must be in 1..=65536"),
+                "{} must be accepted, got: {}",
+                ok,
+                joined
+            );
+        }
+        // #3: the initial literal is longer than the bound.
+        let src = base.replace("[..256]", "[..2]");
+        let joined = verify_source_for_test(&src).join("\n");
+        assert!(
+            joined.contains("initial value is 4 bytes but the declared bound is 2"),
+            "expected refusal #3, got: {}",
+            joined
+        );
+        // Corrected twin: a bound exactly equal to the literal's length. The
+        // `set` source has to shrink with it — `req.path`'s worst case is 256,
+        // so a 4-byte field could not hold it and refusal #6 would fire
+        // instead, masking what this cell is testing.
+        let fixed = base
+            .replace("[..256]", "[..4]")
+            .replace("set last = req.path", "set last = \"beta\"");
+        let errs = verify_source_for_test(&fixed);
+        assert!(errs.is_empty(), "corrected twin must verify, got: {:?}", errs);
+    }
+
+    /// A shared skeleton for the refusal cells above. `__PORT__` is filled by
+    /// `text_state_drive`; `__SET__` is the single `after:` line under test.
+    #[cfg(test)]
+    const TEXT_STATE_SERVICE_TEMPLATE: &str = r#"@verbose 0.1.0
+
+rule echo
+  @intention: "Answer with the remembered path"
+  @source: counter_service.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: concat("seen:", state.last) }
+
+  proofs:
+    purity:
+      reads : [state.last]
+      calls : []
+    termination:
+      bound : 8
+
+service memo
+  @intention: "Remember the last path"
+  @source: counter_service.intent:2
+
+  listen:
+    protocol    : http_1_0
+    port        : __PORT__
+    max_request : 4096
+
+  handler: echo
+
+  state:
+    last : text [..256] = "none"
+
+  after:
+    __SET__
+"#;
+
+    /// Lex + parse + verify a source string, returning the verify errors as
+    /// strings. Panics on a lex or parse error — those are a different failure
+    /// and should not be silently reported as a verify refusal.
+    #[cfg(test)]
+    fn verify_source_for_test(src: &str) -> Vec<String> {
+        let src = src.replace("__PORT__", "18999");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        crate::verifier::verify_program(&program, std::path::Path::new("examples"))
+            .iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
     /// An `after:` state mutation together with `concurrency: forked` is a
     /// WRITE-ONLY declaration and is refused at verify time.
     ///
@@ -49888,7 +50666,7 @@ rule pick
         //
         // Quote as "96/154 at rule #0".
         const EXPECTED_ACCEPTED: usize = 96;
-        const EXPECTED_TOTAL: usize = 154;
+        const EXPECTED_TOTAL: usize = 155;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

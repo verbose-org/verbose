@@ -1938,8 +1938,9 @@ impl Parser {
                 };
                 self.expect_kind(TokenKind::Newline)?;
             } else if self.check_ident("state") {
-                // Mutable state block. Each line: `name : number = <literal>`.
-                // Number-only in this slice; text state is a follow-up.
+                // Mutable state block. Two line shapes:
+                //   `name : number = <signed literal>`
+                //   `name : text [..N] = "<literal>"`   (slice text-state-1)
                 self.advance();
                 self.expect_kind(TokenKind::Colon)?;
                 self.expect_kind(TokenKind::Newline)?;
@@ -1948,19 +1949,84 @@ impl Parser {
                     let fname = self.expect_ident_any()?;
                     self.expect_kind(TokenKind::Colon)?;
                     let ty = self.parse_type()?;
-                    if ty != Type::Number {
-                        return Err(self.error(&format!(
-                            "state field '{}': only 'number' type is supported in this slice; got {:?}",
-                            fname, ty
-                        )));
+                    // An optional `[..N]` bound, reusing the concept-field
+                    // spelling verbatim (`parse_fields_block`). Parsed before
+                    // the type dispatch so a bound on a NUMBER state field is
+                    // reported as "not accepted here" rather than as a stray
+                    // token at the `=`.
+                    let mut max_bytes: Option<i64> = None;
+                    if self.check_kind(&TokenKind::LBracket) {
+                        self.advance();
+                        self.expect_kind(TokenKind::Dot)?;
+                        self.expect_kind(TokenKind::Dot)?;
+                        max_bytes = Some(self.parse_signed_number()?);
+                        self.expect_kind(TokenKind::RBracket)?;
                     }
-                    // Expect `= <literal>`
-                    self.expect_kind(TokenKind::Equal)?;
-                    let initial_value = self.parse_signed_number()?;
+                    let (ty, max_bytes, init) = match ty {
+                        Type::Number => {
+                            if max_bytes.is_some() {
+                                return Err(self.error(&format!(
+                                    "state field '{}': the [..N] bound is a byte-length bound and applies to text \
+                                     state fields only; a number state field takes no bound",
+                                    fname
+                                )));
+                            }
+                            self.expect_kind(TokenKind::Equal)?;
+                            let v = self.parse_signed_number()?;
+                            (Type::Number, None, StateInit::Number(v))
+                        }
+                        Type::Text => {
+                            // Refusal #1 — the buffer is allocated once in the
+                            // service prologue, so its size must be a
+                            // compile-time constant. There is no
+                            // runtime-`strlen` sizing fallback for a slot that
+                            // outlives every request.
+                            let n = max_bytes.ok_or_else(|| {
+                                self.error(&format!(
+                                    "state field '{}': a text state field must declare a maximum byte length, \
+                                     e.g. '{} : text [..256] = \"\"'; the buffer is allocated once in the service \
+                                     prologue, so its size must be a compile-time constant",
+                                    fname, fname
+                                ))
+                            })?;
+                            self.expect_kind(TokenKind::Equal)?;
+                            // Refusal #4 — a literal, never read() / concat() /
+                            // now_unix(). The init runs above accept_top.
+                            if !matches!(self.peek_kind(), Some(TokenKind::StringLit(_))) {
+                                return Err(self.error(&format!(
+                                    "state field '{}': the initial value must be a text literal; state is \
+                                     initialised once before listen(), where there is no request scope and no \
+                                     error policy for a failed read. Resource-initialised state is slice \
+                                     text-state-3",
+                                    fname
+                                )));
+                            }
+                            let s = self.expect_string()?;
+                            (Type::Text, Some(n), StateInit::Text(s))
+                        }
+                        // Refusal #11 — bytes has no reachable position in a
+                        // service (HttpResponse.body and req.body are both
+                        // text), so a bytes state field would be write-only.
+                        Type::Bytes => {
+                            return Err(self.error(&format!(
+                                "state field '{}': type 'bytes' is not supported; a service handler has no \
+                                 bytes-valued position today (HttpResponse.body is text), so a bytes state \
+                                 field would be write-only. Slice text-state-4",
+                                fname
+                            )));
+                        }
+                        other => {
+                            return Err(self.error(&format!(
+                                "state field '{}': only 'number' and 'text' are supported; got {:?}",
+                                fname, other
+                            )));
+                        }
+                    };
                     state_fields.push(StateField {
                         name: fname,
                         ty,
-                        initial_value,
+                        max_bytes,
+                        init,
                     });
                     self.expect_kind(TokenKind::Newline)?;
                 }
@@ -3253,15 +3319,24 @@ service s
         }).expect("expected a service item");
         assert_eq!(svc.state_fields.len(), 2);
         assert_eq!(svc.state_fields[0].name, "counter");
-        assert_eq!(svc.state_fields[0].initial_value, 0);
+        assert!(matches!(svc.state_fields[0].init, StateInit::Number(0)));
+        assert_eq!(svc.state_fields[0].max_bytes, None);
         assert_eq!(svc.state_fields[1].name, "total");
-        assert_eq!(svc.state_fields[1].initial_value, 100);
+        assert!(matches!(svc.state_fields[1].init, StateInit::Number(100)));
         assert_eq!(svc.after_sets.len(), 1);
         assert_eq!(svc.after_sets[0].field_name, "counter");
     }
 
+    /// Slice `text-state-1` refusal #1: a text state field without a `[..N]`
+    /// bound is a PARSE error, not a silently-unbounded field. The buffer is
+    /// allocated once in the service prologue, so there is no runtime-`strlen`
+    /// sizing fallback the way there is for a concept field.
+    ///
+    /// The fixture is the shape that used to be rejected by the Number-only
+    /// check (`name : text = 0`); the refusal moved rather than disappeared,
+    /// and the corrected twin below must now PARSE.
     #[test]
-    fn service_state_rejects_text_type() {
+    fn service_state_text_without_bound_rejected() {
         let src = r#"@verbose 0.1.0
 
 rule h
@@ -3291,13 +3366,110 @@ service s
   state:
     name : text = 0
 "#;
-        let err = parse(src).err().expect("text state should be rejected");
+        let err = parse(src).err().expect("unbounded text state should be rejected");
         assert!(
-            format!("{:?}", err).contains("only 'number' type"),
-            "expected type rejection, got {:?}",
+            format!("{:?}", err).contains("must declare a maximum byte length"),
+            "expected the missing-bound refusal, got {:?}",
+            err
+        );
+
+        // Corrected twin: the same field WITH a bound and a literal initial
+        // value parses, and carries both through the AST.
+        let fixed = src.replace("name : text = 0", "name : text [..64] = \"seed\"");
+        let p = parse(&fixed).expect("bounded text state should parse");
+        let svc = p.items.iter().find_map(|i| match i {
+            Item::Service(s) => Some(s),
+            _ => None,
+        }).expect("expected a service item");
+        assert_eq!(svc.state_fields.len(), 1);
+        assert_eq!(svc.state_fields[0].name, "name");
+        assert_eq!(svc.state_fields[0].ty, Type::Text);
+        assert_eq!(svc.state_fields[0].max_bytes, Some(64));
+        match &svc.state_fields[0].init {
+            StateInit::Text(s) => assert_eq!(s, "seed"),
+            other => panic!("expected a text initial value, got {:?}", other),
+        }
+    }
+
+    /// Refusal #4: the initial value of a text state field must be a LITERAL.
+    /// `read(...)` would need an error policy at a point in the emit where
+    /// there is no request to fail.
+    #[test]
+    fn service_state_text_non_literal_initial_rejected() {
+        let base = TEXT_STATE_PARSE_FIXTURE;
+        let src = base.replace("__STATE__", "name : text [..64] = read(seed)");
+        let err = parse(&src).err().expect("non-literal init should be rejected");
+        assert!(
+            format!("{:?}", err).contains("must be a text literal"),
+            "expected the non-literal-init refusal, got {:?}",
+            err
+        );
+        // Corrected twin.
+        let ok = base.replace("__STATE__", "name : text [..64] = \"seed\"");
+        parse(&ok).expect("literal init should parse");
+    }
+
+    /// Refusal #11: `bytes` state has no reachable position inside a service,
+    /// so it would be write-only — the definition of false explicitation.
+    #[test]
+    fn service_state_bytes_type_rejected() {
+        let base = TEXT_STATE_PARSE_FIXTURE;
+        let src = base.replace("__STATE__", "blob : bytes [..64] = \"\"");
+        let err = parse(&src).err().expect("bytes state should be rejected");
+        assert!(
+            format!("{:?}", err).contains("type 'bytes' is not supported"),
+            "expected the bytes refusal, got {:?}",
             err
         );
     }
+
+    /// A `[..N]` bound on a NUMBER state field is a byte-length bound applied
+    /// to a type that has no bytes. Refused where the bound is, not later.
+    #[test]
+    fn service_state_number_with_byte_bound_rejected() {
+        let base = TEXT_STATE_PARSE_FIXTURE;
+        let src = base.replace("__STATE__", "count : number [..64] = 0");
+        let err = parse(&src).err().expect("bound on number state should be rejected");
+        assert!(
+            format!("{:?}", err).contains("applies to text state fields only"),
+            "expected the number-bound refusal, got {:?}",
+            err
+        );
+        let ok = base.replace("__STATE__", "count : number = 0");
+        parse(&ok).expect("unbounded number state should parse");
+    }
+
+    /// Shared skeleton for the `state:` line-shape tests above. `__STATE__` is
+    /// the single state-block line under test.
+    const TEXT_STATE_PARSE_FIXTURE: &str = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: f.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service s
+  @intention: "test"
+  @source: f.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+  state:
+    __STATE__
+"#;
 
     #[test]
     fn service_after_without_state_rejected() {

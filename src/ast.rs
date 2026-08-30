@@ -261,8 +261,14 @@ pub struct Service {
     /// it is a per-process constant, and a constant reads identically under
     /// both modes.
     ///
-    /// Number-only in slice 1. Text state fields need (ptr, len, buffer)
-    /// management and are a follow-up.
+    /// Slice `text-state-1` (2026-08-30) lifts the Number-only restriction:
+    /// a field may also be `<name> : text [..N] = "<literal>"`, which gets a
+    /// `(ptr_slot, len_slot) + N-byte buffer` triple in the same block — the
+    /// shape a `resource` and a `connection` already have. The bound is
+    /// MANDATORY for text (the buffer is allocated once in the prologue, so
+    /// its size must be a compile-time constant) and the initial value is a
+    /// text literal only (the init runs above `accept_top`, where there is no
+    /// request scope and no error policy for a failed read).
     pub state_fields: Vec<StateField>,
     /// Post-response mutation block. Runs AFTER the response is written,
     /// AFTER the log blocks. Each entry mutates one state field:
@@ -272,12 +278,35 @@ pub struct Service {
 }
 
 /// A mutable state field declared in a service's `state:` block.
-/// Number-only in the first slice (text state needs buffer management).
+///
+/// Two shapes, both persisting for the process's lifetime in the service's
+/// rbp frame:
+///   `count : number = 0`              — one 8-byte slot
+///   `last  : text [..256] = "none"`   — (ptr, len) slots + an N-byte buffer
+///
+/// `max_bytes` is `Some(N)` for text and `None` for number. The text bound is
+/// mandatory at parse time, which is what makes `max_bytes.unwrap()` sound in
+/// the emitter's layout arithmetic; if it ever becomes optional, that is the
+/// site that breaks.
 #[derive(Debug, Clone)]
 pub struct StateField {
     pub name: String,
     pub ty: Type,
-    pub initial_value: i64,
+    pub max_bytes: Option<i64>,
+    pub init: StateInit,
+}
+
+/// The initial value of a state field, declared with `= <literal>`.
+///
+/// A LITERAL only — never `read()`, `concat(...)` or `now_unix()`. The init
+/// sequence runs once, above `accept_top`, before the socket exists: there is
+/// no request scope there, and a failed `read()` would have no error policy to
+/// consult. A literal also keeps the whole state block visible to
+/// `strings <binary>`, which is the audit contract in `docs/effect-model.md`.
+#[derive(Debug, Clone)]
+pub enum StateInit {
+    Number(i64),
+    Text(String),
 }
 
 /// A mutation in a service's `after:` block.

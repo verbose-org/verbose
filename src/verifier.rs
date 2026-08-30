@@ -253,6 +253,25 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
         }
     }
 
+    // Slice `text-state-1`: the declared byte ceiling of every resource and
+    // connection, keyed by name. The compile-time overflow gate for a text
+    // `set` needs the NUMBER, not just the name — `all_resources` /
+    // `all_connections` above carry names only. Built from the item list (a
+    // Vec) so no HashMap iteration order can reach a decision.
+    let mut resource_max_bytes: HashMap<&str, i64> = HashMap::new();
+    let mut connection_max_response: HashMap<&str, i64> = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Resource(r) => {
+                resource_max_bytes.insert(r.name.as_str(), r.max_bytes as i64);
+            }
+            Item::Connection(c) => {
+                connection_max_response.insert(c.name.as_str(), c.max_response as i64);
+            }
+            _ => {}
+        }
+    }
+
     for item in &program.items {
         match item {
             Item::Concept(c) => verify_concept(c, base_dir, &mut errors),
@@ -399,7 +418,15 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                     }
                 }
             }
-            Item::Service(s) => verify_service(s, &concepts, &all_rules, base_dir, &mut errors),
+            Item::Service(s) => verify_service(
+                s,
+                &concepts,
+                &all_rules,
+                &resource_max_bytes,
+                &connection_max_response,
+                base_dir,
+                &mut errors,
+            ),
             Item::Resource(r) => verify_resource_stub(r, base_dir, &mut errors),
             Item::Connection(c) => verify_connection_stub(c, base_dir, &mut errors),
         }
@@ -982,10 +1009,23 @@ fn builtin_http_response() -> Concept {
 ///     with exactly one `bytes [..max_request]` field. The bound MUST match
 ///     the service's declared max_request exactly — a looser handler bound
 ///     would leak unread bytes, a tighter one would truncate.
+/// Slice `text-state-1`: the largest `[..N]` a text state field may declare.
+///
+/// A judgement call, and it should be read as one. The state block shares one
+/// `sub rsp, imm32` frame with `max_request` and every handler let, so 64 KiB
+/// per field is generous for the consumers in
+/// `docs/text-state-fields-design.md` §1.2 while keeping the block from
+/// dominating the frame. It is deliberately NOT the effect model's 64 MiB
+/// resource ceiling: a resource buffer is per-invocation, a state buffer is
+/// per-process-lifetime.
+const TEXT_STATE_MAX_BYTES: i64 = 65536;
+
 fn verify_service(
     s: &Service,
     concepts: &HashMap<String, &Concept>,
     all_rules: &[&Rule],
+    resource_max_bytes: &HashMap<&str, i64>,
+    connection_max_response: &HashMap<&str, i64>,
     base_dir: &StdPath,
     errors: &mut Vec<VerifyError>,
 ) {
@@ -1204,14 +1244,46 @@ fn verify_service(
     {
         let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for sf in &s.state_fields {
-            if sf.ty != Type::Number {
-                errors.push(VerifyError {
-                    context: format!("service '{}' / state / {}", s.name, sf.name),
-                    message: format!(
-                        "state field '{}' must be type 'number' in this slice; got {:?}",
-                        sf.name, sf.ty
-                    ),
-                });
+            match sf.ty {
+                Type::Number => {}
+                Type::Text => {
+                    // Refusal #2 — the declared bound sizes a buffer inside
+                    // the one service frame.
+                    let n = sf.max_bytes.unwrap_or(0);
+                    if n < 1 || n > TEXT_STATE_MAX_BYTES {
+                        errors.push(VerifyError {
+                            context: format!("service '{}' / state / {}", s.name, sf.name),
+                            message: format!(
+                                "state field '{}': declared bound {} must be in 1..={}; the state block shares \
+                                 one stack frame with max_request and every handler let",
+                                sf.name, n, TEXT_STATE_MAX_BYTES
+                            ),
+                        });
+                    }
+                    // Refusal #3 — the init copy is a compile-time-sized
+                    // `rep movsb` into that buffer.
+                    if let StateInit::Text(lit) = &sf.init {
+                        let l = lit.as_bytes().len() as i64;
+                        if l > n {
+                            errors.push(VerifyError {
+                                context: format!("service '{}' / state / {}", s.name, sf.name),
+                                message: format!(
+                                    "state field '{}': initial value is {} bytes but the declared bound is {}",
+                                    sf.name, l, n
+                                ),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    errors.push(VerifyError {
+                        context: format!("service '{}' / state / {}", s.name, sf.name),
+                        message: format!(
+                            "state field '{}' must be type 'number' or 'text'; got {:?}",
+                            sf.name, sf.ty
+                        ),
+                    });
+                }
             }
             if !seen_names.insert(sf.name.as_str()) {
                 errors.push(VerifyError {
@@ -1233,6 +1305,95 @@ fn verify_service(
             });
         }
     }
+    // ── Slice `text-state-1`: the compile-time overflow gate ──────────────
+    //
+    // `docs/text-state-fields-design.md` §3.3 option E. For each
+    // `set <f> = <expr>` where `f` is a TEXT state field, prove
+    // `worst_case(expr) <= N` from declarations alone, or refuse. A program
+    // that passes carries a proof rather than an assertion and emits ZERO
+    // check bytes; the 13-byte backstop the emitter keeps at the copy site is
+    // unreachable by construction.
+    //
+    // The gate is sound only because every source's compile-time bound is
+    // ALREADY runtime-enforced at the point the bytes enter the process:
+    // req.method / req.path by `emit_token_len_guard` in the HTTP parse,
+    // req.body by the kernel's `read(client_fd, buf, max_request)` count,
+    // read() by the resource's `max:`, fetch() by `max_response`, another
+    // state field by this very gate. **That is a stated dependency: weaken any
+    // one of those and this gate breaks silently.**
+    //
+    // Why not a runtime `cmp` + `sys_exit(1)` as the primary gate: this is a
+    // LISTENER, not a one-shot rule binary. A client who could drive the
+    // source past N would have a one-packet DoS. The emitter already made
+    // exactly this call, in writing, for the HTTP-parse bound guards — an
+    // over-long path closes that connection instead of killing the process.
+    if !s.state_fields.is_empty() {
+        let text_state_bounds: HashMap<&str, i64> = s
+            .state_fields
+            .iter()
+            .filter(|sf| sf.ty == Type::Text)
+            .map(|sf| (sf.name.as_str(), sf.max_bytes.unwrap_or(0)))
+            .collect();
+        if !text_state_bounds.is_empty() {
+            // req.method / req.path bounds come from the concept so the
+            // parser and this sizer can never disagree; req.body's bound is
+            // THIS service's `max_request` (the concept carries the
+            // program-wide maximum, which is a looser but still-true bound —
+            // native synthesises its own per-service copy, so the tight one
+            // is the honest one to check against).
+            let req_concept = match &handler.input_ty {
+                Type::Named(n) => concepts.get(n).copied(),
+                _ => None,
+            };
+            for aset in &s.after_sets {
+                let Some(sf) = s.state_fields.iter().find(|sf| sf.name == aset.field_name) else {
+                    continue; // unknown field already reported above
+                };
+                if sf.ty != Type::Text {
+                    continue;
+                }
+                let n = sf.max_bytes.unwrap_or(0);
+                match text_source_worst_case(
+                    &aset.value,
+                    &handler.input_name,
+                    req_concept,
+                    s.max_request as i64,
+                    &text_state_bounds,
+                    &handler.logic.bindings,
+                    resource_max_bytes,
+                    connection_max_response,
+                    0,
+                ) {
+                    // Refusal #5 — no compile-time bound for this shape.
+                    Err(kind) => errors.push(VerifyError {
+                        context: format!("service '{}' / after / set {}", s.name, aset.field_name),
+                        message: format!(
+                            "after: set '{}' = <expr>: source shape '{}' has no compile-time byte bound, so the \
+                             copy into a fixed {}-byte buffer cannot be proved safe. Slice text-state-1 accepts \
+                             literals, {inp}.method / {inp}.path / {inp}.body, state fields, read(), fetch(), \
+                             handler text lets, substring of those, and concat of those.",
+                            aset.field_name, kind, n, inp = handler.input_name
+                        ),
+                    }),
+                    // Refusal #6 — bounded, but too big. Named explicitly so a
+                    // reader is not left thinking the bound is merely small.
+                    Ok(w) if w > n => errors.push(VerifyError {
+                        context: format!("service '{}' / after / set {}", s.name, aset.field_name),
+                        message: format!(
+                            "after: set '{}' = <expr>: worst case {} bytes exceeds the declared bound {}. \
+                             Append-accumulation (concat(state.{}, …)) can never satisfy this — it needs a \
+                             declared overflow policy, which is slice text-state-2.",
+                            aset.field_name, w, n, aset.field_name
+                        ),
+                    }),
+                    Ok(_) => {}
+                }
+            }
+        }
+        // Refusals #8 / #9 — read positions this slice has not wired.
+        check_state_text_read_positions(s, handler, errors);
+    }
+
     // Cross-check: handler's `reads:` paths of the form `state.X` must
     // reference actual state fields declared in this service.
     if !s.state_fields.is_empty() {
@@ -1251,6 +1412,319 @@ fn verify_service(
                         ),
                     });
                 }
+            }
+        }
+    }
+}
+
+/// Slice `text-state-1`: the compile-time upper bound, in bytes, of a text
+/// expression usable as a `set <text state field> = <expr>` source.
+///
+/// `Ok(n)` is a proof that the expression can never produce more than `n`
+/// bytes at runtime. `Err(kind)` names the shape that has no such bound; the
+/// caller turns it into refusal #5.
+///
+/// Every accepted row of `docs/text-state-fields-design.md` §3.3 whose native
+/// producer (`emit_text_produce_ptrlen`) exists today:
+///
+/// | shape                    | bound                                    |
+/// |--------------------------|------------------------------------------|
+/// | text literal             | its exact byte length                    |
+/// | `<input>.method/path`    | the built-in concept's declared `[..N]`  |
+/// | `<input>.body`           | the service's `max_request`              |
+/// | `state.<g>`              | `g`'s declared `[..N]`                   |
+/// | `read(r)`                | `r`'s `max:`                             |
+/// | `fetch(c, _)`            | `c`'s `max_response:`                    |
+/// | a handler text `let`     | recursive over its RHS                   |
+/// | `substring(t, _, _)`     | bound of `t` (a slice ≤ its haystack)    |
+/// | `concat(a, b, …)`        | the sum of the arg bounds                |
+///
+/// DELIBERATELY ABSENT, each refused rather than guessed at: `json_escape`
+/// (§3.3 bounds it at `2 × bound(inner)`, but `emit_text_produce_ptrlen` has
+/// no arm for it, so accepting it here would push a verified program into an
+/// emitter refusal), a text-returning rule `Call` (bounded only by recursing
+/// through another rule's body — its own slice), and every Number-producing
+/// shape (§6.1's accepted list is text sources only).
+#[allow(clippy::too_many_arguments)]
+fn text_source_worst_case(
+    expr: &Expr,
+    input_name: &str,
+    req_concept: Option<&Concept>,
+    max_request: i64,
+    text_state_bounds: &HashMap<&str, i64>,
+    handler_lets: &[(String, Expr)],
+    resource_max_bytes: &HashMap<&str, i64>,
+    connection_max_response: &HashMap<&str, i64>,
+    depth: u32,
+) -> Result<i64, String> {
+    // A handler `let` can only reference bindings declared before it, so the
+    // recursion is over a DAG and cannot cycle. The cap is a belt-and-braces
+    // guard against a future shape that could.
+    if depth > 16 {
+        return Err("deeply nested let chain".to_string());
+    }
+    let recur = |e: &Expr| {
+        text_source_worst_case(
+            e,
+            input_name,
+            req_concept,
+            max_request,
+            text_state_bounds,
+            handler_lets,
+            resource_max_bytes,
+            connection_max_response,
+            depth + 1,
+        )
+    };
+    match expr {
+        Expr::Text(s) => Ok(s.as_bytes().len() as i64),
+        Expr::Field(base, fname) => match base.as_ref() {
+            Expr::Ident(b) if b == input_name => {
+                if fname == "body" {
+                    return Ok(max_request);
+                }
+                let f = req_concept
+                    .and_then(|c| c.fields.iter().find(|f| &f.name == fname))
+                    .ok_or_else(|| format!("{}.{}", input_name, fname))?;
+                match (&f.ty, f.range) {
+                    (Type::Text, Some((_, max))) => Ok(max),
+                    _ => Err(format!("{}.{}", input_name, fname)),
+                }
+            }
+            Expr::Ident(b) if b == "state" => text_state_bounds
+                .get(fname.as_str())
+                .copied()
+                .ok_or_else(|| format!("state.{} (not a text state field)", fname)),
+            _ => Err(format!("field access on '{:?}'", base)),
+        },
+        Expr::Read(name) => resource_max_bytes
+            .get(name.as_str())
+            .copied()
+            .ok_or_else(|| format!("read({}) — undeclared resource", name)),
+        Expr::Fetch(name, _) => connection_max_response
+            .get(name.as_str())
+            .copied()
+            .ok_or_else(|| format!("fetch({}, …) — undeclared connection", name)),
+        Expr::Ident(name) => {
+            let (_, rhs) = handler_lets
+                .iter()
+                .find(|(n, _)| n == name)
+                .ok_or_else(|| format!("identifier '{}'", name))?;
+            recur(rhs)
+        }
+        Expr::Substring(t, _, _) => recur(t),
+        Expr::Concat(args) => {
+            let mut total: i64 = 0;
+            for a in args {
+                total = total.saturating_add(recur(a)?);
+            }
+            Ok(total)
+        }
+        other => Err(expr_shape_name(other).to_string()),
+    }
+}
+
+/// A short, source-shaped name for an expression, for refusal #5's message.
+fn expr_shape_name(e: &Expr) -> &'static str {
+    match e {
+        Expr::Number(_) => "number literal",
+        Expr::Bytes(_) => "byte-string literal",
+        Expr::Binary(_, _, _) => "arithmetic / comparison",
+        Expr::Call(_, _) => "rule call",
+        Expr::If(_, _, _) => "if / then / else",
+        Expr::JsonEscape(_) => "json_escape(...)",
+        Expr::ParseInt(_) => "parse_int(...)",
+        Expr::NowUnix => "now_unix()",
+        Expr::Length(_) => "length(...)",
+        Expr::StartsWith(_, _) => "starts_with(...)",
+        Expr::EndsWith(_, _) => "ends_with(...)",
+        Expr::Contains(_, _) => "contains(...)",
+        Expr::ByteAt(_, _) => "byte_at(...)",
+        Expr::Record(_, _) => "record construction",
+        _ => "unsupported expression",
+    }
+}
+
+/// Slice `text-state-1` refusals #8 and #9: `state.<f>` on a TEXT state field
+/// is wired into three read positions only — a `concat` argument, `length`'s
+/// operand, and an `HttpResponse.body` value directly. Every other text
+/// primitive dispatches through its own field arm gated on
+/// `base == input_name`, and widening seven of them at once is a different
+/// slice. Refuse each with a breadcrumb naming the emitter that would have to
+/// grow the arm.
+///
+/// The alternative — leaving them to fall through to a generic native
+/// "shape not supported" error — is what this project calls an unattributable
+/// refusal: the message would name neither the offender nor the slice.
+fn check_state_text_read_positions(
+    s: &Service,
+    handler: &Rule,
+    errors: &mut Vec<VerifyError>,
+) {
+    let text_fields: HashSet<&str> = s
+        .state_fields
+        .iter()
+        .filter(|sf| sf.ty == Type::Text)
+        .map(|sf| sf.name.as_str())
+        .collect();
+    if text_fields.is_empty() {
+        return;
+    }
+    let mut hits: Vec<(String, &'static str, &'static str)> = Vec::new();
+    let mut walk_all = |e: &Expr, hits: &mut Vec<(String, &'static str, &'static str)>| {
+        walk_state_text_read_positions(e, &text_fields, hits);
+    };
+    walk_all(&handler.logic.value, &mut hits);
+    for (_, e) in &handler.logic.bindings {
+        walk_all(e, &mut hits);
+    }
+    for aset in &s.after_sets {
+        walk_all(&aset.value, &mut hits);
+    }
+    for (field, primitive, site) in hits {
+        errors.push(VerifyError {
+            context: format!("service '{}' / state / {}", s.name, field),
+            message: format!(
+                "{}: 'state.{}' is a text state field; its (ptr, len) load is not wired into {} in slice \
+                 text-state-1. Bind it to a handler let first, or wait for slice text-state-2.",
+                primitive, field, site
+            ),
+        });
+    }
+}
+
+/// The walk behind `check_state_text_read_positions`. Reports one hit per
+/// (primitive, state field) occurrence, in source order — a `Vec`, never a
+/// set, so the diagnostic order is deterministic.
+fn walk_state_text_read_positions(
+    e: &Expr,
+    text_fields: &HashSet<&str>,
+    hits: &mut Vec<(String, &'static str, &'static str)>,
+) {
+    // Is this expression `state.<a text state field>`?
+    let as_state_text = |x: &Expr| -> Option<String> {
+        if let Expr::Field(base, fname) = x {
+            if matches!(base.as_ref(), Expr::Ident(b) if b == "state")
+                && text_fields.contains(fname.as_str())
+            {
+                return Some(fname.clone());
+            }
+        }
+        None
+    };
+    let mut flag = |x: &Expr,
+                    prim: &'static str,
+                    site: &'static str,
+                    hits: &mut Vec<(String, &'static str, &'static str)>| {
+        if let Some(f) = as_state_text(x) {
+            hits.push((f, prim, site));
+        }
+    };
+    match e {
+        Expr::StartsWith(a, b) => {
+            flag(a, "starts_with", "emit_starts_with_load_text (native.rs)", hits);
+            flag(b, "starts_with", "emit_starts_with_load_text (native.rs)", hits);
+        }
+        Expr::EndsWith(a, b) => {
+            flag(a, "ends_with", "emit_starts_with_load_text (native.rs)", hits);
+            flag(b, "ends_with", "emit_starts_with_load_text (native.rs)", hits);
+        }
+        Expr::Contains(a, b) => {
+            flag(a, "contains", "emit_starts_with_load_text (native.rs)", hits);
+            flag(b, "contains", "emit_starts_with_load_text (native.rs)", hits);
+        }
+        Expr::Substring(t, _, _) => {
+            flag(t, "substring", "emit_text_produce_ptrlen's Substring arm (native.rs)", hits);
+        }
+        Expr::JsonEscape(inner) => {
+            flag(inner, "json_escape", "emit_concat_to_buffer_impl's JsonEscapedText arm (native.rs)", hits);
+        }
+        Expr::ParseInt(inner) => {
+            flag(inner, "parse_int", "emit_parse_int (native.rs)", hits);
+        }
+        Expr::Binary(op, a, b) if matches!(op, BinOp::Eq | BinOp::NotEq) => {
+            flag(a, "text equality", "emit_eval_expr's text-comparison arms (native.rs)", hits);
+            flag(b, "text equality", "emit_eval_expr's text-comparison arms (native.rs)", hits);
+        }
+        _ => {}
+    }
+    // Recurse into every child regardless of the arm above, so a refused
+    // position nested inside an accepted one is still found.
+    walk_expr_children(e, &mut |child| walk_state_text_read_positions(child, text_fields, hits));
+}
+
+/// Apply `f` to every direct sub-expression of `e`.
+///
+/// Enumerated arm-for-arm rather than caught by a catch-all, so a new `Expr`
+/// variant is a COMPILE error here instead of a silently-unvisited subtree.
+/// (That is the same discipline `count_badcall_ast` in gen0 had to be taught
+/// the hard way — twelve node families stubbed to a flat `0`.)
+fn walk_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    match e {
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_)
+        | Expr::NowUnix => {}
+        Expr::Field(b, _) => f(b),
+        Expr::Not(a)
+        | Expr::Neg(a)
+        | Expr::Ok(a)
+        | Expr::Err(a)
+        | Expr::JsonEscape(a)
+        | Expr::ParseInt(a)
+        | Expr::Length(a)
+        | Expr::Abs(a)
+        | Expr::Le32(a)
+        | Expr::Le64(a)
+        | Expr::ArenaScope(a)
+        | Expr::AbortIf(a)
+        | Expr::BitNot(a)
+        | Expr::Fetch(_, a) => f(a),
+        Expr::Binary(_, a, b)
+        | Expr::StartsWith(a, b)
+        | Expr::EndsWith(a, b)
+        | Expr::Contains(a, b)
+        | Expr::Min(a, b)
+        | Expr::Max(a, b)
+        | Expr::BitAnd(a, b)
+        | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b)
+        | Expr::ByteAt(a, b)
+        | Expr::Quantifier(_, a, _, b)
+        | Expr::Map(a, _, b)
+        | Expr::Filter(a, _, b) => {
+            f(a);
+            f(b);
+        }
+        Expr::If(a, b, c) | Expr::Substring(a, b, c) | Expr::Fold(a, b, _, _, c) => {
+            f(a);
+            f(b);
+            f(c);
+        }
+        Expr::MatchResult(scrut, _, ok_body, _, err_body) => {
+            f(scrut);
+            f(ok_body);
+            f(err_body);
+        }
+        Expr::FoldBytes(a, b, _, _, _, c) => {
+            f(a);
+            f(b);
+            f(c);
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                f(a);
+            }
+        }
+        Expr::Record(_, fields) | Expr::VariantConstruct(_, _, fields) => {
+            for (_, v) in fields {
+                f(v);
+            }
+        }
+        Expr::MatchVariant(scrut, arms) => {
+            f(scrut);
+            for arm in arms {
+                f(&arm.body);
             }
         }
     }
