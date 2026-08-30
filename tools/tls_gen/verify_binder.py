@@ -18,13 +18,12 @@ def verbose_finished_key(secret32):
     return V.finished_key(secret32)   # record spawn (Digest JSON) since 2026-08-29
 
 def main():
-    V.ensure(V.ALL_RULES + [("psk_early_secret","psk_schedule.verbose"),
-                            ("psk_ext_binder_key","psk_schedule.verbose")])
+    V.ensure(V.ALL_RULES)   # psk_* joined ALL_RULES in tranche 6
     rec = open("/tmp/ch.bin","rb").read()
     ch = ClientHello(rec)
     # --- all crypto via Verbose binaries ---
-    early = V.run_bytes("psk_early_secret", [str(b) for b in PSK], 32)
-    binder_key = V.run_bytes("psk_ext_binder_key", [str(b) for b in early], 32)
+    early = V.psk_early_secret(PSK)             # record spawn (Digest JSON) since 2026-08-30
+    binder_key = V.psk_ext_binder_key(early)    # record spawn (Digest JSON) since 2026-08-30
     fk = verbose_finished_key(binder_key)
     thash = V.sha256(ch.truncated_for_binder())          # Verbose SHA-256
     # binder = HMAC(fk, thash). HMAC is in Verbose for record/keysched; here we

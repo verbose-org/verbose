@@ -95,7 +95,7 @@ def hs_msg(t, body): return bytes([t]) + b24(len(body)) + body
 def record(ct, payload): return bytes([ct]) + b"\x03\x03" + b16(len(payload)) + payload
 
 def hkdf_extract(salt, ikm):
-    return V.run_bytes("hkdf_extract", [str(b) for b in salt] + [str(b) for b in ikm], 32)
+    return V.hkdf_extract(salt, ikm)   # record spawn (Digest JSON) since 2026-08-30
 
 
 def build_hello_retry_request(legacy_session_id, selected_group):
@@ -352,7 +352,7 @@ def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 14555
     with open(CERT_DER, "rb") as f:
         cert_der_bytes = f.read()
-    V.ensure(V.ALL_RULES + [("hkdf_extract", "hkdf_extract.verbose")])
+    V.ensure(V.ALL_RULES)   # hkdf_extract joined ALL_RULES in tranche 6
     E.ensure()  # Ed25519 binaries for CertificateVerify signing
 
     # Reap children automatically so per-connection forks never become zombies.

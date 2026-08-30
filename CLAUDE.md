@@ -1178,6 +1178,80 @@ Tracking what native emits today, what it still rejects, and the design rules th
   recursive record emit serialises the arena node its own walk produces, and
   it matches verbosec's record arm.
 
+  **HKDF-EXTRACT + THE PSK SCHEDULE CLOSED THE ARC (2026-08-30, tranche 6) —
+  THE POOL IS DEAD.** The three LAST which-form rules vcrypto's consumers
+  drove — `hkdf_extract` (examples/hkdf_extract.verbose), `psk_early_secret`
+  + `psk_ext_binder_key` (examples/psk_schedule.verbose) — now return one
+  32-field `Digest` record each, so `run_bytes` and the 64-thread `_POOL`
+  reached ZERO callers and are DELETED from `tools/tls_gen/vcrypto.py`,
+  along with the `concurrent.futures` import. The module docstring's premise
+  ("to beat the one-byte-per-process-run cost, every which-loop is spawned
+  in parallel") is dead with it: **every TLS primitive vcrypto spawns is ONE
+  record spawn of a verified binary** — that sentence is what the whole
+  aggregate-return cash-in (tranches 1-6) existed to make true. Honest
+  scope: vcrypto's pool. `ed25519.py` keeps its OWN per-call 64-thread pool
+  for the five still-which-form Ed25519 rules (sha512_fold / ed_scalarmult /
+  ed_affine / sc_reduce / sc_muladd) — a separate module that never imported
+  vcrypto; the asymmetric half is a future arc.
+  THE SHAPES. All three rules are non-recursive HMAC let-chain unrolls with
+  `calls : []`, so they land on the plain record-entry path (agg-1 caller
+  shape, agg-2c record entry) — NO compiler change, unlike tranche 5's
+  routing widening: with no callees there is nothing to route. Per rule: the
+  32-way `which` dispatch became a `Digest { b0: …, …, b31: … }` constructor
+  over the same let-bound values, `which` left the input concepts (Extract /
+  Psk / Early) and every `reads:` proof; the psk file's two rules share ONE
+  Digest concept (tranche 3's width argument). 326384 → 329708 B
+  (hkdf_extract), 323008 → 326332 (psk_early_secret), 322960 → 326284
+  (psk_ext_binder_key). Generator-driven: `extract_gen.py` + `psk_gen.py`
+  verified byte-in-sync BEFORE editing (regenerate → git status clean).
+  Byte-exactness measured FIRST: the shipped which-form outputs captured on
+  EIGHT vectors (four hkdf_extract — the self-test's HMAC(derived, ecdhe)
+  shape, the binder chain's HMAC(fin_key, thash) shape, a zero salt, a fixed
+  random pair; two per psk rule — the repo PSK chain and a second PSK),
+  every capture validated against Python hmac/hashlib BEFORE any edit; the
+  record binaries reproduce all eight exactly, the interpreter agrees on all
+  eight, and each rule compiles twice byte-identical. **RFC 5869 TC-1 is NOT
+  expressible through this rule and the tranche brief was wrong to name it
+  as the oracle**: the rule's IKM — the HMAC *message* — is fixed at 32
+  bytes, TC-1's IKM is 22. The TC-1 anchor (published PRK 077709362c…) lives
+  in examples/hkdf.verbose, whose 64-byte-salt/22-byte-IKM `hkdf_extract`
+  CAN express it; `hkdf_matches_rfc5869` drives THAT file, is untouched, and
+  stays green — scope the two same-named rules apart before citing either.
+  CONSUMERS: all EIGHT external `run_bytes` sites converted to the three new
+  vcrypto record wrappers (`hkdf_extract` / `psk_early_secret` /
+  `psk_ext_binder_key`, now in ALL_RULES): tls_server.py (3 sites),
+  verify_binder.py (2), tls_cert_server.py, tls_browser_server.py,
+  tls_browser_p256_server.py (1 each — their local hkdf_extract helpers now
+  delegate). PROVEN LIVE, not just grepped: `verify_binder.py` printed
+  BINDER_VERIFIED against a FRESH ClientHello captured from openssl 3.6.2
+  (not a stored fixture), and `tls_server.py` completed a FULL PSK-DHE
+  handshake against `openssl s_client` — binder OK, client Finished
+  decrypted, "hello world" delivered over TLS_AES_128_GCM_SHA256 — the first
+  end-to-end TLS handshake in this repo where every crypto step is a single
+  record spawn and the pool no longer exists to fall back on.
+  KEYSCHED_ASSEMBLY_OK and TLS_SCHEDULE_OK re-verified. Timings: VCRYPTO_OK
+  from a cold /tmp (x25519=0.003s keysched=0.001s sched=0.002s sha256=0.001s
+  extract_psk=0.001s aead=0.003s, roundtrip green; extract_psk is the new
+  self-test leg, oracle-asserted); the converted leg alone (WSL2, Ryzen 7
+  5800X, perf_counter, median of 20): **74.1 ms (96 pooled which spawns) →
+  1.0 ms (3 record spawns), ~74×**.
+  Additive BY MEASUREMENT: corpus sweep over all 154 examples × every
+  rule/reaction/service (1375 targets), baseline `08dcb3b` vs branch,
+  baseline-vs-baseline control EMPTY first — exactly the THREE converted
+  rule-binaries change, 1372 byte-identical by size + sha256, 0 status
+  changes, refused set 558 → 558. Clean negative: no src/ test consumed
+  these rules' which interface. gen0, at rule #0 AND the declared entries:
+  **both files ACCEPTED in BOTH forms at every index** (hkdf single-rule;
+  psk idx 0 = psk_early_secret, idx 1 = psk_ext_binder_key, the two indices
+  emitting DIFFERENT ELFs — idx honored), and every record-form gen0 binary
+  is **byte-for-byte == verbosec on stdout + exit code** across the capture
+  vectors — the first tranche where EVERY converted rule lands in the
+  agreement cell. EXPECTED_ACCEPTED stays 96/154; R0/R1/R2 hold. One
+  measurement note for future probes: gen0 must be built `--stdin-raw`
+  (`compile_native_stdin_raw`, as the acceptance sweep does) — a plain
+  `--native` gen0 tokenizes stdin and refuses every file at rc 1, which
+  reads exactly like six refusals and is an artifact of the wrong build.
+
 ### Register conventions across emitters
 
 Emitters that span multiple syscalls or phases share a register layout. Adding a new cross-phase register use requires either claiming a currently-unused register or saving/restoring on the stack — do not casually reassign any of these without auditing every caller.
