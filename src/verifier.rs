@@ -1305,6 +1305,104 @@ fn verify_service(
             });
         }
     }
+
+    // ── SECURITY: type-check every `set <field> = <expr>` ─────────────────
+    //
+    // A `set` whose RHS does not produce the state field's declared type was
+    // NEVER checked, and for a NUMBER field the consequence is a remotely
+    // reachable ASLR disclosure: `set count = req.path` on `count : number`
+    // compiled to `mov rax, [rbp - <req.path's ptr slot>]` followed by a
+    // store into the number slot, so the HTTP read buffer's ADDRESS became
+    // the counter — and the handler then serves it. Measured on
+    // `examples/counter_service.verbose` with only that one line changed:
+    // three requests answered `count:0`, then `count:140733822829620` twice,
+    // and the value is a canonical `0x7ffd…` stack address that DIFFERS on
+    // every restart. Same family as the 2026-08-20 `t.s * 2` leak — the
+    // verifier certifying a program whose emitter then does pointer
+    // arithmetic — but reachable by an unauthenticated remote client rather
+    // than printed by a CLI binary the operator ran themselves.
+    //
+    // Fixed by routing the RHS through `check_expr_against`, the SAME
+    // bidirectional checker that already covers a rule's body, every `let`
+    // RHS, and every binary operand. A second mechanism is precisely how
+    // this hole existed: the `after:` block was simply never handed to the
+    // checker at all.
+    //
+    // `state.<field>` resolves through the EXISTING `bindings` map rather
+    // than through a new lookup path — a synthetic concept whose fields ARE
+    // the state fields, registered under the name `state`, so
+    // `infer_expr_type`'s `Field(Ident(b), f)` arm answers with the declared
+    // type. No new arm, no second notion of what `state.x` means.
+    //
+    // Errors are re-contexted to `service '<s>' / after / set <f>`, because
+    // `check_expr_against` names the RULE it was given and a reader must be
+    // pointed at the `after:` line, not at the handler's `logic:`.
+    //
+    // A TEXT field was already refused for every Number/Bool source, but
+    // INCIDENTALLY — `text_source_worst_case` (the overflow gate below) has
+    // no arm for an arithmetic / `now_unix()` / `length()` shape and reports
+    // "no compile-time byte bound". True, and the wrong diagnosis. The type
+    // check runs FIRST and the bound gate is skipped for a set it already
+    // flagged, so each offence yields exactly one attributable error.
+    let state_type_errors: HashSet<&str> = if s.state_fields.is_empty() {
+        HashSet::new()
+    } else {
+        let state_concept = Concept {
+            name: "<service state>".to_string(),
+            intention: String::new(),
+            source: SourceRef { file: "<builtin>".to_string(), line: 0 },
+            fields: s
+                .state_fields
+                .iter()
+                .map(|sf| Field {
+                    name: sf.name.clone(),
+                    ty: sf.ty.clone(),
+                    range: sf.max_bytes.map(|n| (0, n)),
+                })
+                .collect(),
+            variants: vec![],
+        };
+        let mut set_bindings: HashMap<String, &Concept> = HashMap::new();
+        set_bindings.insert("state".to_string(), &state_concept);
+        let handler_input_concept = match &handler.input_ty {
+            Type::Named(n) => concepts.get(n).copied(),
+            _ => None,
+        };
+        let mut flagged: HashSet<&str> = HashSet::new();
+        for aset in &s.after_sets {
+            let Some(sf) = s.state_fields.iter().find(|sf| sf.name == aset.field_name) else {
+                continue; // unknown field already reported above
+            };
+            let mut local: Vec<VerifyError> = Vec::new();
+            check_expr_against(
+                &aset.value,
+                &sf.ty,
+                handler,
+                all_rules,
+                handler_input_concept,
+                concepts,
+                &set_bindings,
+                &mut local,
+            );
+            if !local.is_empty() {
+                flagged.insert(sf.name.as_str());
+            }
+            for e in local {
+                errors.push(VerifyError {
+                    context: format!("service '{}' / after / set {}", s.name, aset.field_name),
+                    message: format!(
+                        "after: set '{}' = <expr>: {} (state field '{}' is declared '{}')",
+                        aset.field_name,
+                        e.message,
+                        sf.name,
+                        type_display(&sf.ty),
+                    ),
+                });
+            }
+        }
+        flagged
+    };
+
     // ── Slice `text-state-1`: the compile-time overflow gate ──────────────
     //
     // `docs/text-state-fields-design.md` §3.3 option E. For each
@@ -1350,6 +1448,12 @@ fn verify_service(
                     continue; // unknown field already reported above
                 };
                 if sf.ty != Type::Text {
+                    continue;
+                }
+                // Already reported as a TYPE error above; a second
+                // "no compile-time byte bound" line for the same `set`
+                // would be an unattributable duplicate.
+                if state_type_errors.contains(sf.name.as_str()) {
                     continue;
                 }
                 let n = sf.max_bytes.unwrap_or(0);

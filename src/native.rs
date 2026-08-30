@@ -40550,11 +40550,22 @@ service shadow
     /// Refusal #5 — a source shape with no compile-time byte bound. The
     /// message names the offending shape AND enumerates what the slice does
     /// accept, and the corrected twin uses one of the enumerated shapes.
+    ///
+    /// The probe is `json_escape(...)`: TEXT-typed (so the type check passes
+    /// it) and deliberately absent from `text_source_worst_case`'s table (so
+    /// the bound gate is the ONLY thing that can refuse it). That distinction
+    /// is the point of the shape choice, and it is a correction — this test
+    /// used `now_unix()` until the `set` type check landed, on the reasoning
+    /// that it "is a Number-producing shape with no text bound". Both halves
+    /// were true and the conclusion was not: a Number source into a `text`
+    /// field is a TYPE error, and the bound gate was reporting it only
+    /// because nothing upstream had looked at the types. Asserted below in
+    /// its new home so a future change cannot silently swap which mechanism
+    /// is doing the work.
     #[test]
     fn service_text_state_refuses_unbounded_source_shape() {
         let base = TEXT_STATE_SERVICE_TEMPLATE;
-        // `now_unix()` is a Number-producing shape with no text bound.
-        let src = base.replace("__SET__", "set last = now_unix()");
+        let src = base.replace("__SET__", "set last = json_escape(req.path)");
         let errs = verify_source_for_test(&src);
         let joined = errs.join("\n");
         assert!(
@@ -40563,8 +40574,24 @@ service shadow
             joined
         );
         assert!(
-            joined.contains("now_unix()"),
+            joined.contains("json_escape(...)"),
             "the refusal must name the offending shape, got: {}",
+            joined
+        );
+        // A NUMBER source is a different refusal, and must not be reported
+        // as a missing byte bound: the answer is "wrong type", not "declare
+        // a bigger buffer".
+        let numeric = base.replace("__SET__", "set last = now_unix()");
+        let joined = verify_source_for_test(&numeric).join("\n");
+        assert!(
+            joined.contains("expression has type 'number' but context expects 'text'"),
+            "a number source into a text state field is a TYPE error, got: {}",
+            joined
+        );
+        assert!(
+            !joined.contains("has no compile-time byte bound"),
+            "and it must be reported ONCE, by the type check, not also by the \
+             bound gate: {}",
             joined
         );
         // CORRECTED TWIN: one of the enumerated shapes.
@@ -40912,6 +40939,139 @@ service memo
             errs.is_empty(),
             "read-only state under forked concurrency must stay accepted \
              (it is a constant in both modes); got {errs:#?}",
+        );
+    }
+
+    /// SECURITY: `set <state field> = <expr>` is TYPE-CHECKED, so a verified
+    /// HTTP service can never serve a randomized stack address to a remote
+    /// client.
+    ///
+    /// The defect: the `after:` block was the one expression position in the
+    /// language that `check_expr_against` was never handed. Nothing compared
+    /// a `set`'s RHS against the field's declared type, so on
+    /// `count : number = 0` the line `set count = req.path` verified clean
+    /// (`all proofs check out`), the emitter loaded `req.path`'s (ptr, len)
+    /// slot and stored the POINTER into the number slot, and the handler's
+    /// `concat("count:", state.count)` then serialised it to every subsequent
+    /// client.
+    ///
+    /// Why it is a disclosure and not merely a wrong answer: the value is a
+    /// live `0x7ffd…` stack address, so it DEFEATS ASLR for whoever asks —
+    /// unauthenticated, over HTTP, from a program the compiler certified.
+    /// Same family as the 2026-08-20 `t.s * 2` leak (PR #182), reachable
+    /// remotely instead of printed by a CLI binary the operator ran.
+    ///
+    /// Structure, and each part earns its place:
+    ///   1. the REFUSAL, attributed to the `after:` line and naming the two
+    ///      types — including the `if/else` shape, which the direct-field
+    ///      probe would miss (`check_expr_against` recurses into arms) and
+    ///      which was itself a live 909-byte emitting binary;
+    ///   2. NON-VACUITY, by asking the emitter directly: `text_state_drive`
+    ///      calls `compile_service`, which bypasses `verify_program`, so the
+    ///      leaking program still compiles here and is DRIVEN over real TCP.
+    ///      Without this the test could pass against a compiler that refuses
+    ///      every `after:` block;
+    ///   3. the CORRECTED TWIN — `examples/counter_service.verbose` as
+    ///      shipped must still verify AND still count 0/1/2, so the refusal
+    ///      is attributable to the type violation and nothing else;
+    ///   4. the OTHER DIRECTION — a Number source into a `text` field. It was
+    ///      already refused before this fix, but INCIDENTALLY, by the
+    ///      overflow gate reporting "no compile-time byte bound". Pinned so
+    ///      the two never silently swap which mechanism is doing the work.
+    #[test]
+    fn state_set_type_mismatch_cannot_serve_a_stack_address() {
+        let parse = |src: &str| {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+            crate::parser::Parser::new(tokens).parse_program().expect("parse")
+        };
+        let base = std::fs::read_to_string("examples/counter_service.verbose")
+            .expect("examples/counter_service.verbose");
+        let mutation = "    set count = state.count + 1";
+        assert!(
+            base.contains(mutation),
+            "fixture construction failed — the after: mutation line moved",
+        );
+
+        // ── 1. THE REFUSAL ───────────────────────────────────────────
+        for bad in [
+            "    set count = req.path",
+            "    set count = req.method",
+            "    set count = concat(\"a\", req.path)",
+            // An `if` over text arms: the outer node's inferred type is the
+            // THEN arm's, so a checker that only looked at the top node
+            // would still let this through. Measured pre-fix: verified
+            // clean AND emitted a 909-byte binary.
+            "    set count = if length(req.path) > 2 then req.path else req.method",
+        ] {
+            let src = base.replace(mutation, bad);
+            let errs = crate::verifier::verify_program(&parse(&src), std::path::Path::new("examples"));
+            assert!(
+                errs.iter().any(|e| e.context.contains("after / set count")
+                    && e.message.contains("'number'")),
+                "`{bad}` writes a text-typed value into a `number` state field; \
+                 the emitter stores the request buffer's POINTER there and the \
+                 handler serves it to any client, so this must be refused at \
+                 verify time and the diagnostic must name the after: line and \
+                 the declared type; got {errs:#?}",
+            );
+        }
+
+        // ── 2. NON-VACUITY: the emitter really does leak ─────────────
+        // `text_state_drive` goes through `compile_service`, which does NOT
+        // run `verify_program` — so this is the binary the verifier used to
+        // bless, driven for real.
+        let leak_src = base
+            .replace(mutation, "    set count = req.path")
+            .replace("18950", "__PORT__");
+        let bodies = text_state_drive(&leak_src, "counter", "aslr_leak", &["/a", "/b", "/c"]);
+        assert_eq!(bodies[0], "count:0", "first request serves the initial value");
+        let leaked: i64 = bodies[1]
+            .strip_prefix("count:")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected body {:?}", bodies[1]));
+        assert!(
+            leaked > 1_000_000_000_000,
+            "the emitter must still be capable of this leak, or part 1 proves \
+             nothing: expected a stack address (~0x7ffd_0000_0000), got {leaked} \
+             from bodies {bodies:?}",
+        );
+        assert_ne!(bodies[1], "count:1", "this is the disclosure, not a counter");
+
+        // ── 3. THE CORRECTED TWIN ────────────────────────────────────
+        let errs = crate::verifier::verify_program(&parse(&base), std::path::Path::new("examples"));
+        assert!(
+            errs.is_empty(),
+            "examples/counter_service.verbose must still verify — an \
+             over-strict `set` check would reject valid programs, the one \
+             direction this verifier must never move in; got {errs:#?}",
+        );
+        let good = base.replace("18950", "__PORT__");
+        let bodies = text_state_drive(&good, "counter", "typed_ok", &["/a", "/b", "/c"]);
+        assert_eq!(
+            bodies,
+            vec!["count:0".to_string(), "count:1".to_string(), "count:2".to_string()],
+            "the correctly-typed mutation must still count across requests",
+        );
+
+        // ── 4. THE OTHER DIRECTION: number into a text field ─────────
+        let text_state = std::fs::read_to_string("examples/last_path_service.verbose")
+            .expect("examples/last_path_service.verbose");
+        let text_mutation = "    set last = req.path";
+        assert!(text_state.contains(text_mutation), "fixture construction failed");
+        for bad in ["    set last = 7", "    set last = now_unix()"] {
+            let src = text_state.replace(text_mutation, bad);
+            let errs = crate::verifier::verify_program(&parse(&src), std::path::Path::new("examples"));
+            assert!(
+                errs.iter().any(|e| e.context.contains("after / set last")),
+                "`{bad}` writes a number into a `text [..256]` state field and \
+                 must be refused; got {errs:#?}",
+            );
+        }
+        let errs =
+            crate::verifier::verify_program(&parse(&text_state), std::path::Path::new("examples"));
+        assert!(
+            errs.is_empty(),
+            "examples/last_path_service.verbose must still verify; got {errs:#?}",
         );
     }
 
