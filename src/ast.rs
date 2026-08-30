@@ -246,10 +246,20 @@ pub struct Service {
     /// set of slots. Mutations in the `after:` block are visible to the
     /// next accept iteration.
     ///
-    /// For `concurrency: forked`: the child inherits the parent's state
-    /// via fork's COW. Mutations in the child's `after:` block do NOT
-    /// propagate back to the parent — documented limitation (POC-level;
-    /// shared-memory state is a future design point).
+    /// For `concurrency: forked` WITH an `after:` block: REFUSED at verify
+    /// time (2026-08-30). The child inherits the parent's slots via fork's
+    /// COW, mutates its own page, and exits — and because fork is
+    /// per-accept and http_1_0 serves one request per connection, every
+    /// child starts from the parent's UNCHANGED slots, so the mutation is
+    /// observed by nobody, ever. Measured: the counter service that answers
+    /// count:0 / 1 / 2 / 3 sequentially answers count:0 to EVERY request
+    /// under `forked`. That is a write-only declaration, not degraded
+    /// per-connection counting. Propagating it means shared memory between
+    /// processes, which docs/effect-model.md refuses on principle.
+    ///
+    /// A `state:` block with NO `after:` block stays legal under `forked`:
+    /// it is a per-process constant, and a constant reads identically under
+    /// both modes.
     ///
     /// Number-only in slice 1. Text state fields need (ptr, len, buffer)
     /// management and are a follow-up.

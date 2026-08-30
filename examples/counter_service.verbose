@@ -8,8 +8,12 @@
 -- Each request returns the current count in the response body;
 -- the after: block increments it for the next request.
 -- Sequential mode: one process, one counter, monotonically
--- increasing. Forked mode: child inherits parent's counter
--- via fork's COW, but mutations don't propagate back.
+-- increasing. Forked mode is REFUSED at verify time when an
+-- after: block is present: fork is per-accept and HTTP/1.0
+-- serves one request per connection, so every child would
+-- start from the parent's unchanged counter and its increment
+-- would be observed by nobody, ever — a write-only
+-- declaration, not per-connection counting.
 
 
 rule handle
