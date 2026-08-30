@@ -1,0 +1,51 @@
+@verbose 0.1.0
+
+-- NEGATIVE: slice `text-state-1` refusal #6 — the append-accumulator.
+--
+-- `last : text [..64]` with `set last = concat(state.last, req.path)`. The
+-- compile-time gate sums the arg bounds: 64 (the state field's own declared
+-- bound) + 256 (req.path's, read from the built-in HttpRequest concept) = 320,
+-- against a 64-byte buffer.
+--
+-- The refusal names both numbers AND says that append-accumulation can never
+-- satisfy the gate at any bound, because on the next request the accumulator
+-- is 320 bytes and the one after that 576 — it is unbounded by construction,
+-- not merely too big for this declaration. Lifting it needs a declared
+-- overflow policy (`on_overflow:`), which is slice text-state-2.
+
+rule recall
+  @intention: "Answer with the accumulated paths"
+  @source: negative.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: concat("seen:", state.last) }
+
+  proofs:
+    purity:
+      reads : [state.last]
+      calls : []
+    termination:
+      bound : 3
+
+service memo
+  @intention: "Accumulate every path seen"
+  @source: negative.intent:2
+
+  listen:
+    protocol    : http_1_0
+    port        : 18953
+    max_request : 4096
+
+  handler: recall
+
+  state:
+    last : text [..64] = ""
+
+  after:
+    set last = concat(state.last, req.path)

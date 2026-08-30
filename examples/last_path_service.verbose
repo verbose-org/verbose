@@ -1,0 +1,67 @@
+@verbose 0.1.0
+
+-- Slice `text-state-1`: the first Verbose program that carries BYTES across
+-- requests. A `state:` block could hold a number since counter_service; this
+-- one holds text.
+--
+-- The source of the mutation is `req.path`, and that is the whole point of
+-- the fixture rather than a detail. A text LITERAL source lives in the code
+-- region forever, so an implementation that ALIASED the source pointer
+-- instead of copying its bytes would look perfectly correct on a
+-- literal-sourced example. `req.path` points into the HTTP read buffer, which
+-- the next request overwrites — so an aliasing build answers each request
+-- with its OWN path instead of the previous one, and this example catches it.
+--
+-- Three sequential requests must answer:
+--   GET /alpha  -> prev:none    (the initial literal reached the buffer, and
+--                                the mutation is NOT visible to its own
+--                                request — the after: block runs after the
+--                                response is written)
+--   GET /beta   -> prev:/alpha  (the value survived the iteration tail's
+--                                `lea rsp`, and it was COPIED, not aliased)
+--   GET /gamma  -> prev:/beta   (a live cell, not a one-shot)
+--
+-- The overflow gate is COMPILE-TIME: worst_case(req.path) is 256, the bound
+-- declared below is 256, so the copy is proved safe from declarations alone
+-- and no runtime check byte is emitted. `req.path`'s 256 is not an assertion
+-- either — the HTTP parser enforces it per request and drops an over-long
+-- request without answering it.
+
+
+rule recall
+  @intention: "Answer with the path of the previous request"
+  @source: last_path_service.intent:3
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: concat("prev:", state.last) }
+
+  proofs:
+    purity:
+      reads : [state.last]
+      calls : []
+    termination:
+      bound : 3
+
+
+service memo
+  @intention: "HTTP echo of the previous request's path — text state across requests"
+  @source: last_path_service.intent:5
+
+  listen:
+    protocol    : http_1_0
+    port        : 18952
+    max_request : 4096
+
+  handler: recall
+
+  state:
+    last : text [..256] = "none"
+
+  after:
+    set last = req.path

@@ -459,9 +459,15 @@ walk that segmented on top-level declarations only would score it clean.
 Stated plainly, because "the negative corpus is green" must not be read as
 "gen0's verifier is complete":
 
-- **Only 42 fixtures**, currently measuring **40 PASS / 2 GAP / 0 INVERSE**
+- **Only 43 fixtures**, currently measuring **41 PASS / 2 GAP / 0 INVERSE**
   (plus the 2 `INVERSE_CAPABILITY` entries, which are valid programs and so
-  are not part of the "verbosec refuses" count — 44 `.verbose` files in all).
+  are not part of the "verbosec refuses" count — 45 `.verbose` files in all).
+  The 43rd, `state_text_accumulator`, arrived with slice `text-state-1` and is
+  a PASS in the commit that adds it: `verbosec` refuses it by the compile-time
+  overflow gate (`worst case 320 bytes exceeds the declared bound 64`), gen0
+  refuses it because it refuses every service `state:` block. That agreement
+  is exit-status-only, as the sweep's contract says — it is not a claim that
+  gen0 checks the bound.
   They were chosen from CLAUDE.md's known-gaps table plus
   what a first pass over `src/verifier.rs` and `src/parser.rs` suggested. They
   are not an enumeration of everything `verbosec` refuses — the verifier has
