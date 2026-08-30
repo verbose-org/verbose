@@ -20332,7 +20332,37 @@ fn compile_http10_dynamic_service(
 /// verifier module. If the two ever drift, the phase7_http10 regression
 /// tests will catch it (they type-check the handler via the real verifier
 /// and then compile with this copy).
-fn http_request_builtin_concept_native() -> Concept {
+///
+/// `body`'s declared bound TRACKS the compiled service's `max_request`
+/// rather than being a hardcoded 4096. This is the load-bearing half of the
+/// fix: a text field's `[..N]` bound is EXPLOITED here for compile-time
+/// buffer sizing — `emit_concat_to_buffer_impl` does `static_total += N` for
+/// a bounded Text field and `static_total += 2 * N` for `json_escape` of
+/// one — so a bound smaller than the field's real capacity sizes a stack
+/// buffer that the fill pass then overruns with attacker-controlled bytes.
+/// That is exactly the 2026-08-05 defect, and `max_request` has no upper
+/// bound in the verifier, so a service declaring `max_request : 65536` had a
+/// hardcoded `[..4096]` on a field the wire can fill with ~65500 bytes.
+///
+/// It was NOT reachable at the time of the fix: `req.body` is registered in
+/// `http_text_bindings` whenever it is referenced, so `classify_concat_arg`
+/// returns `BoundText` and the runtime-sized path takes over (measured: a
+/// 60000-byte body through `concat("[", req.body, "]")` with
+/// `max_request : 65536` returns 60002 correct bytes), and the json_escape
+/// arm — which DOES read the concept range, because its `inner_static_max`
+/// matches `Expr::Field` without consulting `text_bindings` — currently dies
+/// in the fill pass with "json_escape inner field 'body' has no rbp slot".
+/// It was a landmine, not a live hole: the day someone wires body's rbp slot
+/// into the json_escape fill path, the sizing silently becomes `2 * 4096`
+/// against an unbounded runtime length.
+///
+/// Deriving the bound from `max_request` makes the declaration true BY
+/// CONSTRUCTION — the body is a suffix of a buffer `read(client_fd, buf,
+/// max_request)` already caps — so no runtime guard is needed, unlike the
+/// method/path bounds which are enforced by explicit checks in
+/// `emit_http_parse_method_path` precisely because THEIR bounds are
+/// independent constants.
+fn http_request_builtin_concept_native(max_request: u32) -> Concept {
     Concept {
         name: "HttpRequest".to_string(),
         intention: "compiler built-in".to_string(),
@@ -20351,7 +20381,7 @@ fn http_request_builtin_concept_native() -> Concept {
             Field {
                 name: "body".to_string(),
                 ty: Type::Text,
-                range: Some((0, 4096)),
+                range: Some((0, max_request as i64)),
             },
         ],
         variants: vec![],
@@ -20452,7 +20482,7 @@ fn emit_http10_dynamic_bytes(
     // (1 slot). Walk in source order so a later binding can refer to a
     // prior text let — same predicate the rule path uses, applied to the
     // synthetic HttpRequest concept the handler reads from.
-    let http_request_concept_for_lets = http_request_builtin_concept_native();
+    let http_request_concept_for_lets = http_request_builtin_concept_native(max_request);
     let mut prior_text_lets: HashSet<&str> = HashSet::new();
     let handler_binding_is_text: Vec<bool> = handler
         .logic
@@ -20811,7 +20841,8 @@ fn emit_http10_dynamic_bytes(
     // On malformed input (no space found, no CR/LF found), jumps to
     // the close/loop label via a pair of rel32 patch sites. We resolve
     // those after emitting the close.
-    let mut parse_fail_patches = emit_http_parse_method_path(&mut code, buf_offset_from_rbp);
+    let mut parse_fail_patches =
+        emit_http_parse_method_path(&mut code, buf_offset_from_rbp, max_request);
 
     // ═══ HTTP PARSE (body) ═════════════════════════════════════
     // Slice X (2026-04-29): when the rule references `req.body`, scan
@@ -20909,7 +20940,7 @@ fn emit_http10_dynamic_bytes(
     // (empty for HttpRequest — text fields don't have numeric ranges),
     // `http_text_bindings` (resources + earlier connections), and
     // allow_dynamic_request=true so the literal-only guard is lifted.
-    let http_request_concept_for_fetch = http_request_builtin_concept_native();
+    let http_request_concept_for_fetch = http_request_builtin_concept_native(max_request);
     for c in &referenced_connections {
         let (ptr_slot, len_slot, _buf_slot, new_next) = emit_connection_fetch_sequence(
             &mut code,
@@ -21018,6 +21049,7 @@ fn emit_http10_dynamic_bytes(
         all_rules,
         field_ranges,
         &http_text_bindings,
+        max_request,
     )?;
 
     // ═══ LOG EFFECT (Phase 8 slices 8a/8b/8c) ══════════════════
@@ -21040,7 +21072,7 @@ fn emit_http10_dynamic_bytes(
     // identical for every block — and reused for each emission. Each
     // block's own on_error policy is passed through to emit_append_file_call.
     if !service.logs.is_empty() {
-        let mut log_concept = http_request_builtin_concept_native();
+        let mut log_concept = http_request_builtin_concept_native(max_request);
         log_concept.fields.push(Field {
             name: "__resp_status".to_string(),
             ty: Type::Number,
@@ -21192,7 +21224,17 @@ fn emit_http10_dynamic_bytes(
 /// the connection without a response.
 ///
 /// Registers used: rax (bytes remaining), rbx (scan pointer), al (byte reg).
-fn emit_http_parse_method_path(code: &mut Vec<u8>, buf_offset_from_rbp: i32) -> Vec<usize> {
+/// `max_request` is threaded in only so this function keeps synthesising the
+/// concept through the SAME constructor as every other site (one shape, one
+/// source of truth). It reads `method` and `path` here and never `body` —
+/// those two bounds are independent constants and are the ones that need the
+/// explicit runtime guards below; `body`'s bound is true by construction of
+/// the `read(client_fd, buf, max_request)` that produced the buffer.
+fn emit_http_parse_method_path(
+    code: &mut Vec<u8>,
+    buf_offset_from_rbp: i32,
+    max_request: u32,
+) -> Vec<usize> {
     let mut fail_patches = Vec::new();
 
     // Declared bounds of the built-in HttpRequest concept, read from the
@@ -21213,7 +21255,7 @@ fn emit_http_parse_method_path(code: &mut Vec<u8>, buf_offset_from_rbp: i32) -> 
     // caller wires to the close-connection label. Per-request fail-closed,
     // no response, no process exit — an over-long path must not be a way
     // to take the listener down.
-    let builtin = http_request_builtin_concept_native();
+    let builtin = http_request_builtin_concept_native(max_request);
     let declared_max = |name: &str| -> i32 {
         builtin
             .fields
@@ -21357,6 +21399,7 @@ fn emit_handler_to_slots(
     all_rules: &HashMap<&str, &Rule>,
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
+    max_request: u32,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Record(name, fields) if name == "HttpResponse" => {
@@ -21456,7 +21499,7 @@ fn emit_handler_to_slots(
                 // here — the per-iteration rsp restore subsumes both
                 // Static and Dynamic free strategies.
                 Expr::Concat(args) => {
-                    let req_concept = http_request_builtin_concept_native();
+                    let req_concept = http_request_builtin_concept_native(max_request);
                     let _ = emit_concat_to_buffer(
                         code,
                         args,
@@ -21552,7 +21595,7 @@ fn emit_handler_to_slots(
             code.extend_from_slice(&[0, 0, 0, 0]);
 
             // then arm
-            emit_handler_to_slots(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_handler_to_slots(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, max_request)?;
             // jmp end_label
             code.push(0xE9);
             let patch_end = code.len();
@@ -21564,7 +21607,7 @@ fn emit_handler_to_slots(
             code[patch_else..patch_else + 4].copy_from_slice(&rel.to_le_bytes());
 
             // else arm
-            emit_handler_to_slots(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_handler_to_slots(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, max_request)?;
 
             // end_label:
             let end_pos = code.len();
@@ -39930,6 +39973,312 @@ rule scalar
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// An `after:` state mutation together with `concurrency: forked` is a
+    /// WRITE-ONLY declaration and is refused at verify time.
+    ///
+    /// The three parts, in the order that makes the refusal attributable:
+    ///
+    /// 1. THE GATE — the forked variant of `examples/counter_service.verbose`
+    ///    is refused, and the message names both halves of the combination.
+    ///
+    /// 2. NON-VACUITY — `compile_service` bypasses `verify_program`, so the
+    ///    emitter still produces the binary the gate exists to stop. Driven
+    ///    over real TCP it answers `count:0` to EVERY request: not degraded
+    ///    per-connection counting, a constant. Without this half the gate
+    ///    could be "the verifier refuses anything with a service in it".
+    ///
+    /// 3. THE CORRECTED TWIN — the same program without `concurrency: forked`
+    ///    still verifies AND still counts 0 / 1 / 2 over the wire, so the
+    ///    refusal is scoped to the combination and not to `state:` itself.
+    #[test]
+    fn forked_state_mutation_is_refused_and_sequential_still_counts() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let parse = |src: &str| {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+            crate::parser::Parser::new(tokens).parse_program().expect("parse")
+        };
+
+        let base = std::fs::read_to_string("examples/counter_service.verbose")
+            .expect("examples/counter_service.verbose");
+
+        // ── 1. THE GATE ──────────────────────────────────────────────
+        let forked_port: u16 = 18963;
+        let forked_src = base
+            .replace("18950", &forked_port.to_string())
+            .replace("  handler: handle", "  concurrency: forked\n\n  handler: handle");
+        assert!(
+            forked_src.contains("concurrency: forked"),
+            "fixture construction failed — the handler line was not found",
+        );
+        let errs =
+            crate::verifier::verify_program(&parse(&forked_src), std::path::Path::new("examples"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("after + concurrency")
+                && e.message.contains("forked")
+                && e.message.contains("write-only")),
+            "state mutation under `concurrency: forked` must be refused with a \
+             breadcrumb naming both halves; got {errs:#?}",
+        );
+
+        // ── 2. NON-VACUITY: the emitter would still ship the defect ───
+        let bad = std::env::temp_dir().join("verbosec_test_forked_state_writeonly");
+        compile_service(&parse(&forked_src), "counter", bad.to_str().unwrap())
+            .expect("the emitter accepts this shape; only the verifier refuses it");
+        let mut child = Command::new(&bad)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let drive = |port: u16, n: usize| -> Vec<String> {
+            let mut bound = false;
+            for _ in 0..50 {
+                if TcpStream::connect_timeout(
+                    &format!("127.0.0.1:{}", port).parse().unwrap(),
+                    Duration::from_millis(100),
+                )
+                .is_ok()
+                {
+                    bound = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(bound, "service never bound on port {}", port);
+            (0..n)
+                .map(|_| {
+                    let mut s = TcpStream::connect_timeout(
+                        &format!("127.0.0.1:{}", port).parse().unwrap(),
+                        Duration::from_secs(2),
+                    )
+                    .expect("connect");
+                    s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    s.write_all(b"GET / HTTP/1.0\r\n\r\n").expect("write");
+                    let mut buf = Vec::new();
+                    s.read_to_end(&mut buf).expect("read");
+                    let resp = String::from_utf8_lossy(&buf).to_string();
+                    let body = resp.rsplit("\r\n\r\n").next().unwrap_or("").to_string();
+                    body
+                })
+                .collect()
+        };
+        let forked_bodies = drive(forked_port, 4);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&bad);
+        assert_eq!(
+            forked_bodies,
+            vec!["count:0", "count:0", "count:0", "count:0"],
+            "the forked binary must answer a CONSTANT — the mutation is read by \
+             nobody, ever. If this ever starts counting, the state made it across \
+             a fork and the refusal above needs revisiting, not deleting.",
+        );
+
+        // ── 3. THE CORRECTED TWIN ────────────────────────────────────
+        let seq_port: u16 = 18964;
+        let seq_src = base.replace("18950", &seq_port.to_string());
+        let errs =
+            crate::verifier::verify_program(&parse(&seq_src), std::path::Path::new("examples"));
+        assert!(
+            errs.is_empty(),
+            "the same program WITHOUT `concurrency: forked` must still verify; got {errs:#?}",
+        );
+        let good = std::env::temp_dir().join("verbosec_test_forked_state_twin");
+        compile_service(&parse(&seq_src), "counter", good.to_str().unwrap())
+            .expect("sequential counter service compiles");
+        let mut child = Command::new(&good)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let seq_bodies = drive(seq_port, 3);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&good);
+        assert_eq!(
+            seq_bodies,
+            vec!["count:0", "count:1", "count:2"],
+            "the sequential counter must keep counting — the refusal is scoped to \
+             the forked COMBINATION, not to mutable state",
+        );
+    }
+
+    /// A `state:` block with NO `after:` block is a per-process CONSTANT, and
+    /// a constant reads identically under both concurrency modes — so it is
+    /// deliberately still ACCEPTED under `concurrency: forked`. Pinned so a
+    /// later "simplification" that widens the refusal to `state_fields`
+    /// fails a named test instead of silently rejecting a valid program.
+    #[test]
+    fn forked_service_with_read_only_state_is_still_accepted() {
+        let base = std::fs::read_to_string("examples/counter_service.verbose")
+            .expect("examples/counter_service.verbose");
+        // Drop the after: block, keep the state: block, add forked.
+        let no_after = base
+            .replace("\n  after:\n    set count = state.count + 1\n", "\n")
+            .replace("  handler: handle", "  concurrency: forked\n\n  handler: handle");
+        // NB: the file's prose comment mentions "after:" too, so match the
+        // BLOCK form (line-leading, two-space indent) rather than the word.
+        assert!(
+            !no_after.contains("\n  after:") && no_after.contains("\n  state:"),
+            "fixture construction failed: {no_after}",
+        );
+        let tokens = crate::lexer::Lexer::new(&no_after).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(
+            errs.is_empty(),
+            "read-only state under forked concurrency must stay accepted \
+             (it is a constant in both modes); got {errs:#?}",
+        );
+    }
+
+    /// `HttpRequest.body`'s declared `[..N]` bound TRACKS the service's
+    /// `max_request` instead of a hardcoded 4096.
+    ///
+    /// Why it matters: a text field's `[..N]` bound is EXPLOITED by
+    /// `emit_concat_to_buffer_impl` for compile-time buffer sizing
+    /// (`static_total += N`, and `2 * N` for `json_escape`), so a bound
+    /// smaller than the field's real capacity is the shape of the 2026-08-05
+    /// argv-controlled stack overflow. `max_request` has no upper bound in
+    /// the verifier, so `max_request : 65536` used to carry a declared
+    /// `[..4096]` on a field the wire can fill with ~65500 bytes.
+    ///
+    /// Three parts: the synthesised bound itself (both synthesis sites agree
+    /// for a single-service program), the RUNTIME proof that the old bound
+    /// was false (a 60000-byte body flows through end to end), and the
+    /// method/path bounds staying the independent constants they are.
+    #[test]
+    fn http_request_body_bound_tracks_max_request() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        // ── 1. THE DECLARATION, at the native synthesis site ─────────
+        for max_request in [64u32, 4096, 65536, 1_048_576] {
+            let c = http_request_builtin_concept_native(max_request);
+            let body = c.fields.iter().find(|f| f.name == "body").expect("body field");
+            assert_eq!(
+                body.range,
+                Some((0, max_request as i64)),
+                "body's declared bound must equal max_request ({max_request}), \
+                 not a hardcoded constant — the bound is exploited for static \
+                 buffer sizing and must never understate the field's capacity",
+            );
+            // method / path are independent constants, enforced by explicit
+            // runtime guards in emit_http_parse_method_path. They must NOT
+            // start tracking max_request.
+            let m = c.fields.iter().find(|f| f.name == "method").unwrap();
+            let p = c.fields.iter().find(|f| f.name == "path").unwrap();
+            assert_eq!(m.range, Some((0, 8)));
+            assert_eq!(p.range, Some((0, 256)));
+        }
+
+        // ── 2. THE SAME BOUND FROM THE VERIFIER'S SYNTHESIS ──────────
+        //     Reached through the public surface: a handler declaring a
+        //     `bound` too small for its own logic reports the operation
+        //     count, so instead we assert the shape the verifier accepts,
+        //     then prove the runtime claim below.
+        let port: u16 = 18965;
+        let src = format!(
+            r#"@verbose 0.1.0
+
+rule handle
+  @intention: "Echo the request body"
+  @source: counter_service.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse {{ status: 200, body: concat("[", req.body, "]") }}
+
+  proofs:
+    purity:
+      reads : [req.body]
+      calls : []
+    termination:
+      bound : 4
+
+
+service echo
+  @intention: "Echo the body back"
+  @source: counter_service.intent:2
+
+  listen:
+    protocol    : http_1_0
+    port        : {port}
+    max_request : 65536
+
+  handler: handle
+"#
+        );
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "echo service must verify; got {errs:#?}");
+
+        // ── 3. THE RUNTIME PROOF THAT [..4096] WAS FALSE ─────────────
+        let out = std::env::temp_dir().join("verbosec_test_body_bound_tracks_max_request");
+        compile_service(&program, "echo", out.to_str().unwrap()).expect("echo service compiles");
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let mut bound = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "echo service never bound on port {}", port);
+
+        const N: usize = 60_000;
+        let mut request = format!("POST /p HTTP/1.0\r\nContent-Length: {N}\r\n\r\n").into_bytes();
+        request.extend(std::iter::repeat(b'A').take(N));
+        let mut s = TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            Duration::from_secs(5),
+        )
+        .expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        s.write_all(&request).expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&out);
+
+        let split = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response has a header terminator");
+        let payload = &buf[split + 4..];
+        assert_eq!(
+            payload.len(),
+            N + 2,
+            "a {N}-byte body must round-trip through concat(\"[\", req.body, \"]\") — \
+             this is the measurement that makes the old hardcoded [..4096] a FALSE \
+             declaration rather than a conservative one",
+        );
+        assert_eq!(payload[0], b'[');
+        assert_eq!(payload[payload.len() - 1], b']');
     }
 
     #[test]

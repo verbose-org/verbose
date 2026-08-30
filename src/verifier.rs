@@ -47,7 +47,22 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
     }
 
     let synth_concepts: Vec<Concept> = if any_http10 {
-        vec![builtin_http_request(), builtin_http_response()]
+        // `body`'s declared bound tracks `max_request` so the declaration is
+        // true rather than decorative (see builtin_http_request). The concept
+        // is program-wide while max_request is per-service, so take the
+        // maximum over every Http10 service — the tightest bound true for all
+        // of them. `any_http10` guarantees at least one, so the fold below
+        // cannot yield the 0 default.
+        let body_max = program
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Service(s) if s.protocol == Protocol::Http10 => Some(s.max_request as i64),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        vec![builtin_http_request(body_max), builtin_http_response()]
     } else {
         Vec::new()
     };
@@ -871,11 +886,35 @@ fn verify_connection_stub(c: &Connection, base_dir: &StdPath, errors: &mut Vec<V
 /// compiler-owned translation. Fields:
 ///   method : text [..8]    — GET / POST / DELETE / etc. (fits OPTIONS = 7)
 ///   path   : text [..256]  — URL path segment
-///   body   : text [..4096] — the bytes after the \r\n\r\n delimiter; capped
-///                            by the service's `max_request` at runtime.
+///   body   : text [..body_max] — the bytes after the \r\n\r\n delimiter.
 ///                            Stored as (ptr, len) — body may contain
 ///                            arbitrary bytes so NUL-termination is unsafe.
-fn builtin_http_request() -> Concept {
+///
+/// `body_max` TRACKS the service's declared `max_request` and is not a
+/// constant. It used to be a hardcoded 4096 while the doc comment on this
+/// very function said body was "capped by the service's `max_request` at
+/// runtime" — and `max_request` has no UPPER bound anywhere (verify_service
+/// checks `!= 0`, plus `>= 64` for http_1_0; both are floors), so a service
+/// declaring `max_request : 65536` carried a
+/// declared `[..4096]` bound on a field that can hold ~65500 bytes. That is
+/// a FALSE declaration, and a declared `[..N]` on a text field is EXPLOITED
+/// by the native emitter for compile-time buffer sizing (see
+/// `emit_concat_to_buffer_impl`'s `static_total += max_len` and its
+/// `2 * max_len` json_escape sibling) — the exact shape of the 2026-08-05
+/// argv-controlled overflow. Deriving the bound from `max_request` makes the
+/// declaration true BY CONSTRUCTION: the body is a suffix of a buffer the
+/// `read(client_fd, buf, max_request)` syscall already caps, so no runtime
+/// check is needed to make it hold.
+///
+/// The concept is synthesised once per PROGRAM while `max_request` is
+/// per-service, so the caller passes the MAXIMUM over every Http10 service —
+/// the tightest program-wide bound that is true for all of them. Native
+/// synthesises its own copy per COMPILED SERVICE and uses that service's
+/// exact `max_request` (see `http_request_builtin_concept_native`), which is
+/// ≤ this value; the divergence is only ever in the safe direction, and for
+/// a single-service program (every example in the repo, and the only shape
+/// `--run <service>` compiles) the two are identical.
+fn builtin_http_request(body_max: i64) -> Concept {
     Concept {
         name: "HttpRequest".to_string(),
         intention:
@@ -896,7 +935,7 @@ fn builtin_http_request() -> Concept {
             Field {
                 name: "body".to_string(),
                 ty: Type::Text,
-                range: Some((0, 4096)),
+                range: Some((0, body_max)),
             },
         ],
         variants: vec![],
@@ -1116,6 +1155,50 @@ fn verify_service(
         errors.push(VerifyError {
             context: format!("service '{}' / state", s.name),
             message: "mutable state is currently restricted to http_1_0 services".into(),
+        });
+    }
+    // 5. An `after:` mutation together with `concurrency: forked` is REFUSED.
+    //
+    // Not a degraded mode — a WRITE-ONLY declaration. `fork()` is per-accept
+    // and http_1_0 serves exactly one request per connection, so every child
+    // starts from the parent's *unchanged* slots, runs its `after:` block
+    // against its own copy-on-write page, and `sys_exit(0)`s. The parent
+    // never re-reads the slot and no sibling ever sees it, so the mutation
+    // is observed by nobody, ever. Measured on a running binary: the counter
+    // service (which answers count:0 / count:1 / count:2 / count:3 under the
+    // default sequential mode) answers count:0 to EVERY request once
+    // `concurrency: forked` is added — a constant, not per-connection
+    // counting.
+    //
+    // Making the mutation propagate would mean shared memory between
+    // processes, which docs/effect-model.md refuses on principle (see its
+    // "Pthreads / shared-memory concurrency" entry: locks need a memory
+    // model, and a memory model is a research problem in its own right).
+    // So this combination is UNBUILDABLE under the standing effect model,
+    // not merely unbuilt — which is why it is refused at verify time rather
+    // than documented as a caveat.
+    //
+    // Deliberately keyed on `after_sets`, NOT on `state_fields`: a `state:`
+    // block with no `after:` block is a per-process CONSTANT, and a constant
+    // reads identically under both concurrency modes. Refusing that shape
+    // would reject a valid program, the one direction this project's
+    // verifier checks must never move in.
+    if !s.after_sets.is_empty() && s.concurrency == ConcurrencyMode::Forked {
+        errors.push(VerifyError {
+            context: format!("service '{}' / after + concurrency", s.name),
+            message: format!(
+                "service mutates state in its 'after:' block ({} set(s): [{}]) while declaring \
+                 'concurrency: forked'; the combination is refused because the mutation would be write-only. \
+                 fork() is per-accept and http_1_0 serves one request per connection, so every child starts \
+                 from the parent's unchanged slots, mutates its own copy-on-write page, and exits — no request \
+                 ever observes a mutation, so the state reads as a constant rather than counting per \
+                 connection. Propagating it would require shared memory between processes, which \
+                 docs/effect-model.md refuses on principle ('Pthreads / shared-memory concurrency'), so this \
+                 is unbuildable rather than unbuilt. Remove 'concurrency: forked' to keep the mutation, or \
+                 remove the 'after:' block to keep forked concurrency.",
+                s.after_sets.len(),
+                s.after_sets.iter().map(|st| st.field_name.as_str()).collect::<Vec<_>>().join(", ")
+            ),
         });
     }
     {
@@ -7193,6 +7276,33 @@ rule test
             mr = max_request,
             h = handler_name
         )
+    }
+
+    /// The verifier's synthesised `HttpRequest.body` bound must TRACK the
+    /// service's `max_request`, not be a hardcoded constant — see the
+    /// doc comment on `builtin_http_request`. `method` / `path` stay the
+    /// independent constants they are (they have their own runtime guards in
+    /// `emit_http_parse_method_path`; body's bound is true by construction of
+    /// the `read(client_fd, buf, max_request)` that produced the buffer).
+    ///
+    /// Asserted at this synthesis site as well as at native's, because the
+    /// two are deliberately DUPLICATED shapes (see the doc comment on
+    /// `http_request_builtin_concept_native`) and nothing else compares them.
+    #[test]
+    fn builtin_http_request_body_bound_tracks_max_request() {
+        for body_max in [64i64, 4096, 65536, 1_048_576] {
+            let c = builtin_http_request(body_max);
+            let f = |n: &str| c.fields.iter().find(|f| f.name == n).unwrap().range;
+            assert_eq!(
+                f("body"),
+                Some((0, body_max)),
+                "body's declared bound must equal the service's max_request ({body_max}); \
+                 a bound below the field's real capacity is the shape of the 2026-08-05 \
+                 static-sizing overflow",
+            );
+            assert_eq!(f("method"), Some((0, 8)));
+            assert_eq!(f("path"), Some((0, 256)));
+        }
     }
 
     #[test]
