@@ -23,22 +23,22 @@ per spawn, `ghash_fold` (recursive, like sha256_fold) returns the whole
 16-byte GHASH accumulator in one spawn, and `gctr` returns one PER-BLOCK
 CipherBlock record — the host loop spawns once per 16-byte block instead of
 once per data byte (framing glue: pad the tail block's hex, truncate after
-unpacking). NOTHING in this module spawns per-`which` any more; the thread
-pool below survives ONLY for run_bytes' external callers — the still-
-which-form `hkdf_extract` (tls_server.py, tls_cert_server.py, both browser
-servers) and `psk_early_secret` / `psk_ext_binder_key` (tls_server.py,
-verify_binder.py) loops. Convert those and the pool dies.
+unpacking). HKDF-Extract and the PSK schedule closed the arc (tranche 6,
+2026-08-30): `hkdf_extract`, `psk_early_secret` and `psk_ext_binder_key`
+each return all 32 output bytes as one Digest record. EVERY primitive is a
+single record spawn of a verified binary — nothing spawns per-`which`, no
+caller loops over output bytes, and the 64-thread pool that existed to beat
+the one-byte-per-process-run cost is gone.
 
 Honest scope (per docs/tls-io-statemachine-design.md §7): the cryptographic
 PRIMITIVES (X25519, key schedule, SHA-256, AES/GCM/GHASH) are pure Verbose.
 Byte repacking (bytes<->limbs), AEAD framing (nonce/AAD/J0/tag-XOR), and
 randomness are host glue, clearly separated below.
 """
-import subprocess, os, sys, json, concurrent.futures as cf
+import subprocess, os, sys, json
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = {}
-_POOL = cf.ThreadPoolExecutor(max_workers=64)
 
 def _compile(rule, src):
     out = f"/tmp/v_{rule}"
@@ -56,26 +56,6 @@ def _compile(rule, src):
 
 def ensure(rules):
     for rule, src in rules: _compile(rule, src)
-
-def _one(binp, args, w):
-    r = subprocess.run([binp]+args+[str(w)], capture_output=True, text=True, timeout=600)
-    s = r.stdout.strip()
-    if s == "": raise RuntimeError(f"{binp} which={w} empty (rc={r.returncode}) {r.stderr[-200:]}")
-    return int(s)
-
-def run_bytes(rule, args, n):
-    """Spawn all n `which` values in parallel; return bytes.
-
-    No rule COMPILED BY THIS MODULE uses the which interface any more
-    (tranche 5 converted the last three: encrypt / gctr / ghash_fold).
-    This helper and _POOL stay for the external callers still driving
-    which-form rules: hkdf_extract (tls_server.py, tls_cert_server.py,
-    tls_browser_server.py, tls_browser_p256_server.py) and
-    psk_early_secret / psk_ext_binder_key (tls_server.py, verify_binder.py).
-    """
-    binp = BIN[rule]
-    futs = {w: _POOL.submit(_one, binp, args, w) for w in range(n)}
-    return bytes(futs[w].result() for w in range(n))
 
 # ---- byte<->limb repacking (host glue: deterministic format conversion) ----
 OFF = [0,26,51,77,102,128,153,179,204,230]; W=[26,25,26,25,26,25,26,25,26,25]
@@ -162,6 +142,18 @@ def finished_key(secret32): return _sched("finished_key", secret32, bytes(32))
 def expand_key(secret32): return _record_bytes("expand_key",[str(b) for b in secret32],16)
 def expand_iv(secret32):  return _record_bytes("expand_iv",[str(b) for b in secret32],12)
 
+# ---- HKDF-Extract + PSK schedule (pure Verbose; record spawns since tranche 6,
+# 2026-08-30 — the LAST which-form rules; their conversion is what killed the pool) ----
+def hkdf_extract(salt32, ikm32):
+    """PRK = HMAC-SHA256(salt, IKM), both 32 bytes (RFC 5869 2.2); one Digest spawn."""
+    return _record_bytes("hkdf_extract", [str(b) for b in salt32]+[str(b) for b in ikm32], 32)
+def psk_early_secret(psk32):
+    """Early Secret = HKDF-Extract(0^32, PSK) (RFC 8446 7.1); one Digest spawn."""
+    return _record_bytes("psk_early_secret", [str(b) for b in psk32], 32)
+def psk_ext_binder_key(early32):
+    """binder_key = Derive-Secret(Early, "ext binder", "") (RFC 8446 7.1); one Digest spawn."""
+    return _record_bytes("psk_ext_binder_key", [str(b) for b in early32], 32)
+
 # ---- AES-GCM AEAD record protection (primitives pure Verbose; framing host) ----
 # All three primitives are RECORD spawns since tranche 5 (2026-08-30):
 #   encrypt    — ONE spawn, all 16 ciphertext bytes as a CipherBlock record
@@ -238,6 +230,8 @@ ALL_RULES = [
     ("derive_c_ap_traffic","tls_schedule.verbose"), ("finished_key","tls_schedule.verbose"),
     ("expand_key","hkdf_expand_label.verbose"), ("expand_iv","hkdf_expand_label.verbose"),
     ("encrypt","aes_encrypt.verbose"), ("gctr","aes_gctr.verbose"), ("ghash_fold","ghash_nblocks.verbose"),
+    ("hkdf_extract","hkdf_extract.verbose"),
+    ("psk_early_secret","psk_schedule.verbose"), ("psk_ext_binder_key","psk_schedule.verbose"),
 ]
 
 if __name__ == "__main__":
@@ -289,6 +283,19 @@ if __name__ == "__main__":
     assert sap==el(ms,b"s ap traffic",thash,32)
     assert cap_==el(ms,b"c ap traffic",thash,32)
     assert fk==el(shs,b"finished",b"",32)
+    # 3c) HKDF-Extract + PSK schedule (record spawns since tranche 6, 2026-08-30 —
+    # the LAST which-form rules; converting them is what deleted the thread pool).
+    # hkdf_extract is the exact PSK-DHE Handshake Secret shape the servers use
+    # (HMAC(derived, ECDHE)); the two psk rules are verify_binder.py's chain.
+    PSK=bytes(range(32))
+    t=time.time()
+    ex=hkdf_extract(der, ecdhe)
+    pe=psk_early_secret(PSK)
+    bk=psk_ext_binder_key(pe)
+    t_px = time.time()-t
+    assert ex==hs                                                  # == HMAC(der, ecdhe), pinned above
+    assert pe==H.new(b'\x00'*32, PSK, hashlib.sha256).digest()
+    assert bk==el(pe, b"ext binder", hashlib.sha256(b"").digest(), 32)
     # 4) AES/GCM/GHASH vs the published NIST vectors — record spawns since
     # tranche 5 (2026-08-30). FIPS-197 Appendix C.1 through `encrypt` (one
     # CipherBlock spawn), NIST GCM Test Case 2 through `gctr` (one per-block
@@ -310,4 +317,4 @@ if __name__ == "__main__":
     ct,pt=aead_decrypt(rk,riv,0,rec)
     t_ae = time.time()-t
     assert ct==0x17 and pt==b"hello world", (ct,pt)
-    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  sha256={t_sha:.3f}s  aead={t_ae:.3f}s  aead_roundtrip=ok  (every primitive this module spawns: record spawns; the pool serves only external run_bytes callers — hkdf_extract + psk_*)")
+    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  sha256={t_sha:.3f}s  extract_psk={t_px:.3f}s  aead={t_ae:.3f}s  aead_roundtrip=ok  (every TLS primitive: ONE record spawn of a verified binary; the which-era thread pool is DELETED)")

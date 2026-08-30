@@ -1,7 +1,7 @@
 @verbose 0.1.0
 
 concept Extract
-  @intention: "HKDF-Extract inputs: 32-byte salt + 32-byte IKM + which output byte"
+  @intention: "HKDF-Extract inputs: 32-byte salt + 32-byte IKM"
   @source: invoices.intent:1
   fields:
     salt0 : number [0, 255]
@@ -68,16 +68,53 @@ concept Extract
     ikm29 : number [0, 255]
     ikm30 : number [0, 255]
     ikm31 : number [0, 255]
-    which : number [0, 31]
+
+
+concept Digest
+  @intention: "the 32 bytes of HKDF-Extract(salt, IKM), returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+    b16 : number [0, 255]
+    b17 : number [0, 255]
+    b18 : number [0, 255]
+    b19 : number [0, 255]
+    b20 : number [0, 255]
+    b21 : number [0, 255]
+    b22 : number [0, 255]
+    b23 : number [0, 255]
+    b24 : number [0, 255]
+    b25 : number [0, 255]
+    b26 : number [0, 255]
+    b27 : number [0, 255]
+    b28 : number [0, 255]
+    b29 : number [0, 255]
+    b30 : number [0, 255]
+    b31 : number [0, 255]
 
 
 rule hkdf_extract
-  @intention: "HKDF-Extract(salt, IKM) = HMAC-SHA256(salt, IKM); byte which (RFC 5869 2.2)"
+  @intention: "HKDF-Extract(salt, IKM) = HMAC-SHA256(salt, IKM) (RFC 5869 2.2); all 32 PRK bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : Extract
   output:
-    out : number
+    out : Digest
   logic:
     let ex_ip0 = bxor(g.salt0, 54)
     let ex_op0 = bxor(g.salt0, 92)
@@ -1599,41 +1636,10 @@ rule hkdf_extract
     let ex_ou_ob7_1 = band(shr(ex_ou_h7_1, 16), 255)
     let ex_ou_ob7_2 = band(shr(ex_ou_h7_1, 8), 255)
     let ex_ou_ob7_3 = band(shr(ex_ou_h7_1, 0), 255)
-    out = if g.which == 0 then ex_ou_ob0_0
-      else if g.which == 1 then ex_ou_ob0_1
-      else if g.which == 2 then ex_ou_ob0_2
-      else if g.which == 3 then ex_ou_ob0_3
-      else if g.which == 4 then ex_ou_ob1_0
-      else if g.which == 5 then ex_ou_ob1_1
-      else if g.which == 6 then ex_ou_ob1_2
-      else if g.which == 7 then ex_ou_ob1_3
-      else if g.which == 8 then ex_ou_ob2_0
-      else if g.which == 9 then ex_ou_ob2_1
-      else if g.which == 10 then ex_ou_ob2_2
-      else if g.which == 11 then ex_ou_ob2_3
-      else if g.which == 12 then ex_ou_ob3_0
-      else if g.which == 13 then ex_ou_ob3_1
-      else if g.which == 14 then ex_ou_ob3_2
-      else if g.which == 15 then ex_ou_ob3_3
-      else if g.which == 16 then ex_ou_ob4_0
-      else if g.which == 17 then ex_ou_ob4_1
-      else if g.which == 18 then ex_ou_ob4_2
-      else if g.which == 19 then ex_ou_ob4_3
-      else if g.which == 20 then ex_ou_ob5_0
-      else if g.which == 21 then ex_ou_ob5_1
-      else if g.which == 22 then ex_ou_ob5_2
-      else if g.which == 23 then ex_ou_ob5_3
-      else if g.which == 24 then ex_ou_ob6_0
-      else if g.which == 25 then ex_ou_ob6_1
-      else if g.which == 26 then ex_ou_ob6_2
-      else if g.which == 27 then ex_ou_ob6_3
-      else if g.which == 28 then ex_ou_ob7_0
-      else if g.which == 29 then ex_ou_ob7_1
-      else if g.which == 30 then ex_ou_ob7_2
-      else ex_ou_ob7_3
+    out = Digest { b0: ex_ou_ob0_0, b1: ex_ou_ob0_1, b2: ex_ou_ob0_2, b3: ex_ou_ob0_3, b4: ex_ou_ob1_0, b5: ex_ou_ob1_1, b6: ex_ou_ob1_2, b7: ex_ou_ob1_3, b8: ex_ou_ob2_0, b9: ex_ou_ob2_1, b10: ex_ou_ob2_2, b11: ex_ou_ob2_3, b12: ex_ou_ob3_0, b13: ex_ou_ob3_1, b14: ex_ou_ob3_2, b15: ex_ou_ob3_3, b16: ex_ou_ob4_0, b17: ex_ou_ob4_1, b18: ex_ou_ob4_2, b19: ex_ou_ob4_3, b20: ex_ou_ob5_0, b21: ex_ou_ob5_1, b22: ex_ou_ob5_2, b23: ex_ou_ob5_3, b24: ex_ou_ob6_0, b25: ex_ou_ob6_1, b26: ex_ou_ob6_2, b27: ex_ou_ob6_3, b28: ex_ou_ob7_0, b29: ex_ou_ob7_1, b30: ex_ou_ob7_2, b31: ex_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.salt0, g.salt1, g.salt2, g.salt3, g.salt4, g.salt5, g.salt6, g.salt7, g.salt8, g.salt9, g.salt10, g.salt11, g.salt12, g.salt13, g.salt14, g.salt15, g.salt16, g.salt17, g.salt18, g.salt19, g.salt20, g.salt21, g.salt22, g.salt23, g.salt24, g.salt25, g.salt26, g.salt27, g.salt28, g.salt29, g.salt30, g.salt31, g.ikm0, g.ikm1, g.ikm2, g.ikm3, g.ikm4, g.ikm5, g.ikm6, g.ikm7, g.ikm8, g.ikm9, g.ikm10, g.ikm11, g.ikm12, g.ikm13, g.ikm14, g.ikm15, g.ikm16, g.ikm17, g.ikm18, g.ikm19, g.ikm20, g.ikm21, g.ikm22, g.ikm23, g.ikm24, g.ikm25, g.ikm26, g.ikm27, g.ikm28, g.ikm29, g.ikm30, g.ikm31, g.which]
+      reads : [g.salt0, g.salt1, g.salt2, g.salt3, g.salt4, g.salt5, g.salt6, g.salt7, g.salt8, g.salt9, g.salt10, g.salt11, g.salt12, g.salt13, g.salt14, g.salt15, g.salt16, g.salt17, g.salt18, g.salt19, g.salt20, g.salt21, g.salt22, g.salt23, g.salt24, g.salt25, g.salt26, g.salt27, g.salt28, g.salt29, g.salt30, g.salt31, g.ikm0, g.ikm1, g.ikm2, g.ikm3, g.ikm4, g.ikm5, g.ikm6, g.ikm7, g.ikm8, g.ikm9, g.ikm10, g.ikm11, g.ikm12, g.ikm13, g.ikm14, g.ikm15, g.ikm16, g.ikm17, g.ikm18, g.ikm19, g.ikm20, g.ikm21, g.ikm22, g.ikm23, g.ikm24, g.ikm25, g.ikm26, g.ikm27, g.ikm28, g.ikm29, g.ikm30, g.ikm31]
       calls : []
     termination:
       bound : 400000

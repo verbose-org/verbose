@@ -1,7 +1,7 @@
 @verbose 0.1.0
 
 concept Psk
-  @intention: "32-byte external PSK + which output byte"
+  @intention: "32-byte external PSK"
   @source: invoices.intent:1
   fields:
     p0 : number [0, 255]
@@ -36,10 +36,9 @@ concept Psk
     p29 : number [0, 255]
     p30 : number [0, 255]
     p31 : number [0, 255]
-    which : number [0, 31]
 
 concept Early
-  @intention: "32-byte Early Secret + which output byte"
+  @intention: "32-byte Early Secret"
   @source: invoices.intent:1
   fields:
     s0 : number [0, 255]
@@ -74,16 +73,52 @@ concept Early
     s29 : number [0, 255]
     s30 : number [0, 255]
     s31 : number [0, 255]
-    which : number [0, 31]
+
+concept Digest
+  @intention: "32 output bytes of a PSK-schedule derivation, returned together as one record"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+    b16 : number [0, 255]
+    b17 : number [0, 255]
+    b18 : number [0, 255]
+    b19 : number [0, 255]
+    b20 : number [0, 255]
+    b21 : number [0, 255]
+    b22 : number [0, 255]
+    b23 : number [0, 255]
+    b24 : number [0, 255]
+    b25 : number [0, 255]
+    b26 : number [0, 255]
+    b27 : number [0, 255]
+    b28 : number [0, 255]
+    b29 : number [0, 255]
+    b30 : number [0, 255]
+    b31 : number [0, 255]
 
 
 rule psk_early_secret
-  @intention: "Early Secret = HKDF-Extract(0^32, PSK) = HMAC(0^32, PSK) (RFC 8446 7.1 external-PSK)"
+  @intention: "Early Secret = HKDF-Extract(0^32, PSK) = HMAC(0^32, PSK) (RFC 8446 7.1 external-PSK); all 32 bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : Psk
   output:
-    out : number
+    out : Digest
   logic:
     let pe_ip0 = bxor(0, 54)
     let pe_op0 = bxor(0, 92)
@@ -1605,53 +1640,22 @@ rule psk_early_secret
     let pe_ou_ob7_1 = band(shr(pe_ou_h7_1, 16), 255)
     let pe_ou_ob7_2 = band(shr(pe_ou_h7_1, 8), 255)
     let pe_ou_ob7_3 = band(shr(pe_ou_h7_1, 0), 255)
-    out = if g.which == 0 then pe_ou_ob0_0
-      else if g.which == 1 then pe_ou_ob0_1
-      else if g.which == 2 then pe_ou_ob0_2
-      else if g.which == 3 then pe_ou_ob0_3
-      else if g.which == 4 then pe_ou_ob1_0
-      else if g.which == 5 then pe_ou_ob1_1
-      else if g.which == 6 then pe_ou_ob1_2
-      else if g.which == 7 then pe_ou_ob1_3
-      else if g.which == 8 then pe_ou_ob2_0
-      else if g.which == 9 then pe_ou_ob2_1
-      else if g.which == 10 then pe_ou_ob2_2
-      else if g.which == 11 then pe_ou_ob2_3
-      else if g.which == 12 then pe_ou_ob3_0
-      else if g.which == 13 then pe_ou_ob3_1
-      else if g.which == 14 then pe_ou_ob3_2
-      else if g.which == 15 then pe_ou_ob3_3
-      else if g.which == 16 then pe_ou_ob4_0
-      else if g.which == 17 then pe_ou_ob4_1
-      else if g.which == 18 then pe_ou_ob4_2
-      else if g.which == 19 then pe_ou_ob4_3
-      else if g.which == 20 then pe_ou_ob5_0
-      else if g.which == 21 then pe_ou_ob5_1
-      else if g.which == 22 then pe_ou_ob5_2
-      else if g.which == 23 then pe_ou_ob5_3
-      else if g.which == 24 then pe_ou_ob6_0
-      else if g.which == 25 then pe_ou_ob6_1
-      else if g.which == 26 then pe_ou_ob6_2
-      else if g.which == 27 then pe_ou_ob6_3
-      else if g.which == 28 then pe_ou_ob7_0
-      else if g.which == 29 then pe_ou_ob7_1
-      else if g.which == 30 then pe_ou_ob7_2
-      else pe_ou_ob7_3
+    out = Digest { b0: pe_ou_ob0_0, b1: pe_ou_ob0_1, b2: pe_ou_ob0_2, b3: pe_ou_ob0_3, b4: pe_ou_ob1_0, b5: pe_ou_ob1_1, b6: pe_ou_ob1_2, b7: pe_ou_ob1_3, b8: pe_ou_ob2_0, b9: pe_ou_ob2_1, b10: pe_ou_ob2_2, b11: pe_ou_ob2_3, b12: pe_ou_ob3_0, b13: pe_ou_ob3_1, b14: pe_ou_ob3_2, b15: pe_ou_ob3_3, b16: pe_ou_ob4_0, b17: pe_ou_ob4_1, b18: pe_ou_ob4_2, b19: pe_ou_ob4_3, b20: pe_ou_ob5_0, b21: pe_ou_ob5_1, b22: pe_ou_ob5_2, b23: pe_ou_ob5_3, b24: pe_ou_ob6_0, b25: pe_ou_ob6_1, b26: pe_ou_ob6_2, b27: pe_ou_ob6_3, b28: pe_ou_ob7_0, b29: pe_ou_ob7_1, b30: pe_ou_ob7_2, b31: pe_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.p0, g.p1, g.p2, g.p3, g.p4, g.p5, g.p6, g.p7, g.p8, g.p9, g.p10, g.p11, g.p12, g.p13, g.p14, g.p15, g.p16, g.p17, g.p18, g.p19, g.p20, g.p21, g.p22, g.p23, g.p24, g.p25, g.p26, g.p27, g.p28, g.p29, g.p30, g.p31, g.which]
+      reads : [g.p0, g.p1, g.p2, g.p3, g.p4, g.p5, g.p6, g.p7, g.p8, g.p9, g.p10, g.p11, g.p12, g.p13, g.p14, g.p15, g.p16, g.p17, g.p18, g.p19, g.p20, g.p21, g.p22, g.p23, g.p24, g.p25, g.p26, g.p27, g.p28, g.p29, g.p30, g.p31]
       calls : []
     termination:
       bound : 400000
 
 
 rule psk_ext_binder_key
-  @intention: "binder_key = Derive-Secret(Early, ext binder, empty) = HKDF-Expand-Label(Early, ext binder, SHA256(empty), 32)"
+  @intention: "binder_key = Derive-Secret(Early, ext binder, empty) = HKDF-Expand-Label(Early, ext binder, SHA256(empty), 32); all 32 bytes as one Digest record"
   @source: invoices.intent:1
   input:
     g : Early
   output:
-    out : number
+    out : Digest
   logic:
     let bk_ip0 = bxor(g.s0, 54)
     let bk_op0 = bxor(g.s0, 92)
@@ -3173,41 +3177,10 @@ rule psk_ext_binder_key
     let bk_ou_ob7_1 = band(shr(bk_ou_h7_1, 16), 255)
     let bk_ou_ob7_2 = band(shr(bk_ou_h7_1, 8), 255)
     let bk_ou_ob7_3 = band(shr(bk_ou_h7_1, 0), 255)
-    out = if g.which == 0 then bk_ou_ob0_0
-      else if g.which == 1 then bk_ou_ob0_1
-      else if g.which == 2 then bk_ou_ob0_2
-      else if g.which == 3 then bk_ou_ob0_3
-      else if g.which == 4 then bk_ou_ob1_0
-      else if g.which == 5 then bk_ou_ob1_1
-      else if g.which == 6 then bk_ou_ob1_2
-      else if g.which == 7 then bk_ou_ob1_3
-      else if g.which == 8 then bk_ou_ob2_0
-      else if g.which == 9 then bk_ou_ob2_1
-      else if g.which == 10 then bk_ou_ob2_2
-      else if g.which == 11 then bk_ou_ob2_3
-      else if g.which == 12 then bk_ou_ob3_0
-      else if g.which == 13 then bk_ou_ob3_1
-      else if g.which == 14 then bk_ou_ob3_2
-      else if g.which == 15 then bk_ou_ob3_3
-      else if g.which == 16 then bk_ou_ob4_0
-      else if g.which == 17 then bk_ou_ob4_1
-      else if g.which == 18 then bk_ou_ob4_2
-      else if g.which == 19 then bk_ou_ob4_3
-      else if g.which == 20 then bk_ou_ob5_0
-      else if g.which == 21 then bk_ou_ob5_1
-      else if g.which == 22 then bk_ou_ob5_2
-      else if g.which == 23 then bk_ou_ob5_3
-      else if g.which == 24 then bk_ou_ob6_0
-      else if g.which == 25 then bk_ou_ob6_1
-      else if g.which == 26 then bk_ou_ob6_2
-      else if g.which == 27 then bk_ou_ob6_3
-      else if g.which == 28 then bk_ou_ob7_0
-      else if g.which == 29 then bk_ou_ob7_1
-      else if g.which == 30 then bk_ou_ob7_2
-      else bk_ou_ob7_3
+    out = Digest { b0: bk_ou_ob0_0, b1: bk_ou_ob0_1, b2: bk_ou_ob0_2, b3: bk_ou_ob0_3, b4: bk_ou_ob1_0, b5: bk_ou_ob1_1, b6: bk_ou_ob1_2, b7: bk_ou_ob1_3, b8: bk_ou_ob2_0, b9: bk_ou_ob2_1, b10: bk_ou_ob2_2, b11: bk_ou_ob2_3, b12: bk_ou_ob3_0, b13: bk_ou_ob3_1, b14: bk_ou_ob3_2, b15: bk_ou_ob3_3, b16: bk_ou_ob4_0, b17: bk_ou_ob4_1, b18: bk_ou_ob4_2, b19: bk_ou_ob4_3, b20: bk_ou_ob5_0, b21: bk_ou_ob5_1, b22: bk_ou_ob5_2, b23: bk_ou_ob5_3, b24: bk_ou_ob6_0, b25: bk_ou_ob6_1, b26: bk_ou_ob6_2, b27: bk_ou_ob6_3, b28: bk_ou_ob7_0, b29: bk_ou_ob7_1, b30: bk_ou_ob7_2, b31: bk_ou_ob7_3 }
   proofs:
     purity:
-      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31, g.which]
+      reads : [g.s0, g.s1, g.s2, g.s3, g.s4, g.s5, g.s6, g.s7, g.s8, g.s9, g.s10, g.s11, g.s12, g.s13, g.s14, g.s15, g.s16, g.s17, g.s18, g.s19, g.s20, g.s21, g.s22, g.s23, g.s24, g.s25, g.s26, g.s27, g.s28, g.s29, g.s30, g.s31]
       calls : []
     termination:
       bound : 400000

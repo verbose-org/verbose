@@ -49,7 +49,7 @@ def hs_msg(t, body): return bytes([t]) + b24(len(body)) + body
 def record(ct, payload): return bytes([ct]) + b"\x03\x03" + b16(len(payload)) + payload
 
 def hkdf_extract(salt, ikm):
-    return V.run_bytes("hkdf_extract", [str(b) for b in salt] + [str(b) for b in ikm], 32)
+    return V.hkdf_extract(salt, ikm)   # record spawn (Digest JSON) since 2026-08-30
 
 
 def serve(conn):
@@ -167,7 +167,7 @@ def main():
     with open(CERT_DER, "rb") as f:
         cert_der_bytes = f.read()
     # Compile/cache every Verbose binary the cert path needs.
-    V.ensure(V.ALL_RULES + [("hkdf_extract", "hkdf_extract.verbose")])
+    V.ensure(V.ALL_RULES)   # hkdf_extract joined ALL_RULES in tranche 6
     E.ensure()  # Ed25519 binaries for CertificateVerify signing
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
