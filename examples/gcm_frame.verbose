@@ -1,0 +1,424 @@
+@verbose 0.1.0
+
+-- TLS 1.3 AEAD FRAMING, IN VERBOSE.
+--
+-- Every fixed-width step of the TLS 1.3 record-protection wrapper around
+-- AES-128-GCM that the host (tools/tls_gen/vcrypto.py) used to compute in
+-- Python -- because until the aggregate-return arc a rule could hand back
+-- only ONE number per process, and a 12-byte nonce or a 16-byte tag is not
+-- one number. Each rule below returns its whole answer as one record, so
+-- each is one spawn of a verified binary.
+--
+-- What is here (SP 800-38D / RFC 8446 section references in each rule):
+--   gcm_nonce    per-record nonce    = IV XOR [seq]64, seq right-aligned
+--   gcm_j0       pre-counter block   = nonce || 0^31 || 1
+--   gcm_aad      TLS record header   = 23 || 0303 || [len(inner) + 16]16
+--   gcm_lenblock GHASH length block  = [len(A)*8]64 || [len(C)*8]64
+--   gcm_tag      T                   = S XOR E_K(J0)
+--   gcm_tag_eq   constant-time compare of two 16-byte tags -> 0 / 1
+--
+-- What is NOT here, and why, so the host's remaining role is stated rather
+-- than implied: E_K(J0) itself is aes_encrypt.verbose::encrypt applied to
+-- gcm_j0's record (the host shuttles those 16 bytes between the two
+-- binaries); the per-block CTR walk is aes_gctr.verbose::gctr, one spawn
+-- per 16-byte block; zero-padding a VARIABLE-length tail to a block
+-- boundary and concatenating pad(A) || pad(C) || lenblock into GHASH's hex
+-- input are variable-length and stay host glue by design (§4 of
+-- docs/tls-io-statemachine-design.md permits framing in the host); so does
+-- appending / stripping the TLS inner content type, which is not crypto.
+--
+-- gcm_j0 is the one aggregate-to-aggregate hop: it BINDS gcm_nonce's record
+-- (`let n = gcm_nonce(i)`, slice agg-1) and EMITS its own (slice agg-2c), so
+-- the nonce derivation is written once and J0 is derived from it inside the
+-- verifier's reach rather than by slicing in the host.
+
+concept RecordNonceInput
+  @intention: "the 12-byte per-direction write IV and the 64-bit record sequence number"
+  @source: gcm_frame.intent:1
+  fields:
+    iv0 : number [0, 255]
+    iv1 : number [0, 255]
+    iv2 : number [0, 255]
+    iv3 : number [0, 255]
+    iv4 : number [0, 255]
+    iv5 : number [0, 255]
+    iv6 : number [0, 255]
+    iv7 : number [0, 255]
+    iv8 : number [0, 255]
+    iv9 : number [0, 255]
+    iv10 : number [0, 255]
+    iv11 : number [0, 255]
+    seq : number [0, 9223372036854775807]
+
+concept Nonce
+  @intention: "the 12-byte per-record GCM nonce, returned as one record"
+  @source: gcm_frame.intent:2
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+
+concept J0Block
+  @intention: "the 16-byte pre-counter block J0 = nonce || 0^31 || 1, returned as one record"
+  @source: gcm_frame.intent:3
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+
+concept AadInput
+  @intention: "the length in bytes of the TLSInnerPlaintext (content || type || padding)"
+  @source: gcm_frame.intent:4
+  fields:
+    inner_len : number [0, 16624]
+
+concept RecordHeader
+  @intention: "the 5-byte TLSCiphertext header, which is the AEAD's additional data"
+  @source: gcm_frame.intent:5
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+
+concept LenInput
+  @intention: "the byte lengths of the additional data and of the ciphertext"
+  @source: gcm_frame.intent:6
+  fields:
+    aad_len : number [0, 68719476704]
+    ct_len : number [0, 68719476704]
+
+concept LenBlock
+  @intention: "the 16-byte GHASH length block [len(A)]64 || [len(C)]64 in bits, returned as one record"
+  @source: gcm_frame.intent:7
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+
+concept TagInput
+  @intention: "the GHASH output S and the encrypted pre-counter block E_K(J0), 16 bytes each"
+  @source: gcm_frame.intent:8
+  fields:
+    s0 : number [0, 255]
+    s1 : number [0, 255]
+    s2 : number [0, 255]
+    s3 : number [0, 255]
+    s4 : number [0, 255]
+    s5 : number [0, 255]
+    s6 : number [0, 255]
+    s7 : number [0, 255]
+    s8 : number [0, 255]
+    s9 : number [0, 255]
+    s10 : number [0, 255]
+    s11 : number [0, 255]
+    s12 : number [0, 255]
+    s13 : number [0, 255]
+    s14 : number [0, 255]
+    s15 : number [0, 255]
+    e0 : number [0, 255]
+    e1 : number [0, 255]
+    e2 : number [0, 255]
+    e3 : number [0, 255]
+    e4 : number [0, 255]
+    e5 : number [0, 255]
+    e6 : number [0, 255]
+    e7 : number [0, 255]
+    e8 : number [0, 255]
+    e9 : number [0, 255]
+    e10 : number [0, 255]
+    e11 : number [0, 255]
+    e12 : number [0, 255]
+    e13 : number [0, 255]
+    e14 : number [0, 255]
+    e15 : number [0, 255]
+
+concept Tag
+  @intention: "the 16-byte authentication tag T, returned as one record"
+  @source: gcm_frame.intent:9
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+
+concept TagPair
+  @intention: "two 16-byte tags to compare: the one computed and the one received"
+  @source: gcm_frame.intent:10
+  fields:
+    a0 : number [0, 255]
+    a1 : number [0, 255]
+    a2 : number [0, 255]
+    a3 : number [0, 255]
+    a4 : number [0, 255]
+    a5 : number [0, 255]
+    a6 : number [0, 255]
+    a7 : number [0, 255]
+    a8 : number [0, 255]
+    a9 : number [0, 255]
+    a10 : number [0, 255]
+    a11 : number [0, 255]
+    a12 : number [0, 255]
+    a13 : number [0, 255]
+    a14 : number [0, 255]
+    a15 : number [0, 255]
+    r0 : number [0, 255]
+    r1 : number [0, 255]
+    r2 : number [0, 255]
+    r3 : number [0, 255]
+    r4 : number [0, 255]
+    r5 : number [0, 255]
+    r6 : number [0, 255]
+    r7 : number [0, 255]
+    r8 : number [0, 255]
+    r9 : number [0, 255]
+    r10 : number [0, 255]
+    r11 : number [0, 255]
+    r12 : number [0, 255]
+    r13 : number [0, 255]
+    r14 : number [0, 255]
+    r15 : number [0, 255]
+
+rule gcm_nonce
+  @intention: "RFC 8446 5.3: per-record nonce = write IV XOR the 64-bit big-endian sequence number, left-padded with zeros to 12 bytes"
+  @source: gcm_frame.intent:11
+  input:
+    i : RecordNonceInput
+  output:
+    n : Nonce
+  logic:
+    n = Nonce {
+      b0 : i.iv0,
+      b1 : i.iv1,
+      b2 : i.iv2,
+      b3 : i.iv3,
+      b4 : bxor(i.iv4, band(shr(i.seq, 56), 255)),
+      b5 : bxor(i.iv5, band(shr(i.seq, 48), 255)),
+      b6 : bxor(i.iv6, band(shr(i.seq, 40), 255)),
+      b7 : bxor(i.iv7, band(shr(i.seq, 32), 255)),
+      b8 : bxor(i.iv8, band(shr(i.seq, 24), 255)),
+      b9 : bxor(i.iv9, band(shr(i.seq, 16), 255)),
+      b10 : bxor(i.iv10, band(shr(i.seq, 8), 255)),
+      b11 : bxor(i.iv11, band(i.seq, 255))
+    }
+  proofs:
+    purity:
+      reads : [i.iv0, i.iv1, i.iv2, i.iv3, i.iv4, i.iv5, i.iv6, i.iv7, i.iv8, i.iv9, i.iv10, i.iv11, i.seq]
+      calls : []
+    termination:
+      bound : 24
+
+rule gcm_j0
+  @intention: "SP 800-38D 7.1 step 2 (96-bit IV): J0 = nonce || 0^31 || 1, with the nonce bound from gcm_nonce's record"
+  @source: gcm_frame.intent:12
+  input:
+    i : RecordNonceInput
+  output:
+    j : J0Block
+  logic:
+    let n = gcm_nonce(i)
+    j = J0Block {
+      b0 : n.b0,
+      b1 : n.b1,
+      b2 : n.b2,
+      b3 : n.b3,
+      b4 : n.b4,
+      b5 : n.b5,
+      b6 : n.b6,
+      b7 : n.b7,
+      b8 : n.b8,
+      b9 : n.b9,
+      b10 : n.b10,
+      b11 : n.b11,
+      b12 : 0,
+      b13 : 0,
+      b14 : 0,
+      b15 : 1
+    }
+  proofs:
+    purity:
+      reads : [i]
+      calls : [gcm_nonce]
+    termination:
+      bound : 1
+
+rule gcm_aad
+  @intention: "RFC 8446 5.2: additional_data = opaque_type(23) || legacy_record_version(0x0303) || TLSCiphertext.length, where length = len(inner) + 16 (the tag)"
+  @source: gcm_frame.intent:13
+  input:
+    a : AadInput
+  output:
+    h : RecordHeader
+  logic:
+    h = RecordHeader {
+      b0 : 23,
+      b1 : 3,
+      b2 : 3,
+      b3 : band(shr(a.inner_len + 16, 8), 255),
+      b4 : band(a.inner_len + 16, 255)
+    }
+  proofs:
+    purity:
+      reads : [a.inner_len]
+      calls : []
+    termination:
+      bound : 6
+
+rule gcm_lenblock
+  @intention: "SP 800-38D 7.1 step 5: the final GHASH block [len(A)]64 || [len(C)]64, both lengths in BITS, big-endian"
+  @source: gcm_frame.intent:14
+  input:
+    l : LenInput
+  output:
+    b : LenBlock
+  logic:
+    b = LenBlock {
+      b0 : band(shr(l.aad_len * 8, 56), 255),
+      b1 : band(shr(l.aad_len * 8, 48), 255),
+      b2 : band(shr(l.aad_len * 8, 40), 255),
+      b3 : band(shr(l.aad_len * 8, 32), 255),
+      b4 : band(shr(l.aad_len * 8, 24), 255),
+      b5 : band(shr(l.aad_len * 8, 16), 255),
+      b6 : band(shr(l.aad_len * 8, 8), 255),
+      b7 : band(l.aad_len * 8, 255),
+      b8 : band(shr(l.ct_len * 8, 56), 255),
+      b9 : band(shr(l.ct_len * 8, 48), 255),
+      b10 : band(shr(l.ct_len * 8, 40), 255),
+      b11 : band(shr(l.ct_len * 8, 32), 255),
+      b12 : band(shr(l.ct_len * 8, 24), 255),
+      b13 : band(shr(l.ct_len * 8, 16), 255),
+      b14 : band(shr(l.ct_len * 8, 8), 255),
+      b15 : band(l.ct_len * 8, 255)
+    }
+  proofs:
+    purity:
+      reads : [l.aad_len, l.ct_len]
+      calls : []
+    termination:
+      bound : 47
+
+rule gcm_tag
+  @intention: "SP 800-38D 7.1 step 6 with t = 128: T = GCTR_K(J0, S) = S XOR E_K(J0)"
+  @source: gcm_frame.intent:15
+  input:
+    t : TagInput
+  output:
+    tag : Tag
+  logic:
+    tag = Tag {
+      b0 : bxor(t.s0, t.e0),
+      b1 : bxor(t.s1, t.e1),
+      b2 : bxor(t.s2, t.e2),
+      b3 : bxor(t.s3, t.e3),
+      b4 : bxor(t.s4, t.e4),
+      b5 : bxor(t.s5, t.e5),
+      b6 : bxor(t.s6, t.e6),
+      b7 : bxor(t.s7, t.e7),
+      b8 : bxor(t.s8, t.e8),
+      b9 : bxor(t.s9, t.e9),
+      b10 : bxor(t.s10, t.e10),
+      b11 : bxor(t.s11, t.e11),
+      b12 : bxor(t.s12, t.e12),
+      b13 : bxor(t.s13, t.e13),
+      b14 : bxor(t.s14, t.e14),
+      b15 : bxor(t.s15, t.e15)
+    }
+  proofs:
+    purity:
+      reads : [t.s0, t.s1, t.s2, t.s3, t.s4, t.s5, t.s6, t.s7, t.s8, t.s9, t.s10, t.s11, t.s12, t.s13, t.s14, t.s15, t.e0, t.e1, t.e2, t.e3, t.e4, t.e5, t.e6, t.e7, t.e8, t.e9, t.e10, t.e11, t.e12, t.e13, t.e14, t.e15]
+      calls : []
+    termination:
+      bound : 17
+
+-- Constant-time by SHAPE, not by luck: the 16 bytes are folded into ONE
+-- accumulator with bxor / bor only -- each is a single ALU instruction with
+-- no flag-dependent control flow -- so every byte is visited whether or not
+-- an earlier one already differed, and the accumulator is zero iff every
+-- byte matched. The single decision is `1 - min(d15, 1)`, and `min` lowers
+-- to cmp + cmov (branch-free) rather than a conditional jump: the emitted
+-- x86 between the first field load and the result contains no jcc at all
+-- (checked with objdump; see the PR that added this file). What is NOT
+-- constant-time is the argv transport around it -- the per-field atoi in
+-- the prologue loops once per decimal digit, so "5" and "255" cost
+-- different iterations -- which is a property of how the host feeds the
+-- binary, not of the compare; it is stated here so nobody reads this rule
+-- as a claim about the whole process.
+rule gcm_tag_eq
+  @intention: "constant-time equality of two 16-byte tags: 1 when every byte matches, 0 otherwise, with no data-dependent branch in the accumulation"
+  @source: gcm_frame.intent:16
+  input:
+    p : TagPair
+  output:
+    eq : number
+  logic:
+    let d0 = bxor(p.a0, p.r0)
+    let d1 = bor(d0, bxor(p.a1, p.r1))
+    let d2 = bor(d1, bxor(p.a2, p.r2))
+    let d3 = bor(d2, bxor(p.a3, p.r3))
+    let d4 = bor(d3, bxor(p.a4, p.r4))
+    let d5 = bor(d4, bxor(p.a5, p.r5))
+    let d6 = bor(d5, bxor(p.a6, p.r6))
+    let d7 = bor(d6, bxor(p.a7, p.r7))
+    let d8 = bor(d7, bxor(p.a8, p.r8))
+    let d9 = bor(d8, bxor(p.a9, p.r9))
+    let d10 = bor(d9, bxor(p.a10, p.r10))
+    let d11 = bor(d10, bxor(p.a11, p.r11))
+    let d12 = bor(d11, bxor(p.a12, p.r12))
+    let d13 = bor(d12, bxor(p.a13, p.r13))
+    let d14 = bor(d13, bxor(p.a14, p.r14))
+    let d15 = bor(d14, bxor(p.a15, p.r15))
+    eq = 1 - min(d15, 1)
+  proofs:
+    purity:
+      reads : [p.a0, p.a1, p.a2, p.a3, p.a4, p.a5, p.a6, p.a7, p.a8, p.a9, p.a10, p.a11, p.a12, p.a13, p.a14, p.a15, p.r0, p.r1, p.r2, p.r3, p.r4, p.r5, p.r6, p.r7, p.r8, p.r9, p.r10, p.r11, p.r12, p.r13, p.r14, p.r15]
+      calls : []
+    termination:
+      bound : 2

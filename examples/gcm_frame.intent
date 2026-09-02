@@ -1,0 +1,20 @@
+1. Take a 12-byte write IV and a 64-bit record sequence number.
+2. Produce the 12-byte per-record nonce as one aggregate.
+3. Produce the 16-byte pre-counter block J0 as one aggregate.
+4. Take the byte length of the inner plaintext (content, type, padding).
+5. Produce the 5-byte record header, which is the AEAD's additional data.
+6. Take the byte lengths of the additional data and of the ciphertext.
+7. Produce the 16-byte GHASH length block as one aggregate.
+8. Take the GHASH output S and the encrypted pre-counter block E_K(J0).
+9. Produce the 16-byte authentication tag as one aggregate.
+10. Take two 16-byte tags: the one computed and the one received.
+11. The nonce: XOR the IV with the sequence number written big-endian and
+    right-aligned, so the first four IV bytes pass through unchanged.
+12. J0: bind the nonce aggregate and append the four bytes 00 00 00 01.
+13. The record header: type 23, version 3.3, then the inner length plus
+    16 for the tag as a 16-bit big-endian number.
+14. The length block: the AAD length and the ciphertext length, each
+    times eight (bits), each as a 64-bit big-endian number.
+15. The tag: XOR S with E_K(J0), byte by byte.
+16. The compare: fold every byte's difference into one accumulator with
+    OR and XOR only -- no early exit -- and answer 1 iff it is zero.

@@ -94,11 +94,32 @@ Every cryptographic transformation on wire bytes is a Verbose-emitted binary:
 - handshake_secret / derive_secret / hkdf_expand_label (the full key schedule)
 - sha256_fold (transcript hash, recomputed at each Derive-Secret cut point)
 - aes_gctr + ghash_nblocks + aes_encrypt (record AEAD, both directions)
+- gcm_frame (2026-09-02): the AEAD *framing* — per-record nonce (IV XOR seq),
+  J0, the record-header AAD, GHASH's length block, tag = S XOR E_K(J0), and
+  the constant-time tag compare — each one record spawn. This is the part
+  §7 MAJOR-1 found in Python; it moved the day the aggregate-return arc made
+  a 12- or 16-byte answer expressible as one rule.
 
-The host does ONLY: socket read/write, TLS message framing/parsing (lengths,
-extension TLVs), sequencing, and gluing stage outputs to stage inputs. No
-cryptography in the host. A reviewer can grep the harness and confirm every
-keystream/tag/secret byte originates from a `verbosec`-compiled binary.
+**The claim, restated honestly (2026-09-02).** The host does: socket
+read/write; TLS message framing/parsing (lengths, extension TLVs, inner
+content type); sequencing; gluing stage outputs to stage inputs (byte
+shuttling — e.g. `gcm_j0`'s record into `encrypt`, GHASH's record into
+`gcm_tag`); and the VARIABLE-LENGTH glue around GHASH/GCTR that a
+fixed-width record rule cannot express — zero-padding an AAD or ciphertext
+tail to a 16-byte boundary, concatenating `pad(A) || pad(C) || lenblock`
+into GHASH's input, and looping `gctr` once per 16-byte block. **No
+cryptographic TRANSFORMATION happens in the host**: every keystream, tag,
+nonce, J0, AAD, length-block and secret byte, and the accept/reject bit of
+the tag compare, originates from a `verbosec`-compiled binary, and a
+reviewer can grep `tools/tls_gen/vcrypto.py` for `^` to confirm the only XOR
+left in it is the self-test's single-bit-flip negative control. Two things
+remain host-side by design and are named so nobody reads them as closed:
+**randomness** (the server ephemeral X25519 scalar and server random come
+from `os.urandom`; pure Verbose needs a `getrandom` effect — §7 MAJOR-1's
+"single host-side secret source"), and **the timing of the argv transport**
+(the tag-compare rule's kernel is branch-free, but the per-byte decimal
+`atoi` in every binary's prologue is not constant-time in the byte values;
+that is a property of how the host feeds the binaries, not of the rules).
 
 ## 5. The path back to Strategy A (north star)
 
@@ -163,6 +184,12 @@ aad) and emitting the full record incl. tag, plus a branch-free compare rule
 returning 0/1). The one irreducible host crypto-input is **randomness**: pure
 Verbose needs a `getrandom` effect to generate the server scalar/random — name
 it explicitly as the single host-side secret source until that effect exists.
+*Status 2026-09-02: CLOSED for every transformation — `examples/gcm_frame.verbose`
+moves the nonce XOR, J0, the AAD, the length block, the tag XOR and a
+branch-free tag compare into record-returning rules (one spawn each), and
+`vcrypto.py` computes none of them any more; the zero-padding of a
+variable-length tail and the per-block CTR loop stay host glue by design,
+and randomness stays the one host-side secret source. §4 restates the claim.*
 
 **MAJOR-2 — PSK-first is partly throwaway; state the trade.** The user's real
 goal is a browser, which won't external-PSK. PSK-DHE milestone defers Ed25519
