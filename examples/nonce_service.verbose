@@ -1,0 +1,66 @@
+@verbose 0.1.0
+
+-- Declared randomness (slice entropy-1): one kernel CSPRNG draw per request,
+-- fresh in every forked child, never equal across two requests. The raw bytes
+-- cannot reach the response, the log, or a text comparison without an explicit
+-- byte_at — every exposure is visible at its site.
+--
+-- The sixteen references to random(nonce) below read ONE buffer: the draw
+-- unit is per NAME per EVALUATION (one getrandom per request), so the token
+-- in the body is one value, not sixteen. A second independent value would be
+-- a second `entropy` declaration, and the reviewer would see exactly two.
+--
+-- Rendered as dotted decimal because those are the rendering primitives that
+-- exist today; a hex(<bytes>) primitive is a later, separate slice.
+-- Design: docs/randomness-effect-design.md.
+
+
+entropy nonce
+  @intention: "16 bytes of kernel randomness per request, the client's session token"
+  @source: nonce_service.intent:1
+
+  bytes : 16
+
+
+rule issue
+  @intention: "Answer every request with a fresh token"
+  @source: nonce_service.intent:2
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse {
+      status: 200,
+      body: concat("token:",
+        byte_at(random(nonce), 0), ".", byte_at(random(nonce), 1), ".",
+        byte_at(random(nonce), 2), ".", byte_at(random(nonce), 3), ".",
+        byte_at(random(nonce), 4), ".", byte_at(random(nonce), 5), ".",
+        byte_at(random(nonce), 6), ".", byte_at(random(nonce), 7), ".",
+        byte_at(random(nonce), 8), ".", byte_at(random(nonce), 9), ".",
+        byte_at(random(nonce), 10), ".", byte_at(random(nonce), 11), ".",
+        byte_at(random(nonce), 12), ".", byte_at(random(nonce), 13), ".",
+        byte_at(random(nonce), 14), ".", byte_at(random(nonce), 15))
+    }
+
+  proofs:
+    purity:
+      reads : [nonce]
+      calls : []
+    termination:
+      bound : 50
+
+
+service token_server
+  @intention: "HTTP token issuer — one fresh token per request"
+  @source: nonce_service.intent:3
+
+  listen:
+    protocol    : http_1_0
+    port        : 18960
+    max_request : 4096
+
+  handler: issue

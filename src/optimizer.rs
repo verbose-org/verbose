@@ -54,6 +54,9 @@ fn count_nodes(expr: &Expr) -> usize {
         // Phase 9 slice 1 stub: a Read carries a resource name (no child Expr
         // to recurse on), so it counts as one node.
         Expr::Read(_) => 1,
+        // Slice entropy-1: a Random carries an entropy name (no child Expr),
+        // one node — same shape as Read.
+        Expr::Random(_) => 1,
         // Phase 11 slice 1: a Fetch carries the connection name plus a
         // request bytes Expr — count this node + recurse.
         Expr::Fetch(_, req) => 1 + count_nodes(req),
@@ -149,6 +152,9 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
                 // Phase 9 slice 1 stub: resources are declarative (no logic
                 // expression to optimise); pass through unchanged.
                 Item::Resource(r) => Item::Resource(r.clone()),
+                // Slice entropy-1: entropy items are declarative (a name and
+                // a width); pass through unchanged.
+                Item::Entropy(e) => Item::Entropy(e.clone()),
                 // Phase 11 slice 1 stub: connections are declarative; the
                 // request bytes live inside the rule's logic and are
                 // optimised through `optimize_expr` like any other Expr.
@@ -395,6 +401,9 @@ pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         // Phase 9 slice 1 stub: Read carries a resource name (no Expr child
         // to substitute into); pass through unchanged.
         Expr::Read(n) => Expr::Read(n.clone()),
+        // Slice entropy-1: Random carries an entropy name, no Expr child;
+        // pass through unchanged (same shape as Read).
+        Expr::Random(n) => Expr::Random(n.clone()),
         // Phase 11 slice 1: substitute through the request bytes Expr.
         Expr::Fetch(n, req) => Expr::Fetch(
             n.clone(),
@@ -739,6 +748,12 @@ pub fn optimize_expr(
         // Phase 9 slice 1 stub: a file read has no compile-time optimisation
         // path (the contents aren't known until runtime); pass through.
         Expr::Read(name) => Expr::Read(name.clone()),
+        // Slice entropy-1: a draw is NEVER folded — the bytes are unknown
+        // until runtime, and that is the effect's entire purpose. Note that
+        // `length(random(k))` COULD legitimately fold to the declared width;
+        // slice 1 deliberately does not, so the emitter's `len_slot` load
+        // stays the single source of that number (design §5.5).
+        Expr::Random(name) => Expr::Random(name.clone()),
         // Phase 11 slice 1: a TCP fetch has no compile-time optimisation
         // path (response bytes aren't known until runtime); recurse into
         // the request bytes Expr.
