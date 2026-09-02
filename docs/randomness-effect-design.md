@@ -645,6 +645,16 @@ a *declared* read the handler must list. Proposed wording: *the response is a fu
 The alternative — refuse randomness in handlers — keeps the doctrine verbatim and deletes the
 flagship consumer; recommended against, but it is the author's call, not this note's.
 
+> **DECIDED (2026-08-31, project author): amend the doctrine.** A service response is a
+> function of `(method, path, body)` **and of the effects the handler declares in its
+> `reads:` proof** (`now`, `random(<name>)`). Auditability is preserved in full — every source
+> of non-determinism is greppable in the proof block, which is the whole point of the effect
+> model. "Replaying a request gives the same response" now holds exactly for handlers that
+> declare no such effect, which is already true of `now`. The alternative (refusing randomness
+> in handlers) would have deleted the flagship consumer and blocked the in-Verbose TLS driver,
+> whose `server_random` must be drawn inside the handler. `docs/effect-model.md`'s wording is
+> amended in this same commit.
+
 **8.8 "a `bytes` value (which is streaming-only today)."** Mostly right; `bytes` also exists as
 a `raw_tcp` field value with a `(ptr, len)` (`check_raw_tcp_binding`, `src/verifier.rs:2079-2165`),
 and `(ptr, len)`-into-a-frame-buffer is exactly how `read`/`fetch` deliver text. A bytes-typed
