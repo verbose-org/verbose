@@ -92,7 +92,9 @@ Each new effect declares its allowed contexts as part of its slice. Adding an ef
 
 `req.timestamp` (Unix seconds, captured once per accept loop iteration) is visible inside service `log:` blocks but **not** inside the handler's response logic. This is a deliberate restriction: if the handler could see the timestamp, the response would depend on time, and replaying a request would not produce the same response — making test reproduction impossible and audit reasoning harder.
 
-The trade: the audit log can timestamp events (operationally necessary for Article 12) without contaminating the response (which stays a function of `(method, path, body)` alone).
+The trade: the audit log can timestamp events (operationally necessary for Article 12) without contaminating the response.
+
+**Amended 2026-08-31.** A handler's response is a function of `(method, path, body)` **and of the effects the handler declares in its `reads:` proof** — `now`, and `random(<name>)` once the randomness effect lands (`docs/randomness-effect-design.md` §8.7). Every source of non-determinism therefore stays greppable in the proof block, which is what the effect model exists to guarantee. "Replaying a request reproduces the response" holds exactly for handlers that declare no such effect. This paragraph previously said the response depends on `(method, path, body)` *alone*; that was already not enforced (the verifier accepts `reads: [now]` in a handler — only the HTTP emitter refused), so the amendment states the contract the code actually keeps, and makes room for a nonce-issuing service, which the old wording forbade by design.
 
 ## What is NOT in the effect model
 
