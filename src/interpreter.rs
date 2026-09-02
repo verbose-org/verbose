@@ -259,22 +259,24 @@ pub fn eval_rule_expr(
     rule: &Rule,
     all_rules: &[&Rule],
     concepts: &[&Concept],
+    entropies: &[&Entropy],
     input: &HashMap<String, Value>,
 ) -> Result<Value, RuntimeError> {
     let mut env: HashMap<String, Value> = HashMap::new();
     env.insert(rule.input_name.clone(), Value::Record(input.clone()));
-    eval_expr(expr, &env, all_rules, concepts)
+    eval_expr(expr, &env, all_rules, concepts, entropies)
 }
 
 pub fn eval_rule(
     rule: &Rule,
     all_rules: &[&Rule],
     concepts: &[&Concept],
+    entropies: &[&Entropy],
     input: &HashMap<String, Value>,
 ) -> Result<Value, RuntimeError> {
     // Existing record-input entry point: wrap input as Value::Record
     // and delegate to the generic eval_rule_with_value path.
-    eval_rule_with_value(rule, all_rules, concepts, Value::Record(input.clone()))
+    eval_rule_with_value(rule, all_rules, concepts, entropies, Value::Record(input.clone()))
 }
 
 /// Phase B slice 3 — generic rule-eval entry point that accepts any
@@ -291,15 +293,16 @@ pub fn eval_rule_with_value(
     rule: &Rule,
     all_rules: &[&Rule],
     concepts: &[&Concept],
+    entropies: &[&Entropy],
     input_value: Value,
 ) -> Result<Value, RuntimeError> {
     let mut env: HashMap<String, Value> = HashMap::new();
     env.insert(rule.input_name.clone(), input_value);
     for (name, expr) in &rule.logic.bindings {
-        let val = eval_expr(expr, &env, all_rules, concepts)?;
+        let val = eval_expr(expr, &env, all_rules, concepts, entropies)?;
         env.insert(name.clone(), val);
     }
-    eval_expr(&rule.logic.value, &env, all_rules, concepts)
+    eval_expr(&rule.logic.value, &env, all_rules, concepts, entropies)
 }
 
 fn eval_expr(
@@ -307,6 +310,10 @@ fn eval_expr(
     env: &HashMap<String, Value>,
     all_rules: &[&Rule],
     concepts: &[&Concept],
+    // Slice entropy-1: the declared entropy items, threaded from main.rs
+    // beside `all_rules` / `concepts` so `Expr::Random(name)` can look up
+    // its width. One more table, NOT a process global (design §6.6).
+    entropies: &[&Entropy],
 ) -> Result<Value, RuntimeError> {
     match expr {
         Expr::Number(n) => Ok(Value::Number(*n)),
@@ -316,7 +323,7 @@ fn eval_expr(
             message: format!("undefined binding '{}'", name),
         }),
         Expr::Field(base, field) => {
-            let base_val = eval_expr(base, env, all_rules, concepts)?;
+            let base_val = eval_expr(base, env, all_rules, concepts, entropies)?;
             match base_val {
                 Value::Record(fields) => {
                     fields.get(field).cloned().ok_or_else(|| RuntimeError {
@@ -329,8 +336,8 @@ fn eval_expr(
             }
         }
         Expr::Binary(op, left, right) => {
-            let l = eval_expr(left, env, all_rules, concepts)?;
-            let r = eval_expr(right, env, all_rules, concepts)?;
+            let l = eval_expr(left, env, all_rules, concepts, entropies)?;
+            let r = eval_expr(right, env, all_rules, concepts, entropies)?;
             match (op, &l, &r) {
                 (BinOp::Eq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a == b)),
                 (BinOp::Eq, Value::Text(a), Value::Text(b)) => Ok(Value::Bool(a == b)),
@@ -365,16 +372,16 @@ fn eval_expr(
             }
         }
         Expr::If(cond, then_expr, else_expr) => {
-            match eval_expr(cond, env, all_rules, concepts)? {
-                Value::Bool(true) => eval_expr(then_expr, env, all_rules, concepts),
-                Value::Bool(false) => eval_expr(else_expr, env, all_rules, concepts),
+            match eval_expr(cond, env, all_rules, concepts, entropies)? {
+                Value::Bool(true) => eval_expr(then_expr, env, all_rules, concepts, entropies),
+                Value::Bool(false) => eval_expr(else_expr, env, all_rules, concepts, entropies),
                 other => Err(RuntimeError {
                     message: format!("'if' condition must be bool, got {}", other),
                 }),
             }
         }
         Expr::Not(inner) => {
-            match eval_expr(inner, env, all_rules, concepts)? {
+            match eval_expr(inner, env, all_rules, concepts, entropies)? {
                 Value::Bool(b) => Ok(Value::Bool(!b)),
                 other => Err(RuntimeError {
                     message: format!("'not' requires bool, got {}", other),
@@ -382,7 +389,7 @@ fn eval_expr(
             }
         }
         Expr::Neg(inner) => {
-            match eval_expr(inner, env, all_rules, concepts)? {
+            match eval_expr(inner, env, all_rules, concepts, entropies)? {
                 Value::Number(n) => Ok(Value::Number(-n)),
                 other => Err(RuntimeError {
                     message: format!("'-' requires number, got {}", other),
@@ -390,7 +397,7 @@ fn eval_expr(
             }
         }
         Expr::Abs(inner) => {
-            match eval_expr(inner, env, all_rules, concepts)? {
+            match eval_expr(inner, env, all_rules, concepts, entropies)? {
                 Value::Number(n) => Ok(Value::Number(n.wrapping_abs())),
                 other => Err(RuntimeError {
                     message: format!("'abs' requires number, got {}", other),
@@ -401,7 +408,7 @@ fn eval_expr(
         // Negative n uses the two's-complement low bytes (mask the bits).
         Expr::Le32(inner) | Expr::Le64(inner) => {
             let width = if matches!(expr, Expr::Le64(_)) { 8 } else { 4 };
-            match eval_expr(inner, env, all_rules, concepts)? {
+            match eval_expr(inner, env, all_rules, concepts, entropies)? {
                 Value::Number(n) => {
                     let le = (n as i64).to_le_bytes();
                     Ok(Value::Bytes(le[..width].to_vec()))
@@ -418,7 +425,7 @@ fn eval_expr(
         // `arena_scope(inner)` — identity for the value. The interpreter has
         // no arena, so the reclaim is a no-op; the emitted-vs-interpreted
         // contract is that arena_scope produces exactly inner's value.
-        Expr::ArenaScope(inner) => eval_expr(inner, env, all_rules, concepts),
+        Expr::ArenaScope(inner) => eval_expr(inner, env, all_rules, concepts, entropies),
         // `abort_if(<number>)` — V3 self-verify gate. The check EXECUTES:
         // a nonzero value is the interpreter's analogue of native's
         // sys_exit(1) — a RuntimeError (fail-closed, nothing more
@@ -426,7 +433,7 @@ fn eval_expr(
         // `concat(abort_if(e), rest...)` equals `concat(rest...)` —
         // mirroring native's zero-output-bytes contract.
         Expr::AbortIf(inner) => {
-            let v = eval_expr(inner, env, all_rules, concepts)?;
+            let v = eval_expr(inner, env, all_rules, concepts, entropies)?;
             match v {
                 Value::Number(0) => Ok(Value::Bytes(Vec::new())),
                 Value::Number(n) => Err(RuntimeError {
@@ -441,7 +448,7 @@ fn eval_expr(
             }
         }
         Expr::Quantifier(kind, collection, var_name, predicate) => {
-            let coll_val = eval_expr(collection, env, all_rules, concepts)?;
+            let coll_val = eval_expr(collection, env, all_rules, concepts, entropies)?;
             let items = match coll_val {
                 Value::List(items) => items,
                 _ => {
@@ -456,7 +463,7 @@ fn eval_expr(
                     for item in &items {
                         let mut inner_env = env.clone();
                         inner_env.insert(var_name.clone(), item.clone());
-                        match eval_expr(predicate, &inner_env, all_rules, concepts)? {
+                        match eval_expr(predicate, &inner_env, all_rules, concepts, entropies)? {
                             Value::Bool(b) => {
                                 if !b {
                                     ok = false;
@@ -477,7 +484,7 @@ fn eval_expr(
                     for item in &items {
                         let mut inner_env = env.clone();
                         inner_env.insert(var_name.clone(), item.clone());
-                        match eval_expr(predicate, &inner_env, all_rules, concepts)? {
+                        match eval_expr(predicate, &inner_env, all_rules, concepts, entropies)? {
                             Value::Bool(b) => {
                                 if b {
                                     ok = true;
@@ -497,17 +504,17 @@ fn eval_expr(
             Ok(Value::Bool(result))
         }
         Expr::Fold(collection, initial, acc_name, item_name, body) => {
-            let coll_val = eval_expr(collection, env, all_rules, concepts)?;
+            let coll_val = eval_expr(collection, env, all_rules, concepts, entropies)?;
             let items = match coll_val {
                 Value::List(items) => items,
                 _ => return Err(RuntimeError { message: "fold requires a collection".into() }),
             };
-            let mut acc = eval_expr(initial, env, all_rules, concepts)?;
+            let mut acc = eval_expr(initial, env, all_rules, concepts, entropies)?;
             for item in &items {
                 let mut inner_env = env.clone();
                 inner_env.insert(acc_name.clone(), acc);
                 inner_env.insert(item_name.clone(), item.clone());
-                acc = eval_expr(body, &inner_env, all_rules, concepts)?;
+                acc = eval_expr(body, &inner_env, all_rules, concepts, entropies)?;
             }
             Ok(acc)
         }
@@ -516,12 +523,12 @@ fn eval_expr(
             // accumulator through three bound names: acc, byte, idx. Body
             // returns the next accumulator value. Same shape as Fold but
             // the iteration source is a text's bytes, not a collection.
-            let text_val = eval_expr(text, env, all_rules, concepts)?;
+            let text_val = eval_expr(text, env, all_rules, concepts, entropies)?;
             let s = match text_val {
                 Value::Text(s) => s,
                 _ => return Err(RuntimeError { message: "fold_bytes requires text as first argument".into() }),
             };
-            let init_val = eval_expr(initial, env, all_rules, concepts)?;
+            let init_val = eval_expr(initial, env, all_rules, concepts, entropies)?;
             let mut acc = match init_val {
                 Value::Number(_) => init_val,
                 _ => return Err(RuntimeError { message: "fold_bytes init must be a number".into() }),
@@ -531,7 +538,7 @@ fn eval_expr(
                 inner_env.insert(acc_name.clone(), acc);
                 inner_env.insert(byte_name.clone(), Value::Number(b as i64));
                 inner_env.insert(idx_name.clone(), Value::Number(i as i64));
-                acc = eval_expr(body, &inner_env, all_rules, concepts)?;
+                acc = eval_expr(body, &inner_env, all_rules, concepts, entropies)?;
                 if !matches!(acc, Value::Number(_)) {
                     return Err(RuntimeError {
                         message: "fold_bytes body must return a number".into(),
@@ -541,7 +548,7 @@ fn eval_expr(
             Ok(acc)
         }
         Expr::Map(collection, var_name, body) => {
-            let coll_val = eval_expr(collection, env, all_rules, concepts)?;
+            let coll_val = eval_expr(collection, env, all_rules, concepts, entropies)?;
             let items = match coll_val {
                 Value::List(items) => items,
                 _ => return Err(RuntimeError { message: "map requires a collection".into() }),
@@ -550,12 +557,12 @@ fn eval_expr(
             for item in &items {
                 let mut inner_env = env.clone();
                 inner_env.insert(var_name.clone(), item.clone());
-                out.push(eval_expr(body, &inner_env, all_rules, concepts)?);
+                out.push(eval_expr(body, &inner_env, all_rules, concepts, entropies)?);
             }
             Ok(Value::List(out))
         }
         Expr::Filter(collection, var_name, predicate) => {
-            let coll_val = eval_expr(collection, env, all_rules, concepts)?;
+            let coll_val = eval_expr(collection, env, all_rules, concepts, entropies)?;
             let items = match coll_val {
                 Value::List(items) => items,
                 _ => return Err(RuntimeError { message: "filter requires a collection".into() }),
@@ -564,7 +571,7 @@ fn eval_expr(
             for item in &items {
                 let mut inner_env = env.clone();
                 inner_env.insert(var_name.clone(), item.clone());
-                match eval_expr(predicate, &inner_env, all_rules, concepts)? {
+                match eval_expr(predicate, &inner_env, all_rules, concepts, entropies)? {
                     Value::Bool(true) => out.push(item.clone()),
                     Value::Bool(false) => {}
                     _ => return Err(RuntimeError {
@@ -576,11 +583,11 @@ fn eval_expr(
         }
         Expr::Ok(inner) => {
             // Pass-through: evaluate the inner expr and tag it as the success arm.
-            let v = eval_expr(inner, env, all_rules, concepts)?;
+            let v = eval_expr(inner, env, all_rules, concepts, entropies)?;
             Ok(Value::Ok(Box::new(v)))
         }
         Expr::Err(inner) => {
-            let v = eval_expr(inner, env, all_rules, concepts)?;
+            let v = eval_expr(inner, env, all_rules, concepts, entropies)?;
             Ok(Value::Err(Box::new(v)))
         }
         Expr::Record(_concept_name, fields) => {
@@ -589,7 +596,7 @@ fn eval_expr(
             // point we trust the structure.
             let mut map = HashMap::new();
             for (name, expr) in fields {
-                let v = eval_expr(expr, env, all_rules, concepts)?;
+                let v = eval_expr(expr, env, all_rules, concepts, entropies)?;
                 map.insert(name.clone(), v);
             }
             Ok(Value::Record(map))
@@ -602,7 +609,7 @@ fn eval_expr(
         Expr::VariantConstruct(concept_name, variant_name, fields) => {
             let mut map = HashMap::new();
             for (name, expr) in fields {
-                let v = eval_expr(expr, env, all_rules, concepts)?;
+                let v = eval_expr(expr, env, all_rules, concepts, entropies)?;
                 map.insert(name.clone(), v);
             }
             Ok(Value::Variant {
@@ -620,7 +627,7 @@ fn eval_expr(
             // true/false, text as-is).
             let vals: Vec<Value> = args
                 .iter()
-                .map(|a| eval_expr(a, env, all_rules, concepts))
+                .map(|a| eval_expr(a, env, all_rules, concepts, entropies))
                 .collect::<Result<_, _>>()?;
             let any_bytes = vals.iter().any(|v| matches!(v, Value::Bytes(_)));
             if any_bytes {
@@ -664,16 +671,16 @@ fn eval_expr(
             // Evaluate the target, dispatch on its Ok/Err tag. Exactly one
             // arm runs; the chosen arm's lambda variable is bound to the
             // inner value.
-            match eval_expr(target, env, all_rules, concepts)? {
+            match eval_expr(target, env, all_rules, concepts, entropies)? {
                 Value::Ok(inner) => {
                     let mut new_env = env.clone();
                     new_env.insert(ok_var.clone(), *inner);
-                    eval_expr(ok_body, &new_env, all_rules, concepts)
+                    eval_expr(ok_body, &new_env, all_rules, concepts, entropies)
                 }
                 Value::Err(inner) => {
                     let mut new_env = env.clone();
                     new_env.insert(err_var.clone(), *inner);
-                    eval_expr(err_body, &new_env, all_rules, concepts)
+                    eval_expr(err_body, &new_env, all_rules, concepts, entropies)
                 }
                 other => Err(RuntimeError {
                     message: format!(
@@ -700,7 +707,7 @@ fn eval_expr(
         //    `None` is the wildcard — no binding.
         // 5) Evaluate the arm body in that env.
         Expr::MatchVariant(scrutinee, arms) => {
-            let scrutinee_val = eval_expr(scrutinee, env, all_rules, concepts)?;
+            let scrutinee_val = eval_expr(scrutinee, env, all_rules, concepts, entropies)?;
             let (concept_name, variant_name, fields) = match scrutinee_val {
                 Value::Variant { concept, variant, fields } => (concept, variant, fields),
                 other => {
@@ -767,7 +774,7 @@ fn eval_expr(
                     arm_env.insert(name.clone(), val);
                 }
             }
-            eval_expr(&arm.body, &arm_env, all_rules, concepts)
+            eval_expr(&arm.body, &arm_env, all_rules, concepts, entropies)
         }
         Expr::Call(name, args) => {
             let called = all_rules
@@ -781,17 +788,56 @@ fn eval_expr(
                     message: format!("rule call expects 1 argument, got {}", args.len()),
                 });
             }
-            let arg_val = eval_expr(&args[0], env, all_rules, concepts)?;
+            let arg_val = eval_expr(&args[0], env, all_rules, concepts, entropies)?;
             // Phase B slice 3: accept any Value as call argument, not
             // just Value::Record. Lets recursive rules pass Variant
             // values bound by a `match` arm directly into the next
             // recursion (e.g., `eval(Binary(_, lhs, rhs)) = eval(lhs)
             // + eval(rhs)` where `lhs` is itself a Variant). Pre-B.3
             // this refused with "call argument must be a record".
-            eval_rule_with_value(called, all_rules, concepts, arg_val)
+            eval_rule_with_value(called, all_rules, concepts, entropies, arg_val)
         }
         // Phase 9 slice 1: real read happens in native; interpreter returns empty placeholder for now.
         Expr::Read(_) => Ok(Value::Text("".into())),
+        // Slice entropy-1: a REAL draw, never a stub. The `read`/`fetch`
+        // precedent just above (an empty placeholder) is deliberately NOT
+        // followed: a zero-filled `Value::Bytes` would be a silent wrong
+        // answer of the class this repo spent eight slices closing, and here
+        // the wrong answer is also a SECRET EQUAL TO ZERO — worse than a
+        // refusal. With zero dependencies the only `std` path is
+        // `/dev/urandom`; one honest divergence from native, stated:
+        // `/dev/urandom` never blocks and may return pre-initialization
+        // output on an unseeded host (random(7)), where native's
+        // `getrandom(…, 0)` waits. The interpreter is the reference for
+        // VALUE semantics, not the deployment artifact. A raw `syscall` via
+        // inline `asm!` would remove the divergence at the cost of the first
+        // inline assembly in the compiler's own source — refused for slice 1
+        // on that ground alone. Failure (no /dev, a short read) is a
+        // RuntimeError, which `--run` turns into exit(1) — the interpreter's
+        // sys_exit(1).
+        Expr::Random(name) => {
+            let item = entropies.iter().find(|e| &e.name == name).ok_or_else(|| RuntimeError {
+                message: format!(
+                    "random('{}') references unknown entropy — declare it at top level with `entropy {} ...`",
+                    name, name
+                ),
+            })?;
+            let mut buf = vec![0u8; item.bytes as usize];
+            let draw = (|| -> std::io::Result<()> {
+                use std::io::Read;
+                let mut f = std::fs::File::open("/dev/urandom")?;
+                f.read_exact(&mut buf)
+            })();
+            match draw {
+                Ok(()) => Ok(Value::Bytes(buf)),
+                Err(e) => Err(RuntimeError {
+                    message: format!(
+                        "random('{}'): kernel randomness unavailable ({}); refusing to serve a zero or partial secret",
+                        name, e
+                    ),
+                }),
+            }
+        }
         // Phase 11 slice 1: real fetch happens in native; interpreter
         // returns empty placeholder for now (same shape as Read).
         Expr::Fetch(_, _) => Ok(Value::Text("".into())),
@@ -800,7 +846,7 @@ fn eval_expr(
         // escape_json_string so the interpreter and the literal-folder
         // agree byte-for-byte.
         Expr::JsonEscape(inner) => {
-            let v = eval_expr(inner, env, all_rules, concepts)?;
+            let v = eval_expr(inner, env, all_rules, concepts, entropies)?;
             match v {
                 Value::Text(s) => {
                     let bytes = s.as_bytes();
@@ -831,7 +877,7 @@ fn eval_expr(
         // as json_escape's type mismatch — fail-closed posture mirrors the
         // native sys_exit(1) abort.
         Expr::ParseInt(inner) => {
-            let v = eval_expr(inner, env, all_rules, concepts)?;
+            let v = eval_expr(inner, env, all_rules, concepts, entropies)?;
             match v {
                 Value::Text(s) => match s.trim().parse::<i64>() {
                     Ok(n) => Ok(Value::Number(n)),
@@ -866,8 +912,8 @@ fn eval_expr(
         // longer than haystack is false. Mirrors Rust's str::starts_with
         // on the byte slices, matching what native will emit.
         Expr::StartsWith(haystack, needle) => {
-            let h = eval_expr(haystack, env, all_rules, concepts)?;
-            let n = eval_expr(needle, env, all_rules, concepts)?;
+            let h = eval_expr(haystack, env, all_rules, concepts, entropies)?;
+            let n = eval_expr(needle, env, all_rules, concepts, entropies)?;
             match (h, n) {
                 (Value::Text(hs), Value::Text(ns)) => {
                     Ok(Value::Bool(hs.as_bytes().starts_with(ns.as_bytes())))
@@ -886,8 +932,8 @@ fn eval_expr(
         // false. Returns Value::Bool. Mirrors what native will emit
         // (naive O(N*M) substring search bounded by `max:` declarations).
         Expr::Contains(haystack, needle) => {
-            let h = eval_expr(haystack, env, all_rules, concepts)?;
-            let n = eval_expr(needle, env, all_rules, concepts)?;
+            let h = eval_expr(haystack, env, all_rules, concepts, entropies)?;
+            let n = eval_expr(needle, env, all_rules, concepts, entropies)?;
             match (h, n) {
                 (Value::Text(hs), Value::Text(ns)) => {
                     Ok(Value::Bool(hs.contains(&ns)))
@@ -906,8 +952,8 @@ fn eval_expr(
         // needle longer than haystack is false. Mirrors Rust's
         // str::ends_with on the byte slices, matching what native will emit.
         Expr::EndsWith(haystack, needle) => {
-            let h = eval_expr(haystack, env, all_rules, concepts)?;
-            let n = eval_expr(needle, env, all_rules, concepts)?;
+            let h = eval_expr(haystack, env, all_rules, concepts, entropies)?;
+            let n = eval_expr(needle, env, all_rules, concepts, entropies)?;
             match (h, n) {
                 (Value::Text(hs), Value::Text(ns)) => {
                     Ok(Value::Bool(hs.as_bytes().ends_with(ns.as_bytes())))
@@ -929,7 +975,7 @@ fn eval_expr(
         // The verifier already limits this to the LITERAL shape, so the only
         // Value::Bytes that can reach here is one the source spelled out.
         Expr::Length(inner) => {
-            let v = eval_expr(inner, env, all_rules, concepts)?;
+            let v = eval_expr(inner, env, all_rules, concepts, entropies)?;
             match v {
                 Value::Text(s) => Ok(Value::Number(s.as_bytes().len() as i64)),
                 Value::Bytes(b) => Ok(Value::Number(b.len() as i64)),
@@ -945,8 +991,8 @@ fn eval_expr(
         // Number; returns the smaller of the two. Mirrors what native
         // emits via cmp + cmovg (branch-free).
         Expr::Min(left, right) => {
-            let l = eval_expr(left, env, all_rules, concepts)?;
-            let r = eval_expr(right, env, all_rules, concepts)?;
+            let l = eval_expr(left, env, all_rules, concepts, entropies)?;
+            let r = eval_expr(right, env, all_rules, concepts, entropies)?;
             match (l, r) {
                 (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a.min(b))),
                 (l, r) => Err(RuntimeError {
@@ -961,8 +1007,8 @@ fn eval_expr(
         // Number; returns the larger of the two. Mirrors what native
         // emits via cmp + cmovl (branch-free).
         Expr::Max(left, right) => {
-            let l = eval_expr(left, env, all_rules, concepts)?;
-            let r = eval_expr(right, env, all_rules, concepts)?;
+            let l = eval_expr(left, env, all_rules, concepts, entropies)?;
+            let r = eval_expr(right, env, all_rules, concepts, entropies)?;
             match (l, r) {
                 (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a.max(b))),
                 (l, r) => Err(RuntimeError {
@@ -980,9 +1026,9 @@ fn eval_expr(
         // and out-of-range values produce a RuntimeError (mirrors what
         // native lowers to sys_exit(1)).
         Expr::Substring(text, start, end) => {
-            let t = eval_expr(text, env, all_rules, concepts)?;
-            let s = eval_expr(start, env, all_rules, concepts)?;
-            let e = eval_expr(end, env, all_rules, concepts)?;
+            let t = eval_expr(text, env, all_rules, concepts, entropies)?;
+            let s = eval_expr(start, env, all_rules, concepts, entropies)?;
+            let e = eval_expr(end, env, all_rules, concepts, entropies)?;
             match (t, s, e) {
                 (Value::Text(text_val), Value::Number(start_n), Value::Number(end_n)) => {
                     let bytes = text_val.as_bytes();
@@ -1024,8 +1070,8 @@ fn eval_expr(
         // indices and out-of-range values produce a RuntimeError (mirrors
         // what native lowers to sys_exit(1)).
         Expr::ByteAt(text, index) => {
-            let t = eval_expr(text, env, all_rules, concepts)?;
-            let i = eval_expr(index, env, all_rules, concepts)?;
+            let t = eval_expr(text, env, all_rules, concepts, entropies)?;
+            let i = eval_expr(index, env, all_rules, concepts, entropies)?;
             match (t, i) {
                 (Value::Text(text_val), Value::Number(idx)) => {
                     let bytes = text_val.as_bytes();
@@ -1065,31 +1111,31 @@ fn eval_expr(
             }
         }
         Expr::BitAnd(a, b) => {
-            let av = eval_expr(a, env, all_rules, concepts)?;
-            let bv = eval_expr(b, env, all_rules, concepts)?;
+            let av = eval_expr(a, env, all_rules, concepts, entropies)?;
+            let bv = eval_expr(b, env, all_rules, concepts, entropies)?;
             match (av, bv) {
                 (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x & y)),
                 _ => Err(RuntimeError { message: "band: number args required".into() }),
             }
         }
         Expr::BitOr(a, b) => {
-            let av = eval_expr(a, env, all_rules, concepts)?;
-            let bv = eval_expr(b, env, all_rules, concepts)?;
+            let av = eval_expr(a, env, all_rules, concepts, entropies)?;
+            let bv = eval_expr(b, env, all_rules, concepts, entropies)?;
             match (av, bv) {
                 (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x | y)),
                 _ => Err(RuntimeError { message: "bor: number args required".into() }),
             }
         }
         Expr::BitXor(a, b) => {
-            let av = eval_expr(a, env, all_rules, concepts)?;
-            let bv = eval_expr(b, env, all_rules, concepts)?;
+            let av = eval_expr(a, env, all_rules, concepts, entropies)?;
+            let bv = eval_expr(b, env, all_rules, concepts, entropies)?;
             match (av, bv) {
                 (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x ^ y)),
                 _ => Err(RuntimeError { message: "bxor: number args required".into() }),
             }
         }
         Expr::BitNot(i) => {
-            let v = eval_expr(i, env, all_rules, concepts)?;
+            let v = eval_expr(i, env, all_rules, concepts, entropies)?;
             match v {
                 Value::Number(x) => Ok(Value::Number(!x)),
                 _ => Err(RuntimeError { message: "bnot: number arg required".into() }),
@@ -1109,16 +1155,16 @@ fn eval_expr(
         // Python's hashlib on examples/sha512_fold.verbose — see
         // `shift_semantics_logical_and_identical_across_backends`.)
         Expr::Shl(a, b) => {
-            let av = eval_expr(a, env, all_rules, concepts)?;
-            let bv = eval_expr(b, env, all_rules, concepts)?;
+            let av = eval_expr(a, env, all_rules, concepts, entropies)?;
+            let bv = eval_expr(b, env, all_rules, concepts, entropies)?;
             match (av, bv) {
                 (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x.wrapping_shl(y as u32))),
                 _ => Err(RuntimeError { message: "shl: number args required".into() }),
             }
         }
         Expr::Shr(a, b) => {
-            let av = eval_expr(a, env, all_rules, concepts)?;
-            let bv = eval_expr(b, env, all_rules, concepts)?;
+            let av = eval_expr(a, env, all_rules, concepts, entropies)?;
+            let bv = eval_expr(b, env, all_rules, concepts, entropies)?;
             match (av, bv) {
                 (Value::Number(x), Value::Number(y)) => {
                     Ok(Value::Number((x as u64).wrapping_shr(y as u32) as i64))
@@ -1202,7 +1248,7 @@ mod tests {
         let rule = make_rule();
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(15000));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(true));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(true));
     }
 
     #[test]
@@ -1210,7 +1256,7 @@ mod tests {
         let rule = make_rule();
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(500));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(false));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(false));
     }
 
     #[test]
@@ -1218,7 +1264,7 @@ mod tests {
         let rule = make_rule();
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(10000));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(false));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(false));
     }
 
     #[test]
@@ -1226,14 +1272,14 @@ mod tests {
         let rule = make_rule();
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(10001));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(true));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(true));
     }
 
     #[test]
     fn missing_field_fails() {
         let rule = make_rule();
         let input = HashMap::new();
-        assert!(eval_rule(&rule, &[], &[], &input).is_err());
+        assert!(eval_rule(&rule, &[], &[], &[], &input).is_err());
     }
 
     #[test]
@@ -1267,7 +1313,7 @@ mod tests {
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(100));
         // The rule tests > 10000, so with 100 it's false
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(false));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(false));
     }
 
     #[test]
@@ -1304,7 +1350,7 @@ mod tests {
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
-        assert!(eval_rule(&rule, &[], &[], &input).is_err());
+        assert!(eval_rule(&rule, &[], &[], &[], &input).is_err());
     }
 
     #[test]
@@ -1341,7 +1387,7 @@ mod tests {
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(10));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Number(1)); // 10 % 3 = 1
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Number(1)); // 10 % 3 = 1
     }
 
     #[test]
@@ -1382,10 +1428,10 @@ mod tests {
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(15));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Number(1));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Number(1));
 
         input.insert("x".into(), Value::Number(5));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Number(0));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Number(0));
     }
 
     #[test]
@@ -1422,10 +1468,10 @@ mod tests {
         };
         let mut input = HashMap::new();
         input.insert("s".into(), Value::Text("active".into()));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(true));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(true));
 
         input.insert("s".into(), Value::Text("blocked".into()));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(false));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(false));
     }
 
     #[test]
@@ -1461,13 +1507,13 @@ mod tests {
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Number(-42));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Number(-42));
 
         input.insert("x".into(), Value::Number(-10));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Number(10));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Number(10));
 
         input.insert("x".into(), Value::Number(0));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Number(0));
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Number(0));
     }
 
     #[test]
@@ -1504,10 +1550,10 @@ mod tests {
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(15));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(false)); // not (15 > 10) = not true = false
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(false)); // not (15 > 10) = not true = false
 
         input.insert("x".into(), Value::Number(5));
-        assert_eq!(eval_rule(&rule, &[], &[], &input).unwrap(), Value::Bool(true)); // not (5 > 10) = not false = true
+        assert_eq!(eval_rule(&rule, &[], &[], &[], &input).unwrap(), Value::Bool(true)); // not (5 > 10) = not false = true
     }
 
     #[test]
@@ -1544,7 +1590,7 @@ mod tests {
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
-        assert!(eval_rule(&rule, &[], &[], &input).is_err());
+        assert!(eval_rule(&rule, &[], &[], &[], &input).is_err());
     }
 
     #[test]
@@ -1588,7 +1634,7 @@ mod tests {
             "items".into(),
             Value::List(vec![Value::Number(1), Value::Number(2), Value::Number(3)]),
         );
-        let result = eval_rule(&rule, &[], &[], &input).unwrap();
+        let result = eval_rule(&rule, &[], &[], &[], &input).unwrap();
         assert_eq!(
             result,
             Value::List(vec![Value::Number(2), Value::Number(4), Value::Number(6)])
@@ -1641,7 +1687,7 @@ mod tests {
                 Value::Number(42),
             ]),
         );
-        let result = eval_rule(&rule, &[], &[], &input).unwrap();
+        let result = eval_rule(&rule, &[], &[], &[], &input).unwrap();
         assert_eq!(
             result,
             Value::List(vec![Value::Number(15), Value::Number(42)])
@@ -1690,13 +1736,13 @@ mod tests {
         let mut input = HashMap::new();
         input.insert("age".into(), Value::Number(25));
         assert_eq!(
-            eval_rule(&rule, &[], &[], &input).unwrap(),
+            eval_rule(&rule, &[], &[], &[], &input).unwrap(),
             Value::Ok(Box::new(Value::Number(25)))
         );
 
         input.insert("age".into(), Value::Number(15));
         assert_eq!(
-            eval_rule(&rule, &[], &[], &input).unwrap(),
+            eval_rule(&rule, &[], &[], &[], &input).unwrap(),
             Value::Err(Box::new(Value::Text("under 18".into())))
         );
     }
@@ -1764,14 +1810,14 @@ mod tests {
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(5));
         assert_eq!(
-            eval_rule(&rule, &[], &[], &input).unwrap(),
+            eval_rule(&rule, &[], &[], &[], &input).unwrap(),
             Value::Ok(Box::new(Value::Number(11)))
         );
 
         // Err path: i.x = -3 → Err("negative") → match binds e="negative" → Err(e) unchanged
         input.insert("x".into(), Value::Number(-3));
         assert_eq!(
-            eval_rule(&rule, &[], &[], &input).unwrap(),
+            eval_rule(&rule, &[], &[], &[], &input).unwrap(),
             Value::Err(Box::new(Value::Text("negative".into())))
         );
     }
@@ -1813,13 +1859,13 @@ mod tests {
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
         assert_eq!(
-            eval_rule(&rule, &[], &[], &input).unwrap(),
+            eval_rule(&rule, &[], &[], &[], &input).unwrap(),
             Value::Text("age 42 years".into())
         );
 
         input.insert("x".into(), Value::Number(-3));
         assert_eq!(
-            eval_rule(&rule, &[], &[], &input).unwrap(),
+            eval_rule(&rule, &[], &[], &[], &input).unwrap(),
             Value::Text("age -3 years".into())
         );
     }
@@ -1917,7 +1963,7 @@ mod tests {
         let run = |text: &str| -> Value {
             let mut input = HashMap::new();
             input.insert("s".into(), Value::Text(text.into()));
-            eval_rule(&rule, &[], &[], &input).unwrap()
+            eval_rule(&rule, &[], &[], &[], &input).unwrap()
         };
         // '  42' → 2 (first digit at position 2)
         assert_eq!(run("  42"), Value::Number(2));
@@ -1987,7 +2033,7 @@ mod tests {
 
         let mut input = HashMap::new();
         input.insert("id".into(), Value::Number(42));
-        let result = eval_rule(&payload_rule, &[], &[], &input).unwrap();
+        let result = eval_rule(&payload_rule, &[], &[], &[], &input).unwrap();
         match result {
             Value::Variant { concept, variant, fields } => {
                 assert_eq!(concept, "Token");
@@ -2024,7 +2070,7 @@ mod tests {
             context_name: None,
             context_ty: None,
         };
-        let result = eval_rule(&eof_rule, &[], &[], &HashMap::new()).unwrap();
+        let result = eval_rule(&eof_rule, &[], &[], &[], &HashMap::new()).unwrap();
         match result {
             Value::Variant { concept, variant, fields } => {
                 assert_eq!(concept, "Token");
@@ -2131,7 +2177,7 @@ mod tests {
             vec![("value".into(), Expr::Number(42))],
         ));
         assert_eq!(
-            eval_rule(&rule_int, &[], &concepts, &empty_input).unwrap(),
+            eval_rule(&rule_int, &[], &concepts, &[], &empty_input).unwrap(),
             Value::Number(42)
         );
 
@@ -2142,7 +2188,7 @@ mod tests {
             vec![("name".into(), Expr::Text("hi".into()))],
         ));
         assert_eq!(
-            eval_rule(&rule_ident, &[], &concepts, &empty_input).unwrap(),
+            eval_rule(&rule_ident, &[], &concepts, &[], &empty_input).unwrap(),
             Value::Number(1)
         );
 
@@ -2153,7 +2199,7 @@ mod tests {
             vec![],
         ));
         assert_eq!(
-            eval_rule(&rule_eof, &[], &concepts, &empty_input).unwrap(),
+            eval_rule(&rule_eof, &[], &concepts, &[], &empty_input).unwrap(),
             Value::Number(0)
         );
     }
@@ -2288,18 +2334,18 @@ mod tests {
         let times_three = mk_bin("Mul", one_plus_two, mk_int(3));
 
         // eval((1 + 2) * 3) → 9
-        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, times_three).unwrap();
+        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, &[], times_three).unwrap();
         assert_eq!(result, Value::Number(9));
 
         // Single Int — recursion depth 1.
-        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, mk_int(42)).unwrap();
+        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, &[], mk_int(42)).unwrap();
         assert_eq!(result, Value::Number(42));
 
         // Deeper tree: ((2 * 3) + 4) * 5 = 50
         let two_times_three = mk_bin("Mul", mk_int(2), mk_int(3));
         let plus_four = mk_bin("Add", two_times_three, mk_int(4));
         let times_five = mk_bin("Mul", plus_four, mk_int(5));
-        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, times_five).unwrap();
+        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, &[], times_five).unwrap();
         assert_eq!(result, Value::Number(50));
     }
 }

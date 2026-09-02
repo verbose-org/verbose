@@ -253,6 +253,41 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
         }
     }
 
+    // Slice entropy-1: collect declared entropy names for cross-checking
+    // every `random(name)` reference. Third member of the resource /
+    // connection family: same global namespace, and an entropy name must
+    // collide with neither, because all three flow through `reads:` purity
+    // facts as a single identifier path (refusal row 4).
+    let mut all_entropies: HashSet<String> = HashSet::new();
+    for item in &program.items {
+        if let Item::Entropy(e) = item {
+            if !all_entropies.insert(e.name.clone()) {
+                errors.push(VerifyError {
+                    context: format!("entropy '{}'", e.name),
+                    message: format!("duplicate entropy name '{}'", e.name),
+                });
+            }
+            if all_resources.contains(&e.name) {
+                errors.push(VerifyError {
+                    context: format!("entropy '{}'", e.name),
+                    message: format!(
+                        "entropy name '{}' collides with a resource of the same name; reads: lists merge both namespaces",
+                        e.name
+                    ),
+                });
+            }
+            if all_connections.contains(&e.name) {
+                errors.push(VerifyError {
+                    context: format!("entropy '{}'", e.name),
+                    message: format!(
+                        "entropy name '{}' collides with a connection of the same name; reads: lists merge both namespaces",
+                        e.name
+                    ),
+                });
+            }
+        }
+    }
+
     // Slice `text-state-1`: the declared byte ceiling of every resource and
     // connection, keyed by name. The compile-time overflow gate for a text
     // `set` needs the NUMBER, not just the name — `all_resources` /
@@ -290,7 +325,7 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                 // types — type-checking against `Type::Named(C)` where
                 // C is in a group works through the program-wide
                 // namespace already shared by B.1.
-                verify_rule(r, &concepts, &all_rules, &all_resources, &all_connections, &group_concept_owner, base_dir, &mut errors);
+                verify_rule(r, &concepts, &all_rules, &all_resources, &all_connections, &all_entropies, &group_concept_owner, base_dir, &mut errors);
                 // Phase 9 slice 1: every read(name) in the rule's logic
                 // must resolve to a declared resource. This is a separate
                 // pass to keep check_expr_against's signature stable; the
@@ -306,6 +341,26 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                             context: format!("rule '{}' / logic", r.name),
                             message: format!(
                                 "read('{}') references unknown resource — declare it at top level with `resource {} ...`",
+                                name, name
+                            ),
+                        });
+                    }
+                }
+                // Slice entropy-1: every random(name) in the rule's logic
+                // or let RHS must resolve to a declared entropy item
+                // (refusal row 5). Mirror of the resource cross-check
+                // above — same shallow walk, separate namespace.
+                let mut random_refs: Vec<String> = Vec::new();
+                collect_random_names(&r.logic.value, &mut random_refs);
+                for (_, expr) in &r.logic.bindings {
+                    collect_random_names(expr, &mut random_refs);
+                }
+                for name in &random_refs {
+                    if !all_entropies.contains(name) {
+                        errors.push(VerifyError {
+                            context: format!("rule '{}' / logic", r.name),
+                            message: format!(
+                                "random('{}') references unknown entropy — declare it at top level with `entropy {} ...`",
                                 name, name
                             ),
                         });
@@ -429,6 +484,7 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
             ),
             Item::Resource(r) => verify_resource_stub(r, base_dir, &mut errors),
             Item::Connection(c) => verify_connection_stub(c, base_dir, &mut errors),
+            Item::Entropy(e) => verify_entropy_stub(e, base_dir, &mut errors),
         }
     }
     errors
@@ -454,7 +510,7 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
                 out.push(name.clone());
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Random(_) => {}
         Expr::Field(base, _) => collect_read_names(base, out),
         Expr::Binary(_, l, r) => {
             collect_read_names(l, out);
@@ -583,6 +639,44 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
     }
 }
 
+/// Slice entropy-1 — walk an expression tree collecting every `Random(name)`
+/// reference (de-duplicated, source order). Used by verify_program to
+/// cross-check that each `random(name)` resolves to a declared `entropy`
+/// item. Built on `walk_expr_children` rather than as a third arm-for-arm
+/// copy of `collect_read_names`: that helper is enumerated without a
+/// catch-all, so a new `Expr` variant fails to compile there instead of
+/// becoming a silently-unvisited subtree here.
+fn collect_random_names(expr: &Expr, out: &mut Vec<String>) {
+    if let Expr::Random(name) = expr {
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    walk_expr_children(expr, &mut |child| collect_random_names(child, out));
+}
+
+/// Slice entropy-1: per-item validation. The @source ref must resolve, and
+/// `bytes` must sit in `1..=256` — the parser already refuses the floor at
+/// the literal, this is the ceiling half of refusal row 1, worded by the
+/// same shared function so the two cannot disagree about the bound. The
+/// 256 is the `getrandom(2)` contract, not taste: below it a read on an
+/// initialized pool cannot be short or interrupted, which is what lets the
+/// emitter store the DECLARED width as the value's length.
+fn verify_entropy_stub(e: &Entropy, base_dir: &StdPath, errors: &mut Vec<VerifyError>) {
+    if let Err(msg) = verify_source_ref(&e.source, base_dir) {
+        errors.push(VerifyError {
+            context: format!("entropy '{}' / @source", e.name),
+            message: msg,
+        });
+    }
+    if e.bytes == 0 || e.bytes > 256 {
+        errors.push(VerifyError {
+            context: format!("entropy '{}' / bytes", e.name),
+            message: entropy_bytes_range_message(&e.name, e.bytes as i64),
+        });
+    }
+}
+
 fn verify_resource_stub(r: &Resource, base_dir: &StdPath, errors: &mut Vec<VerifyError>) {
     if let Err(msg) = verify_source_ref(&r.source, base_dir) {
         errors.push(VerifyError {
@@ -620,7 +714,7 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names(req, out);
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
-        Expr::Read(_) => {}
+        Expr::Read(_) | Expr::Random(_) => {}
         Expr::Field(base, _) => collect_fetch_names(base, out),
         Expr::Binary(_, l, r) => {
             collect_fetch_names(l, out);
@@ -740,7 +834,7 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names_with_dups(req, out);
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
-        Expr::Read(_) => {}
+        Expr::Read(_) | Expr::Random(_) => {}
         Expr::Field(base, _) => collect_fetch_names_with_dups(base, out),
         Expr::Binary(_, l, r) => {
             collect_fetch_names_with_dups(l, out);
@@ -1294,6 +1388,25 @@ fn verify_service(
         }
     }
     for aset in &s.after_sets {
+        // Slice entropy-1, refusal row 11: a draw in an `after:` set. The
+        // type check further down would ALSO refuse it (a `bytes` value
+        // against a number or text field), but with the wrong diagnosis —
+        // "wrong type" rather than "not supported here". Named first so the
+        // author is pointed at the slice that lifts it, and so a future
+        // bytes-typed state field (text-state-4) does not silently admit a
+        // draw into state without its own argument.
+        let mut draws: Vec<String> = Vec::new();
+        collect_random_names(&aset.value, &mut draws);
+        for name in &draws {
+            errors.push(VerifyError {
+                context: format!("service '{}' / after / set {}", s.name, aset.field_name),
+                message: format!(
+                    "after: set {}: random('{}') is not supported here (slice entropy-6: a draw \
+                     stored into service state needs its own secrecy argument — state is not secret)",
+                    aset.field_name, name
+                ),
+            });
+        }
         if !s.state_fields.iter().any(|sf| sf.name == aset.field_name) {
             errors.push(VerifyError {
                 context: format!("service '{}' / after / set {}", s.name, aset.field_name),
@@ -1763,10 +1876,10 @@ fn walk_state_text_read_positions(
 /// variant is a COMPILE error here instead of a silently-unvisited subtree.
 /// (That is the same discipline `count_badcall_ast` in gen0 had to be taught
 /// the hard way — twelve node families stubbed to a flat `0`.)
-fn walk_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+pub(crate) fn walk_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     match e {
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_)
-        | Expr::NowUnix => {}
+        | Expr::Random(_) | Expr::NowUnix => {}
         Expr::Field(b, _) => f(b),
         Expr::Not(a)
         | Expr::Neg(a)
@@ -2013,6 +2126,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Record(_, _) => "record construction",
         Expr::Concat(_) => "concat",
         Expr::Read(_) => "read",
+        Expr::Random(_) => "random",
         Expr::Fetch(_, _) => "fetch",
         Expr::JsonEscape(_) => "json_escape",
         Expr::ParseInt(_) => "parse_int",
@@ -2520,6 +2634,7 @@ fn verify_rule(
     all_rules: &[&Rule],
     all_resources: &HashSet<String>,
     all_connections: &HashSet<String>,
+    all_entropies: &HashSet<String>,
     group_concept_owner: &HashMap<String, String>,
     base_dir: &StdPath,
     errors: &mut Vec<VerifyError>,
@@ -2579,7 +2694,7 @@ fn verify_rule(
     // slots. The verifier surfaces this as a legitimate read of the
     // outer rule, not as an "extra" entry.
     augment_facts_with_transitive_match_result_reads(
-        rule, all_rules, all_resources, all_connections, &mut facts,
+        rule, all_rules, all_resources, all_connections, all_entropies, &mut facts,
     );
 
     for path in &facts.reads {
@@ -2590,6 +2705,7 @@ fn verify_rule(
             context_concept,
             all_resources,
             all_connections,
+            all_entropies,
         ) {
             errors.push(VerifyError {
                 context: format!("rule '{}' / logic", rule.name),
@@ -2762,7 +2878,14 @@ fn check_byte_addressable_operand(
     bindings: &HashMap<String, &Concept>,
     errors: &mut Vec<VerifyError>,
 ) {
-    if matches!(expr, Expr::Bytes(_)) {
+    // A `b"..."` literal and a `random(<entropy>)` draw are the two bytes-
+    // typed operands the byte-addressed pair admits. Both have a
+    // COMPILE-TIME length — the literal by construction, the draw by
+    // declaration plus the getrandom(2) contract — which is the criterion
+    // that keeps a bytes-typed FIELD (`req.data : bytes [..N]`, a runtime
+    // length) out. Every other text primitive keeps checking against
+    // `Type::Text`, so the bytes/text isolation is intact.
+    if matches!(expr, Expr::Bytes(_) | Expr::Random(_)) {
         return;
     }
     check_expr_against(
@@ -3722,6 +3845,11 @@ fn infer_expr_type(
         // resource is checked separately by verify_rule via a dedicated
         // walk; this inference path only needs the type.
         Expr::Read(_) => Some(Type::Text),
+        // Slice entropy-1: random(<entropy>) returns BYTES — never text, so
+        // every text sink (concat, HttpResponse.body, text ==, after: sets)
+        // refuses it through the existing bytes/text isolation. Existence of
+        // the item is checked separately by verify_program's dedicated walk.
+        Expr::Random(_) => Some(Type::Bytes),
         Expr::Ident(name) if name == &rule.input_name => Some(rule.input_ty.clone()),
         // A `let` bound to a RECORD concept, or the `context:` binding. Same
         // map, same lookup and the same soundness argument as the `Field` arm
@@ -4039,6 +4167,7 @@ fn augment_facts_with_transitive_match_result_reads(
     all_rules: &[&Rule],
     all_resources: &HashSet<String>,
     all_connections: &HashSet<String>,
+    all_entropies: &HashSet<String>,
     facts: &mut LogicFacts,
 ) {
     let rules_by_name: std::collections::HashMap<&str, &Rule> =
@@ -4050,6 +4179,7 @@ fn augment_facts_with_transitive_match_result_reads(
         &rules_by_name,
         all_resources,
         all_connections,
+        all_entropies,
         &mut visited,
         &mut facts.reads,
     );
@@ -4059,6 +4189,7 @@ fn augment_facts_with_transitive_match_result_reads(
             &rules_by_name,
             all_resources,
             all_connections,
+            all_entropies,
             &mut visited,
             &mut facts.reads,
         );
@@ -4072,6 +4203,7 @@ fn walk_for_match_result_callees(
     rules_by_name: &std::collections::HashMap<&str, &Rule>,
     all_resources: &HashSet<String>,
     all_connections: &HashSet<String>,
+    all_entropies: &HashSet<String>,
     visited: &mut HashSet<String>,
     out_reads: &mut HashSet<Vec<String>>,
 ) {
@@ -4088,6 +4220,7 @@ fn walk_for_match_result_callees(
                                 let name = &path[0];
                                 if all_resources.contains(name)
                                     || all_connections.contains(name)
+                                    || all_entropies.contains(name)
                                     || name == "now"
                                 {
                                     out_reads.insert(path.clone());
@@ -4101,6 +4234,7 @@ fn walk_for_match_result_callees(
                             rules_by_name,
                             all_resources,
                             all_connections,
+                            all_entropies,
                             visited,
                             out_reads,
                         );
@@ -4110,6 +4244,7 @@ fn walk_for_match_result_callees(
                                 rules_by_name,
                                 all_resources,
                                 all_connections,
+                                all_entropies,
                                 visited,
                                 out_reads,
                             );
@@ -4117,71 +4252,71 @@ fn walk_for_match_result_callees(
                     }
                 }
             }
-            walk_for_match_result_callees(ok_body, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(err_body, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(ok_body, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(err_body, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         // Recurse into shapes that can contain a MatchResult somewhere.
         Expr::If(c, t, e) => {
-            walk_for_match_result_callees(c, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(c, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
         | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i)
         | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
-            walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::Binary(_, l, r) => {
-            walk_for_match_result_callees(l, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(r, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(l, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(r, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
         | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
-            walk_for_match_result_callees(a, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(b, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(a, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(b, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::Call(_, args) | Expr::Concat(args) => {
             for a in args {
-                walk_for_match_result_callees(a, rules_by_name, all_resources, all_connections, visited, out_reads);
+                walk_for_match_result_callees(a, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
             }
         }
         Expr::Record(_, fields) => {
             for (_, v) in fields {
-                walk_for_match_result_callees(v, rules_by_name, all_resources, all_connections, visited, out_reads);
+                walk_for_match_result_callees(v, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
             }
         }
         Expr::Fetch(_, req) => {
-            walk_for_match_result_callees(req, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(req, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::Fold(coll, init, _, _, body) => {
-            walk_for_match_result_callees(coll, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(init, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(coll, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(init, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::Quantifier(_, coll, _, body)
         | Expr::Map(coll, _, body)
         | Expr::Filter(coll, _, body) => {
-            walk_for_match_result_callees(coll, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(coll, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::Substring(t, s, e) => {
-            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(s, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(s, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::ByteAt(t, i) => {
-            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         Expr::FoldBytes(t, init, _, _, _, body) => {
-            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(init, rules_by_name, all_resources, all_connections, visited, out_reads);
-            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(init, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
+            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
         // Phase A slice 2: recurse into each field assignment's expression.
         Expr::VariantConstruct(_, _, fields) => {
             for (_, v) in fields {
-                walk_for_match_result_callees(v, rules_by_name, all_resources, all_connections, visited, out_reads);
+                walk_for_match_result_callees(v, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
             }
         }
         // Phase A slice 3: pattern match — recurse into scrutinee + each
@@ -4189,13 +4324,13 @@ fn walk_for_match_result_callees(
         // shape (unlike MatchResult), so no inlined-callee fact propagation
         // here; we just walk for any MatchResult nested inside the bodies.
         Expr::MatchVariant(scrutinee, arms) => {
-            walk_for_match_result_callees(scrutinee, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(scrutinee, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
             for a in arms {
-                walk_for_match_result_callees(&a.body, rules_by_name, all_resources, all_connections, visited, out_reads);
+                walk_for_match_result_callees(&a.body, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
             }
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
-        | Expr::Read(_) | Expr::NowUnix => {}
+        | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => {}
     }
 }
 
@@ -4230,6 +4365,7 @@ fn collect_call_sites(expr: &Expr, out: &mut Vec<(String, usize)>) {
         | Expr::Bytes(_)
         | Expr::Ident(_)
         | Expr::Read(_)
+        | Expr::Random(_)
         | Expr::NowUnix => {}
         // One sub-expression.
         Expr::Field(inner, _)
@@ -4488,6 +4624,14 @@ fn collect_expr_facts(
         Expr::Read(name) => {
             reads.insert(vec![name.clone()]);
         }
+        // Slice entropy-1: a draw contributes the entropy name to the rule's
+        // `reads:` purity facts — the author MUST list it (e.g. `reads:
+        // [nonce]`), and `check_purity` reports `missing: [nonce]` /
+        // `extra: [nonce]` unchanged, so every non-deterministic rule is
+        // greppable in its proof block. Same shape as a resource name.
+        Expr::Random(name) => {
+            reads.insert(vec![name.clone()]);
+        }
         // Phase 11 slice 1: a fetch contributes the connection name to
         // the rule's `reads:` facts (same single-segment shape as
         // resources). The request bytes expression is also walked so any
@@ -4660,6 +4804,7 @@ fn validate_read_path(
     context_concept: Option<&Concept>,
     all_resources: &HashSet<String>,
     all_connections: &HashSet<String>,
+    all_entropies: &HashSet<String>,
 ) -> Option<String> {
     if path.is_empty() {
         return None;
@@ -4681,6 +4826,13 @@ fn validate_read_path(
     // resource read does — same path shape ([name], length 1, no field).
     let is_connection = path.len() == 1 && all_connections.contains(base);
     if is_connection {
+        return None;
+    }
+    // Slice entropy-1: also accept top-level entropy names. A draw
+    // contributes the entropy name to `reads:` exactly the way a resource
+    // read does — same path shape ([name], length 1, no field).
+    let is_entropy = path.len() == 1 && all_entropies.contains(base);
+    if is_entropy {
         return None;
     }
     // `now_unix()` synthesises a `reads: [now]` entry. Accept the synthetic
@@ -4946,7 +5098,7 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             Expr::BitNot(i) => walk(i, out),
             // Leaves
             Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
-            | Expr::Read(_) | Expr::NowUnix => {}
+            | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => {}
         }
     }
     walk(expr, &mut out);
@@ -5158,7 +5310,7 @@ fn collect_recursive_call_args(expr: &Expr, rule_name: &str, out: &mut Vec<Strin
                 }
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => {}
         Expr::Field(b, _) => collect_recursive_call_args(b, rule_name, out),
         Expr::Binary(_, l, r) => { collect_recursive_call_args(l, rule_name, out); collect_recursive_call_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -5411,7 +5563,7 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
                 out.push((name.clone(), arg.clone()));
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => {}
         Expr::Field(b, _) => collect_recursive_call_record_args(b, rule_name, out),
         Expr::Binary(_, l, r) => { collect_recursive_call_record_args(l, rule_name, out); collect_recursive_call_record_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -5471,6 +5623,9 @@ pub(crate) fn count_operations(expr: &Expr) -> usize {
         // Phase 9 slice 1 stub: a file read costs one op (the syscall) and
         // has no Expr children to count.
         Expr::Read(_) => 1,
+        // Slice entropy-1: a draw costs one op (the getrandom syscall) and
+        // has no Expr children — same shape as Read.
+        Expr::Random(_) => 1,
         // Phase 11 slice 1: a TCP fetch costs roughly one op (the
         // socket+connect+write+read syscall sequence is opaque to the
         // proof system) plus the cost of evaluating the request bytes.
@@ -7003,7 +7158,7 @@ rule use_it
         let mut input = HashMap::new();
         input.insert("a".to_string(), crate::interpreter::Value::Number(9));
         input.insert("b".to_string(), crate::interpreter::Value::Number(7));
-        let got = eval_rule(use_it, &rules, &concepts, &input).unwrap();
+        let got = eval_rule(use_it, &rules, &concepts, &[], &input).unwrap();
         assert_eq!(
             format!("{:?}", got),
             format!("{:?}", crate::interpreter::Value::Number(7007)),
@@ -7407,7 +7562,7 @@ rule layered_caller
                 panic!("cannot load {}: {}", json_path.display(), e)
             });
             for (idx, record) in records.iter().enumerate() {
-                let result = eval_rule(rule, &all_rules, &all_concepts, record);
+                let result = eval_rule(rule, &all_rules, &all_concepts, &[], record);
                 assert!(
                     result.is_ok(),
                     "runtime error running rule '{}' in {} on record [{}]:\n  {}",

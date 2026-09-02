@@ -1855,6 +1855,22 @@ fn emit_wasm_expr(
         Expr::Contains(haystack, needle) => {
             emit_contains(code, haystack, needle, ctx)
         }
+        // Slice entropy-1, refusal row 13: a NAMED breadcrumb rather than the
+        // generic catch-all below, because the reason is a design decision
+        // and not a missing arm. WASM today refuses EVERY effect (read, fetch,
+        // reactions, services); admitting this one through a WASI import
+        // (`random_get`) would silently make the "WASI vs host-imports" call
+        // CLAUDE.md names as open. When that call is made, `random_get` is
+        // the obvious first import — but randomness must not be the effect
+        // that sneaks the decision in.
+        Expr::Random(name) => Err(WasmError {
+            message: format!(
+                "random('{}') has no WASM lowering: WASM has no syscalls, and admitting one effect \
+                 through a WASI import (random_get) is the WASI-vs-host-imports design call \
+                 CLAUDE.md names — the same one read() and fetch() are waiting on",
+                name
+            ),
+        }),
         _ => Err(WasmError {
             message: format!("unsupported expression in WASM backend"),
         }),

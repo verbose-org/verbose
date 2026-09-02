@@ -484,6 +484,17 @@ fn real_main() {
         // `iter_all_concepts` walks both top-level and group-nested
         // concepts (added in B.1).
         let all_concepts: Vec<&ast::Concept> = ast::iter_all_concepts(&program.items).collect();
+        // Slice entropy-1: the declared entropy items, threaded into the
+        // interpreter beside the rules and concepts so `random(<name>)` can
+        // resolve its width (no process global — design §6.6).
+        let all_entropies: Vec<&ast::Entropy> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ast::Item::Entropy(e) => Some(e),
+                _ => None,
+            })
+            .collect();
 
         // Check if it's a reaction
         let reaction = program.items.iter().find_map(|i| match i {
@@ -510,7 +521,7 @@ fn real_main() {
                 rule_name, rx.trigger, records.len());
 
             for (idx, record) in records.iter().enumerate() {
-                match interpreter::eval_rule(trigger_rule, &all_rules, &all_concepts, record) {
+                match interpreter::eval_rule(trigger_rule, &all_rules, &all_concepts, &all_entropies, record) {
                     Ok(val) => {
                         let should_fire = match &val {
                             interpreter::Value::Bool(true) => true,
@@ -522,7 +533,7 @@ fn real_main() {
                                 match effect {
                                     ast::Effect::Print(args) => {
                                         let parts: Vec<String> = args.iter().map(|arg| {
-                                            match interpreter::eval_rule_expr(arg, trigger_rule, &all_rules, &all_concepts, record) {
+                                            match interpreter::eval_rule_expr(arg, trigger_rule, &all_rules, &all_concepts, &all_entropies, record) {
                                                 Ok(v) => format!("{}", v),
                                                 Err(_) => format!("{:?}", arg),
                                             }
@@ -534,7 +545,7 @@ fn real_main() {
                                         // append to the declared path. The path is a
                                         // literal at parse time, so this is the only
                                         // file this effect can ever touch.
-                                        let text = match interpreter::eval_rule_expr(content, trigger_rule, &all_rules, &all_concepts, record) {
+                                        let text = match interpreter::eval_rule_expr(content, trigger_rule, &all_rules, &all_concepts, &all_entropies, record) {
                                             Ok(interpreter::Value::Text(s)) => s,
                                             Ok(interpreter::Value::Number(n)) => n.to_string(),
                                             Ok(interpreter::Value::Bool(b)) => b.to_string(),
@@ -594,7 +605,7 @@ fn real_main() {
             // Machine-readable JSON output
             let mut results = Vec::new();
             for record in records.iter() {
-                match interpreter::eval_rule(rule, &all_rules, &all_concepts, record) {
+                match interpreter::eval_rule(rule, &all_rules, &all_concepts, &all_entropies, record) {
                     Ok(val) => {
                         let json_val = value_to_json(&val);
                         results.push(format!(
@@ -617,7 +628,7 @@ fn real_main() {
                 records.len()
             );
             for (idx, record) in records.iter().enumerate() {
-                match interpreter::eval_rule(rule, &all_rules, &all_concepts, record) {
+                match interpreter::eval_rule(rule, &all_rules, &all_concepts, &all_entropies, record) {
                     // Backend brick b1: a bytes-typed result is written RAW to
                     // stdout (no label, no escaping, no trailing newline) so the
                     // interpreter output is byte-for-byte comparable with the
@@ -788,6 +799,10 @@ fn resolve_imports(mut program: ast::Program, base_dir: &Path) -> ast::Program {
                 // Phase 9 slice 1 stub: source-rewriting for imported
                 // resources lands when modules can re-export resources.
                 ast::Item::Resource(_) => {}
+                // Slice entropy-1: same handling as Resource — an entropy
+                // item re-exported through a module would need its @source
+                // rewritten; modules cannot re-export effects today.
+                ast::Item::Entropy(_) => {}
                 // Phase 11 slice 1 stub: same handling as Resource —
                 // connections re-exported via modules will need source
                 // rewriting in a later slice.

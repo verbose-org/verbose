@@ -1,5 +1,30 @@
 # Declared randomness — a `getrandom` effect for Verbose
 
+> **IMPLEMENTED 2026-09-02 as slice `entropy-1` (§6 as written), with three corrections
+> measured against the code rather than argued.** (1) **§6.5 NC-3 is caught by the BACKSTOP,
+> not by the screen**: deleting the `syscall` alone leaves `rax = 318 ≠ N`, so `cmp rax, N ;
+> jne abort` fires and the binary exits 1 with no output — T1 fails on the exit code, and T2
+> never sees a zero chunk because the server is dead. The zero-buffer outcome this row
+> predicts appears only when the backstop is deleted TOO ("service: chunk 0 is all zero"),
+> i.e. NC-3-as-written is NC-5's "both" variant; the control was run in that form. (2) **§6.5
+> NC-7 does NOT fail**, and the reason is not a vacuous test: since the 2026-06-22 mmap-arena
+> correction every ENTRY-level arena access reloads r11 from rbp
+> (`emit_arena_base_into_r11`), and entry level is the only level slice 1 can emit a draw at,
+> because the callable path — where "callables keep trusting the r11 register" — is refused
+> (row 9). The `push r11 / pop r11` is kept as slice entropy-4's insurance and is documented
+> as such at the draw site; the probe stays as a pin on the arena + draw COMPOSITION. (3)
+> §6.4 T1(c) was **false on the pre-existing compiler for every rule with an abort tail**:
+> the `--stream` wrapper truncated at the LAST `mov rax, 60`, which for a bounded field, a
+> resource or a draw is the abort tail's exit(1), so the record loop's own exit(0) survived
+> and the process answered ONE line. Measured on the baseline with `examples/alert.verbose`
+> (CLAUDE.md's own `true\nfalse` example printed `true`). Fixed in the same slice by an
+> in-place overwrite of the epilogue's `mov rax, 60 ; syscall`; abort tails and their patch
+> sites now survive `--stream`. Every byte count below stays labelled as a prediction; the
+> measurements are 469 B (`nonce_cli`), 3659 B (`nonce_service`, sixteen `byte_at` sites,
+> each carrying its own inline bounds abort), and a 50-byte draw site with disp8 slots.
+> Also measured: `byte_at` had to join `classify_concat_arg`'s Number-arg set — the flagship's
+> `concat("token:", byte_at(random(nonce), 0), …)` was refused at emit until it did.
+
 **Status: DESIGN NOTE, nothing built.** Written against `main = 490cd50` (2026-09-02). No
 source file was modified, no binary compiled, no test run — every byte count below is a
 prediction from instruction encodings, not a measurement, and is labelled as such. Citations

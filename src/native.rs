@@ -199,6 +199,15 @@ fn compile_native_code(
         Item::Connection(c) => Some((c.name.as_str(), c)),
         _ => None,
     }).collect();
+    // Slice entropy-1: index every top-level `entropy` block by name —
+    // third member of the resource / connection family. The prologue walks
+    // the rule's logic for `random(<name>)` sites and allocates one (ptr,
+    // len, buf) triple per unique item; items the rule never references
+    // contribute zero bytes.
+    let entropies: HashMap<&str, &Entropy> = program.items.iter().filter_map(|i| match i {
+        Item::Entropy(e) => Some((e.name.as_str(), e)),
+        _ => None,
+    }).collect();
     let reaction = program.items.iter().find_map(|i| match i { Item::Reaction(rx) if rx.name == rule_name => Some(rx), _ => None });
 
     let (rule, concept) = if let Some(rx) = reaction {
@@ -706,15 +715,88 @@ fn compile_native_code(
         _ => None,
     };
 
+    // ─── Slice entropy-1 dispatch-level refusals (design §6.2 rows 9–11).
+    // Only the emitters built on `emit_record_loop_prologue` (scalar / bool /
+    // Result / record / text / bytes outputs) and the HTTP accept loop have a
+    // draw site. Every other path is refused HERE, naming the emitter and
+    // the slice that lifts it, so a draw never reaches an emitter that would
+    // silently have no `getrandom` — the accept-what-you-cannot-emit class.
+    {
+        let draws: Vec<String> = collect_rule_random_names_transitive(rule, &rules);
+        let scc_draws: Option<(String, String)> = scc_rules_owned.iter().find_map(|r| {
+            collect_rule_random_names_transitive(r, &rules)
+                .into_iter()
+                .next()
+                .map(|k| (r.name.clone(), k))
+        });
+        if let Some(k) = draws.first() {
+            if reaction.is_some() {
+                return Err(NativeError {
+                    message: format!(
+                        "reaction trigger rule '{}': random('{}') is not supported here (slice entropy-6: \
+                         a draw reaching a reaction's append_file content needs the secrecy argument \
+                         re-made for a file sink)",
+                        rule.name, k
+                    ),
+                });
+            }
+            let refuse_emitter = |emitter: &str| NativeError {
+                message: format!(
+                    "rule '{}': random('{}') is not supported in {} (slice entropy-5: per-element \
+                     draws — each collection emitter has its own prologue, so the per-element unit \
+                     must be argued per emitter)",
+                    rule.name, k, emitter
+                ),
+            };
+            if is_collection_output {
+                return Err(refuse_emitter("emit_collection_program"));
+            }
+            if is_fold_number_output {
+                return Err(refuse_emitter("emit_fold_program"));
+            }
+            if is_fold_text_output {
+                return Err(refuse_emitter("emit_text_fold_program"));
+            }
+            if is_fold_bytes_output {
+                return Err(refuse_emitter("emit_fold_bytes_program"));
+            }
+            if matches!(&rule.output_ty, Type::Number | Type::Bool)
+                && record_output_concept.is_none()
+                && contains_quantifier(&rule.logic.value)
+            {
+                return Err(refuse_emitter("emit_multi_fold_program"));
+            }
+            if is_vectorizable && concept.fields.len() == 1 && extract_simple_gt(rule).is_some() {
+                return Err(refuse_emitter("emit_vectorized_program"));
+            }
+            if is_parallel && !is_result_output && record_output_concept.is_none() {
+                return Err(refuse_emitter("emit_parallel_program"));
+            }
+        }
+        if needs_callable_path {
+            if let Some((who, k)) = draws.first().map(|k| (rule.name.clone(), k.clone())).or(scc_draws) {
+                return Err(NativeError {
+                    message: format!(
+                        "recursive rule '{}': random('{}') is not supported on the callable path \
+                         (recursion, a record-returning callee, or a cross-concept callee) — slice \
+                         entropy-4: a draw-let with a per-callable buffer, the shape read-lets already \
+                         have in emit_callable_into",
+                        who, k
+                    ),
+                });
+            }
+        }
+    }
+
     let mut code = if needs_callable_path {
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
-        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group, &concepts, streaming)?
+        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, &entropies, concept_group, &concepts, streaming)?
     } else if let Some(rx) = reaction {
-        emit_reaction_program(rx, rule, concept, &rules, &resources, &connections, concept_group)?
+        emit_reaction_program(rx, rule, concept, &rules, &resources, &connections, &entropies, concept_group)?
     } else if is_result_output {
-        emit_result_program(rule, concept, &concepts, &rules, &resources, &connections, concept_group)?
+        emit_result_program(rule, concept, &concepts, &rules, &resources, &connections, &entropies, concept_group)?
     } else if is_collection_output {
         emit_collection_program(rule, concept, &concepts, &rules, &resources)?
     } else if is_fold_number_output {
@@ -732,21 +814,21 @@ fn compile_native_code(
     } else if is_fold_bytes_output {
         emit_fold_bytes_program(rule, concept, &rules, &resources)?
     } else if matches!(&rule.output_ty, Type::Text) {
-        emit_text_program(rule, concept, &rules, &resources, &connections, concept_group)?
+        emit_text_program(rule, concept, &rules, &resources, &connections, &entropies, concept_group)?
     } else if matches!(&rule.output_ty, Type::Bytes) {
         // Backend brick b1: `output: bytes` with a `b"..."` literal body.
-        emit_bytes_program(rule, concept, &rules, &resources, &connections, concept_group)?
+        emit_bytes_program(rule, concept, &rules, &resources, &connections, &entropies, concept_group)?
     } else if let Some(rec_concept) = record_output_concept {
-        emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources, &connections, concept_group)?
+        emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources, &connections, &entropies, concept_group)?
     } else if matches!(&rule.output_ty, Type::Number | Type::Bool) && contains_quantifier(&rule.logic.value) {
         // Phase 6: scalar output with embedded quantifiers (e.g. if all(...) then X else Y).
         emit_multi_fold_program(rule, concept, &concepts, &rules, &resources)?
     } else if is_vectorizable && concept.fields.len() == 1 {
-        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources, &connections, concept_group)? }
+        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources, &connections, &entropies, concept_group)? }
     } else if is_parallel {
         emit_parallel_program(rule, concept, &rules, &resources)?
     } else {
-        emit_full_program(rule, concept, context_concept, &rules, &resources, &connections, concept_group)?
+        emit_full_program(rule, concept, context_concept, &rules, &resources, &connections, &entropies, concept_group)?
     };
 
     if stream {
@@ -765,19 +847,52 @@ fn compile_native_code(
             });
         }
 
-        // Strip the exit sequence from the rule code. The exit now includes
-        // an exit-flag load before `mov rax, 60; syscall`, so we search backward
-        // for the `mov rax, 60` pattern (48 C7 C0 3C 00 00 00) and strip from there.
-        let mov_rax_60: [u8; 7] = [0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00];
-        if let Some(pos) = code.windows(7).rposition(|w| w == mov_rax_60) {
-            code.truncate(pos);
-        }
-        // Add stack cleanup: mov rsp, rbp; pop rbp
-        code.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D]);
-        // Add jmp placeholder (rel32, patched after prepend)
-        code.push(0xE9);
-        let jmp_offset_in_rule = code.len(); // position of the rel32 within rule code
-        code.extend_from_slice(&[0x00; 4]);
+        // Replace the record loop's `sys_exit(0)` with the loop-back to
+        // `stream_top`. The epilogue's exit is the ONLY `mov rax, 60`
+        // IMMEDIATELY followed by `syscall` (48 C7 C0 3C 00 00 00 0F 05) —
+        // every abort tail after it is `mov rax, 60 ; mov rdi, 1 ; syscall`,
+        // a different byte sequence — and it is overwritten IN PLACE with the
+        // exact 9 bytes `mov rsp, rbp ; pop rbp ; jmp rel32`, so nothing
+        // after it moves.
+        //
+        // FIXED 2026-09-02 (surfaced by slice entropy-1, PRE-EXISTING since
+        // the 2026-08-05 text bound checks). The previous form searched
+        // backward for the LAST `mov rax, 60` and TRUNCATED the code from
+        // there. For a binary with no abort tail that is the epilogue's exit
+        // and the result is byte-for-byte what the in-place overwrite
+        // produces (the truncated 9 bytes were exactly `mov rax, 60 ;
+        // syscall`, replaced by the same 9 bytes of cleanup + jmp). But an
+        // abort tail — present for any rule with a bounded input field, a
+        // resource, or an entropy draw — ends the binary with ANOTHER
+        // `mov rax, 60`, so the search landed there instead: the record
+        // loop's own `exit(0)` survived, the process exited after the FIRST
+        // line, and every abort patch site was left pointing into the
+        // cleanup + jmp (an abort would have silently looped instead of
+        // exiting 1). Measured on the baseline compiler:
+        // `examples/alert.verbose --stream` fed three lines printed ONE —
+        // the CLAUDE.md example output `true\nfalse` had been false since the
+        // slice that gave `alert` its +23 B text bound check. Pinned by
+        // `stream_mode_processes_every_line_when_an_abort_tail_is_present`.
+        let exit0: [u8; 9] = [0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05];
+        let jmp_offset_in_rule = if let Some(pos) = code.windows(9).rposition(|w| w == exit0) {
+            // mov rsp, rbp ; pop rbp ; jmp rel32 (placeholder, patched below)
+            code[pos..pos + 4].copy_from_slice(&[0x48, 0x89, 0xEC, 0x5D]);
+            code[pos + 4] = 0xE9;
+            code[pos + 5..pos + 9].copy_from_slice(&[0x00; 4]);
+            pos + 5
+        } else {
+            // No recognisable exit — keep the historical fallback so an
+            // unforeseen emitter shape degrades exactly as it always did.
+            let mov_rax_60: [u8; 7] = [0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00];
+            if let Some(pos) = code.windows(7).rposition(|w| w == mov_rax_60) {
+                code.truncate(pos);
+            }
+            code.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D]);
+            code.push(0xE9);
+            let off = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            off
+        };
 
         // Emit the stream prologue
         let mut full = Vec::new();
@@ -1147,7 +1262,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
                 out.push(name.clone());
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Random(_) => {}
         Expr::Field(base, _) => collect_read_names_native(base, out),
         Expr::Binary(_, l, r) => {
             collect_read_names_native(l, out);
@@ -1279,7 +1394,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
 fn expr_uses_now_unix(e: &Expr) -> bool {
     match e {
         Expr::NowUnix => true,
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) => false,
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
@@ -1450,7 +1565,7 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
         }
         // Leaves: no inner expression to recurse into.
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
-        | Expr::Read(_) | Expr::NowUnix => 0,
+        | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => 0,
     }
 }
 
@@ -1466,7 +1581,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
             (matches!(base.as_ref(), Expr::Ident(n) if n == input_name) && fname == field_name)
                 || expr_uses_field(base, input_name, field_name)
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => false,
         Expr::Binary(_, l, r) => {
             expr_uses_field(l, input_name, field_name)
                 || expr_uses_field(r, input_name, field_name)
@@ -2263,7 +2378,7 @@ fn expr_uses_ident_outside_field(expr: &Expr, name: &str) -> bool {
         Expr::Substring(t, a, b) => rec(t) || rec(a) || rec(b),
         Expr::ByteAt(t, i) => rec(t) || rec(i),
         Expr::Fetch(_, request) => rec(request),
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => false,
     }
 }
 
@@ -2616,7 +2731,7 @@ fn collect_field_reads_of(expr: &Expr, name: &str, f: &mut dyn FnMut(&str)) {
             collect_field_reads_of(b, name, f);
         }
         Expr::Fetch(_, request) => collect_field_reads_of(request, name, f),
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_)
         | Expr::NowUnix => {}
     }
 }
@@ -2776,7 +2891,7 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
         }
         // Leaves
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_)
-        | Expr::Ident(_) | Expr::Field(_, _) | Expr::Read(_) | Expr::NowUnix => {}
+        | Expr::Ident(_) | Expr::Field(_, _) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => {}
     }
 }
 
@@ -2911,7 +3026,7 @@ fn gather_transitive_callee_reads(
             }
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
-        | Expr::Read(_) | Expr::NowUnix => {}
+        | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => {}
     }
 }
 
@@ -2957,6 +3072,233 @@ fn compute_resource_extra_bytes(referenced: &[&Resource]) -> i32 {
         .iter()
         .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
         .sum()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Slice entropy-1 — the declared randomness effect (`entropy <name>` +
+// `random(<name>)`). Design: docs/randomness-effect-design.md, implemented
+// as its §6. Everything below mirrors the resource machinery arm-for-arm:
+// a per-name `(ptr, len) + N-byte buffer` triple in the frame, one syscall
+// per name per EVALUATION, the value registered as a BoundText under the
+// composite key `__entropy_<name>` so `byte_at` / `length` / the bytes
+// streamer resolve it through the machinery that already serves `read()`.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Every distinct `random(<name>)` reference in an expression, source order.
+/// Built on the verifier's enumerated child walker so a new `Expr` variant
+/// fails to compile there instead of becoming an unvisited subtree here.
+fn collect_random_names_native(expr: &Expr, out: &mut Vec<String>) {
+    if let Expr::Random(name) = expr {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.clone());
+        }
+    }
+    crate::verifier::walk_expr_children(expr, &mut |child| collect_random_names_native(child, out));
+}
+
+/// Walk for `MatchResult` nodes whose target is a `Call(callee, ...)` and
+/// merge THAT callee's draws into `out` — the exact closure
+/// `gather_transitive_callee_reads` walks for resources, because an inlined
+/// match_result callee that draws needs its slot triple in THIS frame.
+fn gather_transitive_callee_randoms(
+    expr: &Expr,
+    all_rules: &HashMap<&str, &Rule>,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    if let Expr::MatchResult(target, _, _, _, _) = expr {
+        if let Expr::Call(name, _) = target.as_ref() {
+            if let Some(callee) = all_rules.get(name.as_str()) {
+                if visited.insert(callee.name.clone()) {
+                    for (_, e) in &callee.logic.bindings {
+                        collect_random_names_native(e, out);
+                        gather_transitive_callee_randoms(e, all_rules, visited, out);
+                    }
+                    collect_random_names_native(&callee.logic.value, out);
+                    gather_transitive_callee_randoms(&callee.logic.value, all_rules, visited, out);
+                }
+            }
+        }
+    }
+    crate::verifier::walk_expr_children(expr, &mut |child| {
+        gather_transitive_callee_randoms(child, all_rules, visited, out)
+    });
+}
+
+/// Every entropy name a rule draws from — its own let RHSes and body, plus
+/// those of every callee inlined through a `match_result` chain. Source
+/// order, de-duplicated; empty for a rule that never draws.
+fn collect_rule_random_names_transitive(
+    rule: &Rule,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(rule.name.clone());
+    for (_, expr) in &rule.logic.bindings {
+        collect_random_names_native(expr, &mut names);
+        gather_transitive_callee_randoms(expr, all_rules, &mut visited, &mut names);
+    }
+    collect_random_names_native(&rule.logic.value, &mut names);
+    gather_transitive_callee_randoms(&rule.logic.value, all_rules, &mut visited, &mut names);
+    names
+}
+
+/// Resolve a rule's draw names against the program's `entropy` table. An
+/// unknown name is a hard error here — the verifier already refuses it —
+/// so reaching it means the dispatch was handed a stale rule.
+fn collect_referenced_entropies<'a>(
+    rule: &Rule,
+    all_entropies: &HashMap<&str, &'a Entropy>,
+    all_rules: &HashMap<&str, &Rule>,
+    role: &str,
+) -> Result<Vec<&'a Entropy>, NativeError> {
+    let names = collect_rule_random_names_transitive(rule, all_rules);
+    let mut out: Vec<&'a Entropy> = Vec::with_capacity(names.len());
+    for name in &names {
+        let e = all_entropies.get(name.as_str()).ok_or_else(|| NativeError {
+            message: format!(
+                "{} '{}' draws random('{}') but no top-level `entropy {}` was declared",
+                role, rule.name, name, name
+            ),
+        })?;
+        out.push(*e);
+    }
+    Ok(out)
+}
+
+/// Each entropy item contributes 16 bytes (ptr + len) plus its N-byte
+/// buffer padded to 8 — the resource / connection accounting verbatim.
+fn compute_entropy_extra_bytes(referenced: &[&Entropy]) -> i32 {
+    referenced
+        .iter()
+        .map(|e| 16 + (((e.bytes as i32) + 7) & !7))
+        .sum()
+}
+
+/// The (ptr_slot, len_slot, buf_slot, next) quadruple for one entropy item
+/// on a descending frame cursor — the same slot arithmetic
+/// `emit_resource_read_sequence` performs inline, factored out because the
+/// entropy item ALLOCATES at prologue time and DRAWS later (per record /
+/// per request), so the two moments are separate functions.
+fn entropy_slot_triple(next_slot: i32, e: &Entropy) -> (i32, i32, i32, i32) {
+    let ptr_slot = next_slot;
+    let len_slot = next_slot - 8;
+    let buf_padded = ((e.bytes as i32) + 7) & !7;
+    let buf_slot = len_slot - buf_padded;
+    let new_next = buf_slot - 8;
+    (ptr_slot, len_slot, buf_slot, new_next)
+}
+
+/// THE ONE DRAW SITE — `getrandom(&buf, N, 0)` into the item's frame buffer,
+/// then the `(ptr, len)` pair stored so every BoundText reader works
+/// unmodified. Design §5.6, mirrored on `emit_resource_read_sequence` with
+/// the `open` / `close` removed.
+///
+/// REPRODUCIBLE BINARY, NON-REPRODUCIBLE OUTPUT — the distinction, stated
+/// where the emit lives: this function is a pure function of (slots, N) and
+/// emits the same bytes on every compile, which is what the byte-identity
+/// sweep asserts; the bytes the emitted code WRITES INTO THE BUFFER are
+/// different on every evaluation, which is the effect's entire purpose. No
+/// test may assert a value; every runtime assertion is about a property.
+///
+/// Flags word is the CONSTANT 0 — no GRND_RANDOM (the blocking /dev/random
+/// pool, pointless post-4.8), no GRND_NONBLOCK (would make EAGAIN reachable),
+/// no GRND_INSECURE (pre-initialization output). `xor edx, edx` is asserted
+/// on the emitted bytes by `entropy_flags_word_is_zero_and_no_userspace_source`
+/// because a seeded developer host cannot see the flags at runtime.
+///
+/// ERROR POLICY IS ABORT, IN A LISTENER TOO. The text-state design refused a
+/// runtime `sys_exit(1)` as the primary gate for a text-state overflow because
+/// that condition was CLIENT-CONTROLLED ("a remote client who can make the
+/// source exceed N has a one-packet DoS"). That reasoning does NOT transfer:
+/// with flags = 0 and N <= 256, `getrandom(2)`'s failure list reduces to
+/// EAGAIN (needs GRND_NONBLOCK — impossible), EFAULT (buffer is rbp-relative
+/// — impossible), EINVAL (bad flag — impossible), EINTR (only while blocking
+/// pre-initialization, and only by a HANDLED signal — this binary installs
+/// none; SIGCHLD is SIG_IGN under `forked`, which discards without
+/// interrupting), a short read (excluded below 256 on an initialized pool),
+/// and ENOSYS (kernel < 3.17 — permanent, a deployment error). So the ONLY
+/// reachable failure is process-level and triggered by no input a client
+/// sends, and for that the fail-closed doctrine applies with no exception:
+/// serving a zero or stale buffer would be a nonce that is not one. Under
+/// `forked` the child exits 1 and the parent keeps accepting — per-request
+/// fail-closed for free. Pre-initialization the syscall BLOCKS rather than
+/// fails, and that is the desired semantics (design §5.3).
+///
+/// THE BACKSTOP is `cmp rax, N ; jne abort`, NOT `test rax, rax ; js abort`:
+/// one compare catches both a `-errno` and a short read, and it is what
+/// stands between "a future kernel or a future widening of N changes the
+/// contract" and "a nonce with trailing stale bytes". Unreachable by contract
+/// for N <= 256 — exactly like the text-state copy's 13-byte backstop — and
+/// NC-5 shows it is a mechanism rather than decoration: with the syscall
+/// number broken it is what turns a printed garbage token into rc 1.
+///
+/// `push r11 / pop r11` around the syscall: r11 is the arena base and a
+/// syscall clobbers it by ABI; in a rule this draw runs BELOW loop_top,
+/// AFTER the prologue's `lea r11`, so the 4 bytes are the same discipline
+/// `emit_streamed_write_rsi_rdx` uses. MEASURED, NOT A MECHANISM IN SLICE
+/// 1: the design's NC-7 (drop the push/pop, expect a one-node arena probe
+/// to break) does NOT fail — since the 2026-06-22 mmap-arena correction
+/// every ENTRY-level arena access reloads r11 from rbp
+/// (`emit_arena_base_into_r11`), and the entry level is the only level a
+/// draw can be emitted at today, because the callable path — where
+/// "callables keep trusting the r11 register" — is refused (row 9). The
+/// push/pop is therefore insurance for slice entropy-4, kept because the
+/// draw site must not have to be revisited when that path opens.
+///
+/// Registers touched: rax / rdi / rsi / rdx (+ rcx / r11 by the syscall,
+/// r11 restored) — all ephemeral per the CLAUDE.md register table.
+fn emit_entropy_draw(
+    code: &mut Vec<u8>,
+    e: &Entropy,
+    ptr_slot: i32,
+    len_slot: i32,
+    buf_slot: i32,
+    abort_patches: &mut Vec<usize>,
+) {
+    let n = e.bytes as i32;
+    // push r11
+    code.extend_from_slice(&[0x41, 0x53]);
+    // mov rax, 318 (sys_getrandom, x86-64)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3E, 0x01, 0x00, 0x00]);
+    // lea rdi, [rbp + buf_slot]
+    emit_lea_rdi_rbp(code, buf_slot);
+    // mov rsi, N  — the declared literal
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6]);
+    code.extend_from_slice(&n.to_le_bytes());
+    // xor edx, edx  — flags = 0
+    code.extend_from_slice(&[0x31, 0xD2]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // pop r11
+    code.extend_from_slice(&[0x41, 0x5B]);
+    // cmp rax, N ; jne rel32 (abort patch) — the backstop
+    code.extend_from_slice(&[0x48, 0x3D]);
+    code.extend_from_slice(&n.to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x85]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    // mov qword [rbp + len_slot], N — a FACT, not rax: the compare above
+    // just proved them equal.
+    if len_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0xC7, 0x45]);
+        code.push(len_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+        code.extend_from_slice(&len_slot.to_le_bytes());
+    }
+    code.extend_from_slice(&n.to_le_bytes());
+    // lea rax, [rbp + buf_slot] ; mov [rbp + ptr_slot], rax
+    emit_lea_rax_rbp(code, buf_slot);
+    store_rax_at_rbp(code, ptr_slot);
+}
+
+/// Does this rule — or any callee inlined through its match_result chain —
+/// draw from an entropy item? Used by the dispatch-level refusals (rows 9,
+/// 10, 11) so a draw never reaches an emitter that has no draw site.
+fn rule_uses_random(rule: &Rule, all_rules: &HashMap<&str, &Rule>) -> bool {
+    !collect_rule_random_names_transitive(rule, all_rules).is_empty()
 }
 
 /// Shared sys_exit(1) tail for resource open/read failures. Emitted
@@ -3102,8 +3444,8 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
             }
             collect_fetch_names_native(req, out);
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
-        Expr::Read(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Random(_) => {}
+        Expr::Read(_) | Expr::Random(_) => {}
         Expr::Field(base, _) => collect_fetch_names_native(base, out),
         Expr::Binary(_, l, r) => {
             collect_fetch_names_native(l, out);
@@ -3448,7 +3790,7 @@ fn emit_connection_fetch_sequence(
     fn first_fetch_for<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
         match expr {
             Expr::Fetch(n, req) if n == name => Some(req),
-            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) => None,
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) => None,
             Expr::Field(b, _) => first_fetch_for(b, name),
             Expr::Binary(_, l, r) => first_fetch_for(l, name).or_else(|| first_fetch_for(r, name)),
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => first_fetch_for(i, name),
@@ -3702,7 +4044,7 @@ fn find_group_variant_construct_in_expr(
             }
             None
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => None,
         Expr::Field(b, _) => find_group_variant_construct_in_expr(b, group_concepts),
         Expr::Binary(_, l, r) => find_group_variant_construct_in_expr(l, group_concepts)
             .or_else(|| find_group_variant_construct_in_expr(r, group_concepts)),
@@ -3809,7 +4151,7 @@ fn find_group_match_variant_in_expr(
             }
             None
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => None,
         Expr::Field(b, _) => find_group_match_variant_in_expr(b, group_concepts, rule_input_name, rule_input_ty, all_rules),
         Expr::Binary(_, l, r) => find_group_match_variant_in_expr(l, group_concepts, rule_input_name, rule_input_ty, all_rules)
             .or_else(|| find_group_match_variant_in_expr(r, group_concepts, rule_input_name, rule_input_ty, all_rules)),
@@ -3927,6 +4269,7 @@ fn emit_record_loop_prologue<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    all_entropies: &HashMap<&str, &'a Entropy>,
     concept_group: Option<&'a ConceptGroup>,
     // Reserve the arena `MatchVariant` arm-binder pool in this frame?
     //
@@ -4036,6 +4379,16 @@ fn emit_record_loop_prologue<'a>(
         .iter()
         .map(|c| 16 + (((c.max_response as i32) + 7) & !7))
         .sum();
+    // Slice entropy-1: enumerate the entropy items the rule draws from, in
+    // source order (transitively through inlined match_result callees, the
+    // same closure resources use). Each contributes 2 slots (ptr, len) plus
+    // an N-byte buffer padded to 8 — the resource / connection accounting
+    // verbatim. The block sits BELOW resources and connections and ABOVE the
+    // now_unix slot, so a program that draws nothing reserves nothing and
+    // every pre-existing frame is byte-for-byte unchanged.
+    let referenced_entropies: Vec<&Entropy> =
+        collect_referenced_entropies(rule, all_entropies, all_rules, "rule")?;
+    let entropy_extra_bytes: i32 = compute_entropy_extra_bytes(&referenced_entropies);
     // `now_unix()` reservation: 16 bytes (tv_sec at the deeper of two
     // slots, tv_nsec scratch at the slot just above). Detected from the
     // rule's logic + let bindings via `rule_uses_now_unix`. The slot
@@ -4133,6 +4486,7 @@ fn emit_record_loop_prologue<'a>(
     let frame_size = (frame_slots * 8) as i32
         + resource_extra_bytes
         + connection_extra_bytes
+        + entropy_extra_bytes
         + now_extra_bytes
         + arena_extra_bytes;
     let base = (n_ctx + nfields + n_binding_slots) as i32;
@@ -4259,6 +4613,22 @@ fn emit_record_loop_prologue<'a>(
             false, // allow_dynamic_request
         )?;
         text_bindings.insert(c.name.as_str(), (ptr_slot, len_slot));
+        resource_next_slot = new_next;
+    }
+
+    // ─── Slice entropy-1: RESERVE the (ptr, len, buffer) triple for every
+    // referenced entropy item on the same descending cursor resources and
+    // connections use, and register it under the composite key. Reservation
+    // only — NO syscall here. The draw is emitted BELOW loop_top (after the
+    // per-record field loads, before the `let` loop), because the unit is
+    // per EVALUATION: a `--stream` binary processes one line per iteration
+    // for the life of the process, and a draw up here — the `now_unix`
+    // position — would hand every line the SAME nonce (design §5.1, NC-2).
+    let mut entropy_slots: Vec<(&'a Entropy, i32, i32, i32)> = Vec::new();
+    for e in &referenced_entropies {
+        let (ptr_slot, len_slot, buf_slot, new_next) = entropy_slot_triple(resource_next_slot, e);
+        text_bindings.insert(e.binding_key.as_str(), (ptr_slot, len_slot));
+        entropy_slots.push((e, ptr_slot, len_slot, buf_slot));
         resource_next_slot = new_next;
     }
 
@@ -4528,6 +4898,17 @@ fn emit_record_loop_prologue<'a>(
     //   * Text RHS:   emit_text_produce_ptrlen → (rax=ptr, rdx=len) → two consecutive
     //                 slots. The name goes into text_bindings so downstream emitters
     //                 that already handle BoundText (concat args, text-write) see it.
+    // ─── Slice entropy-1: THE DRAW, once per referenced item per RECORD.
+    // Positioned after the field loads and their bound checks (an
+    // out-of-range input aborts before any syscall is spent) and BEFORE the
+    // `let` loop, since a let RHS may read `byte_at(random(k), i)`. Under
+    // `--stream` this is inside the per-line loop, so each line gets a fresh
+    // draw. Failure patches into the same sys_exit(1) tail as resource I/O
+    // and the input bounds checks — one abort mechanism, four failure modes.
+    for &(e, ptr_slot, len_slot, buf_slot) in &entropy_slots {
+        emit_entropy_draw(code, e, ptr_slot, len_slot, buf_slot, &mut resource_abort_patches);
+    }
+
     let mut binding_offsets = offsets;
     for (k, v) in &ctx_offsets {
         binding_offsets.insert(k, *v);
@@ -4814,11 +5195,12 @@ fn emit_full_program<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    all_entropies: &HashMap<&str, &'a Entropy>,
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
-    let mut ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, concept_group, true)?;
+    let mut ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, all_entropies, concept_group, true)?;
 
     // Phase B slice 4a.2 — build an arena context iff the program
     // declares a concept_group. Non-group programs pass `None` (byte-
@@ -4918,6 +5300,7 @@ fn emit_self_recursive_program<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    all_entropies: &HashMap<&str, &'a Entropy>,
     concept_group: Option<&'a ConceptGroup>,
     all_concepts: &[&'a Concept],
     streaming: bool,
@@ -5059,6 +5442,7 @@ fn emit_self_recursive_program<'a>(
     entry_for_prologue.logic.bindings.clear();
     let ctx = emit_record_loop_prologue(
         &mut code, &entry_for_prologue, concept, None, all_rules, all_resources, all_connections,
+        all_entropies,
         concept_group,
         // The SCC's `match`es are emitted inside callables, each of which
         // reserves its own binder pool in its own frame. `_start` never runs
@@ -6090,7 +6474,7 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
                     walk(&a.body, m);
                 }
             }
-            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => {}
             Expr::Field(b, _) => walk(b, m),
             Expr::Binary(_, l, r) => { walk(l, m); walk(r, m); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -6149,7 +6533,7 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
                     walk(&a.body, m, cg);
                 }
             }
-            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => {}
             Expr::Field(b, _) => walk(b, m, cg),
             Expr::Binary(_, l, r) => { walk(l, m, cg); walk(r, m, cg); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -6264,7 +6648,7 @@ fn max_stacked_match_binder_slots(
             | Expr::Text(_)
             | Expr::Bytes(_)
             | Expr::Ident(_)
-            | Expr::Read(_)
+            | Expr::Read(_) | Expr::Random(_)
             | Expr::NowUnix => 0,
             Expr::Field(b, _) => go(b, visiting),
             Expr::Binary(_, l, r) => go(l, visiting).max(go(r, visiting)),
@@ -6336,7 +6720,7 @@ fn max_stacked_match_binder_slots(
 fn body_contains_variant_construct(expr: &Expr) -> bool {
     match expr {
         Expr::VariantConstruct(_, _, _) => true,
-        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => false,
         Expr::Field(b, _) => body_contains_variant_construct(b),
         Expr::Binary(_, l, r) => body_contains_variant_construct(l) || body_contains_variant_construct(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -7091,10 +7475,11 @@ fn emit_text_program<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    all_entropies: &HashMap<&str, &'a Entropy>,
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
 
     // Phase 2I — pass the text_bindings built from the prologue's let-eval
     // loop so text-write resolves Ident(let-name) as a BoundText (same path
@@ -7172,6 +7557,7 @@ fn emit_bytes_program<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    all_entropies: &HashMap<&str, &'a Entropy>,
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     // Backend brick b2: accept a `b"..."` literal (b1) OR a `concat(...)` of
@@ -7179,12 +7565,14 @@ fn emit_bytes_program<'a>(
     // streaming bytes body — each piece writes its raw bytes to fd 1 in order,
     // no buffer, no trailing newline. Anything else stays a later brick.
     match &rule.logic.value {
-        Expr::Bytes(_) | Expr::Concat(_) | Expr::Le32(_) | Expr::Le64(_) => {}
+        // Slice entropy-1: `out = random(k)` as the WHOLE body — the draw's
+        // (ptr, len) streams straight to fd 1 (`examples/nonce_cli.verbose`).
+        Expr::Bytes(_) | Expr::Concat(_) | Expr::Le32(_) | Expr::Le64(_) | Expr::Random(_) => {}
         other => {
             return Err(NativeError {
                 message: format!(
                     "native bytes output supports a `b\"...\"` literal, a bytes `concat(...)`, \
-                     or `le32`/`le64` at the top level (brick b2), got {:?}; \
+                     `le32`/`le64`, or `random(<entropy>)` at the top level, got {:?}; \
                      other bytes shapes are later bricks — use --run (interpreter)",
                     other
                 ),
@@ -7192,7 +7580,7 @@ fn emit_bytes_program<'a>(
         }
     }
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
 
     // The streaming body needs the in-scope bindings the prologue populated so
     // a future le32(<field>) can read a field. r11 is not live here (no arena),
@@ -7258,7 +7646,40 @@ fn emit_streaming_bytes_body(
             emit_write_bytes_literal(code, b, 1);
             Ok(())
         }
+        // Slice entropy-1: stream the current draw — load its (ptr, len)
+        // from the registered slots and write. The raw secret reaches fd 1
+        // because the rule DECLARED `output: bytes`; this is the rule's
+        // declared output, not a leak (design §5.4).
+        Expr::Random(name) => {
+            let key = format!("__entropy_{}", name);
+            let &(ptr_slot, len_slot) = text_bindings.get(key.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "random('{}') has no (ptr, len) slots registered in this scope — the draw site \
+                     is emitted only by the record-loop prologue (slice entropy-1)",
+                    name
+                ),
+            })?;
+            emit_load_rsi_rdx_from_slots(code, ptr_slot, len_slot);
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
         Expr::Concat(args) => {
+            // Slice entropy-1, refusal row 12: a draw as ONE ARGUMENT of a
+            // bytes concat is slice entropy-2 (streaming BoundText — the
+            // shape that puts `server_random` into a ServerHello transcript,
+            // whose interaction with the streaming ABI is unanalysed).
+            // Slice 1 accepts `random(k)` only as the whole body.
+            for a in args {
+                if let Expr::Random(name) = a {
+                    return Err(NativeError {
+                        message: format!(
+                            "output: bytes concat: random('{}') as an argument is slice entropy-2 \
+                             (streaming BoundText); slice 1 accepts random({}) only as the whole body",
+                            name, name
+                        ),
+                    });
+                }
+            }
             // THE shape brick b2 exists for. No buffer, no sizing pass:
             // each arg streams its own bytes left to right.
             for a in args {
@@ -7632,7 +8053,13 @@ fn classify_concat_arg(
         Expr::NowUnix => Some(ConcatArgKind::Number),
         // `length(...)`, `parse_int(...)`, `abs(...)` all return Number.
         // Concat's Number-arg path runs them through emit_eval_expr.
-        Expr::Length(_) | Expr::ParseInt(_) | Expr::Abs(_) => Some(ConcatArgKind::Number),
+        // `byte_at(...)` joined them with slice entropy-1: it is Number by
+        // the verifier's inference, `emit_eval_expr` already has its arm, and
+        // rendering a draw byte by byte (`concat("token:", byte_at(random(k),
+        // 0), ".", …)`) is the flagship consumer. No pre-existing program
+        // could have used a `byte_at` here — this arm refused it before, so
+        // the widening changes no emitted byte of the corpus.
+        Expr::Length(_) | Expr::ParseInt(_) | Expr::Abs(_) | Expr::ByteAt(_, _) => Some(ConcatArgKind::Number),
         Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
             Some(ConcatArgKind::BoundText)
         }
@@ -9936,6 +10363,7 @@ fn emit_result_program<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    all_entropies: &HashMap<&str, &'a Entropy>,
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     // Restrict to Result(number, text) for now — the calling convention is
@@ -9978,7 +10406,7 @@ fn emit_result_program<'a>(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
@@ -11015,6 +11443,7 @@ fn emit_record_program<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    all_entropies: &HashMap<&str, &'a Entropy>,
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     // Validate output concept's fields — native today handles number + text only.
@@ -11033,7 +11462,7 @@ fn emit_record_program<'a>(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
 
     emit_eval_record_expr(
         &mut code,
@@ -14058,12 +14487,13 @@ fn emit_reaction_program<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    all_entropies: &HashMap<&str, &'a Entropy>,
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     // Both Print and AppendFile effects are handled below.
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
 
     // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
     emit_eval_expr(
@@ -14204,7 +14634,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Concat(args) => args.iter().map(max_stack_depth).max().unwrap_or(0),
         // Phase 9 slice 1 stub: a Read leaf has no eval-stack consumption
         // (the result lands in registers/slots like any other text).
-        Expr::Read(_) => 0,
+        Expr::Read(_) | Expr::Random(_) => 0,
         // Phase 11 slice 1: a Fetch's response lands in (ptr, len) slots
         // populated by the prologue, exactly like Read. The request bytes
         // expression is evaluated above loop_top once per rule invocation,
@@ -16703,6 +17133,22 @@ fn emit_eval_expr(
         Expr::Read(_) => Err(NativeError {
             message: "Expr::Read in number context — read() returns text, use it in a text-typed position".into(),
         }),
+        // Slice entropy-1: a draw is BYTES and has no scalar lowering. It is
+        // consumed by `byte_at(random(k), i)` / `length(random(k))` (which
+        // never route through here) or as the whole body of an
+        // `output: bytes` rule. Reaching this arm means a value position —
+        // most likely `let s = random(k)` as a WHOLE let RHS, which the
+        // prologue classifies as a number let: a bytes-typed draw-let with
+        // its own buffer is slice entropy-4.
+        Expr::Random(name) => Err(NativeError {
+            message: format!(
+                "random('{}') in a number / value position — a draw is bytes with no scalar lowering; \
+                 consume it with byte_at(random({}), i) or length(random({})), or as the whole body of \
+                 an `output: bytes` rule (a bytes-typed `let` is slice entropy-4: a draw-let with a \
+                 per-callable buffer)",
+                name, name, name
+            ),
+        }),
         // Phase 11 slice 1: same shape as Read — fetch() returns text,
         // not a number. The verifier already rejects this; the error
         // here is a defensive catch.
@@ -17087,6 +17533,29 @@ fn emit_length(
             code.extend_from_slice(&[0x48, 0x89, 0xD0]);
             Ok(())
         }
+        // Slice entropy-1: `length(random(k))` loads the declared width from
+        // the registered len_slot — the SAME instruction a BoundText takes,
+        // deliberately not folded to a literal (design §5.5: the len_slot
+        // stays the single source of that number).
+        Expr::Random(name) => {
+            let key = format!("__entropy_{}", name);
+            let &(_ptr_slot, len_slot) = text_bindings.get(key.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "length(random('{}')) has no (ptr, len) slots registered in this scope — the draw \
+                     site is emitted only by the record-loop prologue and the HTTP accept loop \
+                     (slice entropy-1); this emitter has no draw site",
+                    name
+                ),
+            })?;
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
         Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _)
             if text_bindings.contains_key(name.as_str()) =>
         {
@@ -17468,6 +17937,41 @@ fn emit_starts_with_load_text(
             emit_strlen(code);
             // mov rcx, rdx
             code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+            Ok(())
+        }
+        // Slice entropy-1: `random(<entropy>)` — the draw's (ptr, len) pair
+        // lives at the slots the prologue / accept loop registered under the
+        // COMPOSITE key `__entropy_<name>` (never the bare name — see
+        // `Entropy::binding_key`). Reachable only from `byte_at` / `length`,
+        // the two byte-addressed primitives the verifier admits a bytes
+        // operand for; every text primitive checks against `Type::Text`
+        // first and never gets here with a draw.
+        Expr::Random(name) => {
+            let key = format!("__entropy_{}", name);
+            let &(ptr_slot, len_slot) = text_bindings.get(key.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "random('{}') has no (ptr, len) slots registered in this scope — the draw site \
+                     is emitted only by the record-loop prologue and the HTTP accept loop \
+                     (slice entropy-1); this emitter has no draw site",
+                    name
+                ),
+            })?;
+            // mov rsi, [rbp + ptr_slot]
+            if ptr_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(ptr_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&ptr_slot.to_le_bytes());
+            }
+            // mov rcx, [rbp + len_slot]
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
             Ok(())
         }
         Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _)
@@ -19964,6 +20468,26 @@ pub fn compile_service(
             ),
         })?;
 
+    // Slice entropy-1, refusal row 11: a draw in a `raw_tcp` handler. The
+    // identity-handler gate below would refuse it too, but without naming
+    // the slice: slice entropy-2 brings the bytes stream (`server_random`
+    // into a transcript) and the raw_tcp handler with it.
+    {
+        let rules_by_name: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i {
+            Item::Rule(r) => Some((r.name.as_str(), r)),
+            _ => None,
+        }).collect();
+        if let Some(k) = collect_rule_random_names_transitive(handler, &rules_by_name).first() {
+            return Err(NativeError {
+                message: format!(
+                    "raw_tcp handler '{}': random('{}') is not supported here (slice entropy-2: \
+                     the bytes stream — a draw in a raw_tcp handler lands with it)",
+                    handler.name, k
+                ),
+            });
+        }
+    }
+
     // Enforce identity handler for slice 2b. The verifier already
     // guarantees the shape of input and output concepts; here we check
     // that the logic is literally `OutputConcept { f: input_var.f }` so
@@ -20235,6 +20759,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Record(_, _) => "Record",
         Expr::Concat(_) => "Concat",
         Expr::Read(_) => "Read",
+        Expr::Random(_) => "Random",
         Expr::Fetch(_, _) => "Fetch",
         Expr::JsonEscape(_) => "JsonEscape",
         Expr::ParseInt(_) => "ParseInt",
@@ -20398,7 +20923,15 @@ fn compile_http10_dynamic_service(
         _ => None,
     }).collect();
 
-    let code = emit_http10_dynamic_bytes(service, handler, &offsets, &no_rules, &no_ranges, &all_resources, &all_connections)?;
+    // Slice entropy-1: index every top-level `entropy` block by name so the
+    // dynamic emitter can allocate one (ptr, len, buffer) triple per item
+    // the handler draws from. Mirrors the two indexes above.
+    let all_entropies: HashMap<&str, &Entropy> = program.items.iter().filter_map(|i| match i {
+        Item::Entropy(e) => Some((e.name.as_str(), e)),
+        _ => None,
+    }).collect();
+
+    let code = emit_http10_dynamic_bytes(service, handler, &offsets, &no_rules, &no_ranges, &all_resources, &all_connections, &all_entropies)?;
     write_server_elf(&code, output_path, "service", service.port)
 }
 
@@ -20534,6 +21067,7 @@ fn emit_http10_dynamic_bytes(
     field_ranges: &HashMap<&str, (i64, i64)>,
     all_resources: &HashMap<&str, &Resource>,
     all_connections: &HashMap<&str, &Connection>,
+    all_entropies: &HashMap<&str, &Entropy>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
@@ -20604,6 +21138,17 @@ fn emit_http10_dynamic_bytes(
         .iter()
         .map(|c| 16 + (((c.max_response as i32) + 7) & !7))
         .sum();
+    // Slice entropy-1: enumerate the entropy items the handler draws from
+    // (transitively through inlined match_result callees) and reserve the
+    // same (ptr, len, buffer) triple a resource gets, in the block after
+    // the connections. The DRAW is per accept, emitted after the connection
+    // block — i.e. after the fork dispatch AND after the HTTP parse — so
+    // every instruction of it runs in the child under `forked`: a child
+    // never inherits its parent's sample (design §5.2, NC-1). There is
+    // deliberately no `cache:`-style hoist above `accept_top` for entropy.
+    let referenced_entropies: Vec<&Entropy> =
+        collect_referenced_entropies(handler, all_entropies, all_rules, "service handler")?;
+    let entropy_extra_bytes: i32 = compute_entropy_extra_bytes(&referenced_entropies);
     // Slot map below rbp:
     //   -8     method ptr (parser output)
     //   -16    path ptr   (parser output)
@@ -20702,7 +21247,7 @@ fn emit_http10_dynamic_bytes(
     let state_composite_keys: Vec<String> = service.state_fields.iter()
         .map(|sf| format!("__state_{}", sf.name))
         .collect();
-    let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes;
+    let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes + entropy_extra_bytes;
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
     // shared abort sequence; left empty when policy is Drop.
@@ -21178,6 +21723,25 @@ fn emit_http10_dynamic_bytes(
             true, // allow_dynamic_request — slice 11.3 lifts the guard
         )?;
         http_text_bindings.insert(c.name.as_str(), (ptr_slot, len_slot));
+        resource_next_slot = new_next;
+    }
+
+    // ═══ ENTROPY DRAWS (slice entropy-1) ═══════════════════════
+    // One `getrandom` per referenced item per ACCEPT, placed immediately
+    // after the connection block and before the handler lets: after the
+    // fork dispatch (so under `forked` the child draws its own bytes and
+    // the parent's frame is never the source of a child's sample) and after
+    // the HTTP parse (so a malformed request that is dropped never spends a
+    // draw). The slots continue the resource / connection cursor and are
+    // overwritten in place on every iteration; the (ptr, len) pair registers
+    // under `__entropy_<name>` so `byte_at` / `length` in the handler body
+    // and the handler lets resolve through the BoundText lookup. A `-errno`
+    // or short read patches into the same end-of-binary sys_exit(1) as the
+    // slice-8d log abort and the resource path.
+    for e in &referenced_entropies {
+        let (ptr_slot, len_slot, buf_slot, new_next) = entropy_slot_triple(resource_next_slot, e);
+        emit_entropy_draw(&mut code, e, ptr_slot, len_slot, buf_slot, &mut abort_patches);
+        http_text_bindings.insert(e.binding_key.as_str(), (ptr_slot, len_slot));
         resource_next_slot = new_next;
     }
 
@@ -29702,7 +30266,7 @@ rule discount
             let mut input = std::collections::HashMap::new();
             input.insert("amount".to_string(), crate::interpreter::Value::Number(amount));
             input.insert("approved".to_string(), crate::interpreter::Value::Number(approved));
-            let interp = match crate::interpreter::eval_rule(discount, &all_rules, &concepts, &input) {
+            let interp = match crate::interpreter::eval_rule(discount, &all_rules, &concepts, &[], &input) {
                 Ok(crate::interpreter::Value::Number(n)) => n,
                 other => panic!("interpreter must return a number for discount; got {:?}", other),
             };
@@ -30430,7 +30994,7 @@ rule big_ones
                 [10i64, 20, 30, 40].iter().map(|&n| crate::interpreter::Value::Number(n)).collect(),
             ),
         );
-        let expected = match crate::interpreter::eval_rule(doubled, &all_rules, &concepts, &input) {
+        let expected = match crate::interpreter::eval_rule(doubled, &all_rules, &concepts, &[], &input) {
             Ok(crate::interpreter::Value::List(vs)) => vs
                 .iter()
                 .map(|v| match v {
@@ -33485,6 +34049,770 @@ rule check
             errors
         );
 
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Slice entropy-1 — the declared randomness effect.
+    // docs/randomness-effect-design.md §6.4 (T1–T7) and §6.5 (NC-1..NC-7).
+    // No test below asserts a VALUE: the output is non-deterministic by
+    // design, so every runtime assertion is about a property — length,
+    // distinctness, distribution, exit code — and the security evidence is
+    // asserted on the EMITTED BYTES (syscall number, flags word, position
+    // relative to fork), because a seeded developer host cannot see any of
+    // it at runtime.
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn entropy_parse(src: &str) -> Result<Program, String> {
+        let tokens = crate::lexer::Lexer::new(src).tokenize().map_err(|e| format!("{:?}", e))?;
+        crate::parser::Parser::new(tokens).parse_program().map_err(|e| format!("{:?}", e))
+    }
+
+    /// Lex + parse + verify; every error (either stage) as one string.
+    fn entropy_verify(src: &str) -> Vec<String> {
+        match entropy_parse(src) {
+            Err(e) => vec![e],
+            Ok(p) => crate::verifier::verify_program(&p, std::path::Path::new("examples"))
+                .into_iter()
+                .map(|e| format!("{}: {}", e.context, e.message))
+                .collect(),
+        }
+    }
+
+    /// Compile one rule natively (argv mode unless `stream`) and return the
+    /// emitted bytes.
+    fn entropy_native(src: &str, rule: &str, tag: &str, stream: bool) -> Result<Vec<u8>, String> {
+        let program = entropy_parse(src)?;
+        let out = std::env::temp_dir().join(format!("verbosec_test_entropy_{}", tag));
+        compile_native(&program, rule, out.to_str().unwrap(), stream, stream)
+            .map_err(|e| e.message)?;
+        let bytes = std::fs::read(&out).expect("read emitted binary");
+        Ok(bytes)
+    }
+
+    fn entropy_service_bytes(src: &str, service: &str, tag: &str) -> Result<Vec<u8>, String> {
+        let program = entropy_parse(src)?;
+        let out = std::env::temp_dir().join(format!("verbosec_test_entropy_svc_{}", tag));
+        compile_service(&program, service, out.to_str().unwrap()).map_err(|e| e.message)?;
+        Ok(std::fs::read(&out).expect("read emitted service"))
+    }
+
+    fn entropy_cli_src() -> String {
+        std::fs::read_to_string("examples/nonce_cli.verbose").expect("examples/nonce_cli.verbose")
+    }
+
+    /// The flagship with its port templated, plus the forked twin the design
+    /// (§6.3) says is "the same source" driven by the same test.
+    fn entropy_service_src(forked: bool) -> String {
+        let src = std::fs::read_to_string("examples/nonce_service.verbose")
+            .expect("examples/nonce_service.verbose")
+            .replace("port        : 18960", "port        : __PORT__");
+        if forked {
+            src.replace("  handler: issue\n", "  handler: issue\n\n  concurrency: forked\n")
+        } else {
+            src
+        }
+    }
+
+    /// Spawn a service binary on an ephemeral port and hold `n` real TCP
+    /// conversations, returning each response body. `text_state_drive`'s
+    /// shape, generalised to an arbitrary request and an N.
+    fn entropy_service_drive(
+        src_template: &str,
+        service_name: &str,
+        tag: &str,
+        request: &[u8],
+        n: usize,
+    ) -> Vec<String> {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            l.local_addr().unwrap().port()
+        };
+        let src = src_template.replace("__PORT__", &port.to_string());
+        let program = entropy_parse(&src).expect("parse");
+        let out = std::env::temp_dir().join(format!("verbosec_test_entropy_drive_{}", tag));
+        compile_service(&program, service_name, out.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("service should compile: {}", e.message));
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut bound = false;
+        for _ in 0..100 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "service never bound on port {}", port);
+
+        let mut bodies = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(request).expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let response = String::from_utf8_lossy(&buf).to_string();
+            let body = match response.find("\r\n\r\n") {
+                Some(i) => response[i + 4..].to_string(),
+                None => response.clone(),
+            };
+            bodies.push(body);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&out);
+        bodies
+    }
+
+    /// `token:a.b.c…` (16 numbers, each 0..=255) → the 16 bytes.
+    fn entropy_token_bytes(body: &str) -> Vec<u8> {
+        let rest = body
+            .strip_prefix("token:")
+            .unwrap_or_else(|| panic!("body must start with `token:`, got {:?}", body));
+        let parts: Vec<&str> = rest.trim_end_matches('\n').split('.').collect();
+        assert_eq!(parts.len(), 16, "16 dotted numbers, got {:?}", body);
+        parts
+            .iter()
+            .map(|p| {
+                let v: i64 = p.parse().unwrap_or_else(|_| panic!("not a number: {:?} in {:?}", p, body));
+                assert!((0..=255).contains(&v), "byte out of range in {:?}", body);
+                v as u8
+            })
+            .collect()
+    }
+
+    fn entropy_run_cli(bin: &std::path::Path, args: &[String]) -> (Vec<u8>, i32) {
+        let r = std::process::Command::new(bin).args(args).output().expect("spawn cli");
+        (r.stdout, r.status.code().unwrap_or(-1))
+    }
+
+    /// Compile `examples/nonce_cli.verbose` to a file and return its path.
+    fn entropy_cli_bin(tag: &str, stream: bool) -> std::path::PathBuf {
+        let program = entropy_parse(&entropy_cli_src()).expect("parse");
+        let out = std::env::temp_dir().join(format!("verbosec_test_entropy_cli_{}", tag));
+        compile_native(&program, "nonce", out.to_str().unwrap(), stream, stream)
+            .unwrap_or_else(|e| panic!("nonce_cli should compile: {}", e.message));
+        out
+    }
+
+    fn entropy_chunks_distinct(bytes: &[u8], width: usize) -> bool {
+        let chunks: Vec<&[u8]> = bytes.chunks(width).collect();
+        for i in 0..chunks.len() {
+            for j in (i + 1)..chunks.len() {
+                if chunks[i] == chunks[j] {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// T1 — the SAMPLING UNIT, per name per EVALUATION, measured on every
+    /// context slice 1 serves: per input record in an argv batch (a), across
+    /// invocations (b), per line under `--stream` (c), per request in a
+    /// sequential service (d), and per request in a FORKED service (e).
+    ///
+    /// (a) and (c) are the rows NC-2 breaks (a draw hoisted above loop_top
+    /// hands every record the same bytes) while (b) still passes — which is
+    /// why (a) and (c) exist. (e) is the row NC-1 breaks (a draw hoisted
+    /// above accept_top is inherited by every forked child via COW — 64
+    /// identical bodies) and the reason the forked twin is driven
+    /// separately: it is the §5.2 hazard, exercised.
+    #[test]
+    fn entropy_draw_is_fresh_per_record_and_per_request() {
+        // (a) three records in one invocation → 96 bytes, three distinct nonces
+        let bin = entropy_cli_bin("t1", false);
+        let args: Vec<String> = ["1", "2", "3"].iter().map(|s| s.to_string()).collect();
+        let (out1, rc) = entropy_run_cli(&bin, &args);
+        assert_eq!(rc, 0);
+        assert_eq!(out1.len(), 96, "3 records × 32 bytes, no newline");
+        assert!(entropy_chunks_distinct(&out1, 32), "records in one invocation must not share a draw");
+        // (b) a second invocation → six pairwise-distinct nonces
+        let (out2, _) = entropy_run_cli(&bin, &args);
+        let mut both = out1.clone();
+        both.extend_from_slice(&out2);
+        assert!(entropy_chunks_distinct(&both, 32), "two invocations must not share a draw");
+        let _ = std::fs::remove_file(&bin);
+
+        // (c) --stream: eight lines → 256 bytes, eight distinct nonces
+        {
+            use std::io::{Read, Write};
+            use std::process::{Command, Stdio};
+            let sbin = entropy_cli_bin("t1_stream", true);
+            let mut child = Command::new(&sbin)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn stream");
+            {
+                let mut stdin = child.stdin.take().unwrap();
+                for i in 1..=8 {
+                    stdin.write_all(format!("{}\n", i).as_bytes()).unwrap();
+                }
+            }
+            let mut got = Vec::new();
+            child.stdout.take().unwrap().read_to_end(&mut got).unwrap();
+            let st = child.wait().unwrap();
+            assert_eq!(st.code(), Some(0));
+            assert_eq!(got.len(), 256, "8 lines × 32 bytes under --stream");
+            assert!(entropy_chunks_distinct(&got, 32), "lines under --stream must not share a draw");
+            let _ = std::fs::remove_file(&sbin);
+        }
+
+        // (d) sequential service: 64 requests, 64 well-formed, pairwise-distinct tokens
+        let req = b"GET /token HTTP/1.0\r\n\r\n";
+        let seq = entropy_service_drive(&entropy_service_src(false), "token_server", "t1_seq", req, 64);
+        assert_eq!(seq.len(), 64);
+        let seq_bytes: Vec<Vec<u8>> = seq.iter().map(|b| entropy_token_bytes(b)).collect();
+        for i in 0..seq_bytes.len() {
+            for j in (i + 1)..seq_bytes.len() {
+                assert_ne!(seq_bytes[i], seq_bytes[j], "sequential requests {} and {} share a draw", i, j);
+            }
+        }
+        // (e) the FORKED twin: same assertion. This is the row that catches
+        // NC-1 (a draw above accept_top inherited by every child).
+        let fk = entropy_service_drive(&entropy_service_src(true), "token_server", "t1_forked", req, 64);
+        assert_eq!(fk.len(), 64);
+        let fk_bytes: Vec<Vec<u8>> = fk.iter().map(|b| entropy_token_bytes(b)).collect();
+        for i in 0..fk_bytes.len() {
+            for j in (i + 1)..fk_bytes.len() {
+                assert_ne!(fk_bytes[i], fk_bytes[j], "forked children {} and {} share the parent's draw", i, j);
+            }
+        }
+    }
+
+    /// T2 — the CHEAP STATISTICAL SCREEN, and what it is and is not. It
+    /// distinguishes a CSPRNG from zeros, a constant, or an aliased buffer
+    /// (NC-3, NC-5: a deleted syscall leaves the zero-initialised frame). It
+    /// CANNOT distinguish a CSPRNG from a competent userspace PRNG and does
+    /// not claim to — the security evidence is STRUCTURAL and lives in T6.
+    #[test]
+    fn entropy_bytes_pass_a_gross_breakage_screen() {
+        fn screen(label: &str, chunks: &[Vec<u8>]) {
+            let flat: Vec<u8> = chunks.iter().flatten().copied().collect();
+            for (i, c) in chunks.iter().enumerate() {
+                assert!(c.iter().any(|&b| b != 0), "{}: chunk {} is all zero", label, i);
+            }
+            let mut seen = [false; 256];
+            for &b in &flat {
+                seen[b as usize] = true;
+            }
+            let distinct = seen.iter().filter(|&&s| s).count();
+            assert!(
+                distinct >= 200,
+                "{}: only {} distinct byte values over {} bytes (expected ≈251 at 1024 draws)",
+                label, distinct, flat.len()
+            );
+            let bits = (flat.len() * 8) as f64;
+            let ones: usize = flat.iter().map(|b| b.count_ones() as usize).sum();
+            let tol = 5.5 * (bits / 4.0).sqrt();
+            assert!(
+                ((ones as f64) - bits / 2.0).abs() <= tol,
+                "{}: monobit {} of {} bits is outside {} ± {}",
+                label, ones, bits as usize, bits / 2.0, tol
+            );
+        }
+        // 64 × 16 = 1024 service bytes
+        let req = b"GET /token HTTP/1.0\r\n\r\n";
+        let bodies = entropy_service_drive(&entropy_service_src(false), "token_server", "t2", req, 64);
+        let svc: Vec<Vec<u8>> = bodies.iter().map(|b| entropy_token_bytes(b)).collect();
+        screen("service", &svc);
+        // 64 × 32 = 2048 CLI bytes
+        let bin = entropy_cli_bin("t2", false);
+        let args: Vec<String> = (1..=64).map(|i| i.to_string()).collect();
+        let (out, rc) = entropy_run_cli(&bin, &args);
+        assert_eq!(rc, 0);
+        assert_eq!(out.len(), 2048);
+        let cli: Vec<Vec<u8>> = out.chunks(32).map(|c| c.to_vec()).collect();
+        screen("cli", &cli);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Minimal number-output rule drawing from `k`, with the entropy block
+    /// and the reads list parameterised so every refusal has a corrected
+    /// twin one substitution away.
+    fn entropy_probe(entropy_block: &str, reads: &str, body: &str) -> String {
+        format!(
+            "@verbose 0.1.0\n\n{entropy}\nconcept T\n  @intention: \"one number input\"\n  @source: nonce_cli.intent:1\n  fields:\n    n : number [0, 1000]\n\nrule f\n  @intention: \"probe\"\n  @source: nonce_cli.intent:1\n  input:\n    t : T\n  output:\n    o : number\n  logic:\n    o = {body}\n  proofs:\n    purity:\n      reads : [{reads}]\n      calls : []\n    termination:\n      bound : 6\n",
+            entropy = entropy_block, reads = reads, body = body
+        )
+    }
+
+    fn entropy_block(name: &str, bytes: &str, extra: &str) -> String {
+        format!(
+            "entropy {name}\n  @intention: \"probe entropy\"\n  @source: nonce_cli.intent:1\n\n  bytes : {bytes}\n{extra}\n",
+            name = name, bytes = bytes, extra = extra
+        )
+    }
+
+    /// T3 — §6.2 rows 1–8 (and the `after:` half of row 11), each with a
+    /// CORRECTED TWIN that must verify clean, so every refusal is
+    /// attributable to the one thing the fixture changes. The `reads:` half
+    /// is asserted in BOTH directions — `missing: [k]` when omitted, `extra:
+    /// [k]` when declared on a rule that draws nothing — the half-checked-
+    /// purity lesson from the gen0 arc.
+    #[test]
+    fn entropy_verifier_requires_declaration_reads_and_bounds() {
+        let ok_block = entropy_block("k", "16", "");
+        let twin = entropy_probe(&ok_block, "t.n, k", "t.n + byte_at(random(k), 0)");
+        let errs = entropy_verify(&twin);
+        assert!(errs.is_empty(), "the corrected twin must verify clean: {:?}", errs);
+
+        // row 1: bytes out of 1..=256 — floor at the parser, ceiling at the
+        // verifier, ONE wording.
+        for bad in ["0", "300", "257"] {
+            let src = entropy_probe(&entropy_block("k", bad, ""), "t.n, k", "t.n + byte_at(random(k), 0)");
+            let errs = entropy_verify(&src);
+            assert!(
+                errs.iter().any(|e| e.contains("bytes must be a literal in 1..=256") && e.contains("entropy-3")),
+                "bytes : {} must be refused with the row-1 breadcrumb, got {:?}", bad, errs
+            );
+        }
+        {
+            let src = entropy_probe(
+                "entropy k\n  @intention: \"no width\"\n  @source: nonce_cli.intent:1\n",
+                "t.n, k", "t.n + byte_at(random(k), 0)",
+            );
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("bytes must be a literal in 1..=256")), "missing bytes: {:?}", errs);
+        }
+        // 256 is IN — the contract's boundary, not one past it.
+        {
+            let src = entropy_probe(&entropy_block("k", "256", ""), "t.n, k", "t.n + byte_at(random(k), 255)");
+            assert!(entropy_verify(&src).is_empty(), "bytes : 256 is the contract's inclusive ceiling");
+        }
+        // row 2: on_draw_error: drop
+        {
+            let src = entropy_probe(&entropy_block("k", "16", "  on_draw_error : drop"), "t.n, k", "t.n + byte_at(random(k), 0)");
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("on_draw_error 'drop' is not accepted") && e.contains("§5.3")), "{:?}", errs);
+            let src = entropy_probe(&entropy_block("k", "16", "  on_draw_error : abort"), "t.n, k", "t.n + byte_at(random(k), 0)");
+            assert!(entropy_verify(&src).is_empty());
+        }
+        // row 3: cache on an entropy item
+        {
+            let src = entropy_probe(&entropy_block("k", "16", "  cache : true"), "t.n, k", "t.n + byte_at(random(k), 0)");
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("'cache' is not a field of entropy") && e.contains("forked child")), "{:?}", errs);
+        }
+        // row 4: duplicate name; collision with a resource; with a connection
+        {
+            let dup = format!("{}{}", ok_block, ok_block);
+            let src = entropy_probe(&dup, "t.n, k", "t.n + byte_at(random(k), 0)");
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("duplicate entropy name 'k'")), "{:?}", errs);
+            let res = format!(
+                "{}resource k\n  @intention: \"same name\"\n  @source: nonce_cli.intent:1\n\n  path: \"/tmp/x\"\n  max: 16\n  on_read_error: abort\n\n",
+                ok_block
+            );
+            let src = entropy_probe(&res, "t.n, k", "t.n + byte_at(random(k), 0)");
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("collides with a resource")), "{:?}", errs);
+            let conn = format!(
+                "{}connection k\n  @intention: \"same name\"\n  @source: nonce_cli.intent:1\n\n  host: \"127.0.0.1\"\n  port: 9\n  max_response: 16\n  on_connect_error: abort\n\n",
+                ok_block
+            );
+            let src = entropy_probe(&conn, "t.n, k", "t.n + byte_at(random(k), 0)");
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("collides with a connection")), "{:?}", errs);
+            // twin: a differently-named resource beside the entropy item
+            let res2 = format!(
+                "{}resource cfg\n  @intention: \"other name\"\n  @source: nonce_cli.intent:1\n\n  path: \"/tmp/x\"\n  max: 16\n  on_read_error: abort\n\n",
+                ok_block
+            );
+            let src = entropy_probe(&res2, "t.n, k", "t.n + byte_at(random(k), 0)");
+            assert!(entropy_verify(&src).is_empty());
+        }
+        // row 5: random(k) with no `entropy k`
+        {
+            let src = entropy_probe("", "t.n, k", "t.n + byte_at(random(k), 0)");
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("random('k') references unknown entropy")), "{:?}", errs);
+        }
+        // row 6: reads both ways
+        {
+            let src = entropy_probe(&ok_block, "t.n", "t.n + byte_at(random(k), 0)");
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("missing: [k]")), "undeclared draw must be `missing`: {:?}", errs);
+            let src = entropy_probe(&ok_block, "t.n, k", "t.n + 1");
+            let errs = entropy_verify(&src);
+            assert!(errs.iter().any(|e| e.contains("extra: [k]")), "declared-but-unperformed draw must be `extra`: {:?}", errs);
+        }
+        // row 7: text positions — the existing bytes/text isolation, no new
+        // message. Each fixture is one text sink handed the raw draw.
+        {
+            let text_probe = |body: &str, out_ty: &str| {
+                format!(
+                    "@verbose 0.1.0\n\n{block}\nconcept T\n  @intention: \"one text input\"\n  @source: nonce_cli.intent:1\n  fields:\n    s : text [..8]\n\nrule f\n  @intention: \"probe\"\n  @source: nonce_cli.intent:1\n  input:\n    t : T\n  output:\n    o : {out}\n  logic:\n    o = {body}\n  proofs:\n    purity:\n      reads : [t.s, k]\n      calls : []\n    termination:\n      bound : 6\n",
+                    block = ok_block, out = out_ty, body = body
+                )
+            };
+            let cases: [(&str, &str, &str); 4] = [
+                ("concat(\"x\", random(k))", "text", "concat mixes bytes and text"),
+                ("random(k) == t.s", "bool", "bytes"),
+                ("starts_with(random(k), \"a\")", "bool", "bytes"),
+                ("random(k)", "text", "bytes"),
+            ];
+            for (body, out_ty, needle) in cases {
+                let errs = entropy_verify(&text_probe(body, out_ty));
+                assert!(
+                    errs.iter().any(|e| e.contains(needle)),
+                    "text sink `{}` must refuse a raw draw (needle {:?}), got {:?}", body, needle, errs
+                );
+            }
+            // twins: the explicit, visible extraction
+            for (body, out_ty) in [
+                ("concat(t.s, byte_at(random(k), 0))", "text"),
+                ("byte_at(random(k), 0) == length(t.s)", "bool"),
+                ("length(random(k)) == length(t.s)", "bool"),
+            ] {
+                let errs = entropy_verify(&text_probe(body, out_ty));
+                assert!(errs.is_empty(), "explicit extraction `{}` must verify clean: {:?}", body, errs);
+            }
+            // and the HttpResponse.body sink + the log grammar (row 8) + the
+            // after: set (row 11), on a service
+            let svc = |body: &str, log: &str, after: &str| {
+                format!(
+                    "@verbose 0.1.0\n\n{block}\nrule h\n  @intention: \"probe handler\"\n  @source: nonce_cli.intent:1\n\n  input:\n    req : HttpRequest\n\n  output:\n    resp : HttpResponse\n\n  logic:\n    resp = HttpResponse {{ status: 200, body: {body} }}\n\n  proofs:\n    purity:\n      reads : [k]\n      calls : []\n    termination:\n      bound : 8\n\nservice s\n  @intention: \"probe service\"\n  @source: nonce_cli.intent:1\n\n  listen:\n    protocol    : http_1_0\n    port        : 18961\n    max_request : 4096\n\n  handler: h\n{log}{after}",
+                    block = ok_block, body = body, log = log, after = after
+                )
+            };
+            let errs = entropy_verify(&svc("random(k)", "", ""));
+            assert!(errs.iter().any(|e| e.contains("bytes")), "body: random(k) must be a type error: {:?}", errs);
+            let errs = entropy_verify(&svc("concat(\"t:\", byte_at(random(k), 0))", "", ""));
+            assert!(errs.is_empty(), "explicit byte_at in the body must verify clean: {:?}", errs);
+            let errs = entropy_verify(&svc(
+                "concat(\"t:\", byte_at(random(k), 0))",
+                "\n  log:\n    append_file \"/tmp/verbosec_entropy_probe.log\" random(k)\n",
+                "",
+            ));
+            assert!(
+                errs.iter().any(|e| e.contains("random") && e.contains("not allowed in a log content")),
+                "row 8: the log grammar must refuse a draw: {:?}", errs
+            );
+            let errs = entropy_verify(&svc(
+                "concat(\"t:\", byte_at(random(k), 0))",
+                "",
+                "\n  state:\n    last : number = 0\n\n  after:\n    set last = byte_at(random(k), 0)\n",
+            ));
+            assert!(
+                errs.iter().any(|e| e.contains("after: set last: random('k') is not supported here") && e.contains("entropy-6")),
+                "row 11: an after: set drawing must be refused by name: {:?}", errs
+            );
+        }
+    }
+
+    /// T4 — reproducible BINARY: twenty compiles of each source, one hash.
+    /// (The OUTPUT is non-reproducible by design — that is T1.)
+    #[test]
+    fn entropy_emit_is_byte_identical_across_compiles() {
+        let cli = entropy_cli_src();
+        let first = entropy_native(&cli, "nonce", "t4", false).unwrap();
+        for i in 0..20 {
+            let again = entropy_native(&cli, "nonce", "t4", false).unwrap();
+            assert!(first == again, "nonce_cli compile {} differs", i);
+        }
+        for (forked, tag) in [(false, "t4_seq"), (true, "t4_forked")] {
+            let src = entropy_service_src(forked).replace("__PORT__", "18960");
+            let first = entropy_service_bytes(&src, "token_server", tag).unwrap();
+            for i in 0..20 {
+                let again = entropy_service_bytes(&src, "token_server", tag).unwrap();
+                assert!(first == again, "token_server (forked={}) compile {} differs", forked, i);
+            }
+        }
+    }
+
+    fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
+        hay.windows(needle.len()).enumerate().filter(|(_, w)| *w == needle).map(|(i, _)| i).collect()
+    }
+
+    /// T6 — THE STRUCTURAL SECURITY EVIDENCE, asserted on the emitted
+    /// machine code because no runtime test on a seeded host can see it:
+    ///   * `mov rax, 318` — the getrandom syscall number, exactly once per
+    ///     referenced item per binary;
+    ///   * `xor edx, edx` within the next 24 bytes, then `syscall` — the
+    ///     flags word is the CONSTANT 0 (no GRND_RANDOM / NONBLOCK /
+    ///     INSECURE; NC-4 is the control: `mov edx, 1` passes T1 and T2 on a
+    ///     seeded host and fails only here);
+    ///   * the `cmp rax, N ; jne` backstop right after (NC-5);
+    ///   * no `/dev/urandom` or `/dev/random` anywhere — no userspace source,
+    ///     no device fallback;
+    ///   * POSITION: in a service the draw sits AFTER the `accept` syscall
+    ///     (per request, never hoisted above accept_top — NC-1) and, under
+    ///     `forked`, AFTER the `fork` syscall (in the child).
+    #[test]
+    fn entropy_flags_word_is_zero_and_no_userspace_source() {
+        const MOV_RAX_318: [u8; 7] = [0x48, 0xC7, 0xC0, 0x3E, 0x01, 0x00, 0x00];
+        const XOR_EDX: [u8; 2] = [0x31, 0xD2];
+        const SYSCALL: [u8; 2] = [0x0F, 0x05];
+        const MOV_RAX_43_ACCEPT: [u8; 7] = [0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00];
+        const MOV_RAX_57_FORK: [u8; 7] = [0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00];
+
+        fn check_draw_site(label: &str, bytes: &[u8], n: i32) -> usize {
+            let sites = find_all(bytes, &MOV_RAX_318);
+            assert_eq!(sites.len(), 1, "{}: exactly one getrandom site expected, found {:?}", label, sites);
+            let at = sites[0];
+            let window = &bytes[at..(at + 32).min(bytes.len())];
+            let xor_at = find_all(window, &XOR_EDX);
+            assert!(!xor_at.is_empty() && xor_at[0] <= 24, "{}: `xor edx, edx` must follow within 24 bytes", label);
+            let sc = find_all(&window[xor_at[0]..], &SYSCALL);
+            assert!(!sc.is_empty() && sc[0] == 2, "{}: `syscall` must immediately follow the flags word", label);
+            // the backstop: cmp rax, N ; jne
+            let mut backstop = vec![0x48, 0x3D];
+            backstop.extend_from_slice(&n.to_le_bytes());
+            backstop.extend_from_slice(&[0x0F, 0x85]);
+            assert!(!find_all(&bytes[at..], &backstop).is_empty(), "{}: `cmp rax, {} ; jne` backstop missing", label, n);
+            // no other flag word: `mov edx, imm` (BA) / `mov rdx, imm` right before the syscall
+            let sc_abs = at + xor_at[0] + 2;
+            assert_eq!(&bytes[sc_abs - 2..sc_abs], &XOR_EDX, "{}: the two bytes before the syscall are the flags word", label);
+            for dev in [&b"/dev/urandom"[..], &b"/dev/random"[..]] {
+                assert!(find_all(bytes, dev).is_empty(), "{}: a device path must not appear — no userspace source", label);
+            }
+            at
+        }
+
+        let cli = entropy_native(&entropy_cli_src(), "nonce", "t6", false).unwrap();
+        check_draw_site("nonce_cli", &cli, 32);
+
+        let seq = entropy_service_bytes(&entropy_service_src(false).replace("__PORT__", "18960"), "token_server", "t6_seq").unwrap();
+        let draw = check_draw_site("token_server (sequential)", &seq, 16);
+        let accept = find_all(&seq, &MOV_RAX_43_ACCEPT);
+        assert_eq!(accept.len(), 1);
+        assert!(draw > accept[0], "sequential: the draw must sit AFTER accept (per request), not above accept_top");
+        assert!(find_all(&seq, &MOV_RAX_57_FORK).is_empty(), "sequential service must not fork");
+
+        let fk = entropy_service_bytes(&entropy_service_src(true).replace("__PORT__", "18960"), "token_server", "t6_forked").unwrap();
+        let draw = check_draw_site("token_server (forked)", &fk, 16);
+        let accept = find_all(&fk, &MOV_RAX_43_ACCEPT);
+        let fork = find_all(&fk, &MOV_RAX_57_FORK);
+        assert_eq!(fork.len(), 1, "forked service has exactly one fork site");
+        assert!(draw > accept[0] && draw > fork[0], "forked: the draw must sit AFTER the fork dispatch, in the child");
+    }
+
+    /// T7 — §6.2 rows 9–13 plus the number-context arm, each by breadcrumb,
+    /// each on the smallest program that reaches the arm and each PASSING
+    /// THE VERIFIER first (so the refusal is the emitter's, not a proof
+    /// error), with a corrected twin where one exists.
+    #[test]
+    fn entropy_refused_on_the_callable_path_and_in_wasm() {
+        let block = entropy_block("k", "16", "");
+        let verify_clean = |src: &str| {
+            let errs = entropy_verify(src);
+            assert!(errs.is_empty(), "probe must verify before the emitter refuses it: {:?}", errs);
+        };
+        // row 9: the callable path (direct recursion)
+        {
+            let src = format!(
+                "@verbose 0.1.0\n\n{block}\nconcept N\n  @intention: \"counter\"\n  @source: nonce_cli.intent:1\n  fields:\n    v : number [0, 10]\n\nrule f\n  @intention: \"recursive draw\"\n  @source: nonce_cli.intent:1\n  input:\n    n : N\n  output:\n    o : number\n  logic:\n    o = if n.v == 0 then byte_at(random(k), 0) else f(N {{ v: n.v - 1 }})\n  proofs:\n    purity:\n      reads : [n.v, k]\n      calls : [f]\n    termination:\n      bound : 8\n      decreasing : v\n",
+                block = block
+            );
+            verify_clean(&src);
+            let err = entropy_native(&src, "f", "t7_rec", false).unwrap_err();
+            assert!(err.contains("callable path") && err.contains("entropy-4"), "row 9: {}", err);
+        }
+        // row 10: one probe per collection emitter, each naming its emitter
+        {
+            let coll = |out_ty: &str, body: &str, hints: &str, reads: &str| {
+                format!(
+                    "@verbose 0.1.0\n\n{block}\nconcept Item\n  @intention: \"one number\"\n  @source: nonce_cli.intent:1\n  fields:\n    v : number [0, 1000]\n\nconcept W\n  @intention: \"a batch\"\n  @source: nonce_cli.intent:1\n  fields:\n    items : collection(Item)\n    n : number [0, 1000]\n\nrule f\n  @intention: \"collection probe\"\n  @source: nonce_cli.intent:1\n  input:\n    w : W\n  output:\n    o : {out}\n  logic:\n    o = {body}\n  proofs:\n    purity:\n      reads : [{reads}]\n      calls : []\n    termination:\n      bound : 12\n{hints}",
+                    block = block, out = out_ty, body = body, reads = reads, hints = hints
+                )
+            };
+            let cases: [(&str, &str, &str, &str, &str); 5] = [
+                ("collection(number)", "map(w.items, e => e.v + byte_at(random(k), 0))", "", "w.items, k", "emit_collection_program"),
+                ("number", "sum(w.items, e => e.v + byte_at(random(k), 0))", "", "w.items, k", "emit_fold_program"),
+                ("text", "fold(w.items, \"r:\", acc, e => concat(acc, byte_at(random(k), 0), \";\"))", "", "w.items, k", "emit_text_fold_program"),
+                ("number", "if all(w.items, e => e.v > byte_at(random(k), 0)) then 1 else 0", "", "w.items, k", "emit_multi_fold_program"),
+                ("number", "w.n + byte_at(random(k), 0)", "  hints:\n    parallel: \"records are independent\"\n", "w.n, k", "emit_parallel_program"),
+            ];
+            for (out_ty, body, hints, reads, emitter) in cases {
+                let src = coll(out_ty, body, hints, reads);
+                verify_clean(&src);
+                let err = entropy_native(&src, "f", "t7_coll", false).unwrap_err();
+                assert!(err.contains(emitter) && err.contains("entropy-5"), "row 10 ({}): {}", emitter, err);
+            }
+            // the vectorized emitter: a single-field concept + a simple `>`
+            let vec_src = format!(
+                "@verbose 0.1.0\n\n{block}\nconcept V\n  @intention: \"one number\"\n  @source: nonce_cli.intent:1\n  fields:\n    x : number [0, 1000]\n\nrule f\n  @intention: \"vectorized probe\"\n  @source: nonce_cli.intent:1\n  input:\n    v : V\n  output:\n    o : bool\n  logic:\n    o = v.x > 10\n  proofs:\n    purity:\n      reads : [v.x]\n      calls : []\n    termination:\n      bound : 1\n  hints:\n    vectorizable: \"a threshold\"\n",
+                block = block
+            );
+            // The vectorized shape is exactly `field > literal`, so a draw
+            // cannot sit inside the body and keep the shape. It CAN sit in a
+            // `let` the body never reads — `extract_simple_gt` looks at the
+            // body alone — and the SIMD emitter, which emits no let prologue,
+            // would then silently drop the declared draw. That is the
+            // reachable case, and the one the refusal exists for.
+            let vec_src = vec_src
+                .replace("  logic:\n    o = v.x > 10", "  logic:\n    let z = byte_at(random(k), 0)\n    o = v.x > 10")
+                .replace("reads : [v.x]", "reads : [v.x, k]")
+                .replace("bound : 1", "bound : 6");
+            verify_clean(&vec_src);
+            let err = entropy_native(&vec_src, "f", "t7_vec", false).unwrap_err();
+            assert!(err.contains("emit_vectorized_program") && err.contains("entropy-5"), "row 10 (vectorizable): {}", err);
+            // and once the body READS the let the shape is no longer a bare
+            // threshold: it routes to emit_full_program, which has a draw
+            // site, and compiles.
+            let vec_used = vec_src.replace("    o = v.x > 10", "    o = v.x > 10 and z >= 0");
+            verify_clean(&vec_used);
+            entropy_native(&vec_used, "f", "t7_vec_used", false).expect("non-threshold shape must compile via emit_full_program");
+            // twin: the same collection-free body in a plain scalar rule compiles
+            let twin = entropy_probe(&block, "t.n, k", "t.n + byte_at(random(k), 0)");
+            verify_clean(&twin);
+            entropy_native(&twin, "f", "t7_twin", false).expect("scalar draw must compile");
+        }
+        // row 11: a reaction; a raw_tcp handler
+        {
+            let rx = format!(
+                "@verbose 0.1.0\n\n{block}\nconcept T\n  @intention: \"one number\"\n  @source: nonce_cli.intent:1\n  fields:\n    n : number [0, 1000]\n\nrule trip\n  @intention: \"trigger\"\n  @source: nonce_cli.intent:1\n  input:\n    t : T\n  output:\n    o : bool\n  logic:\n    o = t.n > byte_at(random(k), 0)\n  proofs:\n    purity:\n      reads : [t.n, k]\n      calls : []\n    termination:\n      bound : 4\n\nreaction log_it\n  @intention: \"append on trigger\"\n  @source: nonce_cli.intent:1\n  trigger: trip\n  effects:\n    append_file \"/tmp/verbosec_entropy_rx.log\" \"hit\\n\"\n",
+                block = block
+            );
+            verify_clean(&rx);
+            let err = entropy_native(&rx, "log_it", "t7_rx", false).unwrap_err();
+            assert!(err.contains("reaction trigger rule 'trip'") && err.contains("entropy-6"), "row 11 (reaction): {}", err);
+
+            let raw = format!(
+                "@verbose 0.1.0\n\n{block}\nconcept Frame\n  @intention: \"a frame\"\n  @source: nonce_cli.intent:1\n  fields:\n    data : bytes [..64]\n\nrule h\n  @intention: \"answer with a draw\"\n  @source: nonce_cli.intent:1\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    resp = Frame {{ data: random(k) }}\n  proofs:\n    purity:\n      reads : [k]\n      calls : []\n    termination:\n      bound : 2\n\nservice s\n  @intention: \"raw probe\"\n  @source: nonce_cli.intent:1\n  listen:\n    protocol    : raw_tcp\n    port        : 18962\n    max_request : 64\n  handler: h\n",
+                block = block
+            );
+            verify_clean(&raw);
+            let err = entropy_service_bytes(&raw, "s", "t7_raw").unwrap_err();
+            assert!(err.contains("raw_tcp handler 'h'") && err.contains("entropy-2"), "row 11 (raw_tcp): {}", err);
+        }
+        // row 12: a draw as ONE argument of a bytes concat
+        {
+            let src = entropy_cli_src()
+                .replace("out = random(seed)", "out = concat(b\"\\x01\", random(seed))")
+                .replace("bound : 1", "bound : 2");
+            verify_clean(&src);
+            let err = entropy_native(&src, "nonce", "t7_concat", false).unwrap_err();
+            assert!(err.contains("output: bytes concat") && err.contains("entropy-2"), "row 12: {}", err);
+        }
+        // the number / value-position arm: a bytes-typed `let`
+        {
+            let src = entropy_probe(&block, "t.n, k", "t.n + length(s)")
+                .replace("  logic:\n    o = ", "  logic:\n    let s = random(k)\n    o = ");
+            verify_clean(&src);
+            let err = entropy_native(&src, "f", "t7_let", false).unwrap_err();
+            assert!(err.contains("number / value position") && err.contains("entropy-4"), "draw-let: {}", err);
+        }
+        // row 13: WASM refuses with the NAMED breadcrumb, not the catch-all.
+        // Through `length(...)`, which WASM lowers (slice W3c) by emitting its
+        // inner first — `byte_at` has no WASM arm at all, so a probe through
+        // it would hit the generic catch-all before ever reaching the draw.
+        {
+            let src = entropy_probe(&block, "t.n, k", "t.n + length(random(k))");
+            verify_clean(&src);
+            let program = entropy_parse(&src).unwrap();
+            let out = std::env::temp_dir().join("verbosec_test_entropy_t7.wasm");
+            let err = crate::wasm::compile_wasm(&program, "f", out.to_str().unwrap()).unwrap_err();
+            assert!(err.message.contains("random('k') has no WASM lowering") && err.message.contains("random_get"), "row 13: {}", err.message);
+            assert!(!err.message.contains("unsupported expression in WASM backend"));
+        }
+    }
+
+    /// NC-6 — the composite key is not stylistic. An entropy item NAMED
+    /// `body` beside a handler that reads `req.body`: registered under the
+    /// bare name, one would silently resolve to the other's slots (the
+    /// `state.body` aliasing the text-state slice measured). Driven over
+    /// real TCP with a POST body: the echo must be the request's bytes and
+    /// the draw byte must be a number.
+    #[test]
+    fn entropy_named_body_does_not_alias_req_body() {
+        let src = format!(
+            "@verbose 0.1.0\n\n{block}\nrule h\n  @intention: \"echo the body, then one draw byte\"\n  @source: nonce_cli.intent:1\n\n  input:\n    req : HttpRequest\n\n  output:\n    resp : HttpResponse\n\n  logic:\n    resp = HttpResponse {{ status: 200, body: concat(req.body, \":\", byte_at(random(body), 0)) }}\n\n  proofs:\n    purity:\n      reads : [req.body, body]\n      calls : []\n    termination:\n      bound : 6\n\nservice s\n  @intention: \"NC-6 probe\"\n  @source: nonce_cli.intent:1\n\n  listen:\n    protocol    : http_1_0\n    port        : __PORT__\n    max_request : 4096\n\n  handler: h\n",
+            block = entropy_block("body", "8", "")
+        );
+        let req = b"POST /x HTTP/1.0\r\nContent-Length: 4\r\n\r\nseed";
+        let bodies = entropy_service_drive(&src, "s", "nc6", req, 4);
+        for b in &bodies {
+            let rest = b.strip_prefix("seed:").unwrap_or_else(|| panic!("req.body must echo `seed`, got {:?}", b));
+            let v: i64 = rest.trim().parse().unwrap_or_else(|_| panic!("draw byte must be a number, got {:?}", b));
+            assert!((0..=255).contains(&v));
+        }
+    }
+
+    /// The arena + draw COMPOSITION: a `concept_group` program that
+    /// constructs a node AND draws in the same rule must still produce its
+    /// node, and the draw's syscall sits between the prologue's `lea r11`
+    /// and the VariantConstruct.
+    ///
+    /// The design's NC-7 (drop the `push r11 / pop r11`, expect this probe
+    /// to break) was RUN AND DOES NOT FAIL — this test passes against the
+    /// patched compiler. Not a vacuous test, a wrong prediction: since the
+    /// 2026-06-22 mmap-arena correction every ENTRY-level arena access
+    /// reloads r11 from rbp (`emit_arena_base_into_r11`), and slice 1 can
+    /// only emit a draw at entry level (the callable path, where r11 IS
+    /// trusted, is refused — row 9). What this test therefore pins is the
+    /// composition, not the register; the push/pop stays as slice
+    /// entropy-4's insurance and is documented as such at the draw site.
+    #[test]
+    fn entropy_draw_preserves_arena_base_r11() {
+        let src = format!(
+            "@verbose 0.1.0\n\n{block}\nconcept S\n  @intention: \"one bounded number input\"\n  @source: nonce_cli.intent:1\n  fields:\n    a : number [0, 1000]\n\nconcept_group G [max_depth: 8, max_nodes: 64]\n  @intention: \"arena group for the r11 probe\"\n  @source: nonce_cli.intent:1\n\n  concept Node\n    @intention: \"one variant carrying one number\"\n    @source: nonce_cli.intent:1\n    variants:\n      One of (f1 : number)\n\nrule make\n  @intention: \"construct the node\"\n  @source: nonce_cli.intent:1\n  input:\n    s : S\n  output:\n    n : Node\n  logic:\n    n = Node::One {{ f1: s.a + 1 }}\n  proofs:\n    purity:\n      reads   : [s.a]\n      calls   : []\n    termination:\n      bound : 8\n\nrule total\n  @intention: \"the node's payload plus one draw byte\"\n  @source: nonce_cli.intent:1\n  input:\n    s : S\n  output:\n    o : number\n  logic:\n    o = match make(s):\n      One(v1) => v1 + byte_at(random(k), 0)\n  proofs:\n    purity:\n      reads   : [s, k]\n      calls   : [make]\n    termination:\n      bound : 16\n",
+            block = entropy_block("k", "4", "")
+        );
+        let errs = entropy_verify(&src);
+        assert!(errs.is_empty(), "{:?}", errs);
+        let program = entropy_parse(&src).unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_entropy_nc7");
+        compile_native(&program, "total", out.to_str().unwrap(), false, false)
+            .unwrap_or_else(|e| panic!("arena + draw must compile: {}", e.message));
+        for a in [0i64, 7, 250] {
+            let r = std::process::Command::new(&out).arg(a.to_string()).output().expect("spawn");
+            assert_eq!(r.status.code(), Some(0), "a={}: rc {:?}, stderr {:?}", a, r.status, String::from_utf8_lossy(&r.stderr));
+            let v: i64 = String::from_utf8_lossy(&r.stdout).trim().parse().expect("a number");
+            assert!(v >= a + 1 && v <= a + 1 + 255, "a={}: {} is not payload + one byte", a, v);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// The `--stream` wrapper stripped the WRONG exit when an abort tail was
+    /// present (PRE-EXISTING since the 2026-08-05 text bound checks;
+    /// surfaced by slice entropy-1, whose flagship CLI has both a bounded
+    /// field and a draw). Pinned on the corpus file CLAUDE.md documents:
+    /// `alert.verbose --stream` fed three lines must answer three times —
+    /// and an abort under `--stream` must still exit 1, which is the half
+    /// the old truncation destroyed (its patch sites pointed into the
+    /// loop-back).
+    #[test]
+    fn stream_mode_processes_every_line_when_an_abort_tail_is_present() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        let src = std::fs::read_to_string("examples/alert.verbose").expect("examples/alert.verbose");
+        let program = entropy_parse(&src).unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_stream_alert_lines");
+        compile_native(&program, "should_alert", out.to_str().unwrap(), true, true).expect("stream compile");
+        let run = |lines: &str| -> (String, Option<i32>) {
+            let mut child = Command::new(&out)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn");
+            child.stdin.take().unwrap().write_all(lines.as_bytes()).unwrap();
+            let mut got = String::new();
+            child.stdout.take().unwrap().read_to_string(&mut got).unwrap();
+            (got, child.wait().unwrap().code())
+        };
+        let (got, rc) = run("3 auth\n1 web\n3 web\n");
+        assert_eq!(got, "true\nfalse\nfalse\n", "every line must be answered");
+        assert_eq!(rc, Some(0));
+        // the abort tail survives: an over-long text field on line 2 exits 1
+        // after answering line 1, instead of looping back silently
+        let long = "x".repeat(300);
+        let (got, rc) = run(&format!("3 auth\n3 {}\n3 auth\n", long));
+        assert_eq!(got, "true\n", "the abort must stop the stream, not loop back");
+        assert_eq!(rc, Some(1));
         let _ = std::fs::remove_file(&out);
     }
 
@@ -38372,7 +39700,7 @@ rule rec
         for &n in &[0i64, 3, 5] {
             let mut input = std::collections::HashMap::new();
             input.insert("n".to_string(), crate::interpreter::Value::Number(n));
-            let expected = match crate::interpreter::eval_rule(show, &all_rules, &concepts, &input) {
+            let expected = match crate::interpreter::eval_rule(show, &all_rules, &concepts, &[], &input) {
                 Ok(crate::interpreter::Value::Text(s)) => s,
                 other => panic!("interpreter must return text for show({}); got {:?}", n, other),
             };
@@ -41984,7 +43312,7 @@ rule probe
             m.insert("k".to_string(), crate::interpreter::Value::Number(0));
             crate::interpreter::Value::Record(m)
         };
-        let interp = crate::interpreter::eval_rule_with_value(go_rule, &all_rules, &all_concepts, seed)
+        let interp = crate::interpreter::eval_rule_with_value(go_rule, &all_rules, &all_concepts, &[], seed)
             .expect("interpreter must evaluate 'go'");
         let interp_num = match interp {
             crate::interpreter::Value::Number(n) => n,
@@ -42057,7 +43385,7 @@ rule probe
             m.insert("k".to_string(), crate::interpreter::Value::Number(5));
             crate::interpreter::Value::Record(m)
         };
-        let interp = crate::interpreter::eval_rule_with_value(go_rule, &all_rules, &all_concepts, seed)
+        let interp = crate::interpreter::eval_rule_with_value(go_rule, &all_rules, &all_concepts, &[], seed)
             .expect("interpreter must evaluate 'go'");
         let interp_num = match interp {
             crate::interpreter::Value::Number(n) => n,
@@ -42811,7 +44139,7 @@ rule do_shl
                 let mut input = std::collections::HashMap::new();
                 input.insert("v".to_string(), crate::interpreter::Value::Number(*v));
                 input.insert("n".to_string(), crate::interpreter::Value::Number(*n));
-                let interp = match crate::interpreter::eval_rule(rule, &all_rules, &concepts, &input) {
+                let interp = match crate::interpreter::eval_rule(rule, &all_rules, &concepts, &[], &input) {
                     Ok(crate::interpreter::Value::Number(x)) => x,
                     other => panic!("{}({}, {}) interpreter must return a number; got {:?}", r, v, n, other),
                 };
@@ -43501,7 +44829,7 @@ rule do_shl
                 "i".to_string(),
                 crate::interpreter::Value::Number(i as i64),
             );
-            match crate::interpreter::eval_rule(pick, &all_rules, &concepts, &input) {
+            match crate::interpreter::eval_rule(pick, &all_rules, &concepts, &[], &input) {
                 Ok(crate::interpreter::Value::Number(n)) => assert_eq!(
                     n, want,
                     "interpreter disagrees with native at index {i}: {n} vs {want}"
@@ -46641,7 +47969,7 @@ rule two
                 input.insert("source".to_string(), crate::interpreter::Value::Text(src.clone()));
                 input.insert("pos".to_string(), crate::interpreter::Value::Number(0));
                 let result =
-                    crate::interpreter::eval_rule(count_rules, &all_rules, &all_concepts, &input)
+                    crate::interpreter::eval_rule(count_rules, &all_rules, &all_concepts, &[], &input)
                         .expect("count_rules must evaluate");
                 match result {
                     crate::interpreter::Value::Number(n) => assert_eq!(
@@ -51000,8 +52328,16 @@ rule pick
         // So the 97th acceptance is honest about `gcm_nonce` and about four
         // of the other five rules, and says nothing about `gcm_j0`. Quote as
         // "97/156 at rule #0".
+        //
+        // 156 -> 158 (2026-09-02, slice entropy-1): `nonce_cli.verbose` and
+        // `nonce_service.verbose`. Both REFUSED by gen0 at rule #0 and at the
+        // declared entry (rc 1, zero bytes): gen0's `span_is_primitive` has no
+        // `random`, so the call resolves to an undefined callee and the
+        // `entropy` keyword is top-level junk to its parser — the same safe
+        // direction its own banner documents for `parse_int` / `now_unix`.
+        // EXPECTED_ACCEPTED stays 97; a gaps-table row records it.
         const EXPECTED_ACCEPTED: usize = 97;
-        const EXPECTED_TOTAL: usize = 156;
+        const EXPECTED_TOTAL: usize = 158;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
@@ -56478,7 +57814,7 @@ rule f
         let caller = rules.iter().find(|r| r.name == "caller").unwrap();
         let mut input = std::collections::HashMap::new();
         input.insert("v".to_string(), crate::interpreter::Value::Number(5));
-        let interp = crate::interpreter::eval_rule(caller, &rules, &concepts, &input)
+        let interp = crate::interpreter::eval_rule(caller, &rules, &concepts, &[], &input)
             .expect("interpreter must evaluate caller");
         assert_eq!(
             format!("{}", interp),
@@ -56560,7 +57896,7 @@ rule f
         let mut input = std::collections::HashMap::new();
         input.insert("a".to_string(), crate::interpreter::Value::Number(7));
         input.insert("b".to_string(), crate::interpreter::Value::Number(9));
-        let interp = crate::interpreter::eval_rule(total, &rules, &concepts, &input)
+        let interp = crate::interpreter::eval_rule(total, &rules, &concepts, &[], &input)
             .expect("interpreter must evaluate total");
         assert_eq!(
             format!("{}", interp),
@@ -56655,7 +57991,7 @@ rule f
             input.insert("n".to_string(), crate::interpreter::Value::Number(n));
             input.insert("prev".to_string(), crate::interpreter::Value::Number(prev));
             input.insert("curr".to_string(), crate::interpreter::Value::Number(curr));
-            let interp = crate::interpreter::eval_rule(fib, &rules, &concepts, &input)
+            let interp = crate::interpreter::eval_rule(fib, &rules, &concepts, &[], &input)
                 .expect("interpreter must evaluate fib");
             assert_eq!(
                 format!("{}", interp),
@@ -56999,7 +58335,7 @@ rule drive
             input.insert("n".to_string(), crate::interpreter::Value::Number(n));
             input.insert("prev".to_string(), crate::interpreter::Value::Number(0));
             input.insert("curr".to_string(), crate::interpreter::Value::Number(1));
-            let interp = crate::interpreter::eval_rule(driver, &rules, &concepts, &input)
+            let interp = crate::interpreter::eval_rule(driver, &rules, &concepts, &[], &input)
                 .expect("interpreter must evaluate driver");
             match interp {
                 crate::interpreter::Value::Record(fields) => {

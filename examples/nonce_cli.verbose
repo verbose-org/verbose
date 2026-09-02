@@ -1,0 +1,46 @@
+@verbose 0.1.0
+
+-- Declared randomness (slice entropy-1), the rule-binary half — and the one
+-- that shows the PER-RECORD unit. `./nonce_cli 1 2 3 | xxd` prints 96 bytes:
+-- three distinct 32-byte nonces, one per input record, no newline (the
+-- `output: bytes` contract); `--stream` prints one per stdin line for the
+-- life of the process. A draw hoisted above the record loop — the
+-- now_unix() position — would hand every record the same bytes; the draw
+-- sits inside the loop, after the field loads, precisely so it does not.
+-- Design: docs/randomness-effect-design.md §5.1.
+
+
+entropy seed
+  @intention: "32 bytes of kernel randomness, one draw per input record"
+  @source: nonce_cli.intent:1
+
+  bytes : 32
+
+
+concept Tick
+  @intention: "a record whose only role is to be one evaluation"
+  @source: nonce_cli.intent:1
+
+  fields:
+    n : number [0, 1000000]
+
+
+rule nonce
+  @intention: "emit the 32 raw bytes of one draw"
+  @source: nonce_cli.intent:2
+
+  input:
+    t : Tick
+
+  output:
+    out : bytes
+
+  logic:
+    out = random(seed)
+
+  proofs:
+    purity:
+      reads : [seed]
+      calls : []
+    termination:
+      bound : 1

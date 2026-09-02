@@ -34,6 +34,17 @@ pub enum Item {
     /// filesystem reads. No DNS, no TLS, no keep-alive in slice 1: the
     /// surface stays narrow on purpose.
     Connection(Connection),
+    /// Slice `entropy-1` (2026-09-02): a top-level declared source of kernel
+    /// randomness. The byte count is a compile-time literal; the bytes are
+    /// drawn at runtime by any rule that references the item via
+    /// `random(<name>)`. Declaring it at top level — the `resource` /
+    /// `connection` shape, NOT the `now_unix()` shape — gives the auditor a
+    /// single place to enumerate every draw and its width, and makes
+    /// "sampling per name per evaluation" the default: two references to
+    /// one name in one evaluation read the SAME bytes (the nonce in the body
+    /// and the nonce fed to a computation must agree), two independent
+    /// values are two declarations. Design: docs/randomness-effect-design.md.
+    Entropy(Entropy),
     /// Phase B slice 1: a group of mutually-recursive sum-type concepts
     /// sharing a single set of `[max_depth: N, max_nodes: M]` bounds.
     ///
@@ -197,6 +208,65 @@ pub struct Resource {
     /// rejects `drop` so this is structurally guaranteed; no extra check
     /// in the verifier.
     pub cache: bool,
+}
+
+/// Slice `entropy-1`: a declared source of kernel randomness. Mirrors the
+/// shape established for `Resource` and `Connection` (intention + source
+/// for audit, a declared bound enforced by the verifier).
+///
+/// `bytes` is the width of ONE draw, verifier-bounded to `1..=256`. The
+/// 256 is not taste: `getrandom(2)` guarantees that on an initialized pool
+/// a read of up to 256 bytes "will always return as many bytes as
+/// requested and will not be interrupted by signals", and no such guarantee
+/// applies above it. Under that bound the emitter stores the DECLARED width
+/// as the value's length — a fact it trusts, not an assertion it checks —
+/// and its `cmp rax, N ; jne abort` backstop is unreachable by contract.
+///
+/// There is deliberately NO `cache:` field, and the parser refuses one: a
+/// cached draw hoisted above `accept_top` would be inherited by every forked
+/// child via copy-on-write — the fork-safety failure of userspace RNGs,
+/// re-created with kernel bytes (docs/randomness-effect-design.md §5.2).
+#[derive(Debug, Clone)]
+pub struct Entropy {
+    pub name: String,
+    pub intention: String,
+    pub source: SourceRef,
+    /// Bytes per draw, `1..=256` (see above).
+    pub bytes: u32,
+    /// Only `Abort` is accepted. Entropy failure is process-level and never
+    /// client-triggerable (the reachable errno set is `ENOSYS` alone), so
+    /// `drop` would loop on every request forever hiding a deployment error
+    /// — docs/randomness-effect-design.md §5.3 argues why the text-state
+    /// "never sys_exit in a listener" reasoning does NOT transfer here.
+    pub on_draw_error: ErrorPolicy,
+    /// The key under which the native emitters register this item's
+    /// `(ptr_slot, len_slot)` pair in their `TextBindings` maps:
+    /// `__entropy_<name>`, computed ONCE by the parser.
+    ///
+    /// A composite key rather than the bare name for a measured reason: the
+    /// HTTP emitter registers `req.body` under the BARE name `"body"`, and
+    /// three BoundText key extractions match `Expr::Field(_, n)` discarding
+    /// the base — so an entropy item named `body` keyed bare would make
+    /// `req.body` resolve to the entropy slots or vice versa (the exact
+    /// `state.body` aliasing the text-state slice measured). It lives ON the
+    /// AST node because `TextBindings` keys are `&'a str` borrowed for the
+    /// program's lifetime, and a `String` formatted inside the prologue
+    /// would not outlive the `RecordLoopCtx` that carries the map. Same
+    /// reservation convention as the aggregate arc's `__agg_<let>_<field>`.
+    pub binding_key: String,
+}
+
+/// Slice `entropy-1`, refusal row 1 — ONE wording for the three shapes
+/// (`bytes` missing, `<= 0`, `> 256`), shared by the parser (which sees the
+/// literal and refuses the floor) and the verifier (which refuses the
+/// ceiling), so the two cannot drift apart on what the bound is or why.
+pub fn entropy_bytes_range_message(name: &str, got: i64) -> String {
+    format!(
+        "entropy '{}': bytes must be a literal in 1..=256 (got {}); getrandom(2) guarantees a \
+         full, uninterrupted read only up to 256 bytes — declare a second entropy item, or \
+         wait for slice entropy-3 (fill loop)",
+        name, got
+    )
 }
 
 /// A service is a long-running program declaration. It binds a listener
@@ -636,6 +706,26 @@ pub enum Expr {
     /// as `Read` for resources). Slice 1 is one-shot blocking: at most
     /// one fetch per connection per rule invocation.
     Fetch(String, Box<Expr>),
+    /// Slice `entropy-1`: `random(<entropy>)` — the bytes of the named
+    /// top-level `entropy` item's current draw. Returns `bytes`, `N` long
+    /// (the declared width), delivered exactly the way `read(<resource>)`
+    /// delivers a file: a `(ptr, len)` pair into an `N`-byte frame buffer.
+    /// The verifier rejects references to undeclared items, and the rule's
+    /// `reads:` purity proof must list the name — same audit shape as a
+    /// resource, a connection, or `now`.
+    ///
+    /// SAMPLING UNIT: one `getrandom` per declared name per EVALUATION —
+    /// per input record inside `loop_top` in a rule binary (so a `--stream`
+    /// process never reuses a draw for its life), per request AFTER the
+    /// fork dispatch and the HTTP parse in a service (so a forked child
+    /// never inherits its parent's sample). Within one evaluation every
+    /// reference to one name reads the same buffer.
+    ///
+    /// SECRECY: the value is `bytes`, so every TEXT sink — `concat`,
+    /// `HttpResponse.body`, the `log:` grammar, text `==`, `after:` sets —
+    /// refuses it by the existing bytes/text isolation. Exposing a draw is
+    /// always an explicit, visible `byte_at(random(k), i)` at the site.
+    Random(String),
     /// Phase 12 slice (json_escape): pure text-transform primitive that
     /// escapes 5 JSON-significant bytes in its input — `"`, `\`, `\n`,
     /// `\r`, `\t` — leaving every other byte unchanged. The result is

@@ -65,6 +65,7 @@ pub const PRIMITIVE_CALL_NAMES: &[&str] = &[
     "min",
     "now_unix",
     "parse_int",
+    "random",
     "read",
     "shl",
     "shr",
@@ -111,8 +112,10 @@ impl Parser {
                 items.push(Item::Resource(self.parse_resource()?));
             } else if self.check_ident("connection") {
                 items.push(Item::Connection(self.parse_connection()?));
+            } else if self.check_ident("entropy") {
+                items.push(Item::Entropy(self.parse_entropy()?));
             } else {
-                return Err(self.error("expected 'concept', 'concept_group', 'rule', 'reaction', 'service', 'resource', or 'connection' at top level"));
+                return Err(self.error("expected 'concept', 'concept_group', 'rule', 'reaction', 'service', 'resource', 'connection', or 'entropy' at top level"));
             }
         }
         Ok(Program { version, uses, items })
@@ -1173,6 +1176,18 @@ impl Parser {
                 let resource_name = self.expect_ident_any()?;
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Read(resource_name))
+            } else if name == "random" && self.check_kind(&TokenKind::LParen) {
+                // Slice `entropy-1`: random(<entropy_name>) — the bytes of
+                // the named top-level entropy item's current draw. The
+                // argument must be a bare identifier naming a top-level
+                // `entropy` block; the verifier checks that the name
+                // resolves and that the rule's `reads:` proof lists it.
+                // Reads beside `read(<resource>)` and `fetch(<connection>,
+                // ...)`: it is the reader, `entropy` is the source.
+                self.advance(); // (
+                let entropy_name = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Random(entropy_name))
             } else if name == "fetch" && self.check_kind(&TokenKind::LParen) {
                 // Phase 11 slice 1: fetch(<connection_name>, <request_bytes>)
                 // — dial the declared TCP endpoint, send `request_bytes`
@@ -2208,6 +2223,116 @@ impl Parser {
             max_bytes: max_bytes.ok_or_else(|| self.error("resource missing 'max:'"))?,
             on_read_error,
             cache,
+        })
+    }
+
+    /// Slice `entropy-1`: parse a top-level `entropy` block declaring a
+    /// source of kernel randomness the program can draw from at runtime.
+    ///
+    /// Grammar:
+    ///   entropy <name>
+    ///     @intention: "..."
+    ///     @source: file.intent:NN
+    ///     bytes: <number>              (1..=256; the verifier enforces the
+    ///                                   ceiling, this parser the floor)
+    ///     on_draw_error: abort         (optional; `abort` is the only value)
+    ///
+    /// Refused HERE, each with a breadcrumb naming the offender and the
+    /// slice that lifts it (docs/randomness-effect-design.md §6.2):
+    ///   - `bytes` missing or `<= 0`   (row 1, shared wording with the
+    ///                                   verifier's `> 256` half)
+    ///   - `on_draw_error: drop`       (row 2 — none planned)
+    ///   - `cache: ...`                (row 3 — never: a cached draw would
+    ///                                   be inherited by every forked child)
+    fn parse_entropy(&mut self) -> Result<Entropy, ParseError> {
+        self.expect_ident("entropy")?;
+        let name = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut intention = None;
+        let mut source = None;
+        let mut bytes: Option<u32> = None;
+        let mut on_draw_error: ErrorPolicy = ErrorPolicy::Abort;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if let Some(attr) = self.peek_attribute_name() {
+                match attr.as_str() {
+                    "intention" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        intention = Some(self.expect_string()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    "source" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        source = Some(self.parse_source_ref()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown attribute '@{}' in entropy",
+                            other
+                        )));
+                    }
+                }
+            } else if self.check_ident("bytes") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if n <= 0 || n > 256 {
+                    return Err(self.error(&entropy_bytes_range_message(&name, n)));
+                }
+                bytes = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("on_draw_error") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let policy_name = self.expect_ident_any()?;
+                on_draw_error = match policy_name.as_str() {
+                    "abort" => ErrorPolicy::Abort,
+                    "drop" => {
+                        return Err(self.error(&format!(
+                            "entropy '{}': on_draw_error 'drop' is not accepted; entropy failure is \
+                             process-level and not client-triggerable (docs/randomness-effect-design.md \
+                             §5.3), so drop would loop on every request — only 'abort'",
+                            name
+                        )));
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown on_draw_error policy '{}' (allowed: abort)",
+                            other
+                        )));
+                    }
+                };
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("cache") {
+                return Err(self.error(&format!(
+                    "entropy '{}': 'cache' is not a field of entropy — a cached draw would be \
+                     inherited by every forked child (docs/randomness-effect-design.md §5.2); \
+                     each evaluation draws fresh by construction",
+                    name
+                )));
+            } else {
+                return Err(self.error("expected attribute, 'bytes:', or 'on_draw_error:' in entropy"));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        let bytes = match bytes {
+            Some(b) => b,
+            None => return Err(self.error(&entropy_bytes_range_message(&name, 0))),
+        };
+        let binding_key = format!("__entropy_{}", name);
+        Ok(Entropy {
+            name: name.clone(),
+            intention: intention.ok_or_else(|| self.error("entropy missing @intention"))?,
+            source: source.ok_or_else(|| self.error("entropy missing @source"))?,
+            bytes,
+            on_draw_error,
+            binding_key,
         })
     }
 

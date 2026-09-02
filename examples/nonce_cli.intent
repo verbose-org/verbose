@@ -1,0 +1,2 @@
+A source of thirty-two bytes of kernel randomness, drawn fresh for every input record — a batch of three records yields three independent values, and a streaming process never reuses one.
+A rule that emits the thirty-two raw bytes of one draw for each input record, with no rendering and no trailing newline, so the bytes can be piped straight into another program.
