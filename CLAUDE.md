@@ -688,7 +688,23 @@ examples/
                    instead of copying its bytes passes a literal-sourced
                    example on every row (measured). Design:
                    docs/text-state-fields-design.md.
-  demo.html        Browser demo (WASM)
+  gcm_frame.*      TLS 1.3 AEAD FRAMING in Verbose (2026-09-02) — the part
+                   of record protection that docs/tls-io-statemachine-design.md
+                   §7 MAJOR-1 found still in Python. Six record-returning
+                   rules, each one spawn: `gcm_nonce` (IV XOR [seq]64, 3783 B),
+                   `gcm_j0` (nonce || 0^31 || 1, 5371 B — BINDS gcm_nonce's
+                   record with `let n = gcm_nonce(i)` and emits its own, the
+                   agg-1 + agg-2c composition in a crypto context), `gcm_aad`
+                   (the 5-byte record header, 1240 B), `gcm_lenblock`
+                   ([len(A)*8]64 || [len(C)*8]64, 3429 B), `gcm_tag` (S XOR
+                   E_K(J0), 6326 B) and `gcm_tag_eq` (constant-time compare
+                   → 0/1, 4459 B: a bxor/bor fold into one accumulator and a
+                   cmov decision, zero `jcc` between the first field load and
+                   the result — objdump-verified). Byte-exact on NIST SP
+                   800-38D TC1–TC4 intermediates (J0 = Y0, T = S XOR E(Y0),
+                   the TC4 length block) and RFC 8446 nonce/AAD cases, native
+                   AND interpreter. NO compiler change. Hand-written (no
+                   generator, like tranche 5's three files).
 
 tools/
   generate.py      Intent -> Verbose via Claude API, with verify-and-correct loop:
@@ -1289,6 +1305,105 @@ Tracking what native emits today, what it still rejects, and the design rules th
   `--native` gen0 tokenizes stdin and refuses every file at rc 1, which
   reads exactly like six refusals and is an artifact of the wrong build.
 
+  **THE AEAD FRAMING FOLLOWED (2026-09-02) — the §4 "no cryptography in the
+  host" claim is now true of every TRANSFORMATION, and the tranche needed
+  NO compiler change.** `docs/tls-io-statemachine-design.md` §7 MAJOR-1
+  found the claim false: the host computed nonce = IV XOR seq, the AAD and
+  GHASH length block, J0 = nonce‖00000001, tag = S XOR E(J0), the partial-
+  block zero padding and the tag compare — all in Python, so a reviewer
+  grepping the harness could NOT confirm every tag byte came from a
+  verified binary. Every one of those but the padding is FIXED-WIDTH, which
+  is exactly what a record-returning rule can now hand back, so
+  `examples/gcm_frame.verbose` moves each into a rule: `gcm_nonce` /
+  `gcm_j0` / `gcm_aad` / `gcm_lenblock` / `gcm_tag` / `gcm_tag_eq` (see the
+  examples list). Hand-written, no generator — the nearest siblings
+  (aes_encrypt / aes_gctr / ghash_nblocks) have none.
+  THE ONE AGGREGATE HOP IS `gcm_j0`: it `let n = gcm_nonce(i)` and then
+  emits `J0Block { b0: n.b0, … b11: n.b11, b12: 0, b13: 0, b14: 0, b15: 1 }`
+  — agg-1's record let inside agg-2c's record-output entry, on a same-
+  concept callee, which is `aggregate_emit::driver`'s shape without the
+  recursion. It compiled the first time it was reached (5371 B). That is
+  the whole point of the arc restated in one rule: J0 is derived from the
+  nonce INSIDE the verifier's reach instead of by slicing in the host.
+  THE CONSTANT-TIME COMPARE IS BRANCH-FREE BY SHAPE, AND THE SHAPE IS
+  CHECKED IN THE EMITTED x86. `gcm_tag_eq` folds the 16 byte pairs into one
+  accumulator with `bxor` / `bor` only (15 chained lets), then answers
+  `1 - min(d15, 1)` — `min` lowers to `cmp + cmovl`, not a `jcc`. objdump on
+  the 4459-byte binary: from the first field load after the last input
+  bounds check (`0xe29`) to the result (`0x10cd`) there are 676 bytes of
+  `mov / push / pop / xor / or` and one `cmp rcx,rax ; cmovl rax,rcx ; sub`
+  — **zero conditional jumps**. The first `jcc` after it (`jns` at `0x10e2`)
+  is the itoa's sign test on the 0/1 RESULT, uniformly not-taken. What is
+  NOT constant-time is stated in the rule's own comment: the argv
+  transport — the per-field decimal `atoi` loops once per digit, so `"5"`
+  and `"255"` cost different iterations — is a property of how the host
+  feeds the binary, not of the compare, and the binary's own `[0,255]`
+  bounds checks branch uniformly-not-taken for every in-range input.
+  BYTE-EXACTNESS MEASURED FIRST, AGAINST AN INDEPENDENT REFERENCE: a pure-
+  Python GCM (AES + GF(2^128) core copied from `tls_record_check.py`'s
+  reference, the six framing steps written out one function each) was
+  checked against the PUBLISHED SP 800-38D Test Cases 1–4 intermediates
+  (H, C, GHASH S, E(K,Y0), T — all reproduced) BEFORE any edit, and the
+  host's pre-change Python path captured against it (TC1–4 C and T exact,
+  11 RFC 8446 nonce cases exact). The six rules then reproduce every cell
+  natively AND in the interpreter: J0 == Y0 and T == S XOR E(Y0) on all four
+  test cases, the TC4 length block `…00a0 …01e0` (20-byte AAD, 60-byte C),
+  8 AAD lengths, 8 length-block pairs, 11 nonce cases including seq =
+  2^63−1 (the i64 ceiling the `seq` field declares). `gcm_tag_eq`: equal →
+  1, and 0 on EVERY single-bit flip in every one of the 16 positions (128
+  flips × 3 tags), plus the NIST tags cross-matrix. Each rule compiled
+  twice, byte-identical (reproducible emit).
+  `tools/tls_gen/vcrypto.py`: `_nonce` and `_gcm` are GONE; `aead_encrypt`
+  / `aead_decrypt` call the six wrappers. The BEFORE/AFTER host-crypto
+  ledger, so the §4 claim can be quoted rather than believed — BEFORE:
+  nonce XOR, AAD construction, length-block construction, J0 construction,
+  tag XOR, tag compare (`calc != tag`, and NOT constant-time), zero-
+  padding, block loop. AFTER: zero-padding of a variable-length tail
+  (`_pad16`), concatenating `pad(A) || pad(C) || lenblock` into GHASH's hex
+  input, the per-block `gctr` loop, byte shuttling between binaries, TLS
+  framing that is not crypto (append/strip the inner content type, slice
+  header/ct/tag), and a branch on `gcm_tag_eq`'s public VERDICT. The only
+  `^` left in the file is the self-test's single-bit-flip negative control.
+  Randomness (`os.urandom` for the server scalar / random) stays the one
+  host-side SECRET source, as §7 already named. Cost of the honesty,
+  measured on this host (WSL2, Ryzen 7 5800X, perf_counter, median of 20,
+  quiet system): protecting the 11-byte self-test record goes **1.64 →
+  3.93 ms** and unprotecting it **3.26 → 3.80 ms** (roundtrip ≈ 4.9 →
+  7.7 ms); a 40-byte record 3.41 → 4.70 / 4.81 → 4.82; an empty one 1.71 →
+  3.84 / 3.29 → 3.55. Protect is 8 + nb spawns instead of 3 + nb (each
+  ~0.3 ms process floor); unprotect barely moves because it no longer
+  runs `gctr` over the ciphertext BEFORE checking the tag. The record
+  bytes are byte-identical to the pre-change capture on all three vectors.
+  ORACLES: `rm -f /tmp/v_*` then `python3 tools/tls_gen/vcrypto.py` →
+  VCRYPTO_OK with a new NIST-anchored `framing=` leg (nonce / J0 / length
+  block / tag / tag_eq asserted against the published TC2 + TC4 values)
+  and the AEAD roundtrip + tamper-rejection green; `tls_record_check.py`
+  (TLS_RECORD_OK — its `v_tls_record` driver now spawns the five framing
+  binaries, so the check is Verbose-framed records against a pure-Python
+  reference, and it compiles its `/tmp/tr_*` inputs on demand instead of
+  assuming them); and the live `tls_server.py` PSK-DHE handshake against
+  `openssl s_client` 3.6.2 — binder OK, client Finished decrypted, "hello
+  world" delivered — which is the real oracle for the framing, since a
+  wrong nonce or tag fails the handshake.
+  Additive BY MEASUREMENT: corpus sweep over all 156 examples × every
+  rule/reaction/service (1383 targets, 824 emitted / 559 refused),
+  compiler from `490cd50` vs branch, baseline-vs-baseline control EMPTY
+  first — every pre-existing target byte-identical by size + sha256, and
+  the only rows the new file adds are its own six. The compiler (`src/`)
+  is UNCHANGED apart from the sweep test's constants, so "everything else
+  byte-identical" is structural as well as measured. Clean negative: no
+  `src/` test consumed `_nonce` / `_gcm` / the AEAD host path (zero greps
+  outside `tools/`), so nothing grew into the hole.
+  gen0, at rule #0 AND every other index (five of the six rules are call-
+  graph roots): `gcm_nonce` / `gcm_aad` / `gcm_lenblock` / `gcm_tag` /
+  `gcm_tag_eq` ACCEPTED, each gen0 ELF **byte-for-byte == verbosec on
+  stdout + exit code** on the reference vector; `gcm_j0` (index 1) is the
+  fourth file with the `aggregate_pair::total` gaps-table signature — gen0
+  rc 0, a 22510-byte ELF that SIGTRAPs with no output where verbosec emits
+  5371 B printing the J0 record; the existing row covers it. EXPECTED_ACCEPTED
+  moves 96 → 97 (rule #0 is `gcm_nonce`, which gen0 gets right), total 155
+  → 156; R0/R1/R2 hold.
+
 ### Register conventions across emitters
 
 Emitters that span multiple syscalls or phases share a register layout. Adding a new cross-phase register use requires either claiming a currently-unused register or saving/restoring on the stack — do not casually reassign any of these without auditing every caller.
@@ -1460,7 +1575,7 @@ The load-bearing consequence for the self-compile: `ScanState.source` declared `
 
 **PR #171 revises that to 105/151, and the revision is the honest direction.** Two of the six gained files were measured broken the moment they became reachable (the paragraph below), and one of the two cannot be fixed without an arc: `purchase::discounted_purchase` now REFUSES at its declared entry (rc 1, zero bytes) instead of emitting a 2563-byte binary whose Err arm SIGTRAPs. **The count going DOWN is the count becoming true** — the 106 was counting an ELF that existed, not a program that worked, which is the same error the 100 was making for 37 files before entry selection exposed it. Re-measured at the declared entry with a gen0 built from the parent and one from the patched source: base **106**, patched **105**, and exactly **2 of 151 files move** — `purchase` 2563 B → refused, `token_label` 3027 → 3057 B (+30, the variant-binder fix) — with the other **149 byte-identical by size + sha256**. That second number is the one worth having: it says the transitive fresh-text walk newly refuses *nothing except the file it was written for*, which no argument about the walk's scope could establish on its own.
 
-**The sweep's asserted number stayed 100 through the entry-selection slice deliberately, and moved to 99 on 2026-08-17 for an unrelated reason.** It invokes at the default index, so it still measures rule-#0 breadth, and moving it in the same slice that introduced selection would have made one number mean two things across a commit boundary. It moved later because a LANGUAGE FEATURE — declared constant byte tables — made `examples/aes_sbox.verbose` a shape gen0 cannot emit, so gen0 now refuses it; see that row in the gaps table. What must not happen is the number continuing to be read as breadth-of-subject: **quote it as "96/155 at rule #0" or not at all.** *(The first move was the same one file on both halves: 100 → 99 and 105 → 104. `aes_sbox` declares exactly one rule, so rule #0 and its declared entry are the same rule and the two figures cannot disagree there. The second move, 99 → 93 and 104 → 98 on 2026-08-17, is the other six AES-family files adopting the same declared table — and it is the sharpest illustration this file has of why the rule-#0 figure needs the qualifier, because those six were SIX ACCEPTANCES OF ONE PROGRAM: rule #0 in all six is `aes_sbox`, and their pre-change gen0 binaries — 53884 to 672023 bytes of them — every one answered 99 / 124 / 202 / 22, the S-box, not the file's subject.)* *(Third move, 93 → 94 and 98 → 99 on 2026-08-19: slice agg-1 adds `examples/aggregate_pair.verbose`. Both halves move by one, and the two halves mean OPPOSITE things about the same file — at rule #0 gen0 compiles `swap2` correctly and byte-for-byte agrees with verbosec, while at the declared entry it emits an 825-byte ELF that SIGTRAPs. So the 94 is honest about `swap2` and says nothing about `total`, and the 99 counts a file whose subject gen0 cannot emit. Recorded as its own gaps-table row above; this is the first time the two figures have disagreed about what a single new file is worth.)*
+**The sweep's asserted number stayed 100 through the entry-selection slice deliberately, and moved to 99 on 2026-08-17 for an unrelated reason.** It invokes at the default index, so it still measures rule-#0 breadth, and moving it in the same slice that introduced selection would have made one number mean two things across a commit boundary. It moved later because a LANGUAGE FEATURE — declared constant byte tables — made `examples/aes_sbox.verbose` a shape gen0 cannot emit, so gen0 now refuses it; see that row in the gaps table. What must not happen is the number continuing to be read as breadth-of-subject: **quote it as "97/156 at rule #0" or not at all.** *(The first move was the same one file on both halves: 100 → 99 and 105 → 104. `aes_sbox` declares exactly one rule, so rule #0 and its declared entry are the same rule and the two figures cannot disagree there. The second move, 99 → 93 and 104 → 98 on 2026-08-17, is the other six AES-family files adopting the same declared table — and it is the sharpest illustration this file has of why the rule-#0 figure needs the qualifier, because those six were SIX ACCEPTANCES OF ONE PROGRAM: rule #0 in all six is `aes_sbox`, and their pre-change gen0 binaries — 53884 to 672023 bytes of them — every one answered 99 / 124 / 202 / 22, the S-box, not the file's subject.)* *(Third move, 93 → 94 and 98 → 99 on 2026-08-19: slice agg-1 adds `examples/aggregate_pair.verbose`. Both halves move by one, and the two halves mean OPPOSITE things about the same file — at rule #0 gen0 compiles `swap2` correctly and byte-for-byte agrees with verbosec, while at the declared entry it emits an 825-byte ELF that SIGTRAPs. So the 94 is honest about `swap2` and says nothing about `total`, and the 99 counts a file whose subject gen0 cannot emit. Recorded as its own gaps-table row above; this is the first time the two figures have disagreed about what a single new file is worth.)* *(Fourth move, 96 → 97 and 155 → 156 on 2026-09-02: `examples/gcm_frame.verbose`, the TLS 1.3 AEAD framing rules. Rule #0 is `gcm_nonce` and gen0 gets it byte-for-byte right, as it does four of the file's other five rules; the one it gets wrong is `gcm_j0` at index 1 — the file's single aggregate hop, `let n = gcm_nonce(i)` — with the same record-let SIGTRAP signature as `aggregate_pair::total`, a fourth file in that row. Detail in the sweep constant's comment.)*
 
 **The generalisable lesson is about metrics rather than about gen0.** The two "family is closed" notes above teach *never declare a category empty; enumerate the positions you tested*. This one teaches the harder sibling: **a mechanical, CI-enforced, reproducible number can still measure the wrong thing, and mechanising it is what stops anyone asking what it measures.** Nothing in the harness was broken — it did exactly what it said. The defect was in the sentence "gen0 accepts N files", where "accepts" quietly meant "compiled whichever rule was written first". When a metric is derived from an artifact, state the derivation next to the number, not in the doc comment: this one *was* documented ("entry `elf_program_src`" appears in the sweep's own comment) and still went 30 PRs without anyone noticing that the corresponding phrase for every OTHER file is "entry: whatever came first".
 
@@ -1474,7 +1589,7 @@ The load-bearing consequence for the self-compile: `ScanState.source` declared `
 
 Measured, `purchase::discounted_purchase` at index 1 moves from **rc 0 / 2563 B whose Err arm exits 133 with no output** to **rc 1 / zero bytes**; verbosec still accepts and still emits (`500 12` → `customer age 12 is under 18`, rc 1), which is what makes this a CAPABILITY refusal rather than a verifier gap — see the two INVERSE buckets in `examples/negative/README.md`. **Cost at the default entry is zero, and proving that non-vacuous took the index-1 measurements above**, because at rule #0 `token_label` enters at `classify` (a sum-type output, refused by `entry_badrecord`) and `purchase` at `validate_purchase` (refused by `entry_freshtext`'s original entry-only walk) — so both defect files were already refused where the sweep looks. Sweeping all 151 examples through a gen0 built from the parent and one from the patched source, with the SAME inputs fed to both: **151 of 151 byte-identical by size + sha256**, no binary changing bytes while keeping its size, acceptance unchanged at **100/151** with an unchanged refused set, and the baseline-vs-baseline control empty first. gen0's own binary grew 647180 → 651769 B (+4589), rules 945 → 954, concepts 369 → 375; peak self-compile RSS 724800 → 727396 KiB (+0.36%) against the 8M-node arena. R0/R1/R2 hold. Pinned by `two_generation_gen0_refuses_reachable_match_result_fresh_text` (refusal, corrected twin, verbosec-still-accepts, reachable-not-present + cycle termination) and by probe 1b of `two_generation_gen0_selects_the_entry_rule`, whose as-is assertion flipped to full stdout + exit-code agreement on all three arms; both verified to FAIL pre-change.
 
-**The corpus figure is now mechanical.** gen0's acceptance breadth over `examples/` — currently **96/155 at rule #0** — is produced by `two_generation_corpus_acceptance_sweep` (`src/native.rs`), which builds gen0, feeds it every `examples/*.verbose`, asserts the count and prints the refused list on failure. Run it with `cargo test --release -- --ignored --test-threads=1 two_generation_corpus` (~25 s; `ulimit -s unlimited` is raised internally); the `two_generation` prefix puts it in the existing `self-hosting-bootstrap` CI job. Before this test the number lived only in commit messages, which is how PR #142's predecessor state — files counting as corpus passes while emitting truncated binaries — went unchallenged for as long as it did. **"Accepted" means gen0 exits 0 having written an ELF; it does NOT mean the binary is correct, that gen0 verified what verbosec would, or — until entry selection landed — that the rule compiled was the file's subject** (see the table above and the metric note). Byte-identity and run-correctness are the fixed-point test's job (R0/R1/R2); this one measures breadth.
+**The corpus figure is now mechanical.** gen0's acceptance breadth over `examples/` — currently **97/156 at rule #0** — is produced by `two_generation_corpus_acceptance_sweep` (`src/native.rs`), which builds gen0, feeds it every `examples/*.verbose`, asserts the count and prints the refused list on failure. Run it with `cargo test --release -- --ignored --test-threads=1 two_generation_corpus` (~25 s; `ulimit -s unlimited` is raised internally); the `two_generation` prefix puts it in the existing `self-hosting-bootstrap` CI job. Before this test the number lived only in commit messages, which is how PR #142's predecessor state — files counting as corpus passes while emitting truncated binaries — went unchallenged for as long as it did. **"Accepted" means gen0 exits 0 having written an ELF; it does NOT mean the binary is correct, that gen0 verified what verbosec would, or — until entry selection landed — that the rule compiled was the file's subject** (see the table above and the metric note). Byte-identity and run-correctness are the fixed-point test's job (R0/R1/R2); this one measures breadth.
 
 **THE `rl_head_*` AUDIT, and why "53 call sites" was 17 (2026-08-15).** Entry selection had to answer one question before touching anything: which of the places that read the HEAD of the RuleList mean *the entry rule* and which merely mean *the head of the list I am currently walking*. `grep -c rl_head_ examples/vexprparse.verbose` says **53**, and that number is LINES: 15 comments, 23 `calls:` proof entries, 7 rule definitions, and **17 real invocation lines carrying 28 invocations**. Classifying those 17:
 
@@ -1618,7 +1733,7 @@ printf "3 auth\n1 web\n" | /tmp/alert                                           
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
-cargo test -- --test-threads=1                                                      # 560 tests — SERIAL IS REQUIRED
+cargo test -- --test-threads=1                                                      # 561 tests — SERIAL IS REQUIRED
 make demo                                                                           # full demo
 ```
 

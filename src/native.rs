@@ -45264,6 +45264,155 @@ rule do_shl
 
 
     #[test]
+    fn gcm_frame_matches_nist_and_tag_compare_is_branch_free() {
+        // The TLS 1.3 AEAD FRAMING rules (examples/gcm_frame.verbose,
+        // 2026-09-02) — the steps docs/tls-io-statemachine-design.md §7
+        // MAJOR-1 found still computed in Python. Two halves:
+        //
+        //   1. every rule reproduces the PUBLISHED intermediates of NIST
+        //      SP 800-38D Test Cases 2 / 3 / 4 (J0 = Y0, T = S XOR E(K,Y0),
+        //      the TC4 length block) and the RFC 8446 nonce / AAD shapes, as
+        //      exact-JSON record asserts; `gcm_tag_eq` answers 1 on equal
+        //      tags and 0 on EVERY single-bit flip in every one of the 16
+        //      positions (128 cells — a compare that only looked at the first
+        //      differing byte, or the last, would pass a sampled probe);
+        //
+        //   2. the compare is BRANCH-FREE, checked in the emitted bytes and
+        //      not argued from the source: from the last input bounds check
+        //      to the itoa, the binary is whitelist-DECODED against the
+        //      closed set {mov/push/pop/xor/or/cmp/cmovl/sub/inc} — any byte
+        //      the decoder does not recognise fails the test, so a `jcc`
+        //      cannot hide (a raw scan for 0x7x / 0f 8x would false-positive
+        //      on `[rbp-0x88]`-style displacements, which is why it decodes).
+        //      The counts are asserted too (16 xor, 15 or, exactly one cmov),
+        //      so the walk cannot pass vacuously on an empty region.
+        let h = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(gcm_frame_test_body)
+            .expect("spawn");
+        h.join().expect("test thread panicked");
+    }
+
+    fn gcm_frame_test_body() {
+        let src = std::fs::read_to_string("examples/gcm_frame.verbose")
+            .expect("examples/gcm_frame.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let bin = |rule: &str| -> std::path::PathBuf {
+            let out = std::env::temp_dir().join(format!("verbosec_test_gcm_frame_{}", rule));
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} must compile: {}", rule, e.message));
+            #[cfg(unix)]
+            { use std::os::unix::fs::PermissionsExt;
+              let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
+            out
+        };
+        let run = |out: &std::path::Path, args: &[i64]| -> (bool, String) {
+            let mut cmd = std::process::Command::new(out);
+            for a in args { cmd.arg(a.to_string()); }
+            let o = cmd.output().expect("run");
+            (o.status.success(), String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        let hx = |s: &str| -> Vec<u8> {
+            (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+        };
+        let rec = |b: &[u8]| -> String {
+            let f: Vec<String> = b.iter().enumerate().map(|(i, v)| format!("\"b{}\":{}", i, v)).collect();
+            format!("{{{}}}", f.join(","))
+        };
+        let nums = |b: &[u8]| -> Vec<i64> { b.iter().map(|&x| x as i64).collect() };
+
+        // ---- gcm_nonce: RFC 8446 5.3, nonce = IV XOR [seq]64 right-aligned ----
+        let nonce = bin("gcm_nonce");
+        let iv = hx("cafebabefacedbaddecaf888");             // the TC3/TC4 IV
+        let mut a = nums(&iv); a.push(0x0102030405060708);
+        assert_eq!(run(&nonce, &a), (true, rec(&hx("cafebabefbccd8a9dbccff80"))), "nonce: RFC 8446 shape");
+        let mut a = nums(&iv); a.push(0);
+        assert_eq!(run(&nonce, &a), (true, rec(&iv)), "nonce: seq 0 is the IV itself");
+        let mut a = nums(&iv); a.push(i64::MAX);              // the declared ceiling of `seq`
+        assert_eq!(run(&nonce, &a), (true, rec(&hx("cafebabe8531245221350777"))), "nonce: seq = 2^63-1");
+
+        // ---- gcm_j0: SP 800-38D 7.1 step 2, J0 = nonce || 0^31 || 1 (BINDS gcm_nonce's record) ----
+        let j0 = bin("gcm_j0");
+        let mut a = nums(&[0u8; 12]); a.push(0);
+        assert_eq!(run(&j0, &a), (true, rec(&hx("00000000000000000000000000000001"))), "J0: GCM TC2 Y0");
+        let mut a = nums(&iv); a.push(0);
+        assert_eq!(run(&j0, &a), (true, rec(&hx("cafebabefacedbaddecaf88800000001"))), "J0: GCM TC3/TC4 Y0");
+        let mut a = nums(&iv); a.push(0x0102030405060708);
+        assert_eq!(run(&j0, &a), (true, rec(&hx("cafebabefbccd8a9dbccff8000000001"))), "J0: derived through the bound nonce");
+
+        // ---- gcm_aad: RFC 8446 5.2, 23 || 0303 || [len(inner)+16]16 ----
+        let aad = bin("gcm_aad");
+        assert_eq!(run(&aad, &[12]), (true, rec(&hx("170303001c"))), "AAD: len(inner) 12 -> length 28");
+        assert_eq!(run(&aad, &[16624]), (true, rec(&hx("1703034100"))), "AAD: the TLS maximum, 16640 = 0x4100");
+        assert!(!run(&aad, &[16625]).0, "AAD: one past the declared bound is refused at field-load");
+
+        // ---- gcm_lenblock: SP 800-38D 7.1 step 5, [len(A)*8]64 || [len(C)*8]64 ----
+        let lb = bin("gcm_lenblock");
+        assert_eq!(run(&lb, &[20, 60]), (true, rec(&hx("00000000000000a000000000000001e0"))), "length block: GCM TC4");
+        assert_eq!(run(&lb, &[0, 16]), (true, rec(&hx("00000000000000000000000000000080"))), "length block: GCM TC2");
+        assert_eq!(run(&lb, &[5, 28]), (true, rec(&hx("000000000000002800000000000000e0"))), "length block: a TLS record");
+
+        // ---- gcm_tag: SP 800-38D 7.1 step 6, T = S XOR E_K(J0) ----
+        let tag = bin("gcm_tag");
+        let tc2_s = hx("f38cbb1ad69223dcc3457ae5b6b0f885"); let tc2_e = hx("58e2fccefa7e3061367f1d57a4e7455a");
+        let tc2_t = hx("ab6e47d42cec13bdf53a67b21257bddf");
+        let tc4_s = hx("698e57f70e6ecc7fd9463b7260a9ae5f"); let tc4_e = hx("3247184b3c4f69a44dbcd22887bbb418");
+        let tc4_t = hx("5bc94fbc3221a5db94fae95ae7121a47");
+        let mut a = nums(&tc2_s); a.extend(nums(&tc2_e));
+        assert_eq!(run(&tag, &a), (true, rec(&tc2_t)), "tag: GCM TC2 T");
+        let mut a = nums(&tc4_s); a.extend(nums(&tc4_e));
+        assert_eq!(run(&tag, &a), (true, rec(&tc4_t)), "tag: GCM TC4 T");
+
+        // ---- gcm_tag_eq: 1 on equal, 0 on EVERY single-bit flip in EVERY position ----
+        let eq = bin("gcm_tag_eq");
+        let mut a = nums(&tc4_t); a.extend(nums(&tc4_t));
+        assert_eq!(run(&eq, &a), (true, "1".to_string()), "tag_eq: equal tags");
+        for pos in 0..16 {
+            for bit in 0..8 {
+                let mut r = tc4_t.clone(); r[pos] ^= 1u8 << bit;
+                let mut a = nums(&tc4_t); a.extend(nums(&r));
+                assert_eq!(run(&eq, &a), (true, "0".to_string()), "tag_eq: flip pos {} bit {}", pos, bit);
+            }
+        }
+        let mut a = nums(&tc2_t); a.extend(nums(&tc4_t));
+        assert_eq!(run(&eq, &a), (true, "0".to_string()), "tag_eq: TC2 vs TC4");
+
+        // ---- branch-freeness, decoded from the emitted bytes ----
+        let code = std::fs::read(&eq).expect("read tag_eq binary");
+        // the last input bounds check ends `cmp rax, r10 ; jg rel32` (4c 39 d0 0f 8f xx xx xx xx)
+        let tail: [u8; 5] = [0x4c, 0x39, 0xd0, 0x0f, 0x8f];
+        let last = (0..code.len() - 5).filter(|&i| code[i..i + 5] == tail).last()
+            .expect("the 32 input bounds checks must be present");
+        let mut pc = last + 9;
+        let stop: [u8; 4] = [0x48, 0x83, 0xec, 0x18];     // sub rsp, 0x18 — the itoa's first instruction
+        let (mut xors, mut ors, mut cmovs, start) = (0usize, 0usize, 0usize, pc);
+        loop {
+            if code[pc..pc + 4] == stop { break; }
+            let b = &code[pc..];
+            let len = if b.starts_with(&[0x48, 0x89, 0x85]) { 7 }            // mov [rbp+d32], rax
+                else if b.starts_with(&[0x48, 0x8b, 0x85]) { 7 }             // mov rax, [rbp+d32]
+                else if b.starts_with(&[0x48, 0x8b, 0x45]) { 4 }             // mov rax, [rbp+d8]
+                else if b.starts_with(&[0x49, 0xff, 0xc6]) { 3 }             // inc r14
+                else if b[0] == 0x50 || b[0] == 0x58 || b[0] == 0x59 { 1 }   // push rax / pop rax / pop rcx
+                else if b.starts_with(&[0x48, 0x89, 0xc1]) || b.starts_with(&[0x48, 0x89, 0xc8]) { 3 } // mov rcx,rax / mov rax,rcx
+                else if b.starts_with(&[0x48, 0x31, 0xc8]) { xors += 1; 3 }  // xor rax, rcx
+                else if b.starts_with(&[0x48, 0x09, 0xc8]) { ors += 1; 3 }   // or rax, rcx
+                else if b.starts_with(&[0x48, 0xc7, 0xc0]) { 7 }             // mov rax, imm32
+                else if b.starts_with(&[0x48, 0x39, 0xc1]) { 3 }             // cmp rcx, rax
+                else if b.starts_with(&[0x48, 0x0f, 0x4c, 0xc1]) { cmovs += 1; 4 } // cmovl rax, rcx
+                else if b.starts_with(&[0x48, 0x29, 0xc1]) { 3 }             // sub rcx, rax
+                else { panic!("tag_eq kernel: unrecognised instruction at offset {:#x}: {:02x?} — \
+                               a branch, or a new encoding the whitelist must learn", pc, &b[..8.min(b.len())]) };
+            pc += len;
+        }
+        assert!(pc - start >= 600, "tag_eq kernel too short to be the real fold: {} bytes", pc - start);
+        assert_eq!((xors, ors, cmovs), (16, 15, 1), "tag_eq kernel: 16 bxor, 15 bor, one cmov (the min)");
+
+        for b in [nonce, j0, aad, lb, tag, eq] { let _ = std::fs::remove_file(b); }
+    }
+
+    #[test]
     fn ghash_nblocks_matches_reference() {
         // GHASH over N 16-byte blocks via the recursive fold (Y=(Y^B)*H per
         // block), returning ALL 16 accumulator bytes as ONE GhashOut record
@@ -50824,9 +50973,35 @@ rule pick
         //     signature (accept-what-you-cannot-emit on a record-let
         //     entry); the existing row covers it, no new row.
         //
-        // Quote as "96/154 at rule #0".
-        const EXPECTED_ACCEPTED: usize = 96;
-        const EXPECTED_TOTAL: usize = 155;
+        // Quote as "96/154 at rule #0". (155 after `last_path_service`,
+        // which gen0 refuses at every index — `state:` itself — so the
+        // numerator did not move.)
+        //
+        // 96 -> 97, 155 -> 156 (2026-09-02, `examples/gcm_frame.verbose`,
+        // the TLS 1.3 AEAD framing rules — no compiler change). Measured at
+        // ALL SIX indices, since five of the six rules are call-graph roots:
+        //
+        //   rule #0 (`gcm_nonce`), #2 (`gcm_aad`), #3 (`gcm_lenblock`),
+        //     #4 (`gcm_tag`), #5 (`gcm_tag_eq`, the last-declared rule and so
+        //     the file's declared entry): gen0 ACCEPTS every one (22034 /
+        //     19677 / 21113 / 24923 / 9579 B) and each emitted ELF agrees
+        //     with verbosec's BYTE-FOR-BYTE on stdout + exit code on the
+        //     NIST SP 800-38D / RFC 8446 reference vector fed to it — the
+        //     hkdf_extract/psk agreement cell, five times over.
+        //
+        //   index 1 (`gcm_j0`, the one rule that BINDS an aggregate — `let n
+        //     = gcm_nonce(i)` — before emitting its own): gen0 emits **rc 0,
+        //     a 22510-byte ELF that exits 133 (SIGTRAP) with no output**,
+        //     where verbosec emits 5371 bytes printing the J0 record. Fourth
+        //     file with the `aggregate_pair::total` gaps-table signature
+        //     (accept-what-you-cannot-emit on a record-let); the existing
+        //     row covers it, no new row.
+        //
+        // So the 97th acceptance is honest about `gcm_nonce` and about four
+        // of the other five rules, and says nothing about `gcm_j0`. Quote as
+        // "97/156 at rule #0".
+        const EXPECTED_ACCEPTED: usize = 97;
+        const EXPECTED_TOTAL: usize = 156;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

@@ -30,10 +30,21 @@ single record spawn of a verified binary — nothing spawns per-`which`, no
 caller loops over output bytes, and the 64-thread pool that existed to beat
 the one-byte-per-process-run cost is gone.
 
-Honest scope (per docs/tls-io-statemachine-design.md §7): the cryptographic
-PRIMITIVES (X25519, key schedule, SHA-256, AES/GCM/GHASH) are pure Verbose.
-Byte repacking (bytes<->limbs), AEAD framing (nonce/AAD/J0/tag-XOR), and
-randomness are host glue, clearly separated below.
+The AEAD FRAMING followed on 2026-09-02 (examples/gcm_frame.verbose): the
+per-record nonce, J0, the record-header AAD, GHASH's length block, the tag
+XOR and the constant-time tag compare -- every FIXED-WIDTH step §7 MAJOR-1
+listed as "crypto in Python" -- are each one record spawn of a verified
+binary. The host keeps only the variable-length glue (zero-padding a tail to
+a block boundary, concatenating GHASH's input, the per-block CTR loop),
+byte shuttling between binaries, and TLS framing that is not cryptography
+(inner content type, record slicing). See the AEAD section below for the
+per-step ledger.
+
+Honest scope (per docs/tls-io-statemachine-design.md §4/§7): the cryptographic
+PRIMITIVES (X25519, key schedule, SHA-256, AES/GCM/GHASH) AND the fixed-width
+AEAD framing are pure Verbose. Byte repacking (bytes<->limbs), variable-length
+padding/concatenation, sequencing, and randomness are host glue, clearly
+separated below.
 """
 import subprocess, os, sys, json
 
@@ -154,7 +165,7 @@ def psk_ext_binder_key(early32):
     """binder_key = Derive-Secret(Early, "ext binder", "") (RFC 8446 7.1); one Digest spawn."""
     return _record_bytes("psk_ext_binder_key", [str(b) for b in early32], 32)
 
-# ---- AES-GCM AEAD record protection (primitives pure Verbose; framing host) ----
+# ---- AES-GCM AEAD record protection (primitives AND framing pure Verbose) ----
 # All three primitives are RECORD spawns since tranche 5 (2026-08-30):
 #   encrypt    — ONE spawn, all 16 ciphertext bytes as a CipherBlock record
 #   gctr       — one spawn PER 16-BYTE BLOCK (nb spawns, not len(data)); the
@@ -179,43 +190,70 @@ def _ghash(h16, data):
     args=[str(b) for b in [0]*16]+[str(b) for b in h16]+[str(nb),str(nb),bytes(data).hex()]
     return _record_bytes("ghash_fold", args, 16)
 
-def _gcm(key16, nonce12, pt, aad):
-    H=_aes_block(key16, [0]*16)
-    C=_gctr(key16, nonce12, pt)
-    def pad(b): return bytes(b)+bytes((-len(b))%16)
-    lenb=(len(aad)*8).to_bytes(8,'big')+(len(C)*8).to_bytes(8,'big')
-    S=_ghash(H, pad(aad)+pad(C)+lenb)
-    EJ0=_aes_block(key16, list(nonce12)+[0,0,0,1])
-    tag=bytes(S[i]^EJ0[i] for i in range(16))
-    return bytes(C), tag
+# ---- AEAD framing (pure Verbose since 2026-09-02: examples/gcm_frame.verbose) ----
+# Every FIXED-WIDTH step of TLS 1.3 record protection that used to be Python
+# here is now one record spawn of a verified binary. Per step:
+#   gcm_nonce    RFC 8446 5.3   nonce = IV XOR [seq]64 (right-aligned)   -> 12 bytes
+#   gcm_j0       SP 800-38D 7.1 J0 = nonce || 0^31 || 1 (binds gcm_nonce) -> 16 bytes
+#   gcm_aad      RFC 8446 5.2   23 || 0303 || [len(inner)+16]16            -> 5 bytes
+#   gcm_lenblock SP 800-38D 7.1 [len(A)*8]64 || [len(C)*8]64              -> 16 bytes
+#   gcm_tag      SP 800-38D 7.1 T = S XOR E_K(J0)                          -> 16 bytes
+#   gcm_tag_eq   constant-time compare (bxor/bor fold, cmov decision)      -> 0 / 1
+# What the host STILL does around them, each variable-length or not crypto:
+#   * zero-pad a variable-length AAD / ciphertext tail to a 16-byte boundary
+#     and concatenate pad(A) || pad(C) || lenblock into GHASH's hex input
+#     (_pad16 below; byte_at's fail-closed bounds are what make the padding
+#     load-bearing for the gctr tail as well, see _gctr);
+#   * the per-16-byte-block CTR loop (_gctr spawns gctr once per block);
+#   * shuttle bytes between binaries: gcm_j0's record into `encrypt`,
+#     GHASH's record and E_K(J0)'s record into gcm_tag, the computed and the
+#     received tag into gcm_tag_eq;
+#   * TLS framing that is not cryptography: append the inner content type
+#     on protect, strip zero padding + content type on unprotect, slice the
+#     received record into header / ciphertext / tag;
+#   * branch on gcm_tag_eq's VERDICT (accept / reject is public by nature --
+#     the peer observes it as an alert or a continued handshake).
+# Nothing here XORs, pads a nonce, builds J0 or a length block, or compares
+# tag bytes in Python any more -- grep this file for `^` to confirm: the
+# only XOR left is the self-test's single-bit-flip negative control.
+def gcm_nonce(iv12, seq):    return _record_bytes("gcm_nonce", [str(b) for b in iv12]+[str(seq)], 12)
+def gcm_j0(iv12, seq):       return _record_bytes("gcm_j0", [str(b) for b in iv12]+[str(seq)], 16)
+def gcm_aad(inner_len):      return _record_bytes("gcm_aad", [str(inner_len)], 5)
+def gcm_lenblock(aad_len, ct_len): return _record_bytes("gcm_lenblock", [str(aad_len), str(ct_len)], 16)
+def gcm_tag(S16, EJ0_16):    return _record_bytes("gcm_tag", [str(b) for b in S16]+[str(b) for b in EJ0_16], 16)
+def gcm_tag_eq(a16, b16):
+    """1 iff the two 16-byte tags are equal, computed by the branch-free rule; 0 otherwise."""
+    r = subprocess.run([BIN["gcm_tag_eq"]]+[str(b) for b in a16]+[str(b) for b in b16], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0 or r.stdout.strip() not in ("0", "1"):
+        raise RuntimeError(f"gcm_tag_eq: rc={r.returncode} out={r.stdout!r} {r.stderr[-200:]}")
+    return int(r.stdout)
 
-def _nonce(iv12, seq):
-    n=bytearray(iv12); sb=seq.to_bytes(8,'big')
-    for j in range(8): n[4+j]^=sb[j]
-    return bytes(n)
+def _pad16(b):
+    """Host glue: zero-pad a VARIABLE-length byte string to a 16-byte boundary."""
+    return bytes(b)+bytes((-len(b))%16)
+
+def _gcm_tag_over(key16, iv12, seq, aad, C):
+    """The 16-byte tag T for (aad, C) under (key, iv, seq). Every fixed-width
+    step is a Verbose spawn; the host only pads and concatenates GHASH's input."""
+    H   = _aes_block(key16, bytes(16))                                   # H = E_K(0^128)
+    S   = _ghash(H, _pad16(aad)+_pad16(C)+gcm_lenblock(len(aad), len(C)))
+    EJ0 = _aes_block(key16, gcm_j0(iv12, seq))                           # E_K(J0), J0 from Verbose
+    return gcm_tag(S, EJ0)
 
 def aead_encrypt(key16, iv12, seq, inner_plaintext, content_type=0x17):
     """TLS 1.3 record protect: returns the record (5-byte header + ct + tag)."""
-    inner=bytes(inner_plaintext)+bytes([content_type])
-    length=len(inner)+16
-    aad=bytes([0x17,0x03,0x03,(length>>8)&0xff,length&0xff])
-    C,tag=_gcm(key16, _nonce(iv12,seq), inner, aad)
-    return aad+C+tag
+    inner = bytes(inner_plaintext)+bytes([content_type])   # TLS framing: append the inner content type
+    aad   = gcm_aad(len(inner))                            # the record header IS the additional data
+    C     = _gctr(key16, gcm_nonce(iv12, seq), inner)
+    return aad + C + _gcm_tag_over(key16, iv12, seq, aad, C)
 
 def aead_decrypt(key16, iv12, seq, record):
     """Verify+decrypt a TLS 1.3 record; returns (inner_content_type, plaintext) or None."""
-    aad=record[:5]; ct=record[5:-16]; tag=record[-16:]
-    C,exp=_gcm(key16, _nonce(iv12,seq), ct, aad)  # note: decrypt keystream == encrypt keystream
-    # recompute tag over received ct
-    H=_aes_block(key16,[0]*16)
-    def pad(b): return bytes(b)+bytes((-len(b))%16)
-    lenb=(len(aad)*8).to_bytes(8,'big')+(len(ct)*8).to_bytes(8,'big')
-    S=_ghash(H, pad(aad)+pad(ct)+lenb)
-    EJ0=_aes_block(key16, list(_nonce(iv12,seq))+[0,0,0,1])
-    calc=bytes(S[i]^EJ0[i] for i in range(16))
-    if calc!=tag: return None
-    plain=_gctr(key16, _nonce(iv12,seq), ct)  # CTR is its own inverse
-    # strip inner content type (last non-zero byte; TLS1.3 may zero-pad)
+    aad=record[:5]; ct=record[5:-16]; tag=record[-16:]      # TLS framing: slice header / ct / tag
+    if gcm_tag_eq(_gcm_tag_over(key16, iv12, seq, aad, ct), tag) != 1:
+        return None                                        # the host branches on the VERDICT only
+    plain=_gctr(key16, gcm_nonce(iv12, seq), ct)            # CTR is its own inverse
+    # TLS framing: strip inner content type (last non-zero byte; TLS 1.3 may zero-pad)
     i=len(plain)-1
     while i>=0 and plain[i]==0: i-=1
     return (plain[i], bytes(plain[:i]))
@@ -232,6 +270,8 @@ ALL_RULES = [
     ("encrypt","aes_encrypt.verbose"), ("gctr","aes_gctr.verbose"), ("ghash_fold","ghash_nblocks.verbose"),
     ("hkdf_extract","hkdf_extract.verbose"),
     ("psk_early_secret","psk_schedule.verbose"), ("psk_ext_binder_key","psk_schedule.verbose"),
+    ("gcm_nonce","gcm_frame.verbose"), ("gcm_j0","gcm_frame.verbose"), ("gcm_aad","gcm_frame.verbose"),
+    ("gcm_lenblock","gcm_frame.verbose"), ("gcm_tag","gcm_frame.verbose"), ("gcm_tag_eq","gcm_frame.verbose"),
 ]
 
 if __name__ == "__main__":
@@ -310,11 +350,35 @@ if __name__ == "__main__":
     assert _ghash(_h_tc2, bytes.fromhex("0388dace60b6a392f328c2b971b2fe78")
                           +(0).to_bytes(8,'big')+(128).to_bytes(8,'big')) \
         == bytes.fromhex("f38cbb1ad69223dcc3457ae5b6b0f885")          # GCM TC2 GHASH
-    # 5) AEAD record round-trip (encrypt then decrypt), timed
+    # 4b) the AEAD FRAMING rules (examples/gcm_frame.verbose, 2026-09-02) vs the
+    # PUBLISHED NIST SP 800-38D intermediates and RFC 8446: J0 must be TC2's Y0,
+    # the tag must be S XOR E(K,Y0) on TC2 AND TC4, the length block must be
+    # TC4's ([len(A)]64 || [len(C)]64 for 20-byte AAD / 60-byte C), the nonce
+    # must be IV XOR seq right-aligned, and the AAD the TLS record header.
+    t=time.time()
+    assert gcm_nonce(bytes.fromhex("cafebabefacedbaddecaf888"), 0x0102030405060708) \
+        == bytes.fromhex("cafebabefbccd8a9dbccff80")                  # RFC 8446 5.3
+    assert gcm_j0(bytes(12), 0) == bytes(15)+b"\x01"                  # GCM TC2 Y0
+    assert gcm_aad(12) == bytes.fromhex("170303001c")                 # RFC 8446 5.2, len(inner)=12 -> 28
+    assert gcm_lenblock(20, 60) == bytes.fromhex("00000000000000a000000000000001e0")   # GCM TC4
+    assert gcm_tag(bytes.fromhex("f38cbb1ad69223dcc3457ae5b6b0f885"),
+                   bytes.fromhex("58e2fccefa7e3061367f1d57a4e7455a")) \
+        == bytes.fromhex("ab6e47d42cec13bdf53a67b21257bddf")          # GCM TC2 T = S xor E(K,Y0)
+    _t4=gcm_tag(bytes.fromhex("698e57f70e6ecc7fd9463b7260a9ae5f"),
+                bytes.fromhex("3247184b3c4f69a44dbcd22887bbb418"))
+    assert _t4 == bytes.fromhex("5bc94fbc3221a5db94fae95ae7121a47")   # GCM TC4 T
+    assert gcm_tag_eq(_t4, _t4) == 1
+    assert gcm_tag_eq(_t4, bytes([_t4[0]^0x80])+_t4[1:]) == 0         # single-bit flip -> 0 (negative control)
+    assert gcm_tag_eq(_t4, _t4[:15]+bytes([_t4[15]^0x01])) == 0
+    t_fr = time.time()-t
+    # 5) AEAD record round-trip (encrypt then decrypt), timed, plus tamper rejection
     rk=bytes(range(1,17)); riv=bytes(range(17,29))
     t=time.time()
     rec=aead_encrypt(rk,riv,0,b"hello world",0x17)
     ct,pt=aead_decrypt(rk,riv,0,rec)
     t_ae = time.time()-t
     assert ct==0x17 and pt==b"hello world", (ct,pt)
-    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  sha256={t_sha:.3f}s  extract_psk={t_px:.3f}s  aead={t_ae:.3f}s  aead_roundtrip=ok  (every TLS primitive: ONE record spawn of a verified binary; the which-era thread pool is DELETED)")
+    _bad=bytearray(rec); _bad[-1]^=1                                    # the ONLY xor left in this file
+    assert aead_decrypt(rk,riv,0,bytes(_bad)) is None
+    assert aead_decrypt(rk,riv,1,rec) is None                          # wrong seq -> wrong nonce -> reject
+    print(f"VCRYPTO_OK  x25519={t_x:.3f}s  keysched={t_ks:.3f}s  sched={t_sc:.3f}s  sha256={t_sha:.3f}s  extract_psk={t_px:.3f}s  framing={t_fr:.3f}s  aead={t_ae:.3f}s  aead_roundtrip=ok  (every TLS primitive AND the AEAD framing: ONE record spawn of a verified binary; the which-era thread pool is DELETED)")

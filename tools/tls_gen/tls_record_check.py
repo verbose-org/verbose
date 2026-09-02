@@ -67,7 +67,23 @@ def tls_record_ref(key, iv, seq, plaintext, ctype=0x17):
 # object {"b0":...,...}. encrypt/ghash_fold are ONE spawn; gctr is one spawn
 # per 16-byte block (`which` = block index, tail block hex padded by the
 # host and truncated after unpacking — same framing glue as vcrypto._gctr).
-import json as _json
+# Since 2026-09-02 the FRAMING is Verbose too (examples/gcm_frame.verbose):
+# nonce, J0, AAD, length block, tag XOR and the tag compare are each one
+# record spawn, so this driver no longer XORs or builds a block in Python —
+# the Python reference above is the ONLY place framing is computed by hand,
+# which is what makes it an oracle for the rules rather than a copy of them.
+import json as _json, os as _os
+_ROOT=_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+_BIN={"tr_aes":("encrypt","aes_encrypt.verbose"), "tr_gctr":("gctr","aes_gctr.verbose"),
+      "tr_ghash":("ghash_fold","ghash_nblocks.verbose"),
+      "tr_gcm_nonce":("gcm_nonce","gcm_frame.verbose"), "tr_gcm_j0":("gcm_j0","gcm_frame.verbose"),
+      "tr_gcm_aad":("gcm_aad","gcm_frame.verbose"), "tr_gcm_lenblock":("gcm_lenblock","gcm_frame.verbose"),
+      "tr_gcm_tag":("gcm_tag","gcm_frame.verbose")}
+for _name,(_rule,_src) in _BIN.items():   # compile on demand (the binaries used to be assumed present)
+    if not _os.path.exists("/tmp/"+_name):
+        subprocess.run(["cargo","run","--release","--",_os.path.join("examples",_src),"--native","/tmp/"+_name,"--run",_rule],
+                       cwd=_ROOT, capture_output=True, text=True)
+        assert _os.path.exists("/tmp/"+_name), f"could not compile {_rule} from {_src}"
 def _rec(cmd, n):
     r=subprocess.run(cmd,capture_output=True,text=True)
     o=_json.loads(r.stdout.strip())
@@ -85,17 +101,20 @@ def vghash(H, data):
     nb=len(data)//16; hexd=bytes(data).hex()
     args=[str(b) for b in [0]*16]+[str(b) for b in H]+[str(nb),str(nb),hexd]
     return _rec(["/tmp/tr_ghash"]+args, 16)
+def vnonce(iv, seq):    return _rec(["/tmp/tr_gcm_nonce"]+[str(b) for b in iv]+[str(seq)], 12)
+def vj0(iv, seq):       return _rec(["/tmp/tr_gcm_j0"]+[str(b) for b in iv]+[str(seq)], 16)
+def vaad(inner_len):    return _rec(["/tmp/tr_gcm_aad", str(inner_len)], 5)
+def vlenblock(la, lc):  return _rec(["/tmp/tr_gcm_lenblock", str(la), str(lc)], 16)
+def vtag(S, EJ0):       return _rec(["/tmp/tr_gcm_tag"]+[str(b) for b in S]+[str(b) for b in EJ0], 16)
 def v_tls_record(key, iv, seq, plaintext, ctype=0x17):
-    nonce=bytearray(iv); seqb=seq.to_bytes(8,'big')
-    for j in range(8): nonce[4+j]^=seqb[j]
-    inner=list(plaintext)+[ctype]; length=len(inner)+16
-    aad=[0x17,0x03,0x03,(length>>8)&0xff,length&0xff]
-    H=venc(key,[0]*16); C=vgctr(key,bytes(nonce),inner)
-    def pad(b): return bytes(b)+bytes((-len(b))%16)
-    lenb=(len(aad)*8).to_bytes(8,'big')+(len(C)*8).to_bytes(8,'big')
-    S=vghash(list(H), pad(aad)+pad(C)+lenb)
-    EJ0=venc(key,list(nonce)+[0,0,0,1]); tag=bytes(S[i]^EJ0[i] for i in range(16))
-    return bytes(aad)+C+tag
+    inner=bytes(plaintext)+bytes([ctype])            # TLS framing (host): append the inner content type
+    aad=vaad(len(inner))                              # Verbose: the record header / additional data
+    nonce=vnonce(iv, seq)                             # Verbose: IV XOR seq
+    H=venc(key,[0]*16); C=vgctr(key,nonce,inner)      # Verbose: H, then one gctr spawn per block
+    def pad(b): return bytes(b)+bytes((-len(b))%16)   # host glue: variable-length zero padding
+    S=vghash(list(H), pad(aad)+pad(C)+vlenblock(len(aad),len(C)))   # Verbose: length block + GHASH
+    EJ0=venc(key,vj0(iv,seq))                         # Verbose: J0, then E_K(J0)
+    return aad+C+vtag(S,EJ0)                          # Verbose: T = S XOR E_K(J0)
 
 random.seed(123)
 for _ in range(3):
