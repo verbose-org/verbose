@@ -20931,7 +20931,27 @@ fn compile_http10_dynamic_service(
         _ => None,
     }).collect();
 
-    let code = emit_http10_dynamic_bytes(service, handler, &offsets, &no_rules, &no_ranges, &all_resources, &all_connections, &all_entropies)?;
+    // DIAGNOSTIC-ONLY indexes (slice agg-svc-1's breadcrumb). `no_rules`
+    // above is what the emitter INLINES from, and it is empty ON PURPOSE:
+    // the service path lowers no rule call (a callee's fields would be
+    // resolved against the handler's `HttpRequest` offsets map — the
+    // `unknown field` failure tranche 5 hit on the rule path). The cost of
+    // that emptiness was that every rule call in a handler `let` was
+    // reported as `unknown rule '<callee>' for native inlining` — a rule
+    // the verifier had just resolved. These two indexes let the let
+    // prologue NAME a record-returning callee truthfully; nothing is
+    // emitted from them, so no byte of any accepted program can move.
+    let program_rules: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i {
+        Item::Rule(r) => Some((r.name.as_str(), r)),
+        _ => None,
+    }).collect();
+    let program_concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
+
+    let code = emit_http10_dynamic_bytes(
+        service, handler, &offsets, &no_rules, &no_ranges,
+        &all_resources, &all_connections, &all_entropies,
+        &program_rules, &program_concepts,
+    )?;
     write_server_elf(&code, output_path, "service", service.port)
 }
 
@@ -21068,6 +21088,11 @@ fn emit_http10_dynamic_bytes(
     all_resources: &HashMap<&str, &Resource>,
     all_connections: &HashMap<&str, &Connection>,
     all_entropies: &HashMap<&str, &Entropy>,
+    // The program's REAL rules and concepts, used for DIAGNOSTICS ONLY
+    // (slice agg-svc-1's breadcrumb). `all_rules` is the empty map the
+    // service path inlines from — see `compile_http10_dynamic_service`.
+    diag_rules: &HashMap<&str, &Rule>,
+    diag_concepts: &[&Concept],
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
@@ -21797,6 +21822,44 @@ fn emit_http10_dynamic_bytes(
         for ((name, expr), is_text) in
             handler.logic.bindings.iter().zip(handler_binding_is_text.iter())
         {
+            // Slice agg-svc-1 — a TRUTHFUL breadcrumb for a record-valued
+            // `let`. Before this check, `let q = swap2(In { … })` on a
+            // record-returning `swap2` reported `unknown rule 'swap2' for
+            // native inlining`: `let_rhs_is_text` classified the Call as a
+            // number (its Call arm consults `all_rules`, empty on the
+            // service path), the number arm below reached `emit_eval_expr`'s
+            // Call arm, and THAT looked the callee up in the same empty map.
+            // The rule exists and the verifier had just resolved it — the
+            // message was false. This names what is actually missing: a
+            // slot group in the service frame for a returned aggregate (the
+            // caller-allocated destination convention of slice agg-1, which
+            // the RULE path already has as a `let` slot group).
+            //
+            // Only a CALL whose callee returns a PLAIN RECORD concept takes
+            // this arm — `plain_record_concept` is the same predicate the
+            // rule path keys its sret slot on. Every other RHS falls
+            // through UNCHANGED, so no accepted program moves (measured:
+            // 1386/1386 corpus targets byte-identical).
+            if let Expr::Call(callee, _) = expr {
+                if let Some(called) = diag_rules.get(callee.as_str()) {
+                    if let Some(concept) = plain_record_concept(&called.output_ty, diag_concepts) {
+                        return Err(NativeError {
+                            message: format!(
+                                "service '{}' / handler '{}' / let '{}': callee '{}' returns a record \
+                                 (plain record concept '{}', {} field(s)), and a record-valued `let` \
+                                 inside an HTTP service handler is not lowered natively yet — the \
+                                 handler-let prologue lowers TEXT lets ((ptr, len) slots) and NUMBER \
+                                 lets (one slot) only, and the service frame has no slot group for a \
+                                 returned aggregate; slice agg-svc-1 lifts it (the caller-allocated \
+                                 destination of slice agg-1, docs/bytes-value-return-design.md, \
+                                 applied to the service frame)",
+                                service.name, handler.name, name, callee,
+                                concept.name, concept.fields.len(),
+                            ),
+                        });
+                    }
+                }
+            }
             if *is_text {
                 let ptr_slot = let_cursor;
                 let len_slot = let_cursor - 8;
@@ -36592,6 +36655,114 @@ service chained
         );
 
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// Slice agg-svc-1 (DIAGNOSTIC ONLY — no lowering): a handler `let`
+    /// bound to a RECORD-returning rule is refused, and the refusal must
+    /// tell the truth. Before this pin it said `unknown rule 'swap2' for
+    /// native inlining` — false: the verifier had just resolved `swap2`.
+    /// The service path hands its emitter an EMPTY rules map (on purpose:
+    /// it inlines no rule call — `no_rules` in
+    /// `compile_http10_dynamic_service`), so `let_rhs_is_text` classified
+    /// the Call as a number and `emit_eval_expr`'s Call arm then failed the
+    /// SAME empty lookup. The breadcrumb now names the service, the
+    /// handler, the let, the callee, the record concept and the lifting
+    /// slice; the anti-assertion pins the old wording out. The twin — the
+    /// same handler with a NUMBER let in the record let's place — still
+    /// compiles, so the refusal is attributable to the record let and the
+    /// check is not "every handler let is refused". Verified to FAIL
+    /// against c5e46b0 (`unknown rule 'swap2' for native inlining`).
+    #[test]
+    fn record_valued_handler_let_is_refused_with_a_truthful_breadcrumb() {
+        let parse = |src: &str| {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+            crate::parser::Parser::new(tokens).parse_program().expect("parse")
+        };
+        // `@source` lines point at real files under examples/ so the same
+        // fixture passes verify_program's traceability check unchanged.
+        let fixture = |let_line: &str, status: &str, body: &str, reads: &str, calls: &str| {
+            format!(
+                "@verbose 0.1.0\n\n\
+                 concept In\n  @intention: \"two bytes to be swapped\"\n  @source: aggregate_pair.intent:1\n\
+                 \x20 fields:\n    a : number [0, 255]\n    b : number [0, 255]\n\n\
+                 concept Pair\n  @intention: \"the swapped pair, returned as an aggregate\"\n  @source: aggregate_pair.intent:2\n\
+                 \x20 fields:\n    x : number [0, 255]\n    y : number [0, 255]\n\n\
+                 rule swap2\n  @intention: \"return both bytes swapped, as one record value\"\n  @source: aggregate_pair.intent:3\n\
+                 \x20 input:\n    i : In\n  output:\n    p : Pair\n  logic:\n    p = Pair {{ x: i.b, y: i.a }}\n\
+                 \x20 proofs:\n    purity:\n      reads : [i.a, i.b]\n      calls : []\n    termination:\n      bound : 3\n\n\
+                 rule handle\n  @intention: \"answer with a field of the returned aggregate\"\n  @source: counter_service.intent:3\n\
+                 \x20 input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {let_line}\n\
+                 \x20   resp = HttpResponse {{ status: {status}, body: {body} }}\n\
+                 \x20 proofs:\n    purity:\n      reads : [{reads}]\n      calls : [{calls}]\n    termination:\n      bound : 8\n\n\
+                 service s\n  @intention: \"HTTP front for swap2\"\n  @source: counter_service.intent:5\n\
+                 \x20 listen:\n    protocol    : http_1_0\n    port        : 18961\n    max_request : 4096\n  handler: handle\n",
+                let_line = let_line,
+                status = status,
+                body = body,
+                reads = reads,
+                calls = calls,
+            )
+        };
+
+        // ── 1. THE REFUSAL, and what it says ─────────────────────────
+        let record = fixture(
+            "let q = swap2(In { a: 1, b: 2 })",
+            "200",
+            "concat(\"q:\", q.x)",
+            "",
+            "swap2",
+        );
+        let program = parse(&record);
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(
+            errs.is_empty(),
+            "the fixture must VERIFY clean — the point is that `swap2` exists and \
+             the verifier resolves it, so `unknown rule` was never true; got {errs:#?}",
+        );
+        let out = std::env::temp_dir().join("verbosec_test_agg_svc_1_record_let");
+        let _ = std::fs::remove_file(&out);
+        let msg = compile_service(&program, "s", out.to_str().unwrap())
+            .expect_err("a record-valued handler let is not lowered yet (slice agg-svc-1); it must be REFUSED")
+            .message;
+        for needle in [
+            "service 's'",
+            "handler 'handle'",
+            "let 'q'",
+            "'swap2'",
+            "record",
+            "'Pair'",
+            "agg-svc-1",
+        ] {
+            assert!(msg.contains(needle), "breadcrumb must name {needle:?}; got {msg:?}");
+        }
+        assert!(
+            !msg.contains("unknown rule"),
+            "the rule EXISTS and verified — `unknown rule` is the false breadcrumb this \
+             test exists to pin out; got {msg:?}",
+        );
+        assert!(!out.exists(), "a refusal writes ZERO bytes; found {:?}", out);
+
+        // ── 2. THE CORRECTED TWIN ─────────────────────────────────────
+        // Same handler, a NUMBER let where the record let was, consumed by
+        // the status field (slice 3e). Compiles today; if it stops, the
+        // new check is over-reaching.
+        let twin = fixture(
+            "let q = length(req.path)",
+            "if q > 0 then 200 else 404",
+            "\"ok\"",
+            "req.path",
+            "",
+        );
+        let program = parse(&twin);
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "the twin must verify clean; got {errs:#?}");
+        let out2 = std::env::temp_dir().join("verbosec_test_agg_svc_1_number_let_twin");
+        let _ = std::fs::remove_file(&out2);
+        compile_service(&program, "s", out2.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("the corrected twin (number let) must still compile: {}", e.message));
+        let bytes = std::fs::read(&out2).expect("read the twin's binary");
+        assert!(!bytes.is_empty(), "the twin must produce a real service binary");
+        let _ = std::fs::remove_file(&out2);
     }
 
     /// Phase 8 slice 8e: a service may declare MULTIPLE `log:` blocks,
