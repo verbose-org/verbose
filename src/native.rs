@@ -6215,7 +6215,7 @@ fn emit_callable_into<'a>(
         emit_streaming_bytes_body(
             code, &rule.logic.value, &rule.input_name, &callable_offsets,
             all_rules, &callable_field_ranges, &callable_text_bindings,
-            self_call, arena_ctx_ref,
+            self_call, arena_ctx_ref, WriteFd::Imm(1),
         )?;
     } else if is_text {
         if streaming {
@@ -7042,8 +7042,52 @@ fn emit_recursive_text_body(
 ///   syscall             ; 0F 05                  clobbers rcx, r11
 ///   pop r11             ; 41 5B
 fn emit_streamed_write_rsi_rdx(code: &mut Vec<u8>) {
+    emit_streamed_write_rsi_rdx_fd(code, WriteFd::Imm(1));
+}
+
+/// Where a streamed write goes. Slice `rawtcp-inspect-0` threads this
+/// through `emit_streaming_bytes_body` so a `raw_tcp` handler's response
+/// streams to the CLIENT fd instead of stdout (design §3 W2: the response is
+/// the one place bytes never need materialising, because raw_tcp has no
+/// Content-Length to compute — so the fd is the only thing that changes).
+///
+/// `Imm(1)` emits exactly the 7-byte `mov rdi, 1` every pre-existing caller
+/// emitted, so every rule binary is byte-identical (measured, not argued:
+/// the corpus sweep in the slice's PR). `RbpSlot(off)` is a 4-byte
+/// `mov rdi, [rbp+disp8]` (7 with disp32) — the HTTP emitter's own
+/// `[rbp-48]` client_fd convention, adopted rather than a register because
+/// `r13`/`r14` are handler-reachable scratch once the handler computes
+/// (design §3 W3's register audit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteFd {
+    Imm(i32),
+    RbpSlot(i32),
+}
+
+/// `mov rdi, <fd>` for either `WriteFd` shape.
+fn emit_mov_rdi_fd(code: &mut Vec<u8>, fd: WriteFd) {
+    match fd {
+        WriteFd::Imm(n) => {
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7]); // mov rdi, imm32
+            code.extend_from_slice(&n.to_le_bytes());
+        }
+        WriteFd::RbpSlot(off) => {
+            if off >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x7D]); // mov rdi, [rbp+disp8]
+                code.push(off as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xBD]); // mov rdi, [rbp+disp32]
+                code.extend_from_slice(&off.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// `emit_streamed_write_rsi_rdx` with the destination fd chosen by the
+/// caller. Same r11 push/pop discipline; only the `mov rdi` differs.
+fn emit_streamed_write_rsi_rdx_fd(code: &mut Vec<u8>, fd: WriteFd) {
     code.extend_from_slice(&[0x41, 0x53]);                         // push r11
-    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+    emit_mov_rdi_fd(code, fd);                                     // mov rdi, <fd>
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
     code.extend_from_slice(&[0x0F, 0x05]);                         // syscall
     code.extend_from_slice(&[0x41, 0x5B]);                         // pop r11
@@ -7516,6 +7560,13 @@ fn emit_text_program<'a>(
 /// machine-code payloads that may exceed 255 bytes in later bricks. No
 /// trailing newline: raw bytes, exact.
 fn emit_write_bytes_literal(code: &mut Vec<u8>, bytes: &[u8], fd: i32) {
+    emit_write_bytes_literal_fd(code, bytes, WriteFd::Imm(fd));
+}
+
+/// `emit_write_bytes_literal` with the destination fd as a `WriteFd`, so a
+/// `raw_tcp` handler's literal bytes stream to the client fd slot. The
+/// `Imm` form is byte-for-byte the pre-existing emit.
+fn emit_write_bytes_literal_fd(code: &mut Vec<u8>, bytes: &[u8], fd: WriteFd) {
     let len = bytes.len();
     // jmp rel32 over the data
     code.push(0xE9);
@@ -7531,8 +7582,7 @@ fn emit_write_bytes_literal(code: &mut Vec<u8>, bytes: &[u8], fd: i32) {
     code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
     code.extend_from_slice(&(len as i32).to_le_bytes());
     // mov rdi, fd
-    code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
-    code.extend_from_slice(&fd.to_le_bytes());
+    emit_mov_rdi_fd(code, fd);
     // mov rax, 1 (sys_write)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
     // Preserve r11 across the syscall. In the recursive streaming-bytes
@@ -7611,6 +7661,7 @@ fn emit_bytes_program<'a>(
         &ctx.text_bindings,
         empty_self_call,
         None,
+        WriteFd::Imm(1),
     )?;
 
     // jmp loop_top
@@ -7640,10 +7691,28 @@ fn emit_streaming_bytes_body(
     text_bindings: &TextBindings<'_>,
     self_call: SelfCallCtx<'_>,
     arena_ctx: Option<&ArenaCtx>,
+    fd: WriteFd,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Bytes(b) => {
-            emit_write_bytes_literal(code, b, 1);
+            emit_write_bytes_literal_fd(code, b, fd);
+            Ok(())
+        }
+        // Slice rawtcp-inspect-0: the raw_tcp handler's input field as a
+        // bytes VALUE — the whole received chunk, in the response directly
+        // or as one argument of the bytes concat (design §4.2: "the whole
+        // input chunk" is one of the three things a response is built
+        // from). Registered by `emit_raw_tcp_dynamic_bytes` under the
+        // COMPOSITE key `__req_<field>` — never the bare field name, because
+        // the name is author-chosen and a handler `let` of the same name
+        // would otherwise overwrite the registration (design §4.1-2, NC-0b).
+        Expr::Field(base, fname)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                && text_bindings.contains_key(format!("__req_{}", fname).as_str()) =>
+        {
+            let (ptr_slot, len_slot) = text_bindings[format!("__req_{}", fname).as_str()];
+            emit_load_rsi_rdx_from_slots(code, ptr_slot, len_slot);
+            emit_streamed_write_rsi_rdx_fd(code, fd);
             Ok(())
         }
         // Slice entropy-1: stream the current draw — load its (ptr, len)
@@ -7660,7 +7729,7 @@ fn emit_streaming_bytes_body(
                 ),
             })?;
             emit_load_rsi_rdx_from_slots(code, ptr_slot, len_slot);
-            emit_streamed_write_rsi_rdx(code);
+            emit_streamed_write_rsi_rdx_fd(code, fd);
             Ok(())
         }
         Expr::Concat(args) => {
@@ -7685,7 +7754,7 @@ fn emit_streaming_bytes_body(
             for a in args {
                 emit_streaming_bytes_body(
                     code, a, input_name, offsets, all_rules,
-                    field_ranges, text_bindings, self_call, arena_ctx,
+                    field_ranges, text_bindings, self_call, arena_ctx, fd,
                 )?;
             }
             Ok(())
@@ -7707,7 +7776,7 @@ fn emit_streaming_bytes_body(
             code.extend_from_slice(&[0x48, 0x89, 0xE6]);        // mov rsi, rsp
             code.extend_from_slice(&[0x48, 0xC7, 0xC2]);        // mov rdx, width
             code.extend_from_slice(&width.to_le_bytes());
-            emit_streamed_write_rsi_rdx(code);
+            emit_streamed_write_rsi_rdx_fd(code, fd);
             // add rsp, 8 (free the scratch)
             code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
             Ok(())
@@ -7728,7 +7797,7 @@ fn emit_streaming_bytes_body(
             code.extend_from_slice(&[0x00; 4]);
             emit_streaming_bytes_body(
                 code, then_e, input_name, offsets, all_rules,
-                field_ranges, text_bindings, self_call, arena_ctx,
+                field_ranges, text_bindings, self_call, arena_ctx, fd,
             )?;
             code.push(0xE9);
             let end_patch = code.len();
@@ -7738,7 +7807,7 @@ fn emit_streaming_bytes_body(
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_streaming_bytes_body(
                 code, else_e, input_name, offsets, all_rules,
-                field_ranges, text_bindings, self_call, arena_ctx,
+                field_ranges, text_bindings, self_call, arena_ctx, fd,
             )?;
             let end_pos = code.len();
             let end_off = end_pos as i32 - (end_patch as i32 + 4);
@@ -7888,7 +7957,7 @@ fn emit_streaming_bytes_body(
                 emit_streaming_bytes_body(
                     code, &arm.body, input_name, &extended_offsets,
                     all_rules, &extended_ranges, &extended_text_bindings,
-                    self_call, Some(ac),
+                    self_call, Some(ac), fd,
                 )?;
                 // jmp .match_end
                 code.push(0xE9);
@@ -7961,7 +8030,7 @@ fn emit_streaming_bytes_body(
             code.push(0x50);
             emit_streaming_bytes_body(
                 code, inner, input_name, offsets, all_rules,
-                field_ranges, text_bindings, self_call, arena_ctx,
+                field_ranges, text_bindings, self_call, arena_ctx, fd,
             )?;
             // RESET: pop rax ; mov [r11 + arena_size], rax
             code.push(0x58);
@@ -17494,7 +17563,18 @@ fn emit_length(
             // BoundText path takes precedence: a field whose name is in
             // text_bindings has its length at the registered len_slot
             // (e.g. req.body in HTTP services). Zero-scan.
-            if let Some(&(_ptr_slot, len_slot)) = text_bindings.get(fname.as_str()) {
+            //
+            // Slice rawtcp-inspect-0: the composite `__req_<field>` key is
+            // probed first (see emit_starts_with_load_text's Field arm for
+            // why it is composite). For a raw_tcp input field the len_slot
+            // holds the `read` syscall's RETURN VALUE — the runtime count,
+            // never `max_request` — which is what makes `length(req.data)`
+            // the actual frame length (design §4.3, row 3; NC-0a).
+            let composite = format!("__req_{}", fname);
+            let bound = text_bindings
+                .get(composite.as_str())
+                .or_else(|| text_bindings.get(fname.as_str()));
+            if let Some(&(_ptr_slot, len_slot)) = bound {
                 if len_slot >= -128 {
                     code.extend_from_slice(&[0x48, 0x8B, 0x45]);
                     code.push(len_slot as u8);
@@ -17903,7 +17983,18 @@ fn emit_starts_with_load_text(
             // BoundText path takes precedence: req.body and similar
             // fields registered in text_bindings carry (ptr, len) at
             // dedicated rbp slots — no scan needed.
-            if let Some(&(ptr_slot, len_slot)) = text_bindings.get(fname.as_str()) {
+            //
+            // Slice rawtcp-inspect-0: a raw_tcp handler's bytes input field
+            // is registered under the COMPOSITE key `__req_<field>` (the
+            // name is author-chosen, so a bare key would collide with a
+            // handler `let` of the same name — design §4.1-2). Probe the
+            // composite key FIRST, then the bare one `req.body` uses; a
+            // program with no raw_tcp input registered is byte-identical.
+            let composite = format!("__req_{}", fname);
+            let bound = text_bindings
+                .get(composite.as_str())
+                .or_else(|| text_bindings.get(fname.as_str()));
+            if let Some(&(ptr_slot, len_slot)) = bound {
                 // mov rsi, [rbp + ptr_slot]
                 if ptr_slot >= -128 {
                     code.extend_from_slice(&[0x48, 0x8B, 0x75]);
@@ -20488,43 +20579,514 @@ pub fn compile_service(
         }
     }
 
-    // Enforce identity handler for slice 2b. The verifier already
-    // guarantees the shape of input and output concepts; here we check
-    // that the logic is literally `OutputConcept { f: input_var.f }` so
-    // the emitted echo is semantically the handler's declared behavior.
-    if handler.logic.target != "resp" && handler.logic.target != handler.output_name {
-        // Expected: target matches the declared output binding name.
-        // (Already enforced elsewhere — this is a defensive guard.)
+    // The IDENTITY handler — `resp = <Out> { <f>: <input>.<f> }` with no
+    // `let` bindings — keeps the Phase 7 slice 2b echo emitter UNTOUCHED
+    // (`emit_raw_tcp_echo_bytes`, 358 B for examples/raw_tcp_echo.verbose,
+    // and byte-identical across slice rawtcp-inspect-0 — measured). Every
+    // other shape takes the slice-0 dynamic emitter, which gives the
+    // handler an rbp frame so it can COMPUTE (design §4.1-1).
+    let is_identity = handler.logic.bindings.is_empty()
+        && match &handler.logic.value {
+            Expr::Record(_, fields) if fields.len() == 1 => {
+                let (_, value) = &fields[0];
+                matches!(value, Expr::Field(base, _) if matches!(base.as_ref(), Expr::Ident(n) if n == &handler.input_name))
+            }
+            _ => false,
+        };
+    if is_identity {
+        let code = emit_raw_tcp_echo_bytes(service.port, service.max_request);
+        return write_server_elf(&code, output_path, "service", service.port);
     }
-    if !handler.logic.bindings.is_empty() {
+
+    compile_raw_tcp_dynamic_service(program, service, handler, output_path)
+}
+
+/// Slice `rawtcp-inspect-0` (docs/multistep-connection-design.md §4): a
+/// `raw_tcp` service whose handler is a REAL rule — one that inspects its
+/// input with `byte_at` / `length`, binds number / text `let`s, and answers
+/// with a bytes expression. Resolves the two concepts the verifier already
+/// pinned to one `bytes [..max_request]` field each, refuses what slice 0
+/// does not lower (each naming the lifting slice), and hands the rest to
+/// `emit_raw_tcp_dynamic_bytes`.
+fn compile_raw_tcp_dynamic_service(
+    program: &Program,
+    service: &Service,
+    handler: &Rule,
+    output_path: &str,
+) -> Result<(), NativeError> {
+    let concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
+    let named = |ty: &Type, position: &str| -> Result<&Concept, NativeError> {
+        let name = match ty {
+            Type::Named(n) => n.as_str(),
+            other => {
+                return Err(NativeError {
+                    message: format!(
+                        "raw_tcp handler '{}' {} must be a Named concept (verifier should have caught this); got {:?}",
+                        handler.name, position, other
+                    ),
+                })
+            }
+        };
+        concepts.iter().find(|c| c.name == name).copied().ok_or_else(|| NativeError {
+            message: format!("raw_tcp handler '{}' {} concept '{}' not found", handler.name, position, name),
+        })
+    };
+    let input_concept = named(&handler.input_ty, "input")?;
+    let output_concept = named(&handler.output_ty, "output")?;
+    // `check_raw_tcp_binding` guarantees exactly one bytes field on each;
+    // this is the defensive read of that guarantee, not a second check.
+    let one_bytes_field = |c: &Concept, position: &str| -> Result<String, NativeError> {
+        match c.fields.as_slice() {
+            [f] if matches!(f.ty, Type::Bytes) => Ok(f.name.clone()),
+            _ => Err(NativeError {
+                message: format!(
+                    "raw_tcp handler '{}' {} concept '{}' must have exactly one bytes field \
+                     (verifier should have caught this)",
+                    handler.name, position, c.name
+                ),
+            }),
+        }
+    };
+    let in_field = one_bytes_field(input_concept, "input")?;
+    let out_field = one_bytes_field(output_concept, "output")?;
+
+    // Slice 0 lowers NO effect inside a raw_tcp handler: no resource read,
+    // no outbound fetch, no clock. Each would need the per-accept block the
+    // HTTP emitter has (resource / connection / timestamp slots on the
+    // descending cursor) and its own driven test; none is in design §4.1's
+    // six items. Refused by name rather than reaching `emit_eval_expr`'s
+    // Read / Fetch / NowUnix arms with an unattributable slot error.
+    if let Some(r) = collect_rule_read_names(handler).first() {
         return Err(NativeError {
             message: format!(
-                "Phase 7 slice 2b: handler '{}' has let bindings; only identity handlers \
-                 are supported in this slice",
-                handler.name
+                "raw_tcp handler '{}': read('{}') is not supported here — slice rawtcp-inspect-0 \
+                 lowers no effect inside a raw_tcp handler (the per-accept resource block is the \
+                 HTTP emitter's); slice rawtcp-effects-1 brings read / fetch / now_unix to raw_tcp",
+                handler.name, r
             ),
         });
     }
-    let is_identity = match &handler.logic.value {
-        Expr::Record(_, fields) if fields.len() == 1 => {
-            let (_, value) = &fields[0];
-            matches!(value, Expr::Field(base, _) if matches!(base.as_ref(), Expr::Ident(n) if n == &handler.input_name))
-        }
-        _ => false,
-    };
-    if !is_identity {
+    if let Some(c) = collect_rule_fetch_names(handler).first() {
         return Err(NativeError {
             message: format!(
-                "Phase 7 slice 2b: handler '{}' logic is not identity (expected \
-                 `resp = <OutputConcept> {{ <field>: <input>.<field> }}`); non-identity \
-                 handlers land in slice 2c+",
+                "raw_tcp handler '{}': fetch('{}', …) is not supported here — slice rawtcp-inspect-0 \
+                 lowers no effect inside a raw_tcp handler; slice rawtcp-effects-1 brings read / \
+                 fetch / now_unix to raw_tcp",
+                handler.name, c
+            ),
+        });
+    }
+    if rule_uses_now_unix(handler) {
+        return Err(NativeError {
+            message: format!(
+                "raw_tcp handler '{}': now_unix() is not supported here — the raw_tcp frame has no \
+                 timestamp slot (slice rawtcp-inspect-0 lowers no effect inside a raw_tcp handler); \
+                 slice rawtcp-effects-1 brings read / fetch / now_unix to raw_tcp",
                 handler.name
             ),
         });
     }
 
-    let code = emit_raw_tcp_echo_bytes(service.port, service.max_request);
+    // The service path INLINES no rule call — a callee's fields would be
+    // resolved against the handler's offsets map (the `unknown field`
+    // failure the HTTP path documents). `no_rules` is therefore empty ON
+    // PURPOSE; `program_rules` / `concepts` are handed over for DIAGNOSTICS
+    // only (the agg-svc-1 breadcrumb, PR #202), nothing is emitted from
+    // them.
+    let no_rules: HashMap<&str, &Rule> = HashMap::new();
+    let no_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+    let program_rules: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i {
+        Item::Rule(r) => Some((r.name.as_str(), r)),
+        _ => None,
+    }).collect();
+
+    let code = emit_raw_tcp_dynamic_bytes(
+        service, handler, input_concept, &in_field, &output_concept.name, &out_field,
+        &no_rules, &no_ranges, &program_rules, &concepts,
+    )?;
     write_server_elf(&code, output_path, "service", service.port)
+}
+
+/// Slice `rawtcp-inspect-0`: unwrap the handler body to the bytes expression
+/// the response STREAMS. The verifier pinned the output to one concept with
+/// one bytes field, so the body is `<Out> { <f>: <bytes expr> }` — possibly
+/// under an `if / else` whose arms each are. The record constructor is
+/// erased (the response has no framing to serialise, unlike HTTP's
+/// status + Content-Length), and an `If` above it is rebuilt around the
+/// unwrapped arms so `emit_streaming_bytes_body`'s own `If` arm branches and
+/// streams each side. Any other shape is refused by name.
+fn raw_tcp_response_expr(
+    expr: &Expr,
+    handler_name: &str,
+    out_concept: &str,
+    out_field: &str,
+) -> Result<Expr, NativeError> {
+    match expr {
+        Expr::Record(name, fields)
+            if name == out_concept && fields.len() == 1 && fields[0].0 == out_field =>
+        {
+            Ok(fields[0].1.clone())
+        }
+        Expr::If(c, a, b) => Ok(Expr::If(
+            c.clone(),
+            Box::new(raw_tcp_response_expr(a, handler_name, out_concept, out_field)?),
+            Box::new(raw_tcp_response_expr(b, handler_name, out_concept, out_field)?),
+        )),
+        other => Err(NativeError {
+            message: format!(
+                "raw_tcp handler '{}': the response must be `{} {{ {}: <bytes expr> }}`, \
+                 directly or under if/else — the response is STREAMED to the client fd by \
+                 emit_streaming_bytes_body, which has no lowering for a {} in that position; \
+                 slice rawtcp-inspect-0b (bytes values beyond literal / le32 / le64 / the input \
+                 chunk)",
+                handler_name, out_concept, out_field, expr_kind(other)
+            ),
+        }),
+    }
+}
+
+/// Slice `rawtcp-inspect-0`, refusal #4 of design §4.4: is this handler `let`
+/// RHS a BYTES value? `let_rhs_is_text` classifies every let as text-or-
+/// number, and a bytes RHS would land on the number arm — `emit_eval_expr`
+/// on a bytes field or a streamed concat, with no slot to load. There is no
+/// bytes sibling of `emit_text_produce_ptrlen` (design §3 W2), so a bytes
+/// let cannot be materialised; refuse it by name.
+fn raw_tcp_let_is_bytes(expr: &Expr, input_name: &str, input_concept: &Concept) -> bool {
+    match expr {
+        Expr::Bytes(_) | Expr::Le32(_) | Expr::Le64(_) | Expr::Random(_) => true,
+        Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) => {
+            input_concept
+                .fields
+                .iter()
+                .find(|f| &f.name == fname)
+                .map(|f| matches!(f.ty, Type::Bytes))
+                .unwrap_or(false)
+        }
+        Expr::Concat(args) => args.iter().any(|a| raw_tcp_let_is_bytes(a, input_name, input_concept)),
+        Expr::If(_, a, b) => {
+            raw_tcp_let_is_bytes(a, input_name, input_concept)
+                || raw_tcp_let_is_bytes(b, input_name, input_concept)
+        }
+        _ => false,
+    }
+}
+
+/// Slice `rawtcp-inspect-0` (docs/multistep-connection-design.md §4.1-1):
+/// the `raw_tcp` service emitter with the HTTP frame discipline. Structured
+/// like `emit_http10_dynamic_bytes` MINUS the HTTP parse and serialize:
+///
+///   push rbp ; mov rbp, rsp ; sub rsp, frame_size
+///   socket / setsockopt(SO_REUSEADDR) / bind / listen
+/// accept_top:
+///   accept → mov [rbp-48], rax                (client_fd — the SLOT, §3 W3)
+///   read(client_fd, rbp+buf_off, max_request) → rax
+///   test rax, rax ; jle close                 (EOF or error: no handler run)
+///   mov [rbp-16], rax ; lea rax,[rbp+buf] ; mov [rbp-8], rax   (the (ptr, len) pair)
+///   handler lets
+///   response: emit_streaming_bytes_body(…, fd = [rbp-48])
+/// close:
+///   close([rbp-48])
+///   lea rsp, [rbp - frame_size] ; jmp accept_top
+///
+/// ONE read, ONE write, then close — exactly today's contract; only the
+/// handler changed (the echo emitter's per-connection read loop is the
+/// identity shape's, kept untouched). The step loop is slice `multistep-1`.
+///
+/// Slot map below rbp:
+///   -8     req ptr   = rbp + buf_off     (rewritten per accept — the same
+///                                         address every time, stored per
+///                                         accept so every reader has one
+///                                         source: the slot)
+///   -16    req len   = the `read` return value — the RUNTIME count, never
+///                      max_request (design §4.3 row 3; NC-0a)
+///   -24 .. -40       reserved (the HTTP block's status / body slots; kept so
+///                      client_fd sits at -48 as the design fixes it)
+///   -48    client_fd
+///   below: handler let slots (text: ptr + len, 16 B; number: 8 B), the
+///          same cursor discipline as the HTTP emitter
+///   bottom: read buffer (max_request bytes)
+///
+/// `req.<field>` registers in `text_bindings` under the COMPOSITE key
+/// `__req_<field>`: the field name is author-chosen, so a bare key would let
+/// a handler `let` of the same name overwrite the registration and have
+/// `byte_at(req.<f>, 0)` read the let's slots — a plausible value, rc 0, no
+/// diagnostic (design §4.1-2, NC-0b). The reader sites (`emit_length`,
+/// `emit_starts_with_load_text`, `emit_streaming_bytes_body`) probe the
+/// composite key before the bare one.
+///
+/// `byte_at`'s bounds check is UNCHANGED and fail-closed: `index >= len` →
+/// `sys_exit(1)` of the whole process, with no response on the wire (design
+/// §4.6-3 / NC-0c). Against a runtime length that check does real work for
+/// the first time. Note what that means for a listener: a client that sends
+/// fewer bytes than a handler indexes takes the process down — the design
+/// specifies exit(1) explicitly and this emitter follows it; the HTTP
+/// parse-guard precedent (close the connection, keep serving) is the
+/// alternative a later slice may prefer, and it is recorded in the PR.
+fn emit_raw_tcp_dynamic_bytes(
+    service: &Service,
+    handler: &Rule,
+    input_concept: &Concept,
+    in_field: &str,
+    out_concept: &str,
+    out_field: &str,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    diag_rules: &HashMap<&str, &Rule>,
+    diag_concepts: &[&Concept],
+) -> Result<Vec<u8>, NativeError> {
+    let mut code = Vec::new();
+    let port_be = service.port.to_be_bytes();
+    let max_request = service.max_request;
+    let buf_bytes = max_request.to_le_bytes();
+
+    // ── Handler `let` classification (Phase 2I-H's shape, on the REAL
+    // input concept rather than the synthetic HttpRequest) ──
+    let mut prior_text_lets: HashSet<&str> = HashSet::new();
+    let mut handler_binding_is_text: Vec<bool> = Vec::with_capacity(handler.logic.bindings.len());
+    for (name, expr) in &handler.logic.bindings {
+        // Refusal #5 (design §4.4) — the agg-svc-1 breadcrumb PR #202 gave
+        // the HTTP let prologue, inherited verbatim: a record-valued let.
+        if let Expr::Call(callee, _) = expr {
+            if let Some(called) = diag_rules.get(callee.as_str()) {
+                if let Some(concept) = plain_record_concept(&called.output_ty, diag_concepts) {
+                    return Err(NativeError {
+                        message: format!(
+                            "service '{}' / handler '{}' / let '{}': callee '{}' returns a record \
+                             (plain record concept '{}', {} field(s)), and a record-valued `let` \
+                             inside a service handler is not lowered natively yet — the \
+                             handler-let prologue lowers TEXT lets ((ptr, len) slots) and NUMBER \
+                             lets (one slot) only, and the service frame has no slot group for a \
+                             returned aggregate; slice agg-svc-1 lifts it (the caller-allocated \
+                             destination of slice agg-1, docs/bytes-value-return-design.md, \
+                             applied to the service frame)",
+                            service.name, handler.name, name, callee,
+                            concept.name, concept.fields.len(),
+                        ),
+                    });
+                }
+            }
+        }
+        // Refusal #4 (design §4.4): a bytes-typed let.
+        if raw_tcp_let_is_bytes(expr, &handler.input_name, input_concept) {
+            return Err(NativeError {
+                message: format!(
+                    "handler '{}': let '{}' is bytes-typed; let bindings are number- or text-typed \
+                     (let_rhs_is_text, native.rs) and a bytes let needs a materialised bytes value, \
+                     which does not exist (no bytes sibling of emit_text_produce_ptrlen). \
+                     Slice rawtcp-inspect-0b",
+                    handler.name, name
+                ),
+            });
+        }
+        let is_text = let_rhs_is_text(expr, input_concept, None, all_rules, &prior_text_lets);
+        if is_text {
+            prior_text_lets.insert(name.as_str());
+        }
+        handler_binding_is_text.push(is_text);
+    }
+    let handler_let_slots_bytes: i32 = handler_binding_is_text
+        .iter()
+        .map(|t| if *t { 16i32 } else { 8 })
+        .sum();
+
+    // ── Frame layout ──
+    const FIXED_BLOCK: i32 = 48;
+    const REQ_PTR_SLOT: i32 = -8;
+    const REQ_LEN_SLOT: i32 = -16;
+    const CLIENT_FD_SLOT: i32 = -48;
+    let frame_base: i32 = FIXED_BLOCK + handler_let_slots_bytes;
+    let frame_size: u32 = (frame_base as u32) + max_request;
+    let buf_offset_from_rbp: i32 = -(frame_base + max_request as i32);
+
+    // ═══ PROLOGUE: rbp frame ═══════════════════════════════════
+    code.push(0x55);                                     // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);         // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);         // sub rsp, imm32
+    code.extend_from_slice(&frame_size.to_le_bytes());
+
+    // ═══ SOCKET ════════════════════════════════════════════════
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]); // rdi=2 (AF_INET)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // rsi=1 (STREAM)
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // rdx=0
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x49, 0x89, 0xC4]);                         // mov r12, rax
+
+    // SETSOCKOPT SO_REUSEADDR
+    code.extend_from_slice(&[0x6A, 0x01]);                               // push 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00]); // rax=54
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // rsi=1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00]); // rdx=2
+    code.extend_from_slice(&[0x49, 0x89, 0xE2]);                         // r10=rsp
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00]); // r8=4
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);                   // add rsp, 8
+
+    // BIND
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);                   // sub rsp, 16
+    code.extend_from_slice(&[0x66, 0xC7, 0x04, 0x24, 0x02, 0x00]);       // word [rsp]=2
+    code.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x02]);             // word [rsp+2]=port
+    code.extend_from_slice(&port_be);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x04, 0x00, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x31, 0x00, 0x00, 0x00]); // rax=49 bind
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // rsi=rsp
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // rdx=16
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);                   // add rsp, 16
+
+    // LISTEN
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00]); // rax=50
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // rsi=128
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // ═══ ACCEPT LOOP ═══════════════════════════════════════════
+    let accept_top = code.len();
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // rax=43 accept
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+    code.extend_from_slice(&[0x48, 0x31, 0xF6]);                         // rsi=0
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // rdx=0
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    store_rax_at_rbp(&mut code, CLIENT_FD_SLOT);                         // mov [rbp-48], rax
+
+    // ═══ READ (one frame) ══════════════════════════════════════
+    code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax (sys_read)
+    emit_mov_rdi_fd(&mut code, WriteFd::RbpSlot(CLIENT_FD_SLOT));        // rdi = [rbp-48]
+    code.extend_from_slice(&[0x48, 0x8D, 0xB5]);                         // lea rsi, [rbp + disp32]
+    code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);                         // mov rdx, max_request
+    code.extend_from_slice(&buf_bytes);
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    // rax = bytes_read. A zero-byte read is EOF and a negative one an
+    // error; neither runs the handler (design §4.3 row 4: `byte_at` is never
+    // reached with an empty buffer — the `jle` here, not the bounds check,
+    // is what stands between an empty read and an out-of-range index).
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);                         // test rax, rax
+    code.extend_from_slice(&[0x0F, 0x8E]);                               // jle rel32 → close
+    let read_fail_patch = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    // The (ptr, len) pair every reader loads: len is the syscall's RETURN
+    // VALUE (NC-0a's discriminator — store max_request here and rows 1 and
+    // 3 of design §4.3 disagree), ptr the buffer's address.
+    store_rax_at_rbp(&mut code, REQ_LEN_SLOT);                           // mov [rbp-16], rax
+    emit_lea_rax_rbp(&mut code, buf_offset_from_rbp);                    // lea rax, [rbp + buf]
+    store_rax_at_rbp(&mut code, REQ_PTR_SLOT);                           // mov [rbp-8], rax
+
+    // Register the input field as a BoundText under the COMPOSITE key.
+    let req_key = format!("__req_{}", in_field);
+    let mut text_bindings: TextBindings = HashMap::new();
+    text_bindings.insert(req_key.as_str(), (REQ_PTR_SLOT, REQ_LEN_SLOT));
+    // No offsets: the input concept's single field is bytes, which has no
+    // scalar slot — it is reachable only through the composite BoundText.
+    let mut handler_offsets: HashMap<&str, i32> = HashMap::new();
+
+    // ═══ HANDLER LET BINDINGS (Phase 2I-H's prologue, verbatim shape) ═══
+    {
+        let mut let_cursor: i32 = -(FIXED_BLOCK + 8);
+        for ((name, expr), is_text) in
+            handler.logic.bindings.iter().zip(handler_binding_is_text.iter())
+        {
+            if *is_text {
+                let ptr_slot = let_cursor;
+                let len_slot = let_cursor - 8;
+                let_cursor -= 16;
+                emit_text_produce_ptrlen(
+                    &mut code,
+                    expr,
+                    &handler.input_name,
+                    input_concept,
+                    all_rules,
+                    &handler_offsets,
+                    field_ranges,
+                    &text_bindings,
+                )?;
+                store_rax_at_rbp(&mut code, ptr_slot);
+                // mov [rbp + len_slot], rdx
+                if len_slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                    code.push(len_slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                    code.extend_from_slice(&len_slot.to_le_bytes());
+                }
+                text_bindings.insert(name.as_str(), (ptr_slot, len_slot));
+            } else {
+                let value_slot = let_cursor;
+                let_cursor -= 8;
+                emit_eval_expr(
+                    &mut code,
+                    expr,
+                    &handler.input_name,
+                    &handler_offsets,
+                    all_rules,
+                    field_ranges,
+                    &text_bindings,
+                    None,
+                    None,
+                )?;
+                store_rax_at_rbp(&mut code, value_slot);
+                handler_offsets.insert(name.as_str(), value_slot);
+            }
+        }
+    }
+
+    // ═══ RESPONSE: stream the handler's bytes expression to the CLIENT ═══
+    // The fd is the slot, not `1` — design §4.7 NC-0d: with fd hardcoded to
+    // stdout the bytes land on the server's terminal and the client reads
+    // nothing, and a test that only checks the server did not crash passes.
+    let response = raw_tcp_response_expr(&handler.logic.value, &handler.name, out_concept, out_field)?;
+    let empty_labels: HashMap<&str, i32> = HashMap::new();
+    let empty_arities: HashMap<&str, usize> = HashMap::new();
+    let empty_layouts: HashMap<&str, Vec<(String, i32, bool)>> = HashMap::new();
+    let empty_records: HashMap<&str, Vec<(String, i32)>> = HashMap::new();
+    let empty_self_call = SelfCallCtx {
+        labels: &empty_labels,
+        arities: &empty_arities,
+        struct_layouts: &empty_layouts,
+        param_in_rbx: None,
+        record_returns: &empty_records,
+        sret_dest: None,
+    };
+    emit_streaming_bytes_body(
+        &mut code,
+        &response,
+        &handler.input_name,
+        &handler_offsets,
+        all_rules,
+        field_ranges,
+        &text_bindings,
+        empty_self_call,
+        None,
+        WriteFd::RbpSlot(CLIENT_FD_SLOT),
+    )?;
+
+    // ═══ CLOSE + LOOP ══════════════════════════════════════════
+    let close_label = code.len();
+    let rel = close_label as i32 - (read_fail_patch as i32 + 4);
+    code[read_fail_patch..read_fail_patch + 4].copy_from_slice(&rel.to_le_bytes());
+    // close(client_fd): rax=3, rdi=[rbp-48]
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    emit_mov_rdi_fd(&mut code, WriteFd::RbpSlot(CLIENT_FD_SLOT));
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    // ITERATION TAIL: restore rsp to the post-prologue invariant (frees any
+    // handler-allocated concat buffer in one instruction) and loop. Every
+    // slot above is rbp-relative and inside frame_size, so the `lea` moves
+    // rsp BELOW them and never writes them — the HTTP emitter's argument,
+    // and the one slice multistep-1's state block will inherit (design §5.3).
+    code.extend_from_slice(&[0x48, 0x8D, 0xA5]);                         // lea rsp, [rbp + neg]
+    let neg_frame: i32 = -(frame_size as i32);
+    code.extend_from_slice(&neg_frame.to_le_bytes());
+    code.push(0xE9);                                                     // jmp accept_top
+    let back = accept_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&back.to_le_bytes());
+
+    if let Err(e) = crate::validate_x86::validate_code(&code) {
+        eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
+    }
+    Ok(code)
 }
 
 /// Tier-2 hybrid — rule from `.verbose`, network shell hardcoded
@@ -41988,6 +42550,319 @@ service shadow
         assert_eq!(bodies[1], "s=/one r=");
     }
 
+    // ═══ Slice rawtcp-inspect-0: a raw_tcp handler can INSPECT its input ═══
+    //
+    // docs/multistep-connection-design.md §4.6 (acceptance) and §4.7
+    // (negative controls). Every fixture is a VERIFIED program driven over
+    // real TCP; the helper asserts the verifier's verdict first so a
+    // driven fixture can never be a program the compiler refuses.
+
+    /// What one driven raw_tcp run produced: one reply per payload (the
+    /// bytes read until the server closed the connection), the server's
+    /// exit status if it exited ON ITS OWN before the harness killed it
+    /// (`Some(1)` is `byte_at`'s fail-closed `sys_exit(1)`), and the
+    /// server's stdout — which must stay EMPTY: design §4.7 NC-0d is a
+    /// response streamed to fd 1 instead of the client fd, and a test that
+    /// only looked at the socket would see "no reply" without knowing why.
+    struct RawTcpRun {
+        replies: Vec<Vec<u8>>,
+        exit: Option<i32>,
+        stdout: Vec<u8>,
+    }
+
+    fn raw_tcp_drive(
+        src_template: &str,
+        service_name: &str,
+        tag: &str,
+        payloads: &[&[u8]],
+    ) -> RawTcpRun {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            l.local_addr().unwrap().port()
+        };
+        let src = src_template.replace("__PORT__", &port.to_string());
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "raw_tcp fixture '{}' must verify clean: {:?}", tag, errs);
+        let out = std::env::temp_dir().join(format!("verbosec_test_rawtcp_{}", tag));
+        compile_service(&program, service_name, out.to_str().unwrap())
+            .expect("raw_tcp service should compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut bound = false;
+        for _ in 0..100 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "raw_tcp service never bound on port {}", port);
+
+        let mut replies = Vec::new();
+        for payload in payloads {
+            let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            if !payload.is_empty() {
+                s.write_all(payload).expect("write");
+            }
+            // Half-close so an EMPTY payload is a zero-byte read (EOF) on
+            // the server — design §4.3 row 4 — rather than a hang.
+            let _ = s.shutdown(Shutdown::Write);
+            let mut buf = Vec::new();
+            // A server that sys_exit(1)s mid-response resets the socket;
+            // whatever arrived before that is the reply.
+            let _ = s.read_to_end(&mut buf);
+            replies.push(buf);
+        }
+
+        std::thread::sleep(Duration::from_millis(150));
+        let exit = match child.try_wait().expect("try_wait") {
+            Some(status) => status.code(),
+            None => {
+                let _ = child.kill();
+                None
+            }
+        };
+        let output = child.wait_with_output().expect("wait_with_output");
+        let _ = std::fs::remove_file(&out);
+        RawTcpRun { replies, exit, stdout: output.stdout }
+    }
+
+    /// Design §4.3, all four rows, over real TCP — `examples/tag_probe.verbose`
+    /// with its port swapped for an ephemeral one. Rows 1–3 are the two arms
+    /// plus the runtime length; row 4 is the zero-byte read, which must
+    /// reach `close` without running the handler (the `jle`, not the bounds
+    /// check, is what keeps `byte_at` off an empty buffer) and must NOT take
+    /// the server down. Two extra rows pin the arm choice against a second
+    /// tag byte and a two-byte tag-1 frame.
+    #[test]
+    fn rawtcp_inspect_byte_at_and_length() {
+        let src = std::fs::read_to_string("examples/tag_probe.verbose")
+            .expect("examples/tag_probe.verbose")
+            .replace("18962", "__PORT__");
+        let run = raw_tcp_drive(
+            &src,
+            "prober",
+            "rows",
+            &[b"\x01AB", b"\x02A", b"\x01", b"", b"\x01\xff", b"\x02"],
+        );
+        assert_eq!(run.replies[0], vec![0x01, 3, 0, 0, 0], "row 1: tag 1, length 3");
+        assert_eq!(run.replies[1], vec![0xff, 0, 0, 0, 0], "row 2: the false arm");
+        assert_eq!(run.replies[2], vec![0x01, 1, 0, 0, 0], "row 3: length is the actual count");
+        assert!(run.replies[3].is_empty(), "row 4: a zero-byte read is EOF — no handler, no bytes");
+        assert_eq!(run.replies[4], vec![0x01, 2, 0, 0, 0]);
+        assert_eq!(run.replies[5], vec![0xff, 0, 0, 0, 0]);
+        assert!(run.exit.is_none(), "the server must survive all rows, the empty read included");
+        assert!(run.stdout.is_empty(), "NC-0d: no response byte may land on the server's stdout");
+    }
+
+    /// Design §4.6-2 / NC-0a: rows 1 and 3 ALONE, asserted as DISTINCT
+    /// answers. A build that stored `max_request` in the length slot passes
+    /// row 1 only if the payload happens to be `max_request` bytes long; the
+    /// discriminator is a SHORT read, so the control needs two payload
+    /// lengths — and neither may be the declared 256 (`le32(256)` =
+    /// `00 01 00 00`).
+    #[test]
+    fn rawtcp_inspect_length_is_the_read_count_not_max_request() {
+        let src = std::fs::read_to_string("examples/tag_probe.verbose")
+            .expect("examples/tag_probe.verbose")
+            .replace("18962", "__PORT__");
+        let run = raw_tcp_drive(&src, "prober", "readcount", &[b"\x01AB", b"\x01"]);
+        assert_eq!(&run.replies[0][1..], &[3, 0, 0, 0], "3-byte frame → length 3");
+        assert_eq!(&run.replies[1][1..], &[1, 0, 0, 0], "1-byte frame → length 1");
+        assert_ne!(run.replies[0], run.replies[1], "two payload lengths must give two answers");
+        for r in &run.replies {
+            assert_ne!(&r[1..], &[0, 1, 0, 0], "the length must never be max_request (256)");
+        }
+        assert!(run.exit.is_none());
+    }
+
+    /// Design §4.6-3 / NC-0c: a handler indexing PAST the read count. The
+    /// index is evaluated in the `if` CONDITION, i.e. before the first
+    /// streamed write, so the fail-closed `sys_exit(1)` fires with NO byte on
+    /// the wire; the connection closes and the process is gone with status
+    /// 1. In-range frames first, so the same binary is shown to work.
+    ///
+    /// The second fixture documents the STREAMING caveat the design does not
+    /// state: with `byte_at` as a concat ARGUMENT after a literal, the
+    /// literal has already been streamed when the abort fires — the client
+    /// sees `01` then a reset. That is the streaming lowering's documented
+    /// mid-walk divergence (docs/emitter-streaming-design.md), not a hole in
+    /// the bounds check: exit status is still 1 and the byte read never
+    /// happens. Asserted as measured so a change of policy (close the
+    /// connection, keep serving — the HTTP parse guards' precedent, and the
+    /// alternative recorded in the slice PR) shows up as a named failure.
+    #[test]
+    fn rawtcp_byte_at_out_of_range_is_fail_closed() {
+        let probe = |body: &str, bound: u32| -> String {
+            format!(
+                "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"frame\"\n  @source: tag_probe.intent:1\n  fields:\n    data : bytes [..{b}]\n\nrule probe3\n  @intention: \"index byte 3\"\n  @source: tag_probe.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    resp = Frame {{ data: {body} }}\n  proofs:\n    purity:\n      reads : [req.data]\n      calls : []\n    termination:\n      bound : 9\n\nservice oob\n  @intention: \"probe byte 3\"\n  @source: tag_probe.intent:3\n  listen:\n    protocol    : raw_tcp\n    port        : __PORT__\n    max_request : {b}\n  handler: probe3\n",
+                b = bound, body = body
+            )
+        };
+        // Index in the CONDITION: nothing is streamed before the abort.
+        let src = probe(
+            "if byte_at(req.data, 3) == 1 then concat(b\"\\x01\", le32(1)) else concat(b\"\\x00\", le32(0))",
+            64,
+        );
+        let run = raw_tcp_drive(&src, "oob", "oob_cond", &[b"\x00\x00\x00\x01", b"\x00\x00\x00\x02", b"\x01"]);
+        assert_eq!(run.replies[0], vec![1, 1, 0, 0, 0], "in range, byte 3 == 1");
+        assert_eq!(run.replies[1], vec![0, 0, 0, 0, 0], "in range, byte 3 == 2");
+        assert!(run.replies[2].is_empty(), "index 3 of a 1-byte frame: no response byte");
+        assert_eq!(run.exit, Some(1), "byte_at's bound is fail-closed: sys_exit(1) of the server");
+        assert!(run.stdout.is_empty());
+
+        // Index as a concat ARGUMENT after a literal: the literal prefix is
+        // already on the wire when the abort fires (streaming ABI).
+        let src = probe("concat(b\"\\x01\", le32(byte_at(req.data, 3)))", 64);
+        let run = raw_tcp_drive(&src, "oob", "oob_arg", &[b"\x00\x00\x00\x07", b"\x01"]);
+        assert_eq!(run.replies[0], vec![1, 7, 0, 0, 0]);
+        assert_eq!(run.replies[1], vec![1], "the streamed literal prefix reaches the client before the abort");
+        assert_eq!(run.exit, Some(1));
+    }
+
+    /// Design §4.6-4: the identity-shaped service keeps `emit_raw_tcp_echo_bytes`
+    /// UNTOUCHED. Size AND sha256 are pinned to the values the `85e95a8`
+    /// compiler produced for `examples/raw_tcp_echo.verbose` — the size alone
+    /// is what `phase7_service_matches_echo_probe_size` already pins, and a
+    /// same-size-different-bytes drift is exactly the signature a size pin
+    /// cannot see.
+    #[test]
+    fn rawtcp_identity_service_is_byte_identical() {
+        let src = std::fs::read_to_string("examples/raw_tcp_echo.verbose")
+            .expect("examples/raw_tcp_echo.verbose");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_rawtcp_identity");
+        compile_service(&program, "echo_server", out.to_str().unwrap()).expect("echo compiles");
+        let bytes = std::fs::read(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(bytes.len(), 358, "raw_tcp_echo must stay 358 B");
+        assert_eq!(
+            sha256_hex(&bytes),
+            "0fd08b45f21325e3c10951f5d809b46414122331df955db03dc84536e3384403",
+            "raw_tcp_echo must be byte-identical to the 85e95a8 emit (measured sha256)"
+        );
+        // And the identity gate is what routes it there: the echo emitter
+        // has no rbp frame at all (design §3 W3 — zero `push rbp`), while
+        // the slice-0 emitter opens with one.
+        let code_start = 0x78; // ELF header + one program header
+        assert_ne!(bytes[code_start], 0x55, "the identity echo must not open with push rbp");
+    }
+
+    /// Design §4.6-6 / NC-0b: a service whose input field and a handler
+    /// `let` share a NAME. Under BARE-name registration the text let
+    /// `data` (evaluated after the input registers) OVERWRITES the input's
+    /// `(ptr, len)` entry, so `length(req.data)` answers the let's 3 — a
+    /// plausible value, rc 0, no diagnostic. The composite key `__req_data`
+    /// keeps the two apart. The non-colliding §4.3 fixture is driven in the
+    /// SAME run: a control that only fails on the colliding name proves
+    /// keying only if the plain fixture still passes beside it.
+    #[test]
+    fn rawtcp_input_field_composite_key() {
+        let src = "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"frame\"\n  @source: tag_probe.intent:1\n  fields:\n    data : bytes [..64]\n\nrule collide\n  @intention: \"a handler let named after the input field\"\n  @source: tag_probe.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    let data = \"abc\"\n    resp = Frame { data: concat(le32(length(req.data)), le32(length(data)), req.data) }\n  proofs:\n    purity:\n      reads : [req.data]\n      calls : []\n    termination:\n      bound : 7\n\nservice shadow\n  @intention: \"input field and handler let share a name\"\n  @source: tag_probe.intent:3\n  listen:\n    protocol    : raw_tcp\n    port        : __PORT__\n    max_request : 64\n  handler: collide\n";
+        let run = raw_tcp_drive(&src, "shadow", "collide", &[b"\x01\x02\x03\x04\x05", b"A"]);
+        assert_eq!(
+            run.replies[0],
+            vec![5, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3, 4, 5],
+            "length(req.data)=5, length(data)=3, then the input chunk — under bare keying the first would be 3"
+        );
+        assert_eq!(run.replies[1], vec![1, 0, 0, 0, 3, 0, 0, 0, 0x41]);
+        assert!(run.exit.is_none());
+
+        let plain = std::fs::read_to_string("examples/tag_probe.verbose")
+            .expect("examples/tag_probe.verbose")
+            .replace("18962", "__PORT__");
+        let run = raw_tcp_drive(&plain, "prober", "collide_control", &[b"\x01AB"]);
+        assert_eq!(run.replies[0], vec![0x01, 3, 0, 0, 0], "the non-colliding fixture must pass in the same run");
+    }
+
+    /// Design §4.4 refusals that live in the EMITTER (the verifier admits
+    /// each shape): #4 a bytes-typed handler `let`; the response not being
+    /// a record constructor the streaming body can lower; and the slice-0
+    /// effect refusals (`read` / `fetch` / `now_unix()` inside a raw_tcp
+    /// handler, naming `rawtcp-effects-1`). Each carries a corrected twin
+    /// that MUST compile, so the refusal is attributable to the one thing
+    /// that differs.
+    #[test]
+    fn rawtcp_inspect_emitter_refusals_name_the_lifting_slice() {
+        let probe = |extra_items: &str, lets: &str, body: &str, reads: &str, calls: &str| -> String {
+            format!(
+                "@verbose 0.1.0\n{extra}\nconcept Frame\n  @intention: \"frame\"\n  @source: tag_probe.intent:1\n  fields:\n    data : bytes [..64]\n\nrule h\n  @intention: \"probe\"\n  @source: tag_probe.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n{lets}    resp = {body}\n  proofs:\n    purity:\n      reads : [{reads}]\n      calls : [{calls}]\n    termination:\n      bound : 9\n\nservice s\n  @intention: \"svc\"\n  @source: tag_probe.intent:3\n  listen:\n    protocol    : raw_tcp\n    port        : 18999\n    max_request : 64\n  handler: h\n",
+                extra = extra_items, lets = lets, body = body, reads = reads, calls = calls
+            )
+        };
+        let compile = |src: &str, tag: &str| -> Result<u64, String> {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+            assert!(errs.is_empty(), "fixture '{}' must VERIFY clean (the refusal under test is the emitter's): {:?}", tag, errs);
+            let out = std::env::temp_dir().join(format!("verbosec_test_rawtcp_refuse_{}", tag));
+            let r = compile_service(&program, "s", out.to_str().unwrap()).map_err(|e| e.message);
+            let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            let _ = std::fs::remove_file(&out);
+            r.map(|_| size)
+        };
+
+        // #4: a bytes-typed let — three spellings, one refusal.
+        for (lets, tag) in [
+            ("    let chunk = req.data\n", "bytes_let_field"),
+            ("    let chunk = concat(b\"\\x00\", req.data)\n", "bytes_let_concat"),
+            ("    let chunk = le32(length(req.data))\n", "bytes_let_le32"),
+        ] {
+            let err = compile(&probe("", lets, "Frame { data: concat(b\"\\x01\", req.data) }", "req.data", ""), tag)
+                .expect_err("a bytes-typed let must be refused");
+            assert!(err.contains("let 'chunk' is bytes-typed") && err.contains("rawtcp-inspect-0b"), "{}: {}", tag, err);
+        }
+        // twin: number and text lets are lowered.
+        let size = compile(
+            &probe("", "    let n = length(req.data)\n    let t = \"ab\"\n", "Frame { data: concat(b\"\\x01\", le32(n + length(t))) }", "req.data", ""),
+            "lets_twin",
+        )
+        .expect("number + text lets must compile");
+        assert!(size > 0);
+
+        // Response not a record constructor: a call returning the output
+        // concept verifies (arity 1, same concept) but has no streaming
+        // lowering on the service path.
+        let helper = "\nrule mk\n  @intention: \"helper\"\n  @source: tag_probe.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    resp = Frame { data: req.data }\n  proofs:\n    purity:\n      reads : [req.data]\n      calls : []\n    termination:\n      bound : 2\n";
+        let err = compile(&probe(helper, "", "mk(req)", "req", "mk"), "resp_call")
+            .expect_err("a call as the whole response must be refused");
+        assert!(err.contains("the response must be `Frame { data: <bytes expr> }`") && err.contains("rawtcp-inspect-0b"), "{}", err);
+        // twin: the same call's shape written as the constructor compiles.
+        compile(&probe("", "", "Frame { data: req.data }", "req.data", ""), "resp_twin")
+            .expect("the identity constructor (echo emitter) compiles");
+
+        // Effects inside a raw_tcp handler: refused by name, slice rawtcp-effects-1.
+        let res = "\nresource cfg\n  @intention: \"cfg\"\n  @source: tag_probe.intent:1\n  path : \"/tmp/verbose_rawtcp_cfg.txt\"\n  max : 16\n  on_read_error : abort\n";
+        let err = compile(&probe(res, "    let lim = parse_int(read(cfg))\n", "Frame { data: le32(lim) }", "cfg", ""), "read")
+            .expect_err("read() in a raw_tcp handler must be refused");
+        assert!(err.contains("read('cfg')") && err.contains("rawtcp-effects-1"), "{}", err);
+        let conn = "\nconnection up\n  @intention: \"up\"\n  @source: tag_probe.intent:1\n  host : \"127.0.0.1\"\n  port : 9\n  max_response : 16\n  on_connect_error : abort\n";
+        let err = compile(&probe(conn, "    let r = fetch(up, \"x\")\n", "Frame { data: le32(length(r)) }", "up", ""), "fetch")
+            .expect_err("fetch() in a raw_tcp handler must be refused");
+        assert!(err.contains("fetch('up'") && err.contains("rawtcp-effects-1"), "{}", err);
+        let err = compile(&probe("", "", "Frame { data: le64(now_unix()) }", "now", ""), "now")
+            .expect_err("now_unix() in a raw_tcp handler must be refused");
+        assert!(err.contains("now_unix()") && err.contains("rawtcp-effects-1"), "{}", err);
+        // twin: the effect-free handler compiles.
+        compile(&probe("", "", "Frame { data: le64(length(req.data)) }", "req.data", ""), "effects_twin")
+            .expect("an effect-free computing handler compiles");
+    }
+
     /// Refusal #6 — the append-accumulator — with a CORRECTED TWIN.
     ///
     /// The message must name both numbers (320 and 64) and must say
@@ -52507,8 +53382,20 @@ rule pick
         // `entropy` keyword is top-level junk to its parser — the same safe
         // direction its own banner documents for `parse_int` / `now_unix`.
         // EXPECTED_ACCEPTED stays 97; a gaps-table row records it.
+        //
+        // 158 -> 159 (2026-09-03, slice rawtcp-inspect-0): `tag_probe.verbose`,
+        // the first raw_tcp service whose handler computes. MEASURED with a
+        // gen0 built from this branch (657831 B, the same bytes as before):
+        // REFUSED at index 0 (`probe`, the file's only rule — so rule #0 and
+        // the declared entry coincide), rc 1 and zero bytes — exactly what
+        // gen0 answers for `raw_tcp_echo.verbose` at the same index, because
+        // gen0's own verifier refuses `protocol: raw_tcp` outright (the
+        // effect-position matrix in CLAUDE.md records raw_tcp as "refused by
+        // gen0's verifier and untested"). Not the bytes-field gate, not the
+        // composite key: the protocol. The safe direction; EXPECTED_ACCEPTED
+        // stays 97, and the existing raw_tcp cell in the matrix covers it.
         const EXPECTED_ACCEPTED: usize = 97;
-        const EXPECTED_TOTAL: usize = 158;
+        const EXPECTED_TOTAL: usize = 159;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

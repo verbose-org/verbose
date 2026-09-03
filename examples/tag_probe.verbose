@@ -1,0 +1,70 @@
+@verbose 0.1.0
+
+-- Slice rawtcp-inspect-0 (docs/multistep-connection-design.md §4.3): the
+-- first raw_tcp service whose handler INSPECTS its input. Until this slice a
+-- raw_tcp handler could only pass its frame through (raw_tcp_echo.verbose) —
+-- every computational primitive in the language was inert inside it.
+--
+-- One read, one write, no loop. The handler answers by the frame's first
+-- byte and its runtime length:
+--
+--   01 41 42   →  01 03 00 00 00     tag 1: echo the tag, then le32(length)
+--   02 41      →  ff 00 00 00 00     any other tag: ff, then le32(0)
+--   01         →  01 01 00 00 00     length is the ACTUAL read count, not
+--                                     max_request
+--   (0 bytes)  →  (connection closed, no bytes) — a zero-byte read is EOF,
+--                                     so byte_at is never reached on an empty
+--                                     buffer
+--
+-- `byte_at(req.data, 0)` and `length(req.data)` read the field through the
+-- same (ptr, len) pair a `read(<resource>)` uses: the pointer is the read
+-- buffer, the length is the `read` syscall's return value stored in a slot
+-- the emitter owns. byte_at's fail-closed bound (index >= length →
+-- sys_exit(1)) therefore runs against a RUNTIME length here for the first
+-- time. `le32` turns a Number into bytes; the bytes `concat` streams each
+-- piece to the client fd in order — no buffer, no sizing pass.
+
+
+concept Frame
+  @intention: "A TCP frame is up to 256 bytes received on a connection"
+  @source: tag_probe.intent:1
+
+  fields:
+    data : bytes [..256]
+
+
+rule probe
+  @intention: "Answer a tag-1 frame with 01 + le32(length), anything else with ff + le32(0)"
+  @source: tag_probe.intent:2
+
+  input:
+    req : Frame
+
+  output:
+    resp : Frame
+
+  logic:
+    resp = Frame {
+      data: if byte_at(req.data, 0) == 1
+              then concat(b"\x01", le32(length(req.data)))
+              else concat(b"\xff", le32(0))
+    }
+
+  proofs:
+    purity:
+      reads : [req.data]
+      calls : []
+    termination:
+      bound : 9
+
+
+service prober
+  @intention: "Listen on port 18962, read one frame of up to 256 bytes, answer via probe, close"
+  @source: tag_probe.intent:3
+
+  listen:
+    protocol    : raw_tcp
+    port        : 18962
+    max_request : 256
+
+  handler: probe
