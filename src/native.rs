@@ -17022,17 +17022,9 @@ fn emit_eval_expr(
                 // matched). The arm loop above already patched it to fall
                 // through here.
                 //   mov rax, 60 ; mov rdi, 2 ; syscall
-                if std::env::var("VERBOSE_TRAP_TAG").is_ok() {
-                    // DEBUG: exit with the bad tag value (rcx) so we learn
-                    // what tag was read at the corrupted MatchVariant.
-                    code.extend_from_slice(&[0x48, 0x89, 0xCF]); // mov rdi, rcx
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax,60
-                    code.extend_from_slice(&[0x0F, 0x05]);
-                } else {
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
-                    code.extend_from_slice(&[0x0F, 0x05]);
-                }
+                code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x0F, 0x05]);
                 // Patch every "jmp .match_end" to land here (right after
                 // the trap). Control then continues with whatever follows
                 // in the caller — typically itoa + write + jmp loop_top.
