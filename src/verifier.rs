@@ -2849,6 +2849,99 @@ fn verify_rule(
 ///   - Record(C) where C is unknown, or field set differs from C's declaration,
 ///     or a field's inferable type differs from C's declared field type,
 ///   - Any other inferable expression whose type != expected.
+/// Slice `rawtcp-inspect-0`: is `expr` a `Field` on the rule's INPUT whose
+/// DECLARED type is `Type::Bytes`? Returns the operand's display form
+/// (`req.data`) so a refusal can name it. This is the ONE shape the
+/// byte-addressed gate widens to — never `Type::Bytes` at large.
+fn bytes_input_field(expr: &Expr, rule: &Rule, input_concept: Option<&Concept>) -> Option<String> {
+    if let Expr::Field(base, fname) = expr {
+        if let Expr::Ident(b) = base.as_ref() {
+            if b == &rule.input_name {
+                let is_bytes = input_concept
+                    .and_then(|c| c.fields.iter().find(|f| &f.name == fname))
+                    .map(|f| matches!(f.ty, Type::Bytes))
+                    .unwrap_or(false);
+                if is_bytes {
+                    return Some(format!("{}.{}", b, fname));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Slice `rawtcp-inspect-0`, refusal #2 of docs/multistep-connection-design.md
+/// §4.4: a TEXT primitive (`starts_with` / `ends_with` / `contains` /
+/// `json_escape` / `parse_int`, and text `==`) handed a bytes-typed operand.
+/// The bytes/text isolation is deliberate, and the generic mismatch message
+/// (`expression has type 'bytes' but context expects 'text'`) is true but
+/// unhelpful — it reads like a missing cast. Push the breadcrumb and return
+/// `true` so the caller skips the generic check for that operand; return
+/// `false` for a non-bytes operand so the existing path runs unchanged.
+fn refuse_bytes_in_text_prim(
+    prim: &str,
+    operand: &Expr,
+    rule: &Rule,
+    all_rules: &[&Rule],
+    input_concept: Option<&Concept>,
+    bindings: &HashMap<String, &Concept>,
+    errors: &mut Vec<VerifyError>,
+) -> bool {
+    match infer_expr_type(operand, rule, all_rules, input_concept, bindings) {
+        Some(Type::Bytes) => {
+            let shown = bytes_input_field(operand, rule, input_concept)
+                .unwrap_or_else(|| describe_expr_kind(operand).to_string());
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "{}: '{}' is bytes; this primitive checks its operand against text and the \
+                     bytes/text isolation is deliberate. Convert explicitly with byte_at, or wait \
+                     for slice rawtcp-inspect-0b",
+                    prim, shown
+                ),
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Slice `rawtcp-inspect-0`, refusal #1 of docs/multistep-connection-design.md
+/// §4.4: `substring` over a bytes operand. Deferred to slice
+/// `rawtcp-inspect-0b` for a reason of TYPE, not of difficulty (§4.2):
+/// `byte_at` / `length` produce Numbers, which every sink already accepts,
+/// whereas a bytes slice produces a bytes VALUE whose only sinks are the
+/// response field and a bytes `concat` — and the bytes concat is streamed
+/// with no sizing pass, so the slice arm is a streaming-ABI question, not an
+/// operand-gate one. Returns `true` when it refused (so the caller skips the
+/// generic text check on the operand).
+fn refuse_bytes_substring(
+    operand: &Expr,
+    rule: &Rule,
+    all_rules: &[&Rule],
+    input_concept: Option<&Concept>,
+    bindings: &HashMap<String, &Concept>,
+    errors: &mut Vec<VerifyError>,
+) -> bool {
+    match infer_expr_type(operand, rule, all_rules, input_concept, bindings) {
+        Some(Type::Bytes) => {
+            let shown = bytes_input_field(operand, rule, input_concept)
+                .unwrap_or_else(|| describe_expr_kind(operand).to_string());
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "substring: '{}' is bytes; a bytes slice produces a bytes value whose only sinks \
+                     are the response field and a bytes concat, and the bytes concat is streamed \
+                     with no sizing pass. Slice rawtcp-inspect-0b",
+                    shown
+                ),
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Operand check for the two BYTE-ADDRESSED text primitives, `byte_at` and
 /// `length`. Both answer a question about a run of BYTES, so both accept a
 /// `b"..."` byte-string LITERAL in addition to the usual text shapes.
@@ -2862,14 +2955,31 @@ fn verify_rule(
 /// That makes `b"..."` the honest way to declare a constant byte table, and
 /// indexing it with `byte_at` the honest way to read one.
 ///
-/// Deliberately NOT widened: a bytes-typed FIELD, `le32`/`le64`, or a bytes
-/// `concat`. Those are runtime byte values with no compile-time length, and
-/// each would need its own emitter arm. The declared-constant-table case is
-/// the whole slice. Everything else (`starts_with`, `contains`, `ends_with`,
-/// `substring`, `parse_int`, `json_escape`, text `concat`) still checks its
-/// operand against `Type::Text`, so a `b"..."` there stays a verify error and
-/// the `bytes`/`text` isolation documented on `Type::Bytes` is preserved.
+/// Deliberately NOT widened: `le32`/`le64`, or a bytes `concat`. Those are
+/// runtime byte values with no length the emitter can load (a bytes concat
+/// is STREAMED with no sizing pass — `emit_streaming_bytes_body`'s contract),
+/// so each is refused here BY NAME rather than by the generic text mismatch.
+/// Everything else (`starts_with`, `contains`, `ends_with`, `substring`,
+/// `parse_int`, `json_escape`, text `concat`) still checks its operand
+/// against `Type::Text`, so a `b"..."` there stays a verify error and the
+/// `bytes`/`text` isolation documented on `Type::Bytes` is preserved.
+///
+/// Slice `rawtcp-inspect-0` (docs/multistep-connection-design.md §4.1-3)
+/// admits a THIRD shape: a `Field` whose base is the rule's input and whose
+/// DECLARED type is `Type::Bytes` — `req.data` in a `raw_tcp` handler. The
+/// gate's stated criterion ("a compile-time length") is not weakened; it is
+/// met differently: for a bytes input field the length is the `read`
+/// syscall's return value, which the service emitter stores in a slot it
+/// owns and every reader loads — the same shape as `read(<resource>)`'s
+/// `len_slot`. The honest restatement of the criterion is "a length the
+/// emitter knows, either as a constant or in a slot it owns". That is why
+/// the widening is to the INPUT FIELD and never to `Type::Bytes` at large:
+/// a streamed bytes `concat` has no length anywhere. Outside a service the
+/// native rule-binary prologue still refuses a bytes input field (`only
+/// number/text today`), so the verify-side admission cannot reach a rule
+/// binary that would mis-lower it — the emitter is the backstop.
 fn check_byte_addressable_operand(
+    prim: &str,
     expr: &Expr,
     rule: &Rule,
     all_rules: &[&Rule],
@@ -2878,14 +2988,36 @@ fn check_byte_addressable_operand(
     bindings: &HashMap<String, &Concept>,
     errors: &mut Vec<VerifyError>,
 ) {
-    // A `b"..."` literal and a `random(<entropy>)` draw are the two bytes-
-    // typed operands the byte-addressed pair admits. Both have a
-    // COMPILE-TIME length — the literal by construction, the draw by
-    // declaration plus the getrandom(2) contract — which is the criterion
-    // that keeps a bytes-typed FIELD (`req.data : bytes [..N]`, a runtime
-    // length) out. Every other text primitive keeps checking against
-    // `Type::Text`, so the bytes/text isolation is intact.
+    // A `b"..."` literal and a `random(<entropy>)` draw have a COMPILE-TIME
+    // length — the literal by construction, the draw by declaration plus the
+    // getrandom(2) contract. A bytes INPUT FIELD has a RUNTIME length in a
+    // slot the service emitter owns (slice rawtcp-inspect-0). Every other
+    // text primitive keeps checking against `Type::Text`, so the bytes/text
+    // isolation is intact.
     if matches!(expr, Expr::Bytes(_) | Expr::Random(_)) {
+        return;
+    }
+    if bytes_input_field(expr, rule, input_concept).is_some() {
+        return;
+    }
+    // Refusal #3 of docs/multistep-connection-design.md §4.4: a bytes
+    // expression that is NOT one of the three admitted shapes — a bytes
+    // `concat`, `le32(...)` / `le64(...)`. Its length is nowhere the emitter
+    // can load, so name the shape and the admitted set rather than fall
+    // through to `expression has type 'bytes' but context expects 'text'`,
+    // which would send the reader looking for a text conversion that does
+    // not exist.
+    if let Some(Type::Bytes) = infer_expr_type(expr, rule, all_rules, input_concept, bindings) {
+        errors.push(VerifyError {
+            context: format!("rule '{}' / logic", rule.name),
+            message: format!(
+                "{}: operand has no length the emitter can load — a bytes {} is streamed with no \
+                 sizing pass (emit_streaming_bytes_body, native.rs). Admitted bytes operands: a \
+                 b\"...\" literal, random(<name>), and a raw_tcp input field (slice rawtcp-inspect-0)",
+                prim,
+                describe_expr_kind(expr),
+            ),
+        });
         return;
     }
     check_expr_against(
@@ -2930,6 +3062,19 @@ fn check_equality_operands(
     let comparable = |t: &Type| matches!(t, Type::Number | Type::Text);
     let lt = infer_expr_type(l, rule, all_rules, input_concept, bindings);
     let rt = infer_expr_type(r, rule, all_rules, input_concept, bindings);
+    // Slice rawtcp-inspect-0, refusal #2: a bytes operand on either side of
+    // `==` / `!=` gets the same named breadcrumb the text primitives give,
+    // instead of the generic "compares numbers or text" message. Both sides
+    // are probed so `b"\x01" == req.data` names the field, not the literal.
+    let mut bytes_refused = false;
+    for operand in [l, r] {
+        if refuse_bytes_in_text_prim("==", operand, rule, all_rules, input_concept, bindings, errors) {
+            bytes_refused = true;
+        }
+    }
+    if bytes_refused {
+        return;
+    }
     match (lt, rt) {
         (Some(a), Some(b)) => {
             if a != b {
@@ -3111,7 +3256,9 @@ fn check_expr_against(
         // shape — recurse on the inner with expected=Text, then surface
         // an outer-context error when the surrounding type isn't text.
         (Expr::JsonEscape(inner), Type::Text) => {
-            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            if !refuse_bytes_in_text_prim("json_escape", inner, rule, all_rules, input_concept, bindings, errors) {
+                check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            }
         }
         (Expr::JsonEscape(_), other) => {
             errors.push(VerifyError {
@@ -3126,7 +3273,9 @@ fn check_expr_against(
         // outer-context type is Number (parse_int returns a number). Inner
         // must still produce text.
         (Expr::ParseInt(inner), Type::Number) => {
-            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            if !refuse_bytes_in_text_prim("parse_int", inner, rule, all_rules, input_concept, bindings, errors) {
+                check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            }
         }
         (Expr::ParseInt(_), other) => {
             errors.push(VerifyError {
@@ -3143,8 +3292,11 @@ fn check_expr_against(
         // context expects something else, surface a clear mismatch naming
         // `starts_with` (mirror of the JsonEscape/ParseInt arms).
         (Expr::StartsWith(h, n), Type::Bool) => {
-            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
-            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            for operand in [h, n] {
+                if !refuse_bytes_in_text_prim("starts_with", operand, rule, all_rules, input_concept, bindings, errors) {
+                    check_expr_against(operand, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                }
+            }
         }
         (Expr::StartsWith(_, _), other) => {
             errors.push(VerifyError {
@@ -3159,8 +3311,11 @@ fn check_expr_against(
         // StartsWith: when context is bool, both children must be text;
         // otherwise surface a mismatch naming `contains`.
         (Expr::Contains(h, n), Type::Bool) => {
-            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
-            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            for operand in [h, n] {
+                if !refuse_bytes_in_text_prim("contains", operand, rule, all_rules, input_concept, bindings, errors) {
+                    check_expr_against(operand, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                }
+            }
         }
         (Expr::Contains(_, _), other) => {
             errors.push(VerifyError {
@@ -3175,8 +3330,11 @@ fn check_expr_against(
         // StartsWith / Contains: when context is bool, both children must be
         // text; otherwise surface a mismatch naming `ends_with`.
         (Expr::EndsWith(h, n), Type::Bool) => {
-            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
-            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            for operand in [h, n] {
+                if !refuse_bytes_in_text_prim("ends_with", operand, rule, all_rules, input_concept, bindings, errors) {
+                    check_expr_against(operand, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                }
+            }
         }
         (Expr::EndsWith(_, _), other) => {
             errors.push(VerifyError {
@@ -3194,7 +3352,7 @@ fn check_expr_against(
         // and only the literal. Otherwise surface a clear mismatch (mirror of
         // the ParseInt arms).
         (Expr::Length(inner), Type::Number) => {
-            check_byte_addressable_operand(inner, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_byte_addressable_operand("length", inner, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::Length(_), other) => {
             errors.push(VerifyError {
@@ -3295,10 +3453,18 @@ fn check_expr_against(
         // mismatch (mirror of the JsonEscape/Length arms but with three
         // children).
         (Expr::Substring(t, s, e), Type::Text) => {
-            check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            if !refuse_bytes_substring(t, rule, all_rules, input_concept, bindings, errors) {
+                check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            }
             check_expr_against(s, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
             check_expr_against(e, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
+        // A bytes operand in ANY expected context — `Frame { data:
+        // substring(req.data, 0, 2) }` expects bytes — gets refusal #1's
+        // breadcrumb rather than "substring produces text but the expected
+        // type is 'bytes'", which is true and points nowhere.
+        (Expr::Substring(t, _, _), _)
+            if refuse_bytes_substring(t, rule, all_rules, input_concept, bindings, errors) => {}
         (Expr::Substring(_, _, _), other) => {
             errors.push(VerifyError {
                 context: format!("rule '{}' / logic", rule.name),
@@ -3316,7 +3482,7 @@ fn check_expr_against(
         // The haystack may also be a `b"..."` byte-string literal — a declared
         // constant byte table read by index. See check_byte_addressable_operand.
         (Expr::ByteAt(t, i), Type::Number) => {
-            check_byte_addressable_operand(t, rule, all_rules, input_concept, all_concepts, bindings, errors);
+            check_byte_addressable_operand("byte_at", t, rule, all_rules, input_concept, all_concepts, bindings, errors);
             check_expr_against(i, &Type::Number, rule, all_rules, input_concept, all_concepts, bindings, errors);
         }
         (Expr::ByteAt(_, _), other) => {
@@ -8099,6 +8265,133 @@ rule test
             "expected missing-bound error, got: {:#?}",
             errs
         );
+    }
+
+    // ─── Slice rawtcp-inspect-0: a raw_tcp handler can inspect its input ──
+
+    /// A raw_tcp service whose handler body / lets / service tail are
+    /// supplied by the caller, so each refusal of design §4.4 can be probed
+    /// against its minimally corrected twin.
+    fn rawtcp_src(lets: &str, body: &str, reads: &str, service_tail: &str) -> String {
+        format!(
+            "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"frame\"\n  @source: tag_probe.intent:1\n  fields:\n    data : bytes [..64]\n\nrule h\n  @intention: \"probe\"\n  @source: tag_probe.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n{lets}    resp = {body}\n  proofs:\n    purity:\n      reads : [{reads}]\n      calls : []\n    termination:\n      bound : 9\n\nservice s\n  @intention: \"svc\"\n  @source: tag_probe.intent:3\n  listen:\n    protocol    : raw_tcp\n    port        : 18999\n    max_request : 64\n  handler: h\n{tail}",
+            lets = lets, body = body, reads = reads, tail = service_tail
+        )
+    }
+
+    /// Design §4.1-3: `byte_at` / `length` admit a bytes INPUT FIELD — and
+    /// ONLY that shape among bytes values. The worked example is the
+    /// positive half; the three twins below are the widening's edges.
+    #[test]
+    fn rawtcp_inspect_byte_addressed_gate_admits_a_bytes_input_field() {
+        let src = std::fs::read_to_string("examples/tag_probe.verbose").expect("examples/tag_probe.verbose");
+        let errs = verify_str(&src);
+        assert!(errs.is_empty(), "tag_probe must verify clean: {:#?}", errs);
+
+        // A bytes field on the input, inside an `if`, a `let`, a `le32`.
+        for body in [
+            "Frame { data: le32(byte_at(req.data, 0) + length(req.data)) }",
+            "if length(req.data) > 3 then Frame { data: req.data } else Frame { data: b\"\\x00\" }",
+        ] {
+            let errs = verify_str(&rawtcp_src("", body, "req.data", ""));
+            assert!(errs.is_empty(), "`{}` must verify clean: {:#?}", body, errs);
+        }
+        let errs = verify_str(&rawtcp_src("    let n = byte_at(req.data, 0)\n", "Frame { data: le32(n) }", "req.data", ""));
+        assert!(errs.is_empty(), "a number let over byte_at must verify clean: {:#?}", errs);
+    }
+
+    /// Design §4.4 refusal #3: `byte_at` / `length` over a bytes expression
+    /// that is NOT BoundText-registered — a bytes concat, `le32(...)`. The
+    /// widening is to the input field, never to `Type::Bytes` at large, and
+    /// the message names the admitted set.
+    #[test]
+    fn rawtcp_inspect_refuses_byte_addressing_a_streamed_bytes_value() {
+        for (body, prim) in [
+            ("Frame { data: le32(length(concat(b\"\\x00\", req.data))) }", "length"),
+            ("Frame { data: le32(byte_at(concat(b\"\\x00\", req.data), 0)) }", "byte_at"),
+            ("Frame { data: le32(length(le32(7))) }", "length"),
+            ("Frame { data: le32(byte_at(le64(7), 0)) }", "byte_at"),
+        ] {
+            let errs = verify_str(&rawtcp_src("", body, "req.data", ""));
+            let hit = errs.iter().find(|e| e.message.starts_with(&format!("{}: operand has no length the emitter can load", prim)));
+            assert!(hit.is_some(), "`{}` must be refused by name, got: {:#?}", body, errs);
+            let m = &hit.unwrap().message;
+            assert!(m.contains("streamed with no sizing pass") && m.contains("raw_tcp input field"), "{}", m);
+        }
+        // twins: the same primitives over the ADMITTED bytes operands.
+        for body in [
+            "Frame { data: le32(length(req.data) + length(b\"\\x00\\x01\")) }",
+            "Frame { data: le32(byte_at(req.data, 0) + byte_at(b\"\\x00\\x01\", 1)) }",
+        ] {
+            let errs = verify_str(&rawtcp_src("", body, "req.data", ""));
+            assert!(errs.is_empty(), "`{}` must verify clean: {:#?}", body, errs);
+        }
+    }
+
+    /// Design §4.4 refusal #1: `substring` over a bytes field — deferred to
+    /// slice `rawtcp-inspect-0b` because it produces a bytes VALUE, whose
+    /// only sinks are streamed (§4.2). Both expected contexts are probed:
+    /// the response field (bytes expected) and a text let (text expected).
+    #[test]
+    fn rawtcp_inspect_refuses_bytes_substring_by_name() {
+        for (lets, body) in [
+            ("", "Frame { data: substring(req.data, 0, 1) }"),
+            ("    let t = substring(req.data, 0, 1)\n", "Frame { data: le32(length(t)) }"),
+        ] {
+            let errs = verify_str(&rawtcp_src(lets, body, "req.data", ""));
+            let hit = errs.iter().find(|e| e.message.starts_with("substring: 'req.data' is bytes"));
+            assert!(hit.is_some(), "`{}` must be refused by name, got: {:#?}", body, errs);
+            assert!(hit.unwrap().message.contains("rawtcp-inspect-0b"));
+        }
+        // twin: substring over TEXT is untouched.
+        let errs = verify_str(&rawtcp_src("    let t = \"abc\"\n    let u = substring(t, 0, 1)\n", "Frame { data: le32(length(u)) }", "req.data", ""));
+        assert!(errs.iter().all(|e| !e.message.starts_with("substring:")), "text substring must not trip the bytes refusal: {:#?}", errs);
+    }
+
+    /// Design §4.4 refusal #2: the TEXT primitives and text `==` over a
+    /// bytes field — the bytes/text isolation, named. Each cell carries the
+    /// primitive's name in the message so the offending call is one grep
+    /// away, and the twin shows the explicit `byte_at` conversion.
+    #[test]
+    fn rawtcp_inspect_refuses_text_primitives_on_a_bytes_field_by_name() {
+        let cells: [(&str, &str); 7] = [
+            ("if starts_with(req.data, \"a\") then Frame { data: b\"\\x01\" } else Frame { data: b\"\\x00\" }", "starts_with"),
+            ("if ends_with(req.data, \"a\") then Frame { data: b\"\\x01\" } else Frame { data: b\"\\x00\" }", "ends_with"),
+            ("if contains(req.data, \"a\") then Frame { data: b\"\\x01\" } else Frame { data: b\"\\x00\" }", "contains"),
+            ("if contains(\"abc\", req.data) then Frame { data: b\"\\x01\" } else Frame { data: b\"\\x00\" }", "contains"),
+            ("Frame { data: le32(length(json_escape(req.data))) }", "json_escape"),
+            ("Frame { data: le32(parse_int(req.data)) }", "parse_int"),
+            ("if req.data == \"a\" then Frame { data: b\"\\x01\" } else Frame { data: b\"\\x00\" }", "=="),
+        ];
+        for (body, prim) in cells {
+            let errs = verify_str(&rawtcp_src("", body, "req.data", ""));
+            let needle = format!("{}: 'req.data' is bytes", prim);
+            let hit = errs.iter().find(|e| e.message.starts_with(&needle));
+            assert!(hit.is_some(), "`{}` must be refused naming `{}`, got: {:#?}", body, prim, errs);
+            let m = &hit.unwrap().message;
+            assert!(m.contains("Convert explicitly with byte_at") && m.contains("rawtcp-inspect-0b"), "{}", m);
+        }
+        // twin: the explicit, visible conversion.
+        let errs = verify_str(&rawtcp_src("", "if byte_at(req.data, 0) == 97 then Frame { data: b\"\\x01\" } else Frame { data: b\"\\x00\" }", "req.data", ""));
+        assert!(errs.is_empty(), "the byte_at twin must verify clean: {:#?}", errs);
+    }
+
+    /// Design §4.4 refusal #7: `state:` / `after:` / `concurrency: forked`
+    /// stay refused on raw_tcp (slice `multistep-1`). Pre-existing
+    /// refusals, re-asserted here because slice 0 lifted the emitter's
+    /// identity gate and these three are what keep the one-shot contract.
+    #[test]
+    fn rawtcp_inspect_keeps_state_and_forked_refused_on_raw_tcp() {
+        let ok_body = "Frame { data: le32(length(req.data)) }";
+        let errs = verify_str(&rawtcp_src("", ok_body, "req.data", "\n  state:\n    count : number = 0\n"));
+        assert!(errs.iter().any(|e| e.message.contains("mutable state is currently restricted to http_1_0")), "{:#?}", errs);
+        let errs = verify_str(&rawtcp_src("", ok_body, "req.data", "\n  state:\n    count : number = 0\n\n  after:\n    set count = state.count + 1\n"));
+        assert!(errs.iter().any(|e| e.message.contains("mutable state is currently restricted to http_1_0")), "{:#?}", errs);
+        let errs = verify_str(&rawtcp_src("", ok_body, "req.data", "\n  concurrency: forked\n"));
+        assert!(errs.iter().any(|e| e.message.contains("forked currently restricted to http_1_0")), "{:#?}", errs);
+        // twin: the plain one-shot service.
+        let errs = verify_str(&rawtcp_src("", ok_body, "req.data", ""));
+        assert!(errs.is_empty(), "{:#?}", errs);
     }
 
     // ─── Phase 7 slice 3a: Http10 service tests ─────────────────────────
