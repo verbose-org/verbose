@@ -20766,7 +20766,21 @@ pub fn compile_service(
             }
             _ => false,
         };
-    if is_identity {
+    // Slice `multistep-1`, refusal #1's emitter half: the echo emitter is
+    // handed TWO SCALARS (port, max_request) and cannot see a `state:`
+    // block, a step loop or a concurrency mode at all — routing a stateful
+    // or multi-step service there would DROP those declarations silently.
+    // Only a one-shot, stateless identity service goes to the echo; the
+    // verifier refuses the other combinations, and
+    // `compile_raw_tcp_dynamic_service` refuses them again for callers that
+    // bypass it (tests call `compile_service` directly).
+    let one_shot_stateless = !service.is_multistep()
+        && service.max_steps.is_none()
+        && service.read_timeout.is_none()
+        && service.state_fields.is_empty()
+        && service.after_sets.is_empty()
+        && service.concurrency == ConcurrencyMode::Sequential;
+    if is_identity && one_shot_stateless {
         let code = emit_raw_tcp_echo_bytes(service.port, service.max_request);
         return write_server_elf(&code, output_path, "service", service.port);
     }
@@ -20822,6 +20836,56 @@ fn compile_raw_tcp_dynamic_service(
     };
     let in_field = one_bytes_field(input_concept, "input")?;
     let out_field = one_bytes_field(output_concept, "output")?;
+
+    // Slice `multistep-1` (design §5.5 #1–#3), the EMITTER's copy of the
+    // verifier's declaration-shape gates. `compile_service` is reachable
+    // without `verify_program` (tests, and any future caller), and the three
+    // shapes below are exactly the ones the step-loop emitter cannot serve
+    // truthfully: state with no loop to observe it, a work bound with no
+    // time bound (or the reverse), and a conversation-long connection on a
+    // sequential server.
+    if (!service.state_fields.is_empty() || !service.after_sets.is_empty())
+        && service.max_steps.is_none()
+    {
+        return Err(NativeError {
+            message: format!(
+                "service '{}': a raw_tcp service declaring state must also declare 'max_steps' (and \
+                 'read_timeout' and 'concurrency: forked'). Without a step loop the one-shot emitter \
+                 would compile this to the identity echo and DROP the state declaration silently.",
+                service.name
+            ),
+        });
+    }
+    if service.max_steps.is_some() != service.read_timeout.is_some() {
+        return Err(NativeError {
+            message: format!(
+                "service '{}': a multi-step service must declare both 'max_steps' (a work bound) and \
+                 'read_timeout' (a time bound). max_steps alone bounds how many frames a client may \
+                 send, not how long it may hold a child.",
+                service.name
+            ),
+        });
+    }
+    if service.is_multistep() && service.concurrency != ConcurrencyMode::Forked {
+        return Err(NativeError {
+            message: format!(
+                "service '{}': a multi-step raw_tcp service must declare 'concurrency: forked'. A \
+                 sequential server holding one connection open across a whole conversation is \
+                 monopolised for as long as the peer chooses; forked isolates each conversation to \
+                 one child.",
+                service.name
+            ),
+        });
+    }
+    if !service.is_multistep() && service.concurrency == ConcurrencyMode::Forked {
+        return Err(NativeError {
+            message: format!(
+                "service '{}': concurrency: forked on a raw_tcp service needs a step loop (declare \
+                 max_steps + read_timeout, slice multistep-1); a one-shot raw_tcp service is sequential",
+                service.name
+            ),
+        });
+    }
 
     // Slice 0 lowers NO effect inside a raw_tcp handler: no resource read,
     // no outbound fetch, no clock. Each would need the per-accept block the
@@ -20945,56 +21009,110 @@ fn raw_tcp_let_is_bytes(expr: &Expr, input_name: &str, input_concept: &Concept) 
 }
 
 /// Slice `rawtcp-inspect-0` (docs/multistep-connection-design.md §4.1-1):
-/// the `raw_tcp` service emitter with the HTTP frame discipline. Structured
-/// like `emit_http10_dynamic_bytes` MINUS the HTTP parse and serialize:
+/// the `raw_tcp` service emitter with the HTTP frame discipline, and — since
+/// slice `multistep-1` (§5) — the per-connection STEP LOOP. Structured like
+/// `emit_http10_dynamic_bytes` MINUS the HTTP parse and serialize:
 ///
 ///   push rbp ; mov rbp, rsp ; sub rsp, frame_size
-///   socket / setsockopt(SO_REUSEADDR) / bind / listen
+///   STATE INIT                                (once, in the parent — §5.3)
+///   socket / setsockopt(SO_REUSEADDR) / bind
+///   rt_sigaction(SIGCHLD, SIG_IGN)             (forked only)
+///   listen
 /// accept_top:
 ///   accept → mov [rbp-48], rax                (client_fd — the SLOT, §3 W3)
+///   fork dispatch                              (forked: parent closes + loops,
+///                                              child falls through with a COW
+///                                              copy of the initialised state)
+///   setsockopt(client_fd, SO_RCVTIMEO, {S,0}) (multi-step only — §5.4)
+///   mov qword [rbp-56], 0                      (the step counter)
+/// step_top:                                    (multi-step only)
+///   cmp qword [rbp-56], max_steps ; jae close  (the WORK bound, checked
+///                                              BEFORE the read — see below)
+///   inc qword [rbp-56]
 ///   read(client_fd, rbp+buf_off, max_request) → rax
-///   test rax, rax ; jle close                 (EOF or error: no handler run)
+///   test rax, rax ; jle close                 (EOF, error, AND -EAGAIN from
+///                                              the timeout: no new branch)
 ///   mov [rbp-16], rax ; lea rax,[rbp+buf] ; mov [rbp-8], rax   (the (ptr, len) pair)
 ///   handler lets
 ///   response: emit_streaming_bytes_body(…, fd = [rbp-48])
+///   AFTER BLOCK                                (multi-step only; BEFORE the
+///                                              step tail's lea rsp — §5.7)
+///   lea rsp, [rbp - frame_size] ; jmp step_top (the step tail)
 /// close:
 ///   close([rbp-48])
-///   lea rsp, [rbp - frame_size] ; jmp accept_top
+///   forked:     sys_exit(0)                    (the child's normal tail)
+///   sequential: lea rsp, [rbp - frame_size] ; jmp accept_top
 ///
-/// ONE read, ONE write, then close — exactly today's contract; only the
-/// handler changed (the echo emitter's per-connection read loop is the
-/// identity shape's, kept untouched). The step loop is slice `multistep-1`.
+/// A ONE-SHOT service (no `max_steps`) emits exactly what slice 0 emitted —
+/// every multi-step addition is gated on `service.is_multistep()`, and the
+/// identity echo keeps `emit_raw_tcp_echo_bytes` untouched. Measured by the
+/// corpus sweep: `tag_probe` 606 B and `raw_tcp_echo` 358 B, same sha256.
+///
+/// **The step cap is checked BEFORE the read, not after it** — a deliberate
+/// deviation from design §5.2, whose sketch reads then increments then
+/// compares. Checked after, the child reads a `max_steps + 1`-th frame it
+/// will never answer, and a client can hold it for one more `read_timeout`
+/// after exhausting its step budget: the declared ceiling would be
+/// `(max_steps + 1) × read_timeout`. Checked before, the child closes the
+/// moment the `max_steps`-th response is written, and the ceiling is exactly
+/// `max_steps × read_timeout` — the number §5.4 says the source declares.
+/// The observable contract is the same either way (exactly `max_steps`
+/// responses, then close: NC-1c), only the wall-clock claim is tighter.
+///
+/// **What `read_timeout` bounds and what it does not** (§5.4, quoted so
+/// the claim cannot drift): a multi-step connection's WORK and its
+/// wall-clock READ lifetime are both bounded by declarations in the source,
+/// and both bounds are visible with `grep`. It does NOT bound a `write` —
+/// a client that never reads can stall the child in the response write on
+/// a full socket buffer; `SO_SNDTIMEO` is the symmetric knob and is not in
+/// this slice because the streamed response is many small writes and "what
+/// does a partial write mean when the bytes are already gone" is a semantic
+/// question, not a knob. "Nothing unbounded compiles" is therefore NOT a
+/// claim this emitter makes.
+///
+/// **Per-connection state lifetime is the fork** (§5.3): STATE INIT runs
+/// once in the parent before `listen`; every child gets a copy-on-write
+/// copy of the initialised slots, mutates its own pages across its steps,
+/// and exits. Two concurrent connections are two address spaces, so
+/// cross-connection leakage is impossible by construction. The step tail's
+/// `lea rsp, [rbp - frame_size]` moves rsp BELOW the state block and never
+/// writes it — the same argument the HTTP iteration tail makes, which makes
+/// no reference to which loop it is. Zero reset instructions.
 ///
 /// Slot map below rbp:
-///   -8     req ptr   = rbp + buf_off     (rewritten per accept — the same
+///   -8     req ptr   = rbp + buf_off     (rewritten per read — the same
 ///                                         address every time, stored per
-///                                         accept so every reader has one
+///                                         read so every reader has one
 ///                                         source: the slot)
 ///   -16    req len   = the `read` return value — the RUNTIME count, never
 ///                      max_request (design §4.3 row 3; NC-0a)
 ///   -24 .. -40       reserved (the HTTP block's status / body slots; kept so
 ///                      client_fd sits at -48 as the design fixes it)
 ///   -48    client_fd
+///   -56    step counter                  (multi-step only)
 ///   below: handler let slots (text: ptr + len, 16 B; number: 8 B), the
 ///          same cursor discipline as the HTTP emitter
+///   below: the STATE BLOCK (multi-step only; `compute_state_layout`, the
+///          HTTP emitter's exact shape: number 8 B, text 16 B + N↑8)
 ///   bottom: read buffer (max_request bytes)
 ///
 /// `req.<field>` registers in `text_bindings` under the COMPOSITE key
 /// `__req_<field>`: the field name is author-chosen, so a bare key would let
-/// a handler `let` of the same name overwrite the registration and have
-/// `byte_at(req.<f>, 0)` read the let's slots — a plausible value, rc 0, no
-/// diagnostic (design §4.1-2, NC-0b). The reader sites (`emit_length`,
-/// `emit_starts_with_load_text`, `emit_streaming_bytes_body`) probe the
-/// composite key before the bare one.
+/// a handler `let` — or, since multistep-1, a STATE FIELD — of the same name
+/// overwrite the registration and have `byte_at(req.<f>, 0)` read the
+/// other's slots — a plausible value, rc 0, no diagnostic (design §4.1-2,
+/// NC-0b; `multistep_input_field_and_state_field_share_a_name`). State
+/// fields register under `__state_<f>` for the same reason.
 ///
-/// `byte_at`'s bounds check is UNCHANGED and fail-closed: `index >= len` →
-/// `sys_exit(1)` of the whole process, with no response on the wire (design
-/// §4.6-3 / NC-0c). Against a runtime length that check does real work for
-/// the first time. Note what that means for a listener: a client that sends
-/// fewer bytes than a handler indexes takes the process down — the design
-/// specifies exit(1) explicitly and this emitter follows it; the HTTP
-/// parse-guard precedent (close the connection, keep serving) is the
-/// alternative a later slice may prefer, and it is recorded in the PR.
+/// `byte_at`'s bounds check is fail-closed and, inside a service, CLOSES
+/// THE CONNECTION without a response (slice svc-client-abort-1): the
+/// `ClientAbortScope` below routes every client-tripped `byte_at` /
+/// `substring` / `parse_int` in the lets, the body and the `after:` block
+/// to `close`. In a step loop that is the end of the CONVERSATION — the
+/// child takes its normal `sys_exit(0)` tail — and the listener keeps
+/// accepting. OPERATOR aborts (the text-state backstop) still `sys_exit(1)`
+/// through the abort tail at the end of the binary.
+#[allow(clippy::too_many_arguments)]
 fn emit_raw_tcp_dynamic_bytes(
     service: &Service,
     handler: &Rule,
@@ -21011,6 +21129,7 @@ fn emit_raw_tcp_dynamic_bytes(
     let port_be = service.port.to_be_bytes();
     let max_request = service.max_request;
     let buf_bytes = max_request.to_le_bytes();
+    let multistep = service.is_multistep();
 
     // ── Handler `let` classification (Phase 2I-H's shape, on the REAL
     // input concept rather than the synthetic HttpRequest) ──
@@ -21051,7 +21170,10 @@ fn emit_raw_tcp_dynamic_bytes(
                 ),
             });
         }
-        let is_text = let_rhs_is_text(expr, input_concept, None, all_rules, &prior_text_lets);
+        // `let s = state.<text field>` is a text let — see
+        // `let_is_state_text_field`.
+        let is_text = let_is_state_text_field(expr, service)
+            || let_rhs_is_text(expr, input_concept, None, all_rules, &prior_text_lets);
         if is_text {
             prior_text_lets.insert(name.as_str());
         }
@@ -21063,19 +21185,38 @@ fn emit_raw_tcp_dynamic_bytes(
         .sum();
 
     // ── Frame layout ──
-    const FIXED_BLOCK: i32 = 48;
     const REQ_PTR_SLOT: i32 = -8;
     const REQ_LEN_SLOT: i32 = -16;
     const CLIENT_FD_SLOT: i32 = -48;
-    let frame_base: i32 = FIXED_BLOCK + handler_let_slots_bytes;
+    const STEP_SLOT: i32 = -56;
+    // The fixed block grows by the step counter's 8 bytes under multi-step
+    // and by nothing otherwise, so a one-shot service's frame is slice 0's.
+    let fixed_block: i32 = if multistep { 56 } else { 48 };
+    let state_layout = compute_state_layout(service, -(fixed_block + handler_let_slots_bytes))?;
+    // Owned composite keys for the state fields — declared BEFORE the
+    // binding maps below, which borrow them.
+    let state_composite_keys: Vec<String> = service
+        .state_fields
+        .iter()
+        .map(|sf| format!("__state_{}", sf.name))
+        .collect();
+    let frame_base: i32 = fixed_block + handler_let_slots_bytes + state_layout.slots_bytes;
     let frame_size: u32 = (frame_base as u32) + max_request;
     let buf_offset_from_rbp: i32 = -(frame_base + max_request as i32);
+    // OPERATOR-abort sites (the text-state backstop's `ja`): resolved to a
+    // `sys_exit(1)` tail at the end of the binary, emitted only if any exist.
+    let mut abort_patches: Vec<usize> = Vec::new();
 
     // ═══ PROLOGUE: rbp frame ═══════════════════════════════════
     code.push(0x55);                                     // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);         // mov rbp, rsp
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);         // sub rsp, imm32
     code.extend_from_slice(&frame_size.to_le_bytes());
+
+    // ═══ STATE INIT (once, in the parent — design §5.3) ════════
+    // Zero bytes when there is no state; under `forked` every child inherits
+    // the initialised slots by COW, so per-connection reset is the fork.
+    emit_state_init(&mut code, service, &state_layout);
 
     // ═══ SOCKET ════════════════════════════════════════════════
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41
@@ -21110,6 +21251,11 @@ fn emit_raw_tcp_dynamic_bytes(
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);                   // add rsp, 16
 
+    // ═══ SIGCHLD = SIG_IGN (forked only — the shared Phase 10 block) ═══
+    if service.concurrency == ConcurrencyMode::Forked {
+        emit_sigchld_ignore(&mut code);
+    }
+
     // LISTEN
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00]); // rax=50
     code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
@@ -21125,6 +21271,63 @@ fn emit_raw_tcp_dynamic_bytes(
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
     store_rax_at_rbp(&mut code, CLIENT_FD_SLOT);                         // mov [rbp-48], rax
 
+    // ═══ FORK DISPATCH (forked only — the shared Phase 10 block) ═══
+    // Parent: close(client_fd) + jmp accept_top. Child: falls through
+    // into the step loop with a COW copy of the initialised state.
+    if service.concurrency == ConcurrencyMode::Forked {
+        emit_fork_dispatch(&mut code, accept_top);
+    }
+
+    // ═══ STEP LOOP SETUP (multi-step only — design §5.2 / §5.4) ═══
+    // In the CHILD (forked is mandatory for multi-step), so the listening
+    // socket is untouched:
+    //   setsockopt(client_fd, SOL_SOCKET=1, SO_RCVTIMEO=20, &timeval{S,0}, 16)
+    // A `read` that waits longer than S seconds returns -EAGAIN, which the
+    // existing `test rax,rax ; jle close` treats as close — NO new branch.
+    // Then the step counter is zeroed and `step_top` opens the loop with
+    // the work-bound check (before the read — see the doc comment).
+    let mut step_cap_patch: Option<usize> = None;
+    let mut step_top: usize = accept_top;
+    if multistep {
+        let secs = service.read_timeout.expect("multistep ⇒ read_timeout") as i32;
+        let cap = service.max_steps.expect("multistep ⇒ max_steps") as i32;
+        // sub rsp, 16 — the timeval, on the stack below the frame
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);
+        // mov qword [rsp], S        (tv_sec)
+        code.extend_from_slice(&[0x48, 0xC7, 0x04, 0x24]);
+        code.extend_from_slice(&secs.to_le_bytes());
+        // mov qword [rsp+8], 0      (tv_usec)
+        code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00]);
+        // mov rax, 54 (setsockopt)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00]);
+        // mov rdi, [rbp-48]         (client_fd)
+        emit_mov_rdi_fd(&mut code, WriteFd::RbpSlot(CLIENT_FD_SLOT));
+        // mov rsi, 1 (SOL_SOCKET)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]);
+        // mov rdx, 20 (SO_RCVTIMEO)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x14, 0x00, 0x00, 0x00]);
+        // mov r10, rsp              (&timeval)
+        code.extend_from_slice(&[0x49, 0x89, 0xE2]);
+        // mov r8, 16                (sizeof timeval)
+        code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x10, 0x00, 0x00, 0x00]);
+        // syscall
+        code.extend_from_slice(&[0x0F, 0x05]);
+        // add rsp, 16
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
+        // mov qword [rbp-56], 0     (the step counter)
+        emit_mov_rbp_slot_imm(&mut code, STEP_SLOT, 0);
+
+        step_top = code.len();
+        // cmp qword [rbp-56], max_steps ; jae close   (NC-1c's discriminator)
+        code.extend_from_slice(&[0x48, 0x81, 0x7D, STEP_SLOT as u8]);
+        code.extend_from_slice(&cap.to_le_bytes());
+        code.extend_from_slice(&[0x0F, 0x83]);
+        step_cap_patch = Some(code.len());
+        code.extend_from_slice(&[0, 0, 0, 0]);
+        // inc qword [rbp-56]
+        code.extend_from_slice(&[0x48, 0xFF, 0x45, STEP_SLOT as u8]);
+    }
+
     // ═══ READ (one frame) ══════════════════════════════════════
     code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax (sys_read)
     emit_mov_rdi_fd(&mut code, WriteFd::RbpSlot(CLIENT_FD_SLOT));        // rdi = [rbp-48]
@@ -21134,9 +21337,10 @@ fn emit_raw_tcp_dynamic_bytes(
     code.extend_from_slice(&buf_bytes);
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
     // rax = bytes_read. A zero-byte read is EOF and a negative one an
-    // error; neither runs the handler (design §4.3 row 4: `byte_at` is never
-    // reached with an empty buffer — the `jle` here, not the bounds check,
-    // is what stands between an empty read and an out-of-range index).
+    // error — including -EAGAIN from SO_RCVTIMEO; none runs the handler
+    // (design §4.3 row 4: `byte_at` is never reached with an empty buffer —
+    // the `jle` here, not the bounds check, is what stands between an
+    // empty read and an out-of-range index).
     code.extend_from_slice(&[0x48, 0x85, 0xC0]);                         // test rax, rax
     code.extend_from_slice(&[0x0F, 0x8E]);                               // jle rel32 → close
     let read_fail_patch = code.len();
@@ -21155,19 +21359,29 @@ fn emit_raw_tcp_dynamic_bytes(
     // No offsets: the input concept's single field is bytes, which has no
     // scalar slot — it is reachable only through the composite BoundText.
     let mut handler_offsets: HashMap<&str, i32> = HashMap::new();
+    // State fields under `__state_<f>` (multi-step only: the verifier and
+    // `compile_raw_tcp_dynamic_service` refuse state on a one-shot service,
+    // so this registers nothing there).
+    register_state_bindings(
+        service,
+        &state_layout,
+        &state_composite_keys,
+        &mut handler_offsets,
+        &mut text_bindings,
+    );
 
     // ═══ CLIENT-ABORT SCOPE (slice svc-client-abort-1) ═════════
     // Same split as the HTTP emitter: a `byte_at` / `substring` /
-    // `parse_int` check the handler runs against the frame it just read
-    // closes THIS connection (the `close_label` below, which the zero-byte
-    // read already uses) instead of taking the listener down. The design
-    // note's §4.6-3 said "exits 1 with no response"; that was the defect,
-    // not the contract — see the CLIENT-ABORT ROUTING block.
+    // `parse_int` check the handler runs against the frame it just read —
+    // in the lets, the body, or (multi-step) the `after:` block — closes
+    // THIS connection (the `close_label` below, which the zero-byte read
+    // already uses) instead of taking the listener down. In a step loop
+    // that ends the conversation: the child exits 0 through the tail.
     let client_scope = ClientAbortScope::begin();
 
     // ═══ HANDLER LET BINDINGS (Phase 2I-H's prologue, verbatim shape) ═══
     {
-        let mut let_cursor: i32 = -(FIXED_BLOCK + 8);
+        let mut let_cursor: i32 = -(fixed_block + 8);
         for ((name, expr), is_text) in
             handler.logic.bindings.iter().zip(handler_binding_is_text.iter())
         {
@@ -21245,10 +21459,46 @@ fn emit_raw_tcp_dynamic_bytes(
         WriteFd::RbpSlot(CLIENT_FD_SLOT),
     )?;
 
+    // ═══ AFTER BLOCK + STEP TAIL (multi-step only) ═════════════
+    if multistep {
+        // The `after:` block runs at the bottom of the INNERMOST loop — the
+        // step loop — and BEFORE the step tail's `lea rsp`: every transient a
+        // `set` may copy FROM (a handler concat buffer, the read buffer) is
+        // still live at the copy point for that reason alone (design §5.7;
+        // NC-1e). A value set here is visible from the NEXT step onward,
+        // never to the step that set it.
+        emit_after_block(
+            &mut code,
+            service,
+            handler,
+            input_concept,
+            all_rules,
+            &handler_offsets,
+            field_ranges,
+            &text_bindings,
+            &state_layout,
+            &mut abort_patches,
+        )?;
+        // STEP TAIL: restore rsp to the post-prologue invariant (frees any
+        // handler-allocated concat buffer) and loop to the next frame. Every
+        // state slot is rbp-relative and inside frame_size, so the `lea`
+        // moves rsp BELOW them and never writes them (design §5.3).
+        code.extend_from_slice(&[0x48, 0x8D, 0xA5]);                     // lea rsp, [rbp + neg]
+        let neg_frame: i32 = -(frame_size as i32);
+        code.extend_from_slice(&neg_frame.to_le_bytes());
+        code.push(0xE9);                                                 // jmp step_top
+        let back = step_top as i32 - (code.len() as i32 + 4);
+        code.extend_from_slice(&back.to_le_bytes());
+    }
+
     // ═══ CLOSE + LOOP ══════════════════════════════════════════
     let close_label = code.len();
     let rel = close_label as i32 - (read_fail_patch as i32 + 4);
     code[read_fail_patch..read_fail_patch + 4].copy_from_slice(&rel.to_le_bytes());
+    if let Some(site) = step_cap_patch {
+        let rel = close_label as i32 - (site as i32 + 4);
+        code[site..site + 4].copy_from_slice(&rel.to_le_bytes());
+    }
     // Slice svc-client-abort-1: the handler's client-abort sites land here
     // as well. The response is STREAMED, so a check that fires after the
     // first write leaves the client a prefix and then a close — the
@@ -21260,17 +21510,48 @@ fn emit_raw_tcp_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
     emit_mov_rdi_fd(&mut code, WriteFd::RbpSlot(CLIENT_FD_SLOT));
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    // ITERATION TAIL: restore rsp to the post-prologue invariant (frees any
-    // handler-allocated concat buffer in one instruction) and loop. Every
-    // slot above is rbp-relative and inside frame_size, so the `lea` moves
-    // rsp BELOW them and never writes them — the HTTP emitter's argument,
-    // and the one slice multistep-1's state block will inherit (design §5.3).
-    code.extend_from_slice(&[0x48, 0x8D, 0xA5]);                         // lea rsp, [rbp + neg]
-    let neg_frame: i32 = -(frame_size as i32);
-    code.extend_from_slice(&neg_frame.to_le_bytes());
-    code.push(0xE9);                                                     // jmp accept_top
-    let back = accept_top as i32 - (code.len() as i32 + 4);
-    code.extend_from_slice(&back.to_le_bytes());
+    match service.concurrency {
+        ConcurrencyMode::Sequential => {
+            // ITERATION TAIL: restore rsp to the post-prologue invariant
+            // (frees any handler-allocated concat buffer in one
+            // instruction) and loop. Every slot above is rbp-relative and
+            // inside frame_size, so the `lea` moves rsp BELOW them and
+            // never writes them — the HTTP emitter's argument, and the one
+            // the step tail above inherits for the state block.
+            code.extend_from_slice(&[0x48, 0x8D, 0xA5]);                 // lea rsp, [rbp + neg]
+            let neg_frame: i32 = -(frame_size as i32);
+            code.extend_from_slice(&neg_frame.to_le_bytes());
+            code.push(0xE9);                                             // jmp accept_top
+            let back = accept_top as i32 - (code.len() as i32 + 4);
+            code.extend_from_slice(&back.to_le_bytes());
+        }
+        ConcurrencyMode::Forked => {
+            // Control reaches here only inside the CHILD (the parent took
+            // the close + jmp accept_top path inside the fork dispatch).
+            // The conversation is over — EOF, timeout, step cap, or a
+            // client abort — so the child exits 0; sys_exit closes any
+            // remaining fd and releases the frame.
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]); // mov rdi, 0
+            code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+        }
+    }
+
+    // ═══ ABORT SEQUENCE (operator aborts: the text-state backstop) ═══
+    // Reachable only through the 13-byte `cmp rdx, N ; ja` backstop the
+    // after block keeps at each text copy — unreachable by construction
+    // (the verifier proved the bound). sys_exit(1), emitted only when a
+    // site exists, so every stateless service is byte-identical.
+    if !abort_patches.is_empty() {
+        let abort_label = code.len();
+        for site in &abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    }
 
     if let Err(e) = crate::validate_x86::validate_code(&code) {
         eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
@@ -21830,6 +22111,426 @@ fn bound_text_field_key(base: &Expr, field_name: &str) -> String {
     }
 }
 
+/// Slice `multistep-1`: the frame slots a service's `state:` block occupies,
+/// computed ONCE from `service.state_fields` — a `Vec`, walked in declaration
+/// order by a DESCENDING CURSOR from `cursor_start`. Never a HashMap walk:
+/// these offsets reach emitted bytes, and Rust's default hasher is randomly
+/// seeded (CLAUDE.md "Reproducible emit").
+///
+/// Extracted from `emit_http10_dynamic_bytes` (slice `text-state-1`) so the
+/// `raw_tcp` step-loop emitter shares ONE layout, ONE init and ONE after
+/// block with the HTTP emitter instead of a second copy of each. The
+/// extraction is byte-neutral for every HTTP service — measured by the
+/// corpus sweep, and pinned by the service size tests.
+///
+/// A Number field is one 8-byte slot; a Text field is the SAME triple a
+/// resource and a connection get — 16 bytes for (ptr, len) plus an N-byte
+/// buffer padded to 8 — so a Number-only service contributes the same `8`
+/// per field in the same order and its whole frame is unchanged.
+struct StateLayout<'a> {
+    /// Total bytes the block occupies (what the frame grows by).
+    slots_bytes: i32,
+    /// Number field → its value slot.
+    offsets: HashMap<&'a str, i32>,
+    /// Text field → (name, ptr_slot, len_slot, buf_off).
+    text_slots: Vec<(&'a str, i32, i32, i32)>,
+}
+
+fn compute_state_layout<'a>(
+    service: &'a Service,
+    cursor_start: i32,
+) -> Result<StateLayout<'a>, NativeError> {
+    let mut slots_bytes: i32 = 0;
+    let mut offsets: HashMap<&'a str, i32> = HashMap::new();
+    let mut text_slots: Vec<(&'a str, i32, i32, i32)> = Vec::new();
+    let mut cursor: i32 = cursor_start;
+    for sf in &service.state_fields {
+        match sf.ty {
+            Type::Text => {
+                let padded = state_text_padded_bytes(sf)?;
+                slots_bytes += 16 + padded;
+                let ptr_slot = cursor - 8;
+                let len_slot = cursor - 16;
+                let buf_off = cursor - 16 - padded;
+                cursor -= 16 + padded;
+                text_slots.push((sf.name.as_str(), ptr_slot, len_slot, buf_off));
+            }
+            _ => {
+                slots_bytes += 8;
+                cursor -= 8;
+                offsets.insert(sf.name.as_str(), cursor);
+            }
+        }
+    }
+    Ok(StateLayout { slots_bytes, offsets, text_slots })
+}
+
+/// STATE INIT — initialise each mutable state field to its declared initial
+/// value. Emitted ONCE, right after the prologue and before the socket
+/// exists; the slots persist across accept iterations (and, in a step loop,
+/// across steps) because they are within the rbp-relative frame:
+/// `lea rsp, [rbp - frame_size]` restores rsp BELOW them and never writes
+/// them. Under `forked` the initialised slots are what every child inherits
+/// by copy-on-write — which is why a multi-step service needs NO
+/// per-connection reset site: the reset IS the fork (design §5.3).
+///
+/// A Text field's init points its ptr slot at the persistent buffer (an
+/// address that never changes for the process's life), stores the literal's
+/// length, and copies the literal bytes in via the same jmp-over-data shape
+/// every other text literal uses, so `strings <binary>` still shows the
+/// whole state block — the audit contract in docs/effect-model.md.
+fn emit_state_init(code: &mut Vec<u8>, service: &Service, layout: &StateLayout) {
+    for sf in &service.state_fields {
+        match &sf.init {
+            StateInit::Number(v) => {
+                let slot = layout.offsets[sf.name.as_str()];
+                // mov qword [rbp + slot], initial_value
+                emit_mov_rbp_slot_imm(code, slot, *v);
+            }
+            StateInit::Text(lit) => {
+                let (_, ptr_slot, len_slot, buf_off) = *layout
+                    .text_slots
+                    .iter()
+                    .find(|(n, ..)| *n == sf.name.as_str())
+                    .expect("text state field has a slot triple");
+                emit_lea_rax_rbp(code, buf_off);
+                store_rax_at_rbp(code, ptr_slot);
+                emit_mov_rbp_slot_imm(code, len_slot, lit.as_bytes().len() as i64);
+                let bytes = lit.as_bytes();
+                if !bytes.is_empty() {
+                    let n = bytes.len() as i32;
+                    // jmp over the inline data (rel8 when it fits, else rel32)
+                    if n <= 127 {
+                        code.push(0xEB);
+                        code.push(n as u8);
+                    } else {
+                        code.push(0xE9);
+                        code.extend_from_slice(&n.to_le_bytes());
+                    }
+                    let data_addr = code.len();
+                    code.extend_from_slice(bytes);
+                    // lea rsi, [rip + rel32]
+                    let after = code.len() + 7;
+                    let rel = data_addr as i32 - after as i32;
+                    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+                    code.extend_from_slice(&rel.to_le_bytes());
+                    // lea rdi, [rbp + buf_off]
+                    emit_lea_rdi_rbp(code, buf_off);
+                    // mov rcx, n
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+                    code.extend_from_slice(&n.to_le_bytes());
+                    // cld ; rep movsb
+                    code.push(0xFC);
+                    code.extend_from_slice(&[0xF3, 0xA4]);
+                }
+            }
+        }
+    }
+}
+
+/// Register the state fields so the handler (and the `after:` block) can
+/// READ them: a Text field's (ptr, len) into `text_bindings`, a Number
+/// field's slot into `offsets`, both under the COMPOSITE key `__state_<f>`
+/// (`keys[i]`, owned by the caller so it outlives the maps).
+///
+/// THE COMPOSITE KEY IS MANDATORY, not stylistic. `req.body` is registered
+/// in the HTTP emitter's `text_bindings` under the BARE name "body", and
+/// three BoundText key extractions match `Expr::Field(_, n)` ignoring the
+/// base — so a service declaring `body : text [..64] = ""` would have
+/// `state.body` silently resolve to `req.body`'s slots: a plausible value,
+/// rc 0, no diagnostic. On raw_tcp the input field name is AUTHOR-CHOSEN, so
+/// the collision is one natural declaration away (`seq` / `seq`): design
+/// §4.1-2, and test `multistep_input_field_and_state_field_share_a_name`.
+fn register_state_bindings<'a>(
+    service: &'a Service,
+    layout: &StateLayout<'a>,
+    keys: &'a [String],
+    offsets: &mut HashMap<&'a str, i32>,
+    text_bindings: &mut TextBindings<'a>,
+) {
+    for (i, sf) in service.state_fields.iter().enumerate() {
+        match sf.ty {
+            Type::Text => {
+                let (_, ptr_slot, len_slot, _) = *layout
+                    .text_slots
+                    .iter()
+                    .find(|(n, ..)| *n == sf.name.as_str())
+                    .expect("text state field has a slot triple");
+                text_bindings.insert(&keys[i], (ptr_slot, len_slot));
+            }
+            _ => {
+                let slot = layout.offsets[sf.name.as_str()];
+                offsets.insert(&keys[i], slot);
+            }
+        }
+    }
+}
+
+/// A handler `let` whose RHS is `state.<f>` for a TEXT state field is a
+/// TEXT let — its (ptr, len) come from the persistent slot pair, which
+/// `emit_text_produce_ptrlen`'s state arm already loads.
+///
+/// `let_rhs_is_text` cannot see this: it resolves `Field(Ident(_), f)` by
+/// looking `f` up in the INPUT concept, and a state field is not there, so
+/// the let fell to the NUMBER path, whose `emit_eval_expr` then looked for
+/// `__state_<f>` among the number offsets and reported `unknown field '<f>'
+/// in native codegen`. Measured on `examples/last_path_service.verbose`
+/// with `let seen = state.last` at `0fe0f58`: verifies clean, rc 1 at emit.
+/// That is the "bind it to a handler let first" workaround CLAUDE.md and
+/// the text-state refusals #8/#9 point at, and natively it did not work —
+/// fail-closed, never a wrong answer, but a documented workaround that
+/// refused. Byte-neutral for every program that compiled before (those
+/// never reached this arm).
+fn let_is_state_text_field(expr: &Expr, service: &Service) -> bool {
+    match expr {
+        Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(b) if b == "state") => {
+            service
+                .state_fields
+                .iter()
+                .any(|sf| &sf.name == fname && sf.ty == Type::Text)
+        }
+        _ => false,
+    }
+}
+
+/// The `after:` block — each `set <f> = <expr>` evaluated and stored into
+/// its state slot. Runs AFTER the response is written and AFTER the log
+/// blocks, and — the load-bearing part — BEFORE the enclosing loop's
+/// `lea rsp, [rbp - frame_size]`: every transient a `set` may copy FROM (a
+/// handler concat buffer, the read buffer itself, a resource or fetch
+/// buffer) is still live at the copy point for that reason alone. Design
+/// §5.7 / §6.1: "`after:` runs at the bottom of the INNERMOST loop the
+/// service declares" — the accept loop in HTTP, the step loop in a
+/// multi-step raw_tcp service — and NC-1e is the runnable form of the
+/// ordering.
+///
+/// A TEXT field is COPIED (`rep movsb`), never aliased: an alias works for
+/// a literal (which lives in the code region forever) and for the FIRST
+/// request or step of anything else, then silently returns the NEXT one's
+/// bytes, because every transient source is reused or freed at the loop
+/// tail. NC-1a is the runnable form. The 13-byte backstop before the copy
+/// is unreachable by construction (the verifier proved
+/// `worst_case(source) <= N` from declarations) and kept because the
+/// compile-time gate is a piece of REASONING — thirteen bytes turn "a
+/// future widening of the source table becomes a remote stack overflow"
+/// into "a future widening becomes an exit(1)".
+///
+/// The caller owns the `ClientAbortScope` (a `set` source may be request
+/// data whose `substring` / `byte_at` bound trips) and the abort tail the
+/// backstop's `ja` patches into.
+#[allow(clippy::too_many_arguments)]
+fn emit_after_block(
+    code: &mut Vec<u8>,
+    service: &Service,
+    handler: &Rule,
+    lets_concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    handler_offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings,
+    layout: &StateLayout,
+    abort_patches: &mut Vec<usize>,
+) -> Result<(), NativeError> {
+    for aset in &service.after_sets {
+        let sf = service.state_fields.iter()
+            .find(|sf| sf.name == aset.field_name)
+            .ok_or_else(|| NativeError {
+                message: format!(
+                    "after block references unknown state field '{}' (verifier should have caught this)",
+                    aset.field_name
+                ),
+            })?;
+        match sf.ty {
+            Type::Text => {
+                let (_, _ptr_slot, len_slot, buf_off) = *layout
+                    .text_slots
+                    .iter()
+                    .find(|(n, ..)| *n == aset.field_name.as_str())
+                    .expect("text state field has a slot triple");
+                let n = state_text_bound(sf)?;
+                emit_text_produce_ptrlen(
+                    code,
+                    &aset.value,
+                    &handler.input_name,
+                    lets_concept,
+                    all_rules,
+                    handler_offsets,
+                    field_ranges,
+                    text_bindings,
+                )?;
+                // BACKSTOP, 13 bytes: cmp rdx, N ; ja abort.
+                code.extend_from_slice(&[0x48, 0x81, 0xFA]); // cmp rdx, imm32
+                code.extend_from_slice(&n.to_le_bytes());
+                code.extend_from_slice(&[0x0F, 0x87]);       // ja rel32
+                abort_patches.push(code.len());
+                code.extend_from_slice(&[0, 0, 0, 0]);
+                // mov rsi, rax
+                code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+                // lea rdi, [rbp + buf_off]   — computed LAST, right before
+                // the copy: the producer above is free to clobber rdi/rsi.
+                emit_lea_rdi_rbp(code, buf_off);
+                // mov rcx, rdx
+                code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+                // cld ; rep movsb   — DF is not assumed to be 0, same
+                // discipline as emit_text_bound_check's own cld.
+                code.push(0xFC);
+                code.extend_from_slice(&[0xF3, 0xA4]);
+                // mov [rbp + len_slot], rdx  — the ptr slot is NOT rewritten:
+                // the buffer address is constant, which is what lets every
+                // BoundText reader work unmodified.
+                if len_slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                    code.push(len_slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                    code.extend_from_slice(&len_slot.to_le_bytes());
+                }
+            }
+            _ => {
+                let state_slot = layout.offsets[aset.field_name.as_str()];
+                emit_eval_expr(
+                    code,
+                    &aset.value,
+                    &handler.input_name,
+                    handler_offsets,
+                    all_rules,
+                    field_ranges,
+                    text_bindings,
+                    None,
+                    None,
+                )?;
+                store_rax_at_rbp(code, state_slot);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `rt_sigaction(SIGCHLD, SIG_IGN, NULL, 8)` — Phase 10 slice 10's one-shot
+/// auto-reap, emitted before `listen` in every forked service so it covers
+/// the very first connection. No `wait`/`waitpid`, no zombies.
+///
+/// `struct sigaction` is the kernel x86-64 ABI shape (NOT libc):
+///   offset 0:  sa_handler  (8 bytes) = SIG_IGN = 1
+///   offset 8:  sa_flags    (8 bytes) = 0
+///   offset 16: sa_restorer (8 bytes) = 0  (unused without SA_RESTORER)
+///   offset 24: sa_mask     (8 bytes) = 0  (one longword, sigsetsize=8)
+///
+/// Layout: jmp short over the 32-byte data block, then the syscall itself
+/// with `lea rsi, [rip + disp32]` pointing back at the data. Extracted from
+/// the HTTP emitter by slice `multistep-1` verbatim (byte-identical).
+fn emit_sigchld_ignore(code: &mut Vec<u8>) {
+    // jmp short +32 (over the data block)
+    code.extend_from_slice(&[0xEB, 0x20]);
+    let sigaction_data_at = code.len();
+    // sa_handler = SIG_IGN = 1
+    code.extend_from_slice(&1u64.to_le_bytes());
+    // sa_flags = 0
+    code.extend_from_slice(&0u64.to_le_bytes());
+    // sa_restorer = 0
+    code.extend_from_slice(&0u64.to_le_bytes());
+    // sa_mask = 0
+    code.extend_from_slice(&0u64.to_le_bytes());
+    // mov rax, 13 (rt_sigaction)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00]);
+    // mov rdi, 17 (SIGCHLD)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x11, 0x00, 0x00, 0x00]);
+    // lea rsi, [rip + disp32]  →  point at sigaction_data_at
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    let lea_disp_at = code.len();
+    code.extend_from_slice(&[0u8; 4]); // patched below
+    let after_lea = code.len();
+    let disp = sigaction_data_at as i32 - after_lea as i32;
+    code[lea_disp_at..lea_disp_at + 4].copy_from_slice(&disp.to_le_bytes());
+    // mov rdx, 0 (oldact = NULL)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00]);
+    // mov r10, 8 (sigsetsize)
+    code.extend_from_slice(&[0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// The per-accept FORK DISPATCH (Phase 10 slice 10), emitted right after
+/// `accept` has stored client_fd at `[rbp-48]`. Three branches:
+///   rax > 0  (parent): close(client_fd), jmp accept_top
+///   rax == 0 (child):  fall through to the iteration body
+///   rax < 0  (failed): write "fork failed\n" to stderr, then take the
+///                      same close + loop path as the parent
+///                      (drop the connection, keep serving).
+///
+/// Layout (so the child path is the natural fall-through):
+///   mov rax, 57; syscall; test rax, rax
+///   jz child            (forward, into the rest of the function)
+///   js fork_error       (forward, into the inline error handler)
+///   <parent close + loop>
+///   <fork_error>: write to stderr, then jmp parent_close
+///   <child label>: end of dispatch — falls through naturally
+///
+/// Extracted from the HTTP emitter by slice `multistep-1` verbatim
+/// (byte-identical); the raw_tcp step-loop emitter shares it.
+fn emit_fork_dispatch(code: &mut Vec<u8>, accept_top: usize) {
+    // mov rax, 57 (sys_fork) ; syscall ; test rax, rax
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);                     // test rax, rax
+    // jz rel8 to `child` (end of dispatch). Patched after we know
+    // the dispatch length.
+    code.extend_from_slice(&[0x74, 0x00]);
+    let jz_to_child_at = code.len() - 1;
+    // js rel8 to `fork_error`. Patched after parent_close emits.
+    code.extend_from_slice(&[0x78, 0x00]);
+    let js_to_err_at = code.len() - 1;
+
+    // ── parent_close: close(client_fd) + jmp accept_top ──
+    let parent_close_at = code.len();
+    // mov rax, 3 (close) ; mov rdi, [rbp-48] ; syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // jmp accept_top (rel32 backward)
+    code.push(0xE9);
+    let back = accept_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&back.to_le_bytes());
+
+    // ── fork_error: write "fork failed\n" to stderr, jmp parent_close ──
+    let fork_error_at = code.len();
+    // patch js_to_err: distance from end of `js` (js_to_err_at + 1 + 1) to fork_error_at
+    let js_disp = (fork_error_at as i32) - (js_to_err_at as i32 + 1);
+    // i8 fits — small forward jump
+    code[js_to_err_at] = js_disp as i8 as u8;
+
+    // jmp short +12 (over the message bytes)
+    code.extend_from_slice(&[0xEB, 0x0C]);
+    let msg_at = code.len();
+    code.extend_from_slice(b"fork failed\n");
+    // mov rax, 1 (write) ; mov rdi, 2 (stderr)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+    // lea rsi, [rip + disp32]  →  point at msg_at
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    let lea_disp_at = code.len();
+    code.extend_from_slice(&[0u8; 4]);
+    let after_lea = code.len();
+    let disp = msg_at as i32 - after_lea as i32;
+    code[lea_disp_at..lea_disp_at + 4].copy_from_slice(&disp.to_le_bytes());
+    // mov rdx, 12 (length)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x0C, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // jmp parent_close (rel32 backward)
+    code.push(0xE9);
+    let back = parent_close_at as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&back.to_le_bytes());
+
+    // ── child label: rest of iteration body falls through ──
+    let child_at = code.len();
+    let jz_disp = (child_at as i32) - (jz_to_child_at as i32 + 1);
+    // sanity: jz uses rel8; our dispatch is small enough to fit i8
+    debug_assert!((-128..=127).contains(&jz_disp),
+        "phase 10: jz to child path overflowed rel8 ({})", jz_disp);
+    code[jz_to_child_at] = jz_disp as i8 as u8;
+}
+
 fn emit_http10_dynamic_bytes(
     service: &Service,
     handler: &Rule,
@@ -21948,13 +22649,17 @@ fn emit_http10_dynamic_bytes(
         .bindings
         .iter()
         .map(|(name, expr)| {
-            let is_text = let_rhs_is_text(
-                expr,
-                &http_request_concept_for_lets,
-                None,
-                all_rules,
-                &prior_text_lets,
-            );
+            // `let seen = state.last` on a TEXT state field is a text let —
+            // see `let_is_state_text_field` for why the classifier alone
+            // sent it down the number path (and refused it).
+            let is_text = let_is_state_text_field(expr, service)
+                || let_rhs_is_text(
+                    expr,
+                    &http_request_concept_for_lets,
+                    None,
+                    all_rules,
+                    &prior_text_lets,
+                );
             if is_text {
                 prior_text_lets.insert(name.as_str());
             }
@@ -21965,58 +22670,25 @@ fn emit_http10_dynamic_bytes(
         .iter()
         .map(|t| if *t { 16i32 } else { 8 })
         .sum();
-    // Mutable state (slice `text-state-1`): a Number field gets one 8-byte
-    // slot, exactly as before; a Text field gets the SAME triple a resource
-    // and a connection already get in this frame — 16 bytes for (ptr, len)
-    // plus an N-byte buffer padded to 8. A Number-only service therefore
-    // contributes the same `8` per field in the same order and its whole
-    // frame is byte-identical.
-    let state_slots_bytes: i32 = {
-        let mut total: i32 = 0;
-        for sf in &service.state_fields {
-            total += match sf.ty {
-                Type::Text => 16 + state_text_padded_bytes(sf)?,
-                _ => 8,
-            };
-        }
-        total
-    };
     // Pre-body fixed offset: where the optional timestamp lives.
     let body_pre_offset: i32 = if uses_timestamp { 56 } else { 48 };
     let body_extra_bytes: i32 = if uses_body { 16 } else { 0 };
     // (req.body ptr, req.body len) follow timestamp, before handler lets.
     let body_ptr_slot: i32 = if uses_body { -(body_pre_offset + 8) } else { 0 };
     let body_len_slot: i32 = if uses_body { -(body_pre_offset + 16) } else { 0 };
+    // Mutable state (slice `text-state-1`): each state field gets dedicated
+    // rbp slots below the handler let slots, on a DESCENDING CURSOR over
+    // `service.state_fields` (a Vec) — see `compute_state_layout`, shared
+    // with the raw_tcp step-loop emitter since slice `multistep-1`. These
+    // slots survive the per-iteration rsp reset because they're within the
+    // rbp-relative frame — which is exactly what a persistent text buffer
+    // needs too, at no new cost.
+    let state_layout = compute_state_layout(
+        service,
+        -(body_pre_offset + body_extra_bytes + handler_let_slots_bytes),
+    )?;
+    let state_slots_bytes: i32 = state_layout.slots_bytes;
     let frame_base_fixed: i32 = body_pre_offset + body_extra_bytes + handler_let_slots_bytes + state_slots_bytes;
-    // Build state offsets: each state field gets dedicated rbp slots below
-    // the handler let slots. These slots survive the per-iteration rsp reset
-    // because they're within the rbp-relative frame — which is exactly what
-    // a persistent text buffer needs too, at no new cost.
-    //
-    // A DESCENDING CURSOR over `service.state_fields`, a Vec. Never a HashMap
-    // walk: the offsets it produces reach emitted bytes, and Rust's default
-    // hasher is randomly seeded (CLAUDE.md "Reproducible emit").
-    let mut state_offsets: HashMap<&str, i32> = HashMap::new();
-    let mut state_text_slots: Vec<(&str, i32, i32, i32)> = Vec::new(); // (name, ptr, len, buf)
-    {
-        let mut cursor: i32 = -(body_pre_offset + body_extra_bytes + handler_let_slots_bytes);
-        for sf in &service.state_fields {
-            match sf.ty {
-                Type::Text => {
-                    let padded = state_text_padded_bytes(sf)?;
-                    let ptr_slot = cursor - 8;
-                    let len_slot = cursor - 16;
-                    let buf_off = cursor - 16 - padded;
-                    cursor -= 16 + padded;
-                    state_text_slots.push((sf.name.as_str(), ptr_slot, len_slot, buf_off));
-                }
-                _ => {
-                    cursor -= 8;
-                    state_offsets.insert(sf.name.as_str(), cursor);
-                }
-            }
-        }
-    }
     // Owned composite keys for the state fields. Declared HERE — above
     // `http_text_bindings` — because a TEXT state field registers into that
     // map by reference, so the Vec has to outlive it.
@@ -22042,61 +22714,9 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&frame_size.to_le_bytes());
 
     // ═══ STATE INIT ═══════════════════════════════════════════
-    // Initialize each mutable state field to its declared initial value.
-    // These slots persist across accept iterations because they're within
-    // the rbp-relative frame (lea rsp, [rbp - frame_size] restores rsp
-    // below them but never overwrites the slots themselves).
-    // Slice `text-state-1`: a Text field's init points its ptr slot at the
-    // persistent buffer (an address that never changes for the process's
-    // life), stores the literal's length, and copies the literal bytes in.
-    // The literal is inlined via the same jmp-over-data shape every other
-    // text literal in this emitter uses, so `strings <binary>` still shows
-    // the whole state block — the audit contract in docs/effect-model.md.
-    for sf in &service.state_fields {
-        match &sf.init {
-            StateInit::Number(v) => {
-                let slot = state_offsets[sf.name.as_str()];
-                // mov qword [rbp + slot], initial_value
-                emit_mov_rbp_slot_imm(&mut code, slot, *v);
-            }
-            StateInit::Text(lit) => {
-                let (_, ptr_slot, len_slot, buf_off) = *state_text_slots
-                    .iter()
-                    .find(|(n, ..)| *n == sf.name.as_str())
-                    .expect("text state field has a slot triple");
-                emit_lea_rax_rbp(&mut code, buf_off);
-                store_rax_at_rbp(&mut code, ptr_slot);
-                emit_mov_rbp_slot_imm(&mut code, len_slot, lit.as_bytes().len() as i64);
-                let bytes = lit.as_bytes();
-                if !bytes.is_empty() {
-                    let n = bytes.len() as i32;
-                    // jmp over the inline data (rel8 when it fits, else rel32)
-                    if n <= 127 {
-                        code.push(0xEB);
-                        code.push(n as u8);
-                    } else {
-                        code.push(0xE9);
-                        code.extend_from_slice(&n.to_le_bytes());
-                    }
-                    let data_addr = code.len();
-                    code.extend_from_slice(bytes);
-                    // lea rsi, [rip + rel32]
-                    let after = code.len() + 7;
-                    let rel = data_addr as i32 - after as i32;
-                    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
-                    code.extend_from_slice(&rel.to_le_bytes());
-                    // lea rdi, [rbp + buf_off]
-                    emit_lea_rdi_rbp(&mut code, buf_off);
-                    // mov rcx, n
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
-                    code.extend_from_slice(&n.to_le_bytes());
-                    // cld ; rep movsb
-                    code.push(0xFC);
-                    code.extend_from_slice(&[0xF3, 0xA4]);
-                }
-            }
-        }
-    }
+    // Once, before the socket exists — see `emit_state_init` (shared with
+    // the raw_tcp step-loop emitter since slice `multistep-1`).
+    emit_state_init(&mut code, service, &state_layout);
 
     // ═══ SOCKET ════════════════════════════════════════════════
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41
@@ -22146,36 +22766,10 @@ fn emit_http10_dynamic_bytes(
     //   offset 24: sa_mask     (8 bytes) = 0  (one longword, sigsetsize=8)
     //
     // Layout: jmp short over the 32-byte data block, then the syscall
-    // itself with `lea rsi, [rip + disp32]` pointing back at the data.
+    // itself with `lea rsi, [rip + disp32]` pointing back at the data —
+    // see `emit_sigchld_ignore` (shared with the raw_tcp step-loop emitter).
     if service.concurrency == ConcurrencyMode::Forked {
-        // jmp short +32 (over the data block)
-        code.extend_from_slice(&[0xEB, 0x20]);
-        let sigaction_data_at = code.len();
-        // sa_handler = SIG_IGN = 1
-        code.extend_from_slice(&1u64.to_le_bytes());
-        // sa_flags = 0
-        code.extend_from_slice(&0u64.to_le_bytes());
-        // sa_restorer = 0
-        code.extend_from_slice(&0u64.to_le_bytes());
-        // sa_mask = 0
-        code.extend_from_slice(&0u64.to_le_bytes());
-        // mov rax, 13 (rt_sigaction)
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00]);
-        // mov rdi, 17 (SIGCHLD)
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x11, 0x00, 0x00, 0x00]);
-        // lea rsi, [rip + disp32]  →  point at sigaction_data_at
-        code.extend_from_slice(&[0x48, 0x8D, 0x35]);
-        let lea_disp_at = code.len();
-        code.extend_from_slice(&[0u8; 4]); // patched below
-        let after_lea = code.len();
-        let disp = sigaction_data_at as i32 - after_lea as i32;
-        code[lea_disp_at..lea_disp_at + 4].copy_from_slice(&disp.to_le_bytes());
-        // mov rdx, 0 (oldact = NULL)
-        code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00]);
-        // mov r10, 8 (sigsetsize)
-        code.extend_from_slice(&[0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00]);
-        // syscall
-        code.extend_from_slice(&[0x0F, 0x05]);
+        emit_sigchld_ignore(&mut code);
     }
 
     // LISTEN
@@ -22250,66 +22844,7 @@ fn emit_http10_dynamic_bytes(
     //   <fork_error>: write to stderr, then jmp parent_close
     //   <child label>: end of dispatch — falls through naturally
     if service.concurrency == ConcurrencyMode::Forked {
-        // mov rax, 57 (sys_fork) ; syscall ; test rax, rax
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00]);
-        code.extend_from_slice(&[0x0F, 0x05]);
-        code.extend_from_slice(&[0x48, 0x85, 0xC0]);                     // test rax, rax
-        // jz rel8 to `child` (end of dispatch). Patched after we know
-        // the dispatch length.
-        code.extend_from_slice(&[0x74, 0x00]);
-        let jz_to_child_at = code.len() - 1;
-        // js rel8 to `fork_error`. Patched after parent_close emits.
-        code.extend_from_slice(&[0x78, 0x00]);
-        let js_to_err_at = code.len() - 1;
-
-        // ── parent_close: close(client_fd) + jmp accept_top ──
-        let parent_close_at = code.len();
-        // mov rax, 3 (close) ; mov rdi, [rbp-48] ; syscall
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
-        code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);
-        code.extend_from_slice(&[0x0F, 0x05]);
-        // jmp accept_top (rel32 backward)
-        code.push(0xE9);
-        let back = accept_top as i32 - (code.len() as i32 + 4);
-        code.extend_from_slice(&back.to_le_bytes());
-
-        // ── fork_error: write "fork failed\n" to stderr, jmp parent_close ──
-        let fork_error_at = code.len();
-        // patch js_to_err: distance from end of `js` (js_to_err_at + 1 + 1) to fork_error_at
-        let js_disp = (fork_error_at as i32) - (js_to_err_at as i32 + 1);
-        // i8 fits — small forward jump
-        code[js_to_err_at] = js_disp as i8 as u8;
-
-        // jmp short +12 (over the message bytes)
-        code.extend_from_slice(&[0xEB, 0x0C]);
-        let msg_at = code.len();
-        code.extend_from_slice(b"fork failed\n");
-        // mov rax, 1 (write) ; mov rdi, 2 (stderr)
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
-        // lea rsi, [rip + disp32]  →  point at msg_at
-        code.extend_from_slice(&[0x48, 0x8D, 0x35]);
-        let lea_disp_at = code.len();
-        code.extend_from_slice(&[0u8; 4]);
-        let after_lea = code.len();
-        let disp = msg_at as i32 - after_lea as i32;
-        code[lea_disp_at..lea_disp_at + 4].copy_from_slice(&disp.to_le_bytes());
-        // mov rdx, 12 (length)
-        code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x0C, 0x00, 0x00, 0x00]);
-        // syscall
-        code.extend_from_slice(&[0x0F, 0x05]);
-        // jmp parent_close (rel32 backward)
-        code.push(0xE9);
-        let back = parent_close_at as i32 - (code.len() as i32 + 4);
-        code.extend_from_slice(&back.to_le_bytes());
-
-        // ── child label: rest of iteration body falls through ──
-        let child_at = code.len();
-        let jz_disp = (child_at as i32) - (jz_to_child_at as i32 + 1);
-        // sanity: jz uses rel8; our dispatch is small enough to fit i8
-        debug_assert!((-128..=127).contains(&jz_disp),
-            "phase 10: jz to child path overflowed rel8 ({})", jz_disp);
-        code[jz_to_child_at] = jz_disp as i8 as u8;
+        emit_fork_dispatch(&mut code, accept_top);
     }
 
     // ═══ TIMESTAMP (Phase 8 slice 8c) ══════════════════════════
@@ -22566,30 +23101,15 @@ fn emit_http10_dynamic_bytes(
     // that map is declared earlier in this function.
     let mut handler_offsets: HashMap<&str, i32> = offsets.clone();
     // Register state field offsets under composite keys so emit_eval_expr's
-    // Field(Ident("state"), name) arm resolves them via "__state_<name>".
-    //
-    // THE COMPOSITE KEY IS MANDATORY, not stylistic. `req.body` is registered
-    // in `http_text_bindings` under the BARE name "body" a few hundred lines
-    // above, and three BoundText key extractions match `Expr::Field(_, n)`
-    // ignoring the base — so a service declaring `body : text [..64] = ""`
-    // would have `state.body` silently resolve to `req.body`'s slots: a
-    // plausible value, rc 0, no diagnostic. Same hazard `__agg_<let>_<field>`
-    // records for the aggregate arc.
-    for (i, sf) in service.state_fields.iter().enumerate() {
-        match sf.ty {
-            Type::Text => {
-                let (_, ptr_slot, len_slot, _) = *state_text_slots
-                    .iter()
-                    .find(|(n, ..)| *n == sf.name.as_str())
-                    .expect("text state field has a slot triple");
-                http_text_bindings.insert(&state_composite_keys[i], (ptr_slot, len_slot));
-            }
-            _ => {
-                let slot = state_offsets[sf.name.as_str()];
-                handler_offsets.insert(&state_composite_keys[i], slot);
-            }
-        }
-    }
+    // Field(Ident("state"), name) arm resolves them via "__state_<name>" —
+    // see `register_state_bindings` for why the composite key is MANDATORY.
+    register_state_bindings(
+        service,
+        &state_layout,
+        &state_composite_keys,
+        &mut handler_offsets,
+        &mut http_text_bindings,
+    );
     {
         let let_block_start: i32 = -(body_pre_offset + body_extra_bytes);
         let mut let_cursor: i32 = let_block_start - 8;
@@ -22785,99 +23305,20 @@ fn emit_http10_dynamic_bytes(
     // rejoin the bare close set — the response is already on the wire, the
     // state simply stays unchanged for that request.
     let after_scope = ClientAbortScope::begin();
-    for aset in &service.after_sets {
-        let sf = service.state_fields.iter()
-            .find(|sf| sf.name == aset.field_name)
-            .ok_or_else(|| NativeError {
-                message: format!(
-                    "after block references unknown state field '{}' (verifier should have caught this)",
-                    aset.field_name
-                ),
-            })?;
-        match sf.ty {
-            Type::Text => {
-                // Slice `text-state-1`: COPY the bytes into the persistent
-                // buffer. Never store the source pointer — an alias works for
-                // a text literal (which lives in the code region forever) and
-                // for the FIRST request of anything else, then silently
-                // returns the NEXT request's bytes, because every transient
-                // source here (the HTTP read buffer, a concat buffer, a
-                // resource buffer) is reused or freed at the iteration tail.
-                let (_, _ptr_slot, len_slot, buf_off) = *state_text_slots
-                    .iter()
-                    .find(|(n, ..)| *n == aset.field_name.as_str())
-                    .expect("text state field has a slot triple");
-                let n = state_text_bound(sf)?;
-                // Every transient the source may live in is STILL LIVE here:
-                // the after block runs before the iteration tail's
-                // `lea rsp, [rbp - frame_size]`. That ordering is the
-                // invariant this whole copy rests on — see the comment at the
-                // ITERATION TAIL below.
-                emit_text_produce_ptrlen(
-                    &mut code,
-                    &aset.value,
-                    &handler.input_name,
-                    &http_request_concept_for_lets,
-                    all_rules,
-                    &handler_offsets,
-                    field_ranges,
-                    &http_text_bindings,
-                )?;
-                // BACKSTOP, 13 bytes: cmp rdx, N ; ja abort.
-                //
-                // UNREACHABLE BY CONSTRUCTION — the verifier proved
-                // worst_case(source) <= N from declarations before this
-                // compiled. It is kept because the compile-time gate is a
-                // piece of REASONING, and this repository's 2026-08-05 scar
-                // is a correct-looking static size defended by an argument
-                // with a hole in it. Thirteen bytes turns "a future widening
-                // of the source table becomes a remote stack overflow" into
-                // "a future widening becomes an exit(1)". It creates no DoS
-                // path precisely because nothing can drive the process to it.
-                code.extend_from_slice(&[0x48, 0x81, 0xFA]); // cmp rdx, imm32
-                code.extend_from_slice(&n.to_le_bytes());
-                code.extend_from_slice(&[0x0F, 0x87]);       // ja rel32
-                abort_patches.push(code.len());
-                code.extend_from_slice(&[0, 0, 0, 0]);
-                // mov rsi, rax
-                code.extend_from_slice(&[0x48, 0x89, 0xC6]);
-                // lea rdi, [rbp + buf_off]   — computed LAST, right before
-                // the copy: the producer above is free to clobber rdi/rsi.
-                emit_lea_rdi_rbp(&mut code, buf_off);
-                // mov rcx, rdx
-                code.extend_from_slice(&[0x48, 0x89, 0xD1]);
-                // cld ; rep movsb   — DF is not assumed to be 0, same
-                // discipline as emit_text_bound_check's own cld.
-                code.push(0xFC);
-                code.extend_from_slice(&[0xF3, 0xA4]);
-                // mov [rbp + len_slot], rdx  — the ptr slot is NOT rewritten:
-                // the buffer address is constant, which is what lets every
-                // BoundText reader work unmodified.
-                if len_slot >= -128 {
-                    code.extend_from_slice(&[0x48, 0x89, 0x55]);
-                    code.push(len_slot as u8);
-                } else {
-                    code.extend_from_slice(&[0x48, 0x89, 0x95]);
-                    code.extend_from_slice(&len_slot.to_le_bytes());
-                }
-            }
-            _ => {
-                let state_slot = state_offsets[aset.field_name.as_str()];
-                emit_eval_expr(
-                    &mut code,
-                    &aset.value,
-                    &handler.input_name,
-                    &handler_offsets,
-                    all_rules,
-                    field_ranges,
-                    &http_text_bindings,
-                    None,
-                    None,
-                )?;
-                store_rax_at_rbp(&mut code, state_slot);
-            }
-        }
-    }
+    // Shared with the raw_tcp step-loop emitter since slice `multistep-1`;
+    // the copy discipline and the backstop are documented on the helper.
+    emit_after_block(
+        &mut code,
+        service,
+        handler,
+        &http_request_concept_for_lets,
+        all_rules,
+        &handler_offsets,
+        field_ranges,
+        &http_text_bindings,
+        &state_layout,
+        &mut abort_patches,
+    )?;
 
     // ═══ CLOSE + LOOP ══════════════════════════════════════════
     let close_label = code.len();
@@ -43000,6 +43441,565 @@ service shadow
         assert_eq!(run.exit, None);
     }
 
+    // ═══ Slice multistep-1 (2026-09-05): the raw_tcp step loop and     ═══
+    // ═══ per-connection state — docs/multistep-connection-design.md §5 ═══
+    //
+    // Every driven fixture is a VERIFIED program (the helper asserts the
+    // verdict first) spawned on an ephemeral port and spoken to over real
+    // TCP, holding ONE CONNECTION OPEN across several frames — the one
+    // change from `raw_tcp_drive`, which opens a connection per payload.
+    // §5.8's seven tests, the NC-1a text fixture, NC-1f, and the two
+    // findings the slice made (the step cap's placement, and the HTTP
+    // `let seen = state.last` workaround that did not compile).
+
+    /// Spawn a verified raw_tcp service on an ephemeral port, hand the port
+    /// to `drive`, then collect the server's own exit status (if it exited
+    /// before the harness killed it) and its stdout (which must stay EMPTY —
+    /// a response streamed to fd 1 instead of the client fd lands there).
+    fn raw_tcp_serve<T>(
+        src_template: &str,
+        service_name: &str,
+        tag: &str,
+        drive: impl FnOnce(u16) -> T,
+    ) -> (T, Option<i32>, Vec<u8>) {
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            l.local_addr().unwrap().port()
+        };
+        let src = src_template.replace("__PORT__", &port.to_string());
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "multistep fixture '{}' must verify clean: {:?}", tag, errs);
+        let out = std::env::temp_dir().join(format!("verbosec_test_multistep_{}", tag));
+        compile_service(&program, service_name, out.to_str().unwrap())
+            .expect("multistep service should compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut bound = false;
+        for _ in 0..100 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "multistep service never bound on port {}", port);
+
+        let result = drive(port);
+
+        std::thread::sleep(Duration::from_millis(150));
+        let exit = match child.try_wait().expect("try_wait") {
+            Some(status) => status.code(),
+            None => {
+                let _ = child.kill();
+                None
+            }
+        };
+        let output = child.wait_with_output().expect("wait_with_output");
+        let _ = std::fs::remove_file(&out);
+        (result, exit, output.stdout)
+    }
+
+    /// One conversation step: send `frame`, then read up to `reply_len`
+    /// bytes — fewer if the server closes first (EOF), and whatever arrived
+    /// if the client-side timeout fires. The distinction matters: an empty
+    /// Vec after a closed connection is "the server closed", a timeout is
+    /// "the server is still holding the connection open".
+    fn step(s: &mut std::net::TcpStream, frame: &[u8], reply_len: usize) -> Vec<u8> {
+        use std::io::{Read, Write};
+        if s.write_all(frame).is_err() {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; reply_len];
+        let mut got = 0;
+        while got < reply_len {
+            match s.read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+        }
+        buf.truncate(got);
+        buf
+    }
+
+    fn connect(port: u16) -> std::net::TcpStream {
+        use std::time::Duration;
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        s
+    }
+
+    fn le32_pair(a: u32, b: u32) -> Vec<u8> {
+        let mut v = a.to_le_bytes().to_vec();
+        v.extend_from_slice(&b.to_le_bytes());
+        v
+    }
+
+    fn step_counter_src() -> String {
+        std::fs::read_to_string("examples/step_counter.verbose")
+            .expect("examples/step_counter.verbose")
+            .replace("18964", "__PORT__")
+    }
+
+    /// §5.8-1 / §5.6, all three rows, ONE connection. Three frames of
+    /// DIFFERENT lengths (2 / 4 / 1), so the second field tracks the
+    /// payload and not a constant, and so NC-1a's "step 2 returns step 2's
+    /// own value" is distinguishable from the right answer.
+    ///
+    ///   row 1  (0, 2)  init reached the slot; the mutation is not visible
+    ///                  to its own step
+    ///   row 2  (1, 4)  the value survived the step tail's `lea rsp` — a
+    ///                  live cell across steps
+    ///   row 3  (2, 1)  still live
+    #[test]
+    fn multistep_state_persists_across_steps() {
+        let (replies, exit, stdout) = raw_tcp_serve(&step_counter_src(), "counter", "persist", |port| {
+            let mut s = connect(port);
+            vec![step(&mut s, b"AA", 8), step(&mut s, b"BBBB", 8), step(&mut s, b"C", 8)]
+        });
+        assert_eq!(replies[0], le32_pair(0, 2), "row 1: seq 0, length 2");
+        assert_eq!(replies[1], le32_pair(1, 4), "row 2: seq 1 survived the step tail, length 4");
+        assert_eq!(replies[2], le32_pair(2, 1), "row 3: seq 2, length 1");
+        assert!(exit.is_none(), "the listener must survive the conversation");
+        assert!(stdout.is_empty(), "NC-0d: no response byte may land on the server's stdout");
+    }
+
+    /// §5.8-2: per-connection reset. Two connections INTERLEAVED — A opens,
+    /// B opens, A steps, B steps, A steps, B steps — so the two children
+    /// are alive at once and each must count its OWN steps from 0. Under
+    /// forked this is guaranteed by COW rather than by new code (NC-1b is
+    /// what tests the init's position); the interleaving is what shows the
+    /// isolation is per CONNECTION and not merely per sequence.
+    #[test]
+    fn multistep_state_resets_per_connection() {
+        let (replies, exit, _) = raw_tcp_serve(&step_counter_src(), "counter", "reset", |port| {
+            let mut a = connect(port);
+            let mut b = connect(port);
+            let a1 = step(&mut a, b"A", 8);
+            let b1 = step(&mut b, b"BB", 8);
+            let a2 = step(&mut a, b"AAA", 8);
+            let b2 = step(&mut b, b"B", 8);
+            (a1, b1, a2, b2)
+        });
+        assert_eq!(replies.0, le32_pair(0, 1), "A step 1");
+        assert_eq!(replies.1, le32_pair(0, 2), "B step 1 starts at 0 while A is mid-conversation");
+        assert_eq!(replies.2, le32_pair(1, 3), "A step 2 continues A's count");
+        assert_eq!(replies.3, le32_pair(1, 1), "B step 2 continues B's count");
+        assert!(exit.is_none());
+    }
+
+    /// §5.8-3 / NC-1c: `max_steps` caps the conversation. With `max_steps
+    /// : 3`, four frames get exactly three responses; the fourth read finds
+    /// the connection closed by the server (EOF, not a timeout). The cap
+    /// is checked BEFORE the read (a deviation from design §5.2, recorded
+    /// on the emitter): after the third response the child closes at once,
+    /// so the fourth frame is never read and the client is never held for
+    /// a further `read_timeout`. A fresh connection is then answered — the
+    /// cap ends the CHILD, never the listener.
+    #[test]
+    fn multistep_max_steps_caps_the_conversation() {
+        let src = step_counter_src().replace("max_steps:    100", "max_steps:    3");
+        assert!(src.contains("max_steps:    3"), "fixture edit must apply");
+        let (replies, exit, _) = raw_tcp_serve(&src, "counter", "cap", |port| {
+            let mut s = connect(port);
+            let r = vec![
+                step(&mut s, b"x", 8),
+                step(&mut s, b"x", 8),
+                step(&mut s, b"x", 8),
+                step(&mut s, b"x", 8),
+            ];
+            drop(s);
+            let mut fresh = connect(port);
+            (r, step(&mut fresh, b"yy", 8))
+        });
+        assert_eq!(replies.0[0], le32_pair(0, 1));
+        assert_eq!(replies.0[1], le32_pair(1, 1));
+        assert_eq!(replies.0[2], le32_pair(2, 1));
+        assert!(
+            replies.0[3].is_empty(),
+            "the 4th frame must find the connection CLOSED (max_steps = 3), got {:?}",
+            replies.0[3]
+        );
+        assert_eq!(replies.1, le32_pair(0, 2), "a fresh connection starts at 0: the cap ended the child, not the listener");
+        assert!(exit.is_none());
+    }
+
+    /// §5.8-4 / NC-1d: `read_timeout` closes a SILENT client. With
+    /// `read_timeout : 1`, a client that sends one frame and then stalls
+    /// 1.6 s finds its second frame unanswered (the child's `read` returned
+    /// -EAGAIN, took the `jle close`, and exited), while a fresh connection
+    /// right afterwards is answered immediately — the timeout ends the
+    /// child, never the listener.
+    ///
+    /// PAIRED, in the same run, with a WELL-BEHAVED client on the same
+    /// binary — three frames 200 ms apart, all answered — because a build
+    /// that closes everything passes the stalling half alone (NC-1d's
+    /// pairing requirement). Structural checks on the emitted bytes pin
+    /// the `SO_RCVTIMEO` setsockopt with the declared tv_sec, and the
+    /// SIGCHLD auto-reap the forked mode needs.
+    #[test]
+    fn multistep_read_timeout_closes_a_silent_client() {
+        use std::time::{Duration, Instant};
+        let src = step_counter_src().replace("read_timeout: 5", "read_timeout: 1");
+        assert!(src.contains("read_timeout: 1"), "fixture edit must apply");
+        let (r, exit, _) = raw_tcp_serve(&src, "counter", "timeout", |port| {
+            // The well-behaved client first: three frames 200 ms apart.
+            let mut ok = connect(port);
+            let w1 = step(&mut ok, b"a", 8);
+            std::thread::sleep(Duration::from_millis(200));
+            let w2 = step(&mut ok, b"bb", 8);
+            std::thread::sleep(Duration::from_millis(200));
+            let w3 = step(&mut ok, b"ccc", 8);
+            drop(ok);
+            // The silent client: one frame, then a stall past read_timeout.
+            let mut s = connect(port);
+            let first = step(&mut s, b"AA", 8);
+            std::thread::sleep(Duration::from_millis(1600));
+            let after_stall = step(&mut s, b"BB", 8);
+            drop(s);
+            // A fresh connection must be answered at once.
+            let t0 = Instant::now();
+            let mut fresh = connect(port);
+            let fresh_reply = step(&mut fresh, b"CCC", 8);
+            let fresh_latency = t0.elapsed();
+            ((w1, w2, w3), first, after_stall, fresh_reply, fresh_latency)
+        });
+        assert_eq!(r.0, (le32_pair(0, 1), le32_pair(1, 2), le32_pair(2, 3)),
+            "the well-behaved client (frames 200 ms apart) must get all three answers on the SAME binary");
+        assert_eq!(r.1, le32_pair(0, 2), "the silent client's first frame is answered");
+        assert!(
+            r.2.is_empty(),
+            "after a 1.6 s stall past read_timeout = 1 the child must have CLOSED: no reply to the second frame, got {:?}",
+            r.2
+        );
+        assert_eq!(r.3, le32_pair(0, 3), "a fresh connection is answered after the timeout");
+        assert!(r.4 < Duration::from_secs(1), "…and immediately, not after another timeout: {:?}", r.4);
+        assert!(exit.is_none(), "the timeout must end the child, never the listener");
+        // Structural pins, AFTER the runtime half so a build without the
+        // setsockopt fails on the discriminating assertion above (NC-1d's
+        // "the stalling client is still answered") and not on a byte scan:
+        // the emitted bytes carry setsockopt(…, SOL_SOCKET=1, SO_RCVTIMEO=20,
+        // &{tv_sec=1, tv_usec=0}, 16) and the SIGCHLD auto-reap.
+        {
+            let tokens = crate::lexer::Lexer::new(&src.replace("__PORT__", "18999")).tokenize().unwrap();
+            let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+            let out = std::env::temp_dir().join("verbosec_test_multistep_timeout_bytes");
+            compile_service(&program, "counter", out.to_str().unwrap()).expect("compiles");
+            let bytes = std::fs::read(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            let find = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+            // mov qword [rsp], 1 ; mov qword [rsp+8], 0 — the timeval
+            assert!(find(&[0x48, 0xC7, 0x04, 0x24, 1, 0, 0, 0, 0x48, 0xC7, 0x44, 0x24, 0x08, 0, 0, 0, 0]),
+                "the timeval {{tv_sec = 1, tv_usec = 0}} must be built on the stack");
+            // mov rdx, 20 (SO_RCVTIMEO) followed by mov r10, rsp ; mov r8, 16
+            assert!(find(&[0x48, 0xC7, 0xC2, 0x14, 0, 0, 0, 0x49, 0x89, 0xE2, 0x49, 0xC7, 0xC0, 0x10, 0, 0, 0]),
+                "setsockopt must name SO_RCVTIMEO (20) with a 16-byte option");
+            // mov rax, 13 (rt_sigaction) ; mov rdi, 17 (SIGCHLD)
+            assert!(find(&[0x48, 0xC7, 0xC0, 0x0D, 0, 0, 0, 0x48, 0xC7, 0xC7, 0x11, 0, 0, 0]),
+                "a forked multi-step service must set SIGCHLD to SIG_IGN before listen");
+        }
+    }
+
+    /// §5.8-5 / §5.5 refusals #1–#4, #7, #9 and the re-keyed PR #194 gate,
+    /// each with a minimally corrected twin that must VERIFY — so every
+    /// refusal is attributable to the one thing that differs. Verifier
+    /// level (the emitter's mirror is the next test).
+    #[test]
+    fn multistep_declaration_refusals_and_twins() {
+        let src = |listen_extra: &str, tail: &str| -> String {
+            format!(
+                "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"frame\"\n  @source: step_counter.intent:1\n  fields:\n    data : bytes [..64]\n\nrule step\n  @intention: \"count\"\n  @source: step_counter.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    resp = Frame {{ data: concat(le32(state.seq), le32(length(req.data))) }}\n  proofs:\n    purity:\n      reads : [req.data, state.seq]\n      calls : []\n    termination:\n      bound : 6\n\nservice counter\n  @intention: \"count steps\"\n  @source: step_counter.intent:3\n  listen:\n    protocol    : raw_tcp\n    port        : __PORT__\n    max_request : 64\n{}\n  handler: step\n{}",
+                listen_extra, tail
+            )
+        };
+        let state = "\n  state:\n    seq : number = 0\n\n  after:\n    set seq = state.seq + 1\n";
+        // THE CORRECTED TWIN, first: the full multi-step declaration verifies.
+        let good = src("  concurrency: forked\n  max_steps: 4\n  read_timeout: 2\n", state);
+        assert!(verify_source_for_test(&good).is_empty(), "{:?}", verify_source_for_test(&good));
+
+        // #1 — state with no step loop (the one that matters most: the
+        // one-shot emitter would DROP the state declaration).
+        let e = verify_source_for_test(&src("", state)).join("\n");
+        assert!(e.contains("must also declare 'max_steps'") && e.contains("DROP the state declaration silently"), "#1: {}", e);
+        // #2 — one knob without the other, both directions.
+        let e = verify_source_for_test(&src("  concurrency: forked\n  max_steps: 4\n", state)).join("\n");
+        assert!(e.contains("must declare both 'max_steps'") && e.contains("read_timeout absent"), "#2a: {}", e);
+        let e = verify_source_for_test(&src("  concurrency: forked\n  read_timeout: 2\n", state)).join("\n");
+        assert!(e.contains("must declare both 'max_steps'") && e.contains("max_steps absent"), "#2b: {}", e);
+        // #3 — multi-step without forked: explicit sequential AND the default.
+        for conc in ["  concurrency: sequential\n", ""] {
+            let e = verify_source_for_test(&src(&format!("{}  max_steps: 4\n  read_timeout: 2\n", conc), state)).join("\n");
+            assert!(e.contains("must declare 'concurrency: forked'") && e.contains("monopolised"), "#3 ({:?}): {}", conc, e);
+        }
+        // The pre-existing forked gate, re-scoped: forked on a ONE-SHOT
+        // raw_tcp service still refuses, naming the step loop.
+        let e = verify_source_for_test(&src("  concurrency: forked\n", "")).join("\n");
+        assert!(e.contains("raw_tcp services with a step loop") && e.contains("multistep-1"), "forked one-shot: {}", e);
+        // #4 — max_steps on http_1_0.
+        let http = std::fs::read_to_string("examples/counter_service.verbose").unwrap()
+            .replace("18950", "__PORT__")
+            .replace("  handler: handle", "  max_steps: 4\n  read_timeout: 2\n  handler: handle");
+        let e = verify_source_for_test(&http).join("\n");
+        assert!(e.contains("max_steps applies to raw_tcp multi-step services") && e.contains("HTTP/1.1 keep-alive"), "#4: {}", e);
+        // The re-keyed PR #194 gate: forked + after on HTTP is STILL refused
+        // (no step loop there), and the message now names the way out.
+        let http_forked = std::fs::read_to_string("examples/counter_service.verbose").unwrap()
+            .replace("18950", "__PORT__")
+            .replace("  handler: handle", "  concurrency: forked\n  handler: handle");
+        let e = verify_source_for_test(&http_forked).join("\n");
+        assert!(e.contains("write-only") && e.contains("max_steps + read_timeout"), "re-keyed #194: {}", e);
+        // #7 — a bytes state field, refused at PARSE time with the design's
+        // two prerequisites named.
+        let bytes_state = good.replace("seq : number = 0", "key : bytes [..16] = b\"\"");
+        let tokens = crate::lexer::Lexer::new(&bytes_state.replace("__PORT__", "18999")).tokenize().expect("tokenize");
+        let err = crate::parser::Parser::new(tokens).parse_program().err().expect("bytes state must be a parse error");
+        let m = format!("{:?}", err);
+        assert!(m.contains("bytes state is deferred") && m.contains("state-read-typing") && m.contains("multistep-2"), "#7: {}", m);
+        // #9 — a declared framing block, refused at PARSE time by name.
+        let framed = good.replace("  handler: step", "  frame: length_prefixed\n  handler: step");
+        let tokens = crate::lexer::Lexer::new(&framed.replace("__PORT__", "18999")).tokenize().expect("tokenize");
+        let err = crate::parser::Parser::new(tokens).parse_program().err().expect("frame: must be a parse error");
+        let m = format!("{:?}", err);
+        assert!(m.contains("declared framing is slice multistep-3") && m.contains("one frame per read"), "#9: {}", m);
+        // Range checks on the two knobs (parse time).
+        for (bad, needle) in [("max_steps: 0", "max_steps 0 out of range"), ("max_steps: 65536", "max_steps 65536 out of range"),
+                              ("read_timeout: 0", "read_timeout 0 out of range"), ("read_timeout: 3601", "read_timeout 3601 out of range")] {
+            let s = good.replace("max_steps: 4", if bad.starts_with("max_steps") { bad } else { "max_steps: 4" })
+                .replace("read_timeout: 2", if bad.starts_with("read_timeout") { bad } else { "read_timeout: 2" });
+            let tokens = crate::lexer::Lexer::new(&s.replace("__PORT__", "18999")).tokenize().expect("tokenize");
+            let err = crate::parser::Parser::new(tokens).parse_program().err().expect("out-of-range knob must be a parse error");
+            assert!(format!("{:?}", err).contains(needle), "{}: {:?}", bad, err);
+        }
+        // The boundary values are ACCEPTED (an off-by-one is the likeliest
+        // defect and nothing else would see it).
+        for (a, b) in [("max_steps: 1", "read_timeout: 1"), ("max_steps: 65535", "read_timeout: 3600")] {
+            let s = good.replace("max_steps: 4", a).replace("read_timeout: 2", b);
+            assert!(verify_source_for_test(&s).is_empty(), "{} / {} must be accepted", a, b);
+        }
+    }
+
+    /// The EMITTER's copy of refusals #1–#3, reached by calling
+    /// `compile_service` directly (which bypasses `verify_program`, as every
+    /// test here does): a stateful raw_tcp service with no step loop must
+    /// be refused — never routed to the two-scalar echo emitter that would
+    /// drop the state — and the identity handler with a step loop must NOT
+    /// go to the echo either.
+    #[test]
+    fn multistep_emitter_refuses_state_without_a_step_loop() {
+        let compile = |src: &str, tag: &str| -> Result<Vec<u8>, String> {
+            let tokens = crate::lexer::Lexer::new(&src.replace("__PORT__", "18999")).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            let out = std::env::temp_dir().join(format!("verbosec_test_multistep_emitter_{}", tag));
+            let r = compile_service(&program, "counter", out.to_str().unwrap()).map_err(|e| e.message);
+            let bytes = std::fs::read(&out).unwrap_or_default();
+            let _ = std::fs::remove_file(&out);
+            r.map(|_| bytes)
+        };
+        let base = step_counter_src();
+        // The identity handler + state + step loop: the DYNAMIC emitter, not
+        // the 358-byte echo (which cannot see the state block).
+        let identity = base.replace(
+            "resp = Frame { data: concat(le32(state.seq), le32(length(req.data))) }",
+            "resp = Frame { data: req.data }",
+        );
+        let bytes = compile(&identity, "identity_multistep").expect("identity + step loop compiles");
+        assert_ne!(bytes.len(), 358, "an identity handler WITH a step loop must not take the echo emitter");
+        assert_eq!(bytes[0x78], 0x55, "…it opens with push rbp: the dynamic emitter");
+        // #1 at the emitter: state, no max_steps / read_timeout / forked.
+        let no_loop = base
+            .replace("  concurrency:  forked\n  max_steps:    100\n  read_timeout: 5\n", "");
+        assert!(no_loop.contains("  state:"), "fixture edit must keep the state block");
+        let e = compile(&no_loop, "no_loop").err().expect("state without a step loop must be refused at the emitter too");
+        assert!(e.contains("must also declare 'max_steps'") && e.contains("DROP the state declaration silently"), "{}", e);
+        // #2 at the emitter.
+        let e = compile(&base.replace("  read_timeout: 5\n", ""), "no_timeout").err().expect("max_steps alone refused");
+        assert!(e.contains("must declare both 'max_steps'"), "{}", e);
+        // #3 at the emitter.
+        let e = compile(&base.replace("  concurrency:  forked\n", ""), "sequential").err().expect("sequential multistep refused");
+        assert!(e.contains("must declare 'concurrency: forked'"), "{}", e);
+        // And the corrected twin compiles to the measured size.
+        let bytes = compile(&base, "twin").expect("the worked example compiles");
+        assert_eq!(bytes.len(), 746, "examples/step_counter.verbose is 746 B (measured)");
+    }
+
+    /// §5.8-6: the one-shot raw_tcp shapes are BYTE-IDENTICAL across the
+    /// slice — the identity echo (358 B, untouched emitter) and the slice-0
+    /// dynamic service (`tag_probe`, 606 B) both keep their `0fe0f58`
+    /// sha256. Every multi-step addition to the dynamic emitter is gated on
+    /// `is_multistep()`; this is what proves the gate.
+    #[test]
+    fn multistep_one_shot_rawtcp_is_byte_identical() {
+        for (file, service, size, sha) in [
+            ("examples/raw_tcp_echo.verbose", "echo_server", 358usize,
+             "0fd08b45f21325e3c10951f5d809b46414122331df955db03dc84536e3384403"),
+            ("examples/tag_probe.verbose", "prober", 606usize,
+             "ae534e497b2c220558b75fc4a7b09ef13dd44e0777c042e7b4b8c55773dcf9b4"),
+        ] {
+            let src = std::fs::read_to_string(file).expect(file);
+            let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+            let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+            // Through the OPTIMIZER, as `main.rs` compiles: `tag_probe`'s
+            // `le32(0)` folds, and the 606 B is the CLI's number (unoptimised
+            // it is 612 B — measured, and the reason this line exists).
+            let (program, _) = crate::optimizer::optimize_program(&program);
+            let out = std::env::temp_dir().join(format!("verbosec_test_multistep_oneshot_{}", service));
+            compile_service(&program, service, out.to_str().unwrap()).expect("compiles");
+            let bytes = std::fs::read(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            assert_eq!(bytes.len(), size, "{} must stay {} B", file, size);
+            assert_eq!(sha256_hex(&bytes), sha, "{} must be byte-identical to the 0fe0f58 emit", file);
+        }
+    }
+
+    /// §5.8-7 / design §4.1-2: the input field and a STATE field share a
+    /// name — `data` on both sides. The state field is TEXT, so it registers
+    /// in the same `text_bindings` map the input field does; under BARE-name
+    /// keying the state registration (it comes second) would overwrite the
+    /// input's `(ptr, len)`, and `length(req.data)` would answer the state's
+    /// length — a plausible value, rc 0, no diagnostic. The composite keys
+    /// `__req_data` / `__state_data` keep the two apart: the frame lengths
+    /// (2, 5) must come back beside the state lengths (4, 7).
+    #[test]
+    fn multistep_input_field_and_state_field_share_a_name() {
+        let src = "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"frame\"\n  @source: step_counter.intent:1\n  fields:\n    data : bytes [..64]\n\nrule collide\n  @intention: \"input field and state field both named data\"\n  @source: step_counter.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    resp = Frame { data: concat(le32(length(req.data)), le32(length(state.data))) }\n  proofs:\n    purity:\n      reads : [req.data, state.data]\n      calls : []\n    termination:\n      bound : 6\n\nservice shadow\n  @intention: \"the author-chosen-name collision\"\n  @source: step_counter.intent:3\n  listen:\n    protocol    : raw_tcp\n    port        : __PORT__\n    max_request : 64\n  concurrency: forked\n  max_steps: 8\n  read_timeout: 2\n  handler: collide\n  state:\n    data : text [..16] = \"init\"\n  after:\n    set data = \"abcdefg\"\n";
+        let (replies, exit, _) = raw_tcp_serve(src, "shadow", "collide", |port| {
+            let mut s = connect(port);
+            vec![step(&mut s, b"AB", 8), step(&mut s, b"ABCDE", 8)]
+        });
+        assert_eq!(replies[0], le32_pair(2, 4), "length(req.data) = 2 (the frame), length(state.data) = 4 (\"init\")");
+        assert_eq!(replies[1], le32_pair(5, 7), "length(req.data) = 5, length(state.data) = 7 after the set — under bare keying the first would be 7");
+        assert!(exit.is_none());
+    }
+
+    /// NC-1a's fixture, and the copy-not-alias proof for TEXT state across
+    /// STEPS. Design §5.9 says why §5.6's Number-only example cannot carry
+    /// it: a Number is copied by value, a LITERAL source lives in the code
+    /// region forever (so an alias would pass), and a fixture that never
+    /// reads the buffer back cannot observe aliasing at all. So this one:
+    ///
+    ///   * sources `last` from a handler CONCAT — `let tag = concat("L",
+    ///     pick)` with `pick = substring("ABCDEFGH", n-1, n)` and `n =
+    ///     length(req.data)` bound first (a `substring` directly inside a
+    ///     let's concat is a CallText arg, which the Phase 2H-b nested
+    ///     pre-eval refuses; as a prior let it is a BoundText, which it
+    ///     accepts). `pick` alone would NOT do: it points INTO the literal,
+    ///     which lives in the code region forever, so an aliased build
+    ///     would still answer correctly. The concat's buffer is what an
+    ///     alias cannot survive — freed by the step tail and re-allocated
+    ///     at the SAME address next step, holding the next step's tag;
+    ///   * uses DIFFERENT payload lengths, so the tag differs per step;
+    ///   * reads the buffer BACK through `let s = state.last` and answers
+    ///     `(length(s), byte_at(s, length(s) - 1))` — the last byte, which
+    ///     an aliased build reports as the CURRENT step's tag ("step 2
+    ///     returns step 2's own value").
+    ///
+    /// It carries a Number field too, set from a NON-simple expression
+    /// (`state.seq + length(req.data)`, whose `push rax` is what NC-1e's
+    /// misplaced after block clobbers the freed concat buffer with) — the
+    /// same fixture serves both controls. It is also the first program to
+    /// use `let s = state.<text field>`, the "bind it to a handler let
+    /// first" workaround, which did not compile natively before this slice
+    /// (`let_is_state_text_field`).
+    #[test]
+    fn multistep_text_state_is_copied_not_aliased_across_steps() {
+        let src = "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"frame\"\n  @source: step_counter.intent:1\n  fields:\n    data : bytes [..64]\n\nrule remember\n  @intention: \"answer with the remembered tag's length and last byte\"\n  @source: step_counter.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    let n = length(req.data)\n    let pick = substring(\"ABCDEFGH\", n - 1, n)\n    let tag = concat(\"L\", pick)\n    let s = state.last\n    resp = Frame { data: concat(le32(length(s)), le32(byte_at(s, length(s) - 1))) }\n  proofs:\n    purity:\n      reads : [req.data, state.last]\n      calls : []\n    termination:\n      bound : 20\n\nservice memo\n  @intention: \"remember the previous frame's tag\"\n  @source: step_counter.intent:3\n  listen:\n    protocol    : raw_tcp\n    port        : __PORT__\n    max_request : 64\n  concurrency: forked\n  max_steps: 8\n  read_timeout: 2\n  handler: remember\n  state:\n    seq  : number = 0\n    last : text [..64] = \"init\"\n  after:\n    set seq = state.seq + length(req.data)\n    set last = tag\n";
+        let (replies, exit, _) = raw_tcp_serve(src, "memo", "textcopy", |port| {
+            let mut s = connect(port);
+            vec![step(&mut s, b"AB", 8), step(&mut s, b"ABCD", 8), step(&mut s, b"A", 8), step(&mut s, b"ABC", 8)]
+        });
+        assert_eq!(replies[0], le32_pair(4, b't' as u32), "step 1 reads the init literal \"init\"");
+        assert_eq!(replies[1], le32_pair(2, b'B' as u32), "step 2 reads \"LB\" (step 1's tag) — an ALIASED build answers 'D', step 2's own tag");
+        assert_eq!(replies[2], le32_pair(2, b'D' as u32), "step 3 reads \"LD\"");
+        assert_eq!(replies[3], le32_pair(2, b'A' as u32), "step 4 reads \"LA\"");
+        assert!(exit.is_none());
+    }
+
+    /// NC-1f, runnable: framing is ONE FRAME PER READ. A frame whose header
+    /// and payload arrive in two segments (200 ms apart) is answered as TWO
+    /// frames — two counter values, lengths 1 and 4 — while the same five
+    /// bytes in one segment are one frame of length 5. Paired in the same
+    /// run, as §5.9 requires, so a compiler that refused everything could
+    /// not pass.
+    ///
+    /// The second half is the fail-closed shape: a handler that indexes the
+    /// byte its length prefix DECLARES (`byte_at(req.data, byte_at(req.data,
+    /// 0))`) on a split frame trips the bound on the header-only read —
+    /// the connection closes with no response and the child exits 0
+    /// (a CLIENT abort, slice svc-client-abort-1: rc 1 was the design's
+    /// pre-#204 wording) — while the whole frame is answered with its last
+    /// byte. Never silently truncated, never mis-parsed.
+    #[test]
+    fn multistep_a_frame_spanning_two_reads_is_two_frames() {
+        use std::time::Duration;
+        let (r, exit, _) = raw_tcp_serve(&step_counter_src(), "counter", "split", |port| {
+            let mut s = connect(port);
+            let first = step(&mut s, b"\x04", 8);
+            std::thread::sleep(Duration::from_millis(200));
+            let second = step(&mut s, b"WXYZ", 8);
+            drop(s);
+            let mut w = connect(port);
+            let whole = step(&mut w, b"\x04WXYZ", 8);
+            (first, second, whole)
+        });
+        assert_eq!(r.0, le32_pair(0, 1), "the header segment is a frame of its own");
+        assert_eq!(r.1, le32_pair(1, 4), "the payload segment is the NEXT frame — no reassembly");
+        assert_eq!(r.2, le32_pair(0, 5), "the single-segment twin is one frame of 5");
+        assert!(exit.is_none());
+
+        let src = step_counter_src()
+            .replace(
+                "resp = Frame { data: concat(le32(state.seq), le32(length(req.data))) }",
+                "resp = Frame { data: le32(byte_at(req.data, byte_at(req.data, 0))) }",
+            )
+            .replace("reads : [req.data, state.seq]", "reads : [req.data]")
+            .replace("bound : 6", "bound : 4");
+        let (r, exit, _) = raw_tcp_serve(&src, "counter", "split_prefixed", |port| {
+            let mut s = connect(port);
+            let first = step(&mut s, b"\x04", 4);
+            std::thread::sleep(Duration::from_millis(200));
+            let second = step(&mut s, b"WXYZ", 4);
+            drop(s);
+            let mut w = connect(port);
+            let whole = step(&mut w, b"\x04WXYZ", 4);
+            (first, second, whole)
+        });
+        assert!(r.0.is_empty(), "the header-only read trips byte_at(…, 4): closed, no response, got {:?}", r.0);
+        assert!(r.1.is_empty(), "…and the connection is gone for the payload segment");
+        assert_eq!(r.2, (b'Z' as u32).to_le_bytes().to_vec(), "the whole frame is answered with its declared last byte");
+        assert!(exit.is_none(), "a client-tripped bound ends the child, never the listener");
+    }
+
+    /// The HTTP side of `let_is_state_text_field`: `let seen = state.last`
+    /// on `examples/last_path_service.verbose` VERIFIED and then died at
+    /// emit with `unknown field 'last' in native codegen` at `0fe0f58` —
+    /// the "bind it to a handler let first" workaround CLAUDE.md and
+    /// refusals #8/#9 point at, refused natively. Now it compiles and
+    /// answers exactly what the direct read answers.
+    #[test]
+    fn service_text_state_bound_to_a_handler_let_compiles_and_reads() {
+        let src = std::fs::read_to_string("examples/last_path_service.verbose")
+            .expect("examples/last_path_service.verbose")
+            .replace("18952", "__PORT__")
+            .replace("  logic:\n", "  logic:\n    let seen = state.last\n")
+            .replace("body: concat(\"prev:\", state.last)", "body: concat(\"prev:\", seen)");
+        assert!(src.contains("let seen = state.last") && src.contains("\"prev:\", seen"), "fixture edit must apply");
+        let bodies = text_state_drive(&src, "memo", "state_let", &["/alpha", "/beta"]);
+        assert_eq!(bodies, vec!["prev:none".to_string(), "prev:/alpha".to_string()]);
+    }
+
     // ═══ Slice svc-client-abort-1 (2026-09-03): client aborts close the ═══
     // ═══ connection; operator aborts still exit 1                       ═══
 
@@ -54032,8 +55032,18 @@ rule pick
         // gen0's verifier and untested"). Not the bytes-field gate, not the
         // composite key: the protocol. The safe direction; EXPECTED_ACCEPTED
         // stays 97, and the existing raw_tcp cell in the matrix covers it.
+        //
+        // 159 -> 160 (2026-09-05, slice multistep-1): `step_counter.verbose`,
+        // the first raw_tcp service with a step loop and per-connection
+        // state. MEASURED with a gen0 built from this branch: REFUSED at
+        // index 0 (`step`, the file's only rule — rule #0 and the declared
+        // entry coincide), rc 1 and zero bytes — the same protocol-wide
+        // `raw_tcp` refusal that covers `tag_probe` and `raw_tcp_echo`;
+        // `max_steps` / `read_timeout` never reach gen0's parser because
+        // the protocol is refused first. The safe direction; EXPECTED_ACCEPTED
+        // stays 97, the existing raw_tcp cell covers it.
         const EXPECTED_ACCEPTED: usize = 97;
-        const EXPECTED_TOTAL: usize = 159;
+        const EXPECTED_TOTAL: usize = 160;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

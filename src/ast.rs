@@ -331,6 +331,17 @@ pub struct Service {
     /// it is a per-process constant, and a constant reads identically under
     /// both modes.
     ///
+    /// Slice `multistep-1` (2026-09-05) RE-KEYS that refusal to `after_sets
+    /// && forked && no step loop`: a `raw_tcp` service declaring `max_steps`
+    /// + `read_timeout` runs one child per CONNECTION, and inside that child
+    /// the `after:` block runs at the bottom of the step loop, so the
+    /// mutation IS observed — by the next step of the same connection.
+    /// `state:` then has two lifetimes among accepted programs (per process,
+    /// per connection) under one rule: `after:` runs at the bottom of the
+    /// innermost loop the service declares, and a `state:` field lives for
+    /// the frame that encloses that loop. `state:` on a one-shot `raw_tcp`
+    /// service is refused (the echo emitter would drop it silently).
+    ///
     /// Slice `text-state-1` (2026-08-30) lifts the Number-only restriction:
     /// a field may also be `<name> : text [..N] = "<literal>"`, which gets a
     /// `(ptr_slot, len_slot) + N-byte buffer` triple in the same block — the
@@ -345,6 +356,36 @@ pub struct Service {
     /// `set <field_name> = <expr>` where <expr> can reference `state.*`,
     /// `req.*`, `resp.*`. Empty Vec means no mutation (pure service).
     pub after_sets: Vec<StateSet>,
+    /// Slice `multistep-1` (docs/multistep-connection-design.md §5.1): the
+    /// per-connection STEP LOOP's work bound. `Some(N)` (`1 ≤ N ≤ 65535`)
+    /// makes a `raw_tcp` service multi-step: one child per connection reads
+    /// a frame, runs the handler, streams the response, runs `after:`, and
+    /// loops — at most `N` times. Declaring it makes `read_timeout`
+    /// mandatory (a work bound alone is not a resource bound — it says how
+    /// many frames a client may send, not how long it may hold a child),
+    /// `concurrency: forked` mandatory (§5.4), and lifts `state:` / `after:`
+    /// for the protocol. `None` is slice 0's one-shot shape. Refused on
+    /// `http_1_0` (one request per connection; keep-alive is a later slice).
+    pub max_steps: Option<u32>,
+    /// Slice `multistep-1`: the per-READ wall-clock bound, in seconds
+    /// (`1 ≤ S ≤ 3600`), applied to the accepted socket as `SO_RCVTIMEO` in
+    /// the child. A `read` that waits longer returns `-EAGAIN`, which the
+    /// existing `test rax,rax ; jle close` treats as close — no new branch.
+    /// Mandatory together with `max_steps`; the declared per-connection
+    /// ceiling is then `max_steps × read_timeout` seconds of READ time.
+    /// It covers `read`, not `write` (§5.4's named residual).
+    pub read_timeout: Option<u32>,
+}
+
+impl Service {
+    /// Is this service multi-step — does it declare a per-connection step
+    /// loop? Both knobs are mandatory together (verifier refusal #2), so
+    /// after verification `max_steps.is_some()` alone would do; the
+    /// emitter is reachable WITHOUT the verifier (`compile_service` is
+    /// called directly by tests), so it asks for both.
+    pub fn is_multistep(&self) -> bool {
+        self.max_steps.is_some() && self.read_timeout.is_some()
+    }
 }
 
 /// A mutable state field declared in a service's `state:` block.
