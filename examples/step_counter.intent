@@ -1,0 +1,3 @@
+1. A TCP frame is a sequence of up to 256 bytes received on a TCP connection.
+2. The step handler answers each frame with two 4-byte little-endian numbers: the connection's step counter as it was when the frame arrived, then the frame's length.
+3. The counter service listens on port 18964 and holds each connection open for a conversation: it reads a frame, answers it, adds one to the step counter, and reads again — up to 100 frames per connection, giving up on a read that waits more than 5 seconds. Every connection runs in its own child process and starts its counter at 0.

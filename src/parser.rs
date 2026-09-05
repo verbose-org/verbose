@@ -1805,6 +1805,12 @@ impl Parser {
         let mut state_fields: Vec<StateField> = Vec::new();
         // Post-response mutation block.
         let mut after_sets: Vec<StateSet> = Vec::new();
+        // Slice `multistep-1`: the two step-loop knobs. Service-level keys
+        // beside `concurrency:` (they describe the connection's lifecycle,
+        // not the socket), each range-checked at parse time; the verifier
+        // enforces that they come as a pair and only on raw_tcp.
+        let mut max_steps: Option<u32> = None;
+        let mut read_timeout: Option<u32> = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -2019,15 +2025,20 @@ impl Parser {
                             let s = self.expect_string()?;
                             (Type::Text, Some(n), StateInit::Text(s))
                         }
-                        // Refusal #11 — bytes has no reachable position in a
-                        // service (HttpResponse.body and req.body are both
-                        // text), so a bytes state field would be write-only.
+                        // Refusal #7 of docs/multistep-connection-design.md
+                        // §5.5 (was text-state-1's #11, whose reason — "a
+                        // service has no bytes-valued position" — stopped
+                        // being true when a raw_tcp response became one).
+                        // Two prerequisites, both named, neither built.
                         Type::Bytes => {
                             return Err(self.error(&format!(
-                                "state field '{}': type 'bytes' is not supported; a service handler has no \
-                                 bytes-valued position today (HttpResponse.body is text), so a bytes state \
-                                 field would be write-only. Slice text-state-4",
-                                fname
+                                "state field '{}': bytes state is deferred. It needs (a) a bytes source \
+                                 that can be COPIED — every bytes value today is streamed, not \
+                                 materialised (emit_streaming_bytes_body, native.rs) — and (b) the state \
+                                 read path threaded into infer_expr_type, without which \
+                                 concat(\"k=\", state.{}) over a bytes field passes the verifier and is \
+                                 emitted as text. Slice multistep-2, gated on slice state-read-typing",
+                                fname, fname
                             )));
                         }
                         other => {
@@ -2064,8 +2075,50 @@ impl Parser {
                     self.expect_kind(TokenKind::Newline)?;
                 }
                 self.expect_kind(TokenKind::Dedent)?;
+            } else if self.check_ident("max_steps") {
+                // Slice `multistep-1`: the step loop's WORK bound. 65535 is
+                // the design's ceiling (§5.1); the emitter compares the step
+                // slot against it as an imm32, so any u16 fits.
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=65535).contains(&n) {
+                    return Err(self.error(&format!(
+                        "max_steps {} out of range [1, 65535]; it bounds how many frames one \
+                         connection may send before the child closes it",
+                        n
+                    )));
+                }
+                max_steps = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("read_timeout") {
+                // Slice `multistep-1`: the per-read WALL-CLOCK bound, in
+                // seconds, applied as SO_RCVTIMEO on the accepted socket.
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=3600).contains(&n) {
+                    return Err(self.error(&format!(
+                        "read_timeout {} out of range [1, 3600] seconds; it bounds how long one \
+                         read may wait for the client before the child closes the connection",
+                        n
+                    )));
+                }
+                read_timeout = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("frame") {
+                // Refusal #9 (design §5.5): a DECLARED framing block. It is
+                // recognised so it can be refused by name — an unknown key
+                // would report "expected ... in service", which does not say
+                // that framing is a known, deferred shape.
+                return Err(self.error(&format!(
+                    "service '{}': declared framing is slice multistep-3; slice 1 is one frame \
+                     per read (a frame that spans two reads is answered as two frames, and one \
+                     read that holds two frames is one frame)",
+                    name
+                )));
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', or 'after:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', or 'read_timeout:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -2087,6 +2140,8 @@ impl Parser {
             concurrency,
             state_fields,
             after_sets,
+            max_steps,
+            read_timeout,
         })
     }
 
@@ -3534,16 +3589,23 @@ service s
         parse(&ok).expect("literal init should parse");
     }
 
-    /// Refusal #11: `bytes` state has no reachable position inside a service,
-    /// so it would be write-only — the definition of false explicitation.
+    /// `bytes` state is refused — since slice `multistep-1` by design §5.5
+    /// refusal #7, naming its two prerequisites (a bytes source that can be
+    /// COPIED, and `state-read-typing`) and the lifting slice. It was
+    /// text-state-1's refusal #11 ("no reachable bytes position in a
+    /// service, so write-only"), a reason that stopped being true when a
+    /// raw_tcp response became a bytes-valued position.
     #[test]
     fn service_state_bytes_type_rejected() {
         let base = TEXT_STATE_PARSE_FIXTURE;
         let src = base.replace("__STATE__", "blob : bytes [..64] = \"\"");
         let err = parse(&src).err().expect("bytes state should be rejected");
+        let m = format!("{:?}", err);
         assert!(
-            format!("{:?}", err).contains("type 'bytes' is not supported"),
-            "expected the bytes refusal, got {:?}",
+            m.contains("bytes state is deferred")
+                && m.contains("state-read-typing")
+                && m.contains("multistep-2"),
+            "expected the bytes refusal naming both prerequisites, got {:?}",
             err
         );
     }

@@ -1,8 +1,35 @@
 # Multi-step `raw_tcp` connections — design note (slices `rawtcp-inspect-0` and `multistep-1`)
 
-> **Status: DESIGN ONLY. Nothing in this note is implemented.** Written against `main = c5e46b0`,
-> clean tree. Every `file:line` below was re-grepped at that commit — line numbers in
-> `src/native.rs` shifted this week, so none is remembered.
+> **Status (2026-09-05): BOTH SLICES SHIPPED.** Slice 0 (§4) as PR #203, its client-abort correction
+> as PR #204, and slice 1 (§5) as slice `multistep-1` — `examples/step_counter.verbose`, 746 B.
+> Originally written against `main = c5e46b0`; every `file:line` below was re-grepped at that commit
+> and has since moved. **Where slice 1 corrected this note, measured rather than argued:**
+>
+> - **§5.2's step cap is checked BEFORE the read, not after it.** The sketch reads, stores, increments,
+>   then compares; built that way the child reads a `max_steps + 1`-th frame it never answers, and a
+>   client can hold it for one more `read_timeout` after exhausting its budget — the ceiling would be
+>   `(max_steps + 1) × read_timeout`, not the `max_steps × read_timeout` §5.4 says the source declares.
+>   The emitter compares at `step_top` and closes the moment the `max_steps`-th response is written.
+>   Same observable contract (exactly `max_steps` responses: NC-1c), tighter wall-clock claim.
+> - **§5.9 NC-1e is VACUOUS on §5.6's fixture, and nearly so on NC-1a's.** Moving the `after:` block
+>   below the step tail's `lea rsp` does NOT make the copy "read freed stack" in any observable way on
+>   its own: nothing writes below `rsp` between the `lea` and the copy, so the freed concat buffer still
+>   holds its bytes. The control bites only when something pushes onto the stack between the two — a
+>   NON-simple `set` source (`set seq = state.seq + length(req.data)`, whose evaluation `push`es) placed
+>   BEFORE the text copy in the `after:` block, so the push lands on the freed buffer's top bytes. The
+>   NC-1a fixture carries exactly that and is what NC-1e is run on; §5.6 alone cannot serve it.
+> - **§5.5 refusal #8's "bind it to a handler let first" workaround did not compile natively** (also
+>   asserted by `docs/text-state-fields-design.md` and CLAUDE.md): `let seen = state.last` verified and
+>   died with `unknown field 'last' in native codegen`, because the let classifier looks the field up in
+>   the INPUT concept. Fixed in this slice (`let_is_state_text_field`), byte-neutral for every program
+>   that compiled before; NC-1a's fixture depends on it.
+> - **§5.8-4's timeout fixture needs a WELL-BEHAVED twin in the same run** (§5.9 NC-1d says so; §5.8
+>   did not), and the silent client must send a SECOND frame after the stall — "no reply to it" is
+>   what distinguishes a closed child from one still blocked in `read`.
+> - **NC-1f's "rc 1"** predates PR #204: a split frame that trips `byte_at` is a CLIENT abort, so the
+>   connection closes with no response and the child exits 0. The single-segment twin is answered.
+>
+> Everything below is kept as written; the corrections above are the diff.
 >
 > **Revision 2 (adversarial review verdict on revision 1: "do not commit — redesign the middle").**
 > Three code premises revision 1 built on were false. §3 states them plainly and keeps them there,

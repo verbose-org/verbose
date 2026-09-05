@@ -1,0 +1,95 @@
+@verbose 0.1.0
+
+-- Slice multistep-1 (docs/multistep-connection-design.md §5.6): the first
+-- raw_tcp service that holds a CONVERSATION. Until this slice a raw_tcp
+-- service was one exchange per connection — read one frame, answer it,
+-- close. This one reads a frame, answers it, runs its `after:` block, and
+-- reads AGAIN on the same connection, carrying a per-connection step counter
+-- across those steps:
+--
+--   frame 1  AA     →  00000000 02000000     seq 0, length 2
+--   frame 2  BBBB   →  01000000 04000000     seq 1, length 4
+--   frame 3  C      →  02000000 01000000     seq 2, length 1
+--   (a second connection starts again at seq 0)
+--
+-- Each response is two little-endian u32s: the step counter AS OF STEP
+-- ENTRY, then the frame's runtime length. The counter a step sees is the
+-- one the PREVIOUS step's `after:` block stored — never its own: a step's
+-- response is a function of (req.data, state-as-of-step-entry), the same
+-- reproducibility argument the HTTP counter service makes per request.
+--
+-- Three declarations make it a multi-step service, and all three are
+-- mandatory together:
+--
+--   max_steps    : 100   — the WORK bound: at most 100 frames per connection,
+--                          then the child closes it
+--   read_timeout : 5     — the TIME bound: a read that waits more than 5 s
+--                          returns -EAGAIN (SO_RCVTIMEO on the accepted
+--                          socket), which the existing `jle close` treats as
+--                          close — no new branch in the emitter
+--   concurrency  : forked — one child per connection, so a slow or silent
+--                          peer holds ITS child, never the listener; the
+--                          child inherits the initialised state by
+--                          copy-on-write, which is what makes "seq starts
+--                          at 0 on every connection" cost zero instructions
+--
+-- The declared per-connection ceiling is therefore max_steps × read_timeout
+-- = 500 seconds of READ time, and both factors are one grep away. What that
+-- does NOT bound, stated rather than glossed: a `write` — a client that
+-- never reads can stall the child in the response write on a full socket
+-- buffer. SO_SNDTIMEO is the symmetric knob and is a later slice.
+--
+-- Framing is ONE FRAME PER READ: a frame that arrives in two segments is
+-- answered as two frames (two counter values), and the handler cannot
+-- reassemble it — declared framing is slice multistep-3.
+
+
+concept Frame
+  @intention: "A TCP frame is up to 256 bytes received on a connection"
+  @source: step_counter.intent:1
+
+  fields:
+    data : bytes [..256]
+
+
+rule step
+  @intention: "Answer each frame with le32(the step counter) followed by le32(the frame's length)"
+  @source: step_counter.intent:2
+
+  input:
+    req : Frame
+
+  output:
+    resp : Frame
+
+  logic:
+    resp = Frame { data: concat(le32(state.seq), le32(length(req.data))) }
+
+  proofs:
+    purity:
+      reads : [req.data, state.seq]
+      calls : []
+    termination:
+      bound : 6
+
+
+service counter
+  @intention: "Listen on port 18964, hold each connection for up to 100 frames or 5 s per read, answer via step, count the steps"
+  @source: step_counter.intent:3
+
+  listen:
+    protocol    : raw_tcp
+    port        : 18964
+    max_request : 256
+
+  concurrency:  forked
+  max_steps:    100
+  read_timeout: 5
+
+  handler: step
+
+  state:
+    seq : number = 0
+
+  after:
+    set seq = state.seq + 1

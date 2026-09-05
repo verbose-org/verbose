@@ -1268,27 +1268,115 @@ fn verify_service(
         }
     }
 
-    // Phase 10 slice 10: forked concurrency is currently restricted to
-    // http_1_0. raw_tcp services that fork would also need the parent to
-    // close the client fd before re-entering accept (same shape) but the
-    // recon explicitly scoped this slice to Http10; lifting the
-    // restriction is one slice, not a free side-effect.
-    if s.concurrency == ConcurrencyMode::Forked && s.protocol != Protocol::Http10 {
+    // ── Slice `multistep-1` (docs/multistep-connection-design.md §5) ──────
+    //
+    // A `raw_tcp` service declaring `max_steps` + `read_timeout` is
+    // MULTI-STEP: one forked child per connection runs a per-connection step
+    // loop (read → handler → response → `after:`), so `state:` / `after:`
+    // gain a second lifetime — per connection — and `concurrency: forked`
+    // becomes mandatory (§5.4). The four declaration-shape refusals below
+    // (#1–#4 of §5.5) come FIRST, each attributable to one missing or
+    // misplaced key, so a reader is never sent to the emitter for a shape
+    // the source already decides.
+    let multistep = s.max_steps.is_some() || s.read_timeout.is_some();
+
+    // Refusal #2 — both knobs or neither. `max_steps` alone bounds WORK, not
+    // TIME: it says how many frames a client may send, not how long it may
+    // hold a child. Shipping it alone would be false explicitation.
+    if s.max_steps.is_some() != s.read_timeout.is_some() {
+        errors.push(VerifyError {
+            context: format!("service '{}' / max_steps + read_timeout", s.name),
+            message: format!(
+                "service '{}': a multi-step service must declare both 'max_steps' (a work bound) and \
+                 'read_timeout' (a time bound). max_steps alone bounds how many frames a client may \
+                 send, not how long it may hold a child; read_timeout alone bounds one read, not the \
+                 conversation. Declared: max_steps {}, read_timeout {}",
+                s.name,
+                s.max_steps.map(|n| n.to_string()).unwrap_or_else(|| "absent".into()),
+                s.read_timeout.map(|n| n.to_string()).unwrap_or_else(|| "absent".into()),
+            ),
+        });
+    }
+
+    // Refusal #4 — the step loop is a raw_tcp shape. http_1_0 is one request
+    // per connection by protocol; HTTP/1.1 keep-alive is the slice that
+    // brings the step loop under that protocol (and the one that makes the
+    // `state:` / `session:` split mandatory — design §6.1).
+    if multistep && s.protocol == Protocol::Http10 {
+        errors.push(VerifyError {
+            context: format!("service '{}' / max_steps", s.name),
+            message: format!(
+                "service '{}': max_steps applies to raw_tcp multi-step services; http_1_0 is one \
+                 request per connection. HTTP/1.1 keep-alive is a later slice.",
+                s.name
+            ),
+        });
+    }
+
+    // Refusal #3 — a multi-step service must fork. A sequential server
+    // holding one connection open across a whole conversation is monopolised
+    // for as long as the peer chooses (§5.4: the WELL-BEHAVED slow client is
+    // what the step loop changes); forked isolates each conversation to one
+    // child. Sequential multi-step needs poll/epoll — a separate arc.
+    if multistep && s.protocol == Protocol::RawTcp && s.concurrency != ConcurrencyMode::Forked {
         errors.push(VerifyError {
             context: format!("service '{}' / concurrency", s.name),
-            message: "Phase 10: concurrency: forked currently restricted to http_1_0 services".into(),
+            message: format!(
+                "service '{}': a multi-step raw_tcp service must declare 'concurrency: forked'. A \
+                 sequential server holding one connection open across a whole conversation is \
+                 monopolised for as long as the peer chooses; forked isolates each conversation to \
+                 one child.",
+                s.name
+            ),
+        });
+    }
+
+    // Phase 10 slice 10, re-scoped by slice `multistep-1`: forked concurrency
+    // is accepted on http_1_0 (one request per child) and on a raw_tcp
+    // service WITH a step loop (one conversation per child). A one-shot
+    // raw_tcp service stays refused: forking it buys nothing the step loop
+    // does not need, and the echo emitter has no fork dispatch.
+    if s.concurrency == ConcurrencyMode::Forked
+        && s.protocol != Protocol::Http10
+        && !multistep
+    {
+        errors.push(VerifyError {
+            context: format!("service '{}' / concurrency", s.name),
+            message: format!(
+                "service '{}': concurrency: forked is accepted on http_1_0 services and on raw_tcp \
+                 services with a step loop (declare max_steps + read_timeout, slice multistep-1); a \
+                 one-shot raw_tcp service is sequential",
+                s.name
+            ),
         });
     }
 
     // Mutable state validation.
-    // 1. Each state field must be Number-typed (text state is a follow-up).
+    // 1. Each state field must be Number- or Text-typed (bytes: refusal #7,
+    //    at parse time).
     // 2. No duplicate field names.
     // 3. Each after_set must reference an existing state field.
-    // 4. State is restricted to http_1_0 services in this slice.
-    if !s.state_fields.is_empty() && s.protocol != Protocol::Http10 {
+    // 4. Refusal #1 (§5.5) — state on a raw_tcp service needs the step loop.
+    //    THE ONE THAT MATTERS MOST: `compile_service` hands the one-shot
+    //    identity emitter two scalars (port, max_request) and cannot see a
+    //    `state:` block at all, so without this gate the declaration would
+    //    compile to the identity echo and be DROPPED silently — the exact
+    //    hazard the HTTP constant fast path already records for `after:`.
+    //    Keyed on the step loop's PRESENCE (`max_steps`), not on forked:
+    //    forked without max_steps is already refused above, and one refusal
+    //    per missing key is what keeps each attributable.
+    if (!s.state_fields.is_empty() || !s.after_sets.is_empty())
+        && s.protocol == Protocol::RawTcp
+        && s.max_steps.is_none()
+    {
         errors.push(VerifyError {
             context: format!("service '{}' / state", s.name),
-            message: "mutable state is currently restricted to http_1_0 services".into(),
+            message: format!(
+                "service '{}': a raw_tcp service declaring state must also declare 'max_steps' (and \
+                 'read_timeout' and 'concurrency: forked'). Without a step loop the one-shot emitter \
+                 would compile this to the identity echo and DROP the state declaration silently.",
+                s.name
+            ),
         });
     }
     // 5. An `after:` mutation together with `concurrency: forked` is REFUSED.
@@ -1317,7 +1405,16 @@ fn verify_service(
     // reads identically under both concurrency modes. Refusing that shape
     // would reject a valid program, the one direction this project's
     // verifier checks must never move in.
-    if !s.after_sets.is_empty() && s.concurrency == ConcurrencyMode::Forked {
+    //
+    // RE-KEYED by slice `multistep-1` (design §6.1), not reused: the refusal
+    // exists because WITHOUT A LOOP the child's mutation is observed by
+    // nobody. With a step loop the mutation IS observed — by the next step
+    // of the same connection, in the same child — so the condition gains
+    // `&& no step loop`. Still keyed on `after_sets`, for the reason above.
+    if !s.after_sets.is_empty()
+        && s.concurrency == ConcurrencyMode::Forked
+        && !multistep
+    {
         errors.push(VerifyError {
             context: format!("service '{}' / after + concurrency", s.name),
             message: format!(
@@ -1329,7 +1426,9 @@ fn verify_service(
                  connection. Propagating it would require shared memory between processes, which \
                  docs/effect-model.md refuses on principle ('Pthreads / shared-memory concurrency'), so this \
                  is unbuildable rather than unbuilt. Remove 'concurrency: forked' to keep the mutation, or \
-                 remove the 'after:' block to keep forked concurrency.",
+                 remove the 'after:' block to keep forked concurrency — or, on a raw_tcp service, declare \
+                 max_steps + read_timeout: with a step loop the mutation is observed by the next step of \
+                 the same connection in the same child (slice multistep-1).",
                 s.after_sets.len(),
                 s.after_sets.iter().map(|st| st.field_name.as_str()).collect::<Vec<_>>().join(", ")
             ),
@@ -1582,15 +1681,31 @@ fn verify_service(
                     0,
                 ) {
                     // Refusal #5 — no compile-time bound for this shape.
+                    // The accepted-source list is protocol-aware (slice
+                    // multistep-1, design §5.5 #6): a raw_tcp input field is
+                    // BYTES and can never be a text source, so naming
+                    // `<inp>.method / .path / .body` there would send the
+                    // author to fields the concept does not have.
                     Err(kind) => errors.push(VerifyError {
                         context: format!("service '{}' / after / set {}", s.name, aset.field_name),
-                        message: format!(
-                            "after: set '{}' = <expr>: source shape '{}' has no compile-time byte bound, so the \
-                             copy into a fixed {}-byte buffer cannot be proved safe. Slice text-state-1 accepts \
-                             literals, {inp}.method / {inp}.path / {inp}.body, state fields, read(), fetch(), \
-                             handler text lets, substring of those, and concat of those.",
-                            aset.field_name, kind, n, inp = handler.input_name
-                        ),
+                        message: match s.protocol {
+                            Protocol::Http10 => format!(
+                                "after: set '{}' = <expr>: source shape '{}' has no compile-time byte bound, so the \
+                                 copy into a fixed {}-byte buffer cannot be proved safe. Slice text-state-1 accepts \
+                                 literals, {inp}.method / {inp}.path / {inp}.body, state fields, read(), fetch(), \
+                                 handler text lets, substring of those, and concat of those.",
+                                aset.field_name, kind, n, inp = handler.input_name
+                            ),
+                            Protocol::RawTcp => format!(
+                                "after: set '{}' = <expr>: source shape '{}' has no compile-time byte bound, so the \
+                                 copy into a fixed {}-byte buffer cannot be proved safe. On a raw_tcp service the \
+                                 accepted sources are literals, state fields, handler text lets, substring of \
+                                 those, and concat of those — the input field {inp}.<field> is bytes, not text, \
+                                 and reaches a text set only through a handler let built from length() / \
+                                 byte_at() (slice multistep-1).",
+                                aset.field_name, kind, n, inp = handler.input_name
+                            ),
+                        },
                     }),
                     // Refusal #6 — bounded, but too big. Named explicitly so a
                     // reader is not left thinking the bound is merely small.
@@ -8376,19 +8491,21 @@ rule test
         assert!(errs.is_empty(), "the byte_at twin must verify clean: {:#?}", errs);
     }
 
-    /// Design §4.4 refusal #7: `state:` / `after:` / `concurrency: forked`
-    /// stay refused on raw_tcp (slice `multistep-1`). Pre-existing
-    /// refusals, re-asserted here because slice 0 lifted the emitter's
-    /// identity gate and these three are what keep the one-shot contract.
+    /// Design §4.4 refusal #7, RE-SCOPED by slice `multistep-1` (§5.5 #1 and
+    /// the forked gate): `state:` / `after:` / `concurrency: forked` stay
+    /// refused on a ONE-SHOT raw_tcp service — the shapes that keep slice
+    /// 0's one-exchange contract — and each refusal now names the step loop
+    /// (max_steps + read_timeout) as what lifts it. The multi-step twins
+    /// live in `multistep_declaration_refusals_and_twins`.
     #[test]
-    fn rawtcp_inspect_keeps_state_and_forked_refused_on_raw_tcp() {
+    fn rawtcp_inspect_keeps_state_and_forked_refused_on_one_shot_raw_tcp() {
         let ok_body = "Frame { data: le32(length(req.data)) }";
         let errs = verify_str(&rawtcp_src("", ok_body, "req.data", "\n  state:\n    count : number = 0\n"));
-        assert!(errs.iter().any(|e| e.message.contains("mutable state is currently restricted to http_1_0")), "{:#?}", errs);
+        assert!(errs.iter().any(|e| e.message.contains("must also declare 'max_steps'") && e.message.contains("DROP the state declaration silently")), "{:#?}", errs);
         let errs = verify_str(&rawtcp_src("", ok_body, "req.data", "\n  state:\n    count : number = 0\n\n  after:\n    set count = state.count + 1\n"));
-        assert!(errs.iter().any(|e| e.message.contains("mutable state is currently restricted to http_1_0")), "{:#?}", errs);
+        assert!(errs.iter().any(|e| e.message.contains("must also declare 'max_steps'")), "{:#?}", errs);
         let errs = verify_str(&rawtcp_src("", ok_body, "req.data", "\n  concurrency: forked\n"));
-        assert!(errs.iter().any(|e| e.message.contains("forked currently restricted to http_1_0")), "{:#?}", errs);
+        assert!(errs.iter().any(|e| e.message.contains("raw_tcp services with a step loop") && e.message.contains("multistep-1")), "{:#?}", errs);
         // twin: the plain one-shot service.
         let errs = verify_str(&rawtcp_src("", ok_body, "req.data", ""));
         assert!(errs.is_empty(), "{:#?}", errs);
