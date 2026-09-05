@@ -43024,9 +43024,16 @@ service shadow
         /// `None` while the listener was still running after the LAST request
         /// (it is then killed); `Some(code)` if it had exited on its own.
         exit: Option<i32>,
-        /// Open fds of the listener after the last request (Linux /proc), or
-        /// 0 if it was gone. A sequential service that serves N requests and
-        /// closes every fd it opened sits at 4: stdin/out/err + the socket.
+        /// Open fds of the listener BEFORE the first request (Linux /proc),
+        /// sampled once it is bound: stdin/out/err + the listening socket +
+        /// whatever the harness leaked into it. On a bare shell that is 4; the
+        /// cidx container runner hands the child two more (measured: 6 in CI,
+        /// 4 locally), which is why the assertion is RELATIVE to this and not
+        /// the absolute 4 the first version of these tests pinned.
+        fds_baseline: usize,
+        /// Open fds of the listener after the last request, or 0 if it was
+        /// gone. A service that closes every fd it opened is back at
+        /// `fds_baseline`; a leaked client / upstream / log fd sits above it.
         fds_after: usize,
         /// `count_exit1_sequences` over the emitted ELF.
         exit1_sites: usize,
@@ -43078,6 +43085,8 @@ service shadow
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(bound, "service never bound on port {}", port);
+        let fds_of = |pid: u32| std::fs::read_dir(format!("/proc/{}/fd", pid)).map(|d| d.count()).unwrap_or(0);
+        let fds_baseline = fds_of(child.id());
 
         let mut replies = Vec::new();
         for req in requests {
@@ -43095,20 +43104,26 @@ service shadow
             replies.push(buf);
         }
 
-        std::thread::sleep(Duration::from_millis(150));
-        let (exit, fds_after) = match child.try_wait().expect("try_wait") {
-            Some(status) => (status.code(), 0),
-            None => {
-                let fds = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
-                    .map(|d| d.count())
-                    .unwrap_or(0);
-                let _ = child.kill();
-                (None, fds)
+        // Settle-poll rather than sleep: an in-flight close is transient and
+        // returns to the baseline, a LEAK never does, so polling cannot turn a
+        // leak into a pass — it only stops a slow runner from failing a
+        // correct binary (the shape the parallel-server fd test already uses).
+        let mut fds_after = 0;
+        let mut exit = None;
+        for _ in 0..40 {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => { exit = status.code(); fds_after = 0; break; }
+                None => {
+                    fds_after = fds_of(child.id());
+                    if fds_after <= fds_baseline { break; }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
-        };
+        }
+        if exit.is_none() { let _ = child.kill(); }
         let _ = child.wait();
         let _ = std::fs::remove_file(&out);
-        ClientAbortRun { replies, exit, fds_after, exit1_sites }
+        ClientAbortRun { replies, exit, fds_baseline, fds_after, exit1_sites }
     }
 
     /// One-rule HTTP/1.0 service whose body is `concat("b:", <expr>)` — the
@@ -43162,7 +43177,7 @@ service shadow
             assert_eq!(run.exit, None, "{}: the listener must survive a client-tripped {} check", tag, tag);
             assert_eq!(http_body(&run.replies[1]), expected, "{}: a good request on a NEW connection is answered", tag);
             assert_eq!(run.exit1_sites, 0, "{}: no sys_exit(1) sequence may remain in a client-only service", tag);
-            assert_eq!(run.fds_after, 4, "{}: the tripping connection's fd was closed (stdin/out/err + socket)", tag);
+            assert_eq!(run.fds_after, run.fds_baseline, "{}: the tripping connection's fd was closed (back to the pre-request fd count)", tag);
         }
     }
 
@@ -43242,7 +43257,7 @@ service shadow
         assert!(run.replies[0].is_empty(), "tripping request: no response");
         assert_eq!(http_body(&run.replies[1]), "UP:/97", "the good request reached the upstream and came back");
         assert_eq!(run.exit, None, "listener survives a client abort inside the fetch request bytes");
-        assert_eq!(run.fds_after, 4, "the upstream socket opened before the abort was CLOSED by the r15 stub");
+        assert_eq!(run.fds_after, run.fds_baseline, "the upstream socket opened before the abort was CLOSED by the r15 stub (back to the pre-request fd count)");
         // The connect/write/read failures of the same fetch stay operator
         // class: the shared exit(1) tail is still there, exactly once.
         assert_eq!(run.exit1_sites, 1);
@@ -43270,7 +43285,7 @@ service shadow
         let run = client_abort_drive(&src, "svc", "log_parse_int", &[TRIP, GOOD_LONG, GOOD_NUM]);
         assert!(run.replies.iter().all(|r| r.is_empty()), "every request trips the log's parse_int: no response");
         assert_eq!(run.exit, None, "listener survives three client-tripped log checks");
-        assert_eq!(run.fds_after, 4, "the log fd was closed by the r15 stub on every trip");
+        assert_eq!(run.fds_after, run.fds_baseline, "the log fd was closed by the r15 stub on every trip (back to the pre-request fd count)");
         assert_eq!(std::fs::read(&log_path).expect("the log file was opened"), b"", "nothing was appended");
         assert_eq!(run.exit1_sites, 0);
         let _ = std::fs::remove_file(&log_path);
