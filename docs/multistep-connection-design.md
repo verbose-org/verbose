@@ -280,6 +280,26 @@ corollary is stated separately because it is the sentence that made revision 1's
 **Independently shippable. No loop, no state, no concurrency change. One read, one write, exactly as
 today.** What changes is that the handler may compute.
 
+**Correction (2026-09-03, slice `svc-client-abort-1`) — this section's original wording of the
+out-of-range case was wrong, and the slice built from it shipped the defect.** §4.6-3 said a handler
+indexing past the read count "exits 1 with no response", and §4.7 NC-0c's "must" column said the
+same; PR #203 implemented exactly that and its own report flagged it. Measured on `5c2377d`: one
+client sending a 2-byte frame to `byte_at(req.data, 5)` took the whole `raw_tcp` listener down
+(rc 1), and the identical shape in an HTTP/1.0 handler — `byte_at(req.path, 50)`,
+`substring(req.path, 0, 50)`, `parse_int(substring(req.path, 1, 3))`, each sent `GET /ab
+HTTP/1.0` — killed the listener on the first request in every case. A fail-closed `sys_exit(1)` is
+the right contract for a one-shot RULE binary, where exiting is free and the exit code is the
+answer; inside a LISTENER the same instruction is a remote kill switch, which is the shape the HTTP
+parse's method/path guards already refuse ("an over-long path must not be a remote kill switch")
+and the shape `docs/text-state-fields-design.md` §3.3 rejected as a listener's primary gate. The
+correct behaviour, now implemented and pinned: a CLIENT-class abort (`byte_at` / `substring` /
+`parse_int` on request data, in the handler lets, body, `after:` sources, a fetch's request bytes
+or a log block's content) **closes the connection without a response and the listener survives**;
+OPERATOR-class aborts — resource read failure under `on_read_error: abort`, fetch socket failure
+under `on_connect_error: abort`, `log:` `on_error: abort`, the entropy and text-state backstops,
+and `parse_int(read(<resource>))` whose input is the operator's file — **still exit 1**. §4.6-3,
+§4.7 NC-0c and §5.7's "fail-closed is per CONNECTION" bullet are corrected below in place.
+
 ### 4.1 Scope
 
 1. **The `raw_tcp` service emitter gains the HTTP frame discipline.** A new
@@ -321,9 +341,11 @@ today.** What changes is that the handler may compute.
    `Type::Bytes` at large; widening it to the type would admit a streamed concat, whose length is
    nowhere.
 
-   `byte_at`'s bounds check is unchanged and already fail-closed: `index >= length` → `sys_exit(1)`,
+   `byte_at`'s bounds check is unchanged and already fail-closed: `index >= length` aborts,
    negative index caught by the same unsigned compare. Against a runtime length that check is doing
-   real work for the first time.
+   real work for the first time. *(What the abort DOES was corrected on 2026-09-03 — see the
+   correction at the top of §4: in a rule binary it is `sys_exit(1)`; in a service handler it
+   closes the connection and the listener keeps accepting.)*
 
 4. **The handler may be a real rule.** The identity gate (`src/native.rs:20508-20524`) and the
    let-bindings gate (`:20500`) are lifted for the dynamic path. Number/text `let`s work by the
@@ -439,8 +461,12 @@ one-TCP-conversation shape is the template.
 2. `rawtcp_inspect_length_is_the_read_count_not_max_request` — rows 1 and 3 alone, asserted as
    distinct answers. (Split out because a build that returned `max_request` passes row 1 by accident
    only if `max_request` is 3.)
-3. `rawtcp_byte_at_out_of_range_is_fail_closed` — a handler indexing past the read count exits 1 with
-   no response; the connection closes without bytes.
+3. `rawtcp_byte_at_out_of_range_closes_the_connection_and_the_listener_survives` — a handler
+   indexing past the read count closes the connection without a response byte; **the listener
+   survives** and answers the next frame on a new connection. *(Originally written as "exits 1
+   with no response" and pinned that way as `rawtcp_byte_at_out_of_range_is_fail_closed`; that was
+   the defect, corrected 2026-09-03 — see the correction at the top of §4. Operator aborts still
+   exit 1.)*
 4. `rawtcp_identity_service_is_byte_identical` — `examples/raw_tcp_echo.verbose` still compiles to
    exactly 358 B through the unchanged `emit_raw_tcp_echo_bytes`.
 5. Verifier units for refusals 1–4 and 7 of §4.4, **each with a minimally corrected twin that must
@@ -455,7 +481,7 @@ one-TCP-conversation shape is the template.
 |---|---|---|---|---|
 | **NC-0a** | Store `max_request` in the length slot instead of the `read` return | §4.3, rows 1 **and** 3 | FAIL | Row 1 alone passes if the payload happens to be `max_request` bytes; a *short* read is the discriminator, so the control needs two payload lengths. |
 | **NC-0b** | Register `req.<field>` under the **bare** field name | the §4.6-6 fixture, where a handler let shares the input field's name | FAIL | The §4.3 fixture passes bare-name registration — nothing collides with `data`. The control is only discriminating on a colliding name, and the non-colliding fixture must **still pass in the same run**, or the control proves nothing about keying (text-state NC-3's exact shape). |
-| **NC-0c** | Delete `byte_at`'s `jae` bounds branch | §4.6-3's out-of-range fixture | FAIL — reads past the buffer instead of exiting 1 | An in-range fixture passes the broken build, and every §4.3 row is in range. |
+| **NC-0c** | Delete `byte_at`'s `jae` bounds branch | §4.6-3's out-of-range fixture | FAIL — reads past the buffer and ANSWERS from stale bytes instead of closing the connection without a response (was "instead of exiting 1"; corrected 2026-09-03 — the listener must survive, and operator aborts still exit 1) | An in-range fixture passes the broken build, and every §4.3 row is in range. |
 | **NC-0d** | Emit the response through `emit_streaming_bytes_body` with fd hardcoded to `1` | any §4.3 row | FAIL — the client receives nothing; the bytes land on the server's stdout | This is the one-line mistake the fd threading exists to prevent, and a test that only asserts the server does not crash passes it. |
 
 ---
@@ -677,9 +703,13 @@ non-vacuous (§5.9).
   live at the copy point. Moving the free earlier, or the after block later, breaks it *silently*
   (the copy reads freed stack). §5.9 NC-1e is the runnable form of that dependency.
 - **Per-connection isolation is the fork** (§5.3).
-- **Fail-closed is per CONNECTION.** A bad frame aborts the **child** via the shared `sys_exit(1)`
-  tail; the parent keeps accepting. That is the correct unit, and it is
-  `docs/text-state-fields-design.md` §3.3's argument applied to a conversation.
+- **Fail-closed is per CONNECTION.** A bad frame closes the **connection** — under `forked`, the
+  child takes its normal `sys_exit(0)` tail through the close path; sequentially, the close path
+  frees the frame and loops to `accept_top` — and the listener keeps accepting. That is the
+  correct unit, and it is `docs/text-state-fields-design.md` §3.3's argument applied to a
+  conversation. *(This bullet said "aborts the child via the shared `sys_exit(1)` tail" until
+  2026-09-03; slice 0 never had a child, so that was a kill switch sequentially — see the
+  correction at the top of §4. The `sys_exit(1)` tail is for OPERATOR aborts only.)*
 
 ### 5.8 Acceptance tests
 

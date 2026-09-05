@@ -3431,6 +3431,133 @@ fn emit_resource_abort_tail(code: &mut Vec<u8>, abort_patches: &[usize]) {
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
 }
 
+// ═══ CLIENT-ABORT ROUTING (slice `svc-client-abort-1`, 2026-09-03) ═══════
+//
+// A fail-closed primitive evaluated on REQUEST data — `byte_at`'s index
+// check, `substring`'s two bound checks, `parse_int`'s malformed-input
+// scan — was designed for a one-shot RULE binary, where `sys_exit(1)` is
+// free and the exit code IS the contract. Inside a LISTENER the same
+// instruction is a remote kill switch: measured on `5c2377d`, one client
+// sending `GET /ab HTTP/1.0` to a sequential service whose body is
+// `concat("b:", byte_at(req.path, 50))` took the whole process down. The
+// repo already refuses that shape twice — the HTTP parse's method/path
+// guards route to close-without-response ("an over-long path must not be
+// a remote kill switch"), and docs/text-state-fields-design.md §3.3
+// rejected a runtime `sys_exit(1)` as a listener's primary gate — and
+// these four sites had simply never been brought under the rule.
+//
+// Service-time aborts are therefore TWO classes:
+//
+//   OPERATOR — resource open/read under `on_read_error: abort`, fetch
+//   socket/connect/write/read under `on_connect_error: abort`, `log:`
+//   `on_error: abort`, the entropy backstop, the text-state backstop.
+//   Deployment conditions, not client input. They keep the explicit
+//   `abort_patches` vector and the end-of-binary `sys_exit(1)` tail.
+//
+//   CLIENT — the four primitive checks above, whenever they are emitted
+//   while a service lowers its HANDLER (let prologue, body / response
+//   fields, the `after:` block's `set` sources, and the request bytes of a
+//   handler `fetch`). They must close the CONNECTION and let the listener
+//   go on accepting — the existing close path the parse guards use.
+//
+// The four sites live deep inside `emit_eval_expr` and its helpers, which
+// take no abort vector: they emit an INLINE 16-byte `mov rax,60 ; mov
+// rdi,1 ; syscall` behind a `jmp .ok`. Threading a vector through the ~45
+// `emit_eval_expr` call sites and every text helper would be a refactor
+// with more surface than the defect. Instead the service emitters open a
+// SCOPE around handler lowering; while it is open, each site hands its
+// `jcc rel32` patch offsets to the scope and emits NOTHING else (no `jmp
+// .ok`, no exit block), and the service emitter resolves every recorded
+// site to its close label. Outside a scope every site is byte-for-byte
+// what it was — a rule binary cannot observe the mechanism, which is what
+// the corpus sweep measures (every rule binary identical; only services
+// with a client-abortable primitive on request data move, each by exactly
+// the bytes of the inline exits it no longer carries).
+//
+// Two properties make the scope safe rather than merely convenient:
+//   * `ClientAbortScope` is RAII. A `?` early-return from a service emitter
+//     drops it and RESTORES the previous state, so a refused service can
+//     never leave the scope armed for the next compile — every test runs
+//     on one thread (`--test-threads=1`), so a leak would silently redirect
+//     the next RULE binary's aborts to a label that does not exist.
+//   * Every recorded offset indexes the ONE `code` vector the service
+//     emitter owns: the handler path emits into it directly (verified: no
+//     scratch vector on the path), so a recorded site is always a real
+//     byte position in the binary being built. Nesting (a `substring`
+//     inside a `byte_at`) appends to the same vector.
+//
+// What the scope deliberately does NOT cover: `abort_if(<expr>)` in a
+// streamed bytes body. That is an EXPLICIT, declared abort the author
+// wrote, not an implicit bound; it keeps its inline exit.
+
+thread_local! {
+    static CLIENT_ABORT_SITES: std::cell::RefCell<Option<Vec<usize>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Opened by a service emitter around its handler-lowering phase. While it
+/// is alive, the four client-abort primitives record their `jcc rel32`
+/// patch offsets here instead of emitting an inline `sys_exit(1)`.
+struct ClientAbortScope {
+    prev: Option<Vec<usize>>,
+    ended: bool,
+}
+
+impl ClientAbortScope {
+    fn begin() -> ClientAbortScope {
+        let prev = CLIENT_ABORT_SITES.with(|s| s.replace(Some(Vec::new())));
+        ClientAbortScope { prev, ended: false }
+    }
+
+    /// Close the scope and hand back every recorded site. The caller
+    /// resolves them to its close label.
+    fn end(mut self) -> Vec<usize> {
+        self.ended = true;
+        let prev = self.prev.take();
+        CLIENT_ABORT_SITES
+            .with(|s| s.replace(prev))
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for ClientAbortScope {
+    fn drop(&mut self) {
+        if !self.ended {
+            let prev = self.prev.take();
+            CLIENT_ABORT_SITES.with(|s| {
+                s.replace(prev);
+            });
+        }
+    }
+}
+
+/// The one call every client-abort site makes. `jcc_patches` are the rel32
+/// offsets of the conditional jumps that fire the abort. Returns `true` —
+/// having recorded them — when a `ClientAbortScope` is open, in which case
+/// the site must emit NO inline exit; returns `false` outside a scope, in
+/// which case the site emits exactly the bytes it always did.
+fn route_client_abort(jcc_patches: &[usize]) -> bool {
+    CLIENT_ABORT_SITES.with(|s| {
+        let mut slot = s.borrow_mut();
+        match slot.as_mut() {
+            Some(v) => {
+                v.extend_from_slice(jcc_patches);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// Resolve every recorded client-abort site to `target` (the service's
+/// close label). Each site is the 4-byte rel32 of a `jcc`.
+fn patch_client_abort_sites(code: &mut [u8], sites: &[usize], target: usize) {
+    for site in sites {
+        let rel = target as i32 - (*site as i32 + 4);
+        code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+    }
+}
+
 /// Phase 11 slice 1 — walk an expression tree collecting every
 /// `Fetch(name, _)` connection name (de-duplicated, in source order).
 /// Mirrors `collect_read_names_native` exactly. Used by the prologue to
@@ -8824,24 +8951,31 @@ fn emit_substring_bounds_and_slice(
     code.extend_from_slice(&[0x48, 0x01, 0xC1]);
     //   mov rax, rcx                        (rax = slice_ptr per convention)
     code.extend_from_slice(&[0x48, 0x89, 0xC8]);
-    // (8) add rsp, 24 ; jmp .ok
+    // (8) add rsp, 24
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
-    code.push(0xE9);
-    let ok_jmp_patch = code.len();
-    code.extend_from_slice(&[0; 4]);
-    // .abort: sys_exit(1)
-    let abort_pos = code.len();
-    let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
-    code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
-    let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
-    code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x0F, 0x05]);
-    // .ok: result at (rax = slice_ptr, rdx = slice_len)
-    let ok_pos = code.len();
-    let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
-    code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+    // Inside a service handler (slice svc-client-abort-1) the two `ja`
+    // sites are handed to the service's close label — the pushes above are
+    // freed by the close path's `lea rsp, [rbp - frame_size]` — and nothing
+    // more is emitted here. Outside one: `jmp .ok ; .abort: sys_exit(1) ;
+    // .ok:`, byte-for-byte the rule-binary tail.
+    if !route_client_abort(&[end_abort_patch, start_abort_patch]) {
+        code.push(0xE9);
+        let ok_jmp_patch = code.len();
+        code.extend_from_slice(&[0; 4]);
+        // .abort: sys_exit(1)
+        let abort_pos = code.len();
+        let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
+        code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
+        let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
+        code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x0F, 0x05]);
+        // .ok: result at (rax = slice_ptr, rdx = slice_len)
+        let ok_pos = code.len();
+        let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+        code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -17488,22 +17622,28 @@ fn emit_eval_expr(
             code.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x08]);
             //   movzx eax, byte [rdx + rax] (rax = byte value, zero-ext)
             code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x02]);
-            // (6) add rsp, 16 ; jmp .ok
+            // (6) add rsp, 16
             code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
-            code.push(0xE9);
-            let ok_jmp_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // .abort: sys_exit(1)
-            let abort_pos = code.len();
-            let abort_rel = abort_pos as i32 - (abort_patch as i32 + 4);
-            code[abort_patch..abort_patch + 4].copy_from_slice(&abort_rel.to_le_bytes());
-            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x0F, 0x05]);
-            // .ok:
-            let ok_pos = code.len();
-            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
-            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            // Inside a service handler (slice svc-client-abort-1) the `jae`
+            // is handed to the service's close label and nothing more is
+            // emitted; the two pushes are freed by the close path's
+            // `lea rsp`. Outside one: `jmp .ok ; .abort: sys_exit(1) ; .ok:`.
+            if !route_client_abort(&[abort_patch]) {
+                code.push(0xE9);
+                let ok_jmp_patch = code.len();
+                code.extend_from_slice(&[0; 4]);
+                // .abort: sys_exit(1)
+                let abort_pos = code.len();
+                let abort_rel = abort_pos as i32 - (abort_patch as i32 + 4);
+                code[abort_patch..abort_patch + 4].copy_from_slice(&abort_rel.to_le_bytes());
+                code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x0F, 0x05]);
+                // .ok:
+                let ok_pos = code.len();
+                let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+                code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            }
             Ok(())
         }
     }
@@ -17890,23 +18030,27 @@ fn emit_length(
             code.extend_from_slice(&[0x48, 0x89, 0xD0]);
             // (9) add rsp, 16 (free saved end + text_len)
             code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
-            // (10) jmp .ok
-            code.push(0xE9);
-            let ok_jmp_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // .abort: sys_exit(1)
-            let abort_pos = code.len();
-            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
-            code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
-            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
-            code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
-            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x0F, 0x05]);
-            // .ok:
-            let ok_pos = code.len();
-            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
-            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            // (10) Inside a service handler (slice svc-client-abort-1) both
+            // `ja` sites go to the service's close label; outside one,
+            // `jmp .ok ; .abort: sys_exit(1) ; .ok:` as before.
+            if !route_client_abort(&[end_abort_patch, start_abort_patch]) {
+                code.push(0xE9);
+                let ok_jmp_patch = code.len();
+                code.extend_from_slice(&[0; 4]);
+                // .abort: sys_exit(1)
+                let abort_pos = code.len();
+                let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
+                code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
+                let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
+                code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
+                code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x0F, 0x05]);
+                // .ok:
+                let ok_pos = code.len();
+                let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+                code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            }
             Ok(())
         }
         _ => Err(NativeError {
@@ -18494,6 +18638,23 @@ fn emit_parse_int(
     all_rules: &HashMap<&str, &Rule>,
     field_ranges: &HashMap<&str, (i64, i64)>,
 ) -> Result<(), NativeError> {
+    // Slice svc-client-abort-1 — PROVENANCE decides the abort class here,
+    // not the position. `parse_int(read(<resource>))` is the corpus idiom
+    // for a runtime-tunable limit (`length(req.body) > parse_int(read(
+    // max_body))` in audit_gateway / body_size_gate / body_content_gate /
+    // uri_size_gate), and a malformed FILE is a deployment condition the
+    // operator declared `on_read_error: abort` for — so that site keeps its
+    // inline `sys_exit(1)` even inside a service handler, exactly as it did
+    // before this slice (measured: those four services are byte-identical
+    // across it). Every OTHER inner is client class: `req.*` fields and
+    // their substrings are the request itself, a `fetch` response can echo
+    // the request (the reverse-proxy shape), and a handler `let` is opaque
+    // at this site — a `let m = read(r)` therefore lands in the client
+    // class too, which is the SAFE misclassification (the listener
+    // survives; the operator sees closed connections instead of an exit).
+    // The reverse misclassification would re-open the kill switch.
+    let inner_is_resource = matches!(inner, Expr::Read(_));
+
     // Step 1: resolve (rsi=ptr, rcx=len) for the inner. Three shapes:
     //   - BoundText (Read / Ident / Fetch in text_bindings): load
     //     (ptr, len) from the two registered slots — zero scan.
@@ -18784,28 +18945,40 @@ fn emit_parse_int(
     // neg rax
     code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
 
-    // jmp .pi_done (skip the abort tail)
-    code.push(0xEB);
-    let done_jmp_patch = code.len();
-    code.push(0x00);
+    // Inside a service handler (slice svc-client-abort-1) the three
+    // malformed-input `je`/`ja` sites are handed to the service's close
+    // label and the value falls straight through to .pi_done — no `jmp`,
+    // no exit block — UNLESS the inner is `read(<resource>)` (operator
+    // data, see `inner_is_resource` above; the `||` short-circuit keeps
+    // the sites out of the scope so they are never patched twice). Outside
+    // a scope: `jmp .pi_done ; .pi_abort: sys_exit(1)`, byte-for-byte the
+    // rule-binary tail.
+    if inner_is_resource
+        || !route_client_abort(&[empty_abort_patch, lone_minus_abort_patch, nondigit_abort_patch])
+    {
+        // jmp .pi_done (skip the abort tail)
+        code.push(0xEB);
+        let done_jmp_patch = code.len();
+        code.push(0x00);
 
-    // .pi_abort: sys_exit(1) — fail-closed on any parse error.
-    let pi_abort_label = code.len();
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
-    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+        // .pi_abort: sys_exit(1) — fail-closed on any parse error.
+        let pi_abort_label = code.len();
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
 
-    // Patch the three abort jumps to land at .pi_abort.
-    let off = pi_abort_label as i32 - (empty_abort_patch as i32 + 4);
-    code[empty_abort_patch..empty_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
-    let off = pi_abort_label as i32 - (lone_minus_abort_patch as i32 + 4);
-    code[lone_minus_abort_patch..lone_minus_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
-    let off = pi_abort_label as i32 - (nondigit_abort_patch as i32 + 4);
-    code[nondigit_abort_patch..nondigit_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
+        // Patch the three abort jumps to land at .pi_abort.
+        let off = pi_abort_label as i32 - (empty_abort_patch as i32 + 4);
+        code[empty_abort_patch..empty_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
+        let off = pi_abort_label as i32 - (lone_minus_abort_patch as i32 + 4);
+        code[lone_minus_abort_patch..lone_minus_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
+        let off = pi_abort_label as i32 - (nondigit_abort_patch as i32 + 4);
+        code[nondigit_abort_patch..nondigit_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
 
-    // .pi_done: rax holds the parsed (signed) value.
-    let pi_done_label = code.len();
-    code[done_jmp_patch] = (pi_done_label - done_jmp_patch - 1) as u8;
+        // .pi_done: rax holds the parsed (signed) value.
+        let pi_done_label = code.len();
+        code[done_jmp_patch] = (pi_done_label - done_jmp_patch - 1) as u8;
+    }
 
     Ok(())
 }
@@ -20983,6 +21156,15 @@ fn emit_raw_tcp_dynamic_bytes(
     // scalar slot — it is reachable only through the composite BoundText.
     let mut handler_offsets: HashMap<&str, i32> = HashMap::new();
 
+    // ═══ CLIENT-ABORT SCOPE (slice svc-client-abort-1) ═════════
+    // Same split as the HTTP emitter: a `byte_at` / `substring` /
+    // `parse_int` check the handler runs against the frame it just read
+    // closes THIS connection (the `close_label` below, which the zero-byte
+    // read already uses) instead of taking the listener down. The design
+    // note's §4.6-3 said "exits 1 with no response"; that was the defect,
+    // not the contract — see the CLIENT-ABORT ROUTING block.
+    let client_scope = ClientAbortScope::begin();
+
     // ═══ HANDLER LET BINDINGS (Phase 2I-H's prologue, verbatim shape) ═══
     {
         let mut let_cursor: i32 = -(FIXED_BLOCK + 8);
@@ -21067,6 +21249,13 @@ fn emit_raw_tcp_dynamic_bytes(
     let close_label = code.len();
     let rel = close_label as i32 - (read_fail_patch as i32 + 4);
     code[read_fail_patch..read_fail_patch + 4].copy_from_slice(&rel.to_le_bytes());
+    // Slice svc-client-abort-1: the handler's client-abort sites land here
+    // as well. The response is STREAMED, so a check that fires after the
+    // first write leaves the client a prefix and then a close — the
+    // streaming ABI's documented mid-walk divergence, not something to
+    // buffer around.
+    let client_abort_sites = client_scope.end();
+    patch_client_abort_sites(&mut code, &client_abort_sites, close_label);
     // close(client_fd): rax=3, rdi=[rbp-48]
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
     emit_mov_rdi_fd(&mut code, WriteFd::RbpSlot(CLIENT_FD_SLOT));
@@ -22295,6 +22484,16 @@ fn emit_http10_dynamic_bytes(
     // `http_text_bindings` (resources + earlier connections), and
     // allow_dynamic_request=true so the literal-only guard is lifted.
     let http_request_concept_for_fetch = http_request_builtin_concept_native(max_request);
+    // Slice svc-client-abort-1: the REQUEST BYTES of a handler fetch are
+    // built from `req.*` (slice 11.3), so `byte_at(req.path, 50)` or
+    // `parse_int(req.path)` inside them is a client-abortable check —
+    // measured: both compile. It fires AFTER `socket` + `connect`, with the
+    // upstream fd live in r15, so these sites cannot take the bare close
+    // path: they resolve to the `r15_close_stub` below (close(r15), then
+    // the close path). The socket/connect/write/read failures inside the
+    // same sequence stay on `abort_patches` — operator class.
+    let mut r15_abort_sites: Vec<usize> = Vec::new();
+    let fetch_scope = ClientAbortScope::begin();
     for c in &referenced_connections {
         let (ptr_slot, len_slot, _buf_slot, new_next) = emit_connection_fetch_sequence(
             &mut code,
@@ -22312,6 +22511,7 @@ fn emit_http10_dynamic_bytes(
         http_text_bindings.insert(c.name.as_str(), (ptr_slot, len_slot));
         resource_next_slot = new_next;
     }
+    r15_abort_sites.extend(fetch_scope.end());
 
     // ═══ ENTROPY DRAWS (slice entropy-1) ═══════════════════════
     // One `getrandom` per referenced item per ACCEPT, placed immediately
@@ -22331,6 +22531,18 @@ fn emit_http10_dynamic_bytes(
         http_text_bindings.insert(e.binding_key.as_str(), (ptr_slot, len_slot));
         resource_next_slot = new_next;
     }
+
+    // ═══ CLIENT-ABORT SCOPE (slice svc-client-abort-1) ═════════
+    // From here to the end of the `after:` block, every `byte_at` /
+    // `substring` / `parse_int` check the handler evaluates on REQUEST data
+    // records its `jcc` site here instead of emitting an inline
+    // `sys_exit(1)`; the sites resolve to `close_label` below, so a client
+    // that trips one loses its connection and the listener keeps accepting.
+    // The operator aborts above (resource / fetch / entropy) and below
+    // (`log:` on_error: abort, the text-state backstop) stay on
+    // `abort_patches` and its `sys_exit(1)` tail: those are deployment
+    // conditions, not client input. See the CLIENT-ABORT ROUTING block.
+    let client_scope = ClientAbortScope::begin();
 
     // ═══ HANDLER LET BINDINGS (Phase 2I-in-handlers) ══════════
     // Evaluate the handler's `let` bindings AFTER the HTTP parse and any
@@ -22478,6 +22690,10 @@ fn emit_http10_dynamic_bytes(
         &http_text_bindings,
         max_request,
     )?;
+    // Lets + body done: these sites take the bare close path. The log
+    // blocks below get their OWN scope (their fd is live in r15 while the
+    // content evaluates), and the `after:` block rejoins this set.
+    let mut client_abort_sites = client_scope.end();
 
     // ═══ LOG EFFECT (Phase 8 slices 8a/8b/8c) ══════════════════
     // After the handler has populated the output slots and before the
@@ -22528,6 +22744,13 @@ fn emit_http10_dynamic_bytes(
             log_text_bindings.insert("body", (body_ptr_slot, body_len_slot));
         }
 
+        // Slice svc-client-abort-1: the log grammar admits `parse_int(...)`
+        // over `req.path` / `req.body`, and `emit_append_file_call` opens
+        // the log fd into r15 BEFORE it evaluates the content — so a
+        // client-triggered parse_int abort here must close r15 first: the
+        // same stub the fetch block uses. `on_error: abort` on the open /
+        // write themselves stays on `abort_patches` (operator class).
+        let log_scope = ClientAbortScope::begin();
         for log_block in &service.logs {
             if let Effect::AppendFile { path, content } = &log_block.effect {
                 let rewritten = rewrite_log_content(content, &handler.input_name);
@@ -22546,6 +22769,7 @@ fn emit_http10_dynamic_bytes(
                 )?;
             }
         }
+        r15_abort_sites.extend(log_scope.end());
     }
 
     // ═══ HTTP SERIALIZE ════════════════════════════════════════
@@ -22555,6 +22779,12 @@ fn emit_http10_dynamic_bytes(
     // Runs AFTER the response is written, AFTER log blocks. Each entry
     // evaluates its value expression (can reference state.*, req.* fields)
     // and stores the result into the corresponding state slot.
+    //
+    // Slice svc-client-abort-1: a `set` source is handler-scope request
+    // data (`substring(req.path, …)` is a legal source), so its checks
+    // rejoin the bare close set — the response is already on the wire, the
+    // state simply stays unchanged for that request.
+    let after_scope = ClientAbortScope::begin();
     for aset in &service.after_sets {
         let sf = service.state_fields.iter()
             .find(|sf| sf.name == aset.field_name)
@@ -22656,6 +22886,14 @@ fn emit_http10_dynamic_bytes(
         let rel = close_label as i32 - (patch as i32 + 4);
         code[patch..patch + 4].copy_from_slice(&rel.to_le_bytes());
     }
+    // Slice svc-client-abort-1: every client-abort site the handler lets,
+    // body and `after:` block recorded lands here too — the same
+    // close-without-response path a malformed request takes. Under `forked`
+    // this is the child, and the tail below is its normal `sys_exit(0)`;
+    // sequentially the `lea rsp` below frees whatever the aborting
+    // primitive had pushed.
+    client_abort_sites.extend(after_scope.end());
+    patch_client_abort_sites(&mut code, &client_abort_sites, close_label);
     // close(client_fd): rax=3, rdi=[rbp-48]
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
@@ -22696,6 +22934,28 @@ fn emit_http10_dynamic_bytes(
             code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
             code.extend_from_slice(&[0x0F, 0x05]);
         }
+    }
+
+    // ═══ R15 CLOSE STUB (slice svc-client-abort-1) ═════════════
+    // A client abort that fired while an fd was live in r15 — inside a
+    // fetch's request bytes (upstream socket) or a log block's content
+    // (log fd) — lands here: close(r15), then the ordinary close path. Cold
+    // and emitted only when such a site exists, so every service without
+    // one is byte-identical. 17 bytes: mov rax,3 (7) ; mov rdi,r15 (3) ;
+    // syscall (2) ; jmp close_label (5) — placed after the tail so it is
+    // never fallen into. Measured: a fetch whose request bytes carry one
+    // `byte_at` moves 1269 → 1265 B (−21 for the inline exit it lost, +17
+    // for this stub), and its fd count after a tripped request is 4 — the
+    // upstream socket was closed, not leaked.
+    if !r15_abort_sites.is_empty() {
+        let stub = code.len();
+        patch_client_abort_sites(&mut code, &r15_abort_sites, stub);
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]); // mov rax, 3
+        code.extend_from_slice(&[0x4C, 0x89, 0xFF]);                         // mov rdi, r15
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+        code.push(0xE9);                                                     // jmp close_label
+        let back = close_label as i32 - (code.len() as i32 + 4);
+        code.extend_from_slice(&back.to_le_bytes());
     }
 
     // ═══ ABORT SEQUENCE (Phase 8 slice 8d) ═════════════════════
@@ -42690,48 +42950,411 @@ service shadow
         assert!(run.exit.is_none());
     }
 
-    /// Design §4.6-3 / NC-0c: a handler indexing PAST the read count. The
-    /// index is evaluated in the `if` CONDITION, i.e. before the first
-    /// streamed write, so the fail-closed `sys_exit(1)` fires with NO byte on
-    /// the wire; the connection closes and the process is gone with status
-    /// 1. In-range frames first, so the same binary is shown to work.
+    /// Design §4.6-3 / NC-0c, CORRECTED by slice svc-client-abort-1
+    /// (2026-09-03): a handler indexing PAST the read count. Until this
+    /// slice the fixture asserted `exit == Some(1)` — the design note said
+    /// "exits 1 with no response", and the test pinned it. That was the
+    /// DEFECT, not the contract: a raw_tcp listener that `sys_exit(1)`s on a
+    /// 1-byte frame is a remote kill switch, the exact shape the HTTP parse
+    /// guards refuse ("an over-long path must not be a remote kill switch").
+    /// The correct behaviour, asserted now: the connection closes with no
+    /// response byte, the LISTENER SURVIVES, and the next frame on a new
+    /// connection is answered. In-range frames first, so the same binary is
+    /// shown to work; the tripping frame in the MIDDLE, so "answered after"
+    /// is measured on the same process.
     ///
-    /// The second fixture documents the STREAMING caveat the design does not
-    /// state: with `byte_at` as a concat ARGUMENT after a literal, the
-    /// literal has already been streamed when the abort fires — the client
-    /// sees `01` then a reset. That is the streaming lowering's documented
-    /// mid-walk divergence (docs/emitter-streaming-design.md), not a hole in
-    /// the bounds check: exit status is still 1 and the byte read never
-    /// happens. Asserted as measured so a change of policy (close the
-    /// connection, keep serving — the HTTP parse guards' precedent, and the
-    /// alternative recorded in the slice PR) shows up as a named failure.
+    /// The second fixture keeps the STREAMING caveat: with `byte_at` as a
+    /// concat ARGUMENT after a literal, the literal has already been
+    /// streamed when the abort fires — the client sees `01` then the close.
+    /// That is the streaming lowering's documented mid-walk divergence
+    /// (docs/emitter-streaming-design.md), not a hole in the bounds check:
+    /// the byte read never happens and the listener goes on serving.
     #[test]
-    fn rawtcp_byte_at_out_of_range_is_fail_closed() {
+    fn rawtcp_byte_at_out_of_range_closes_the_connection_and_the_listener_survives() {
         let probe = |body: &str, bound: u32| -> String {
             format!(
                 "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"frame\"\n  @source: tag_probe.intent:1\n  fields:\n    data : bytes [..{b}]\n\nrule probe3\n  @intention: \"index byte 3\"\n  @source: tag_probe.intent:2\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    resp = Frame {{ data: {body} }}\n  proofs:\n    purity:\n      reads : [req.data]\n      calls : []\n    termination:\n      bound : 9\n\nservice oob\n  @intention: \"probe byte 3\"\n  @source: tag_probe.intent:3\n  listen:\n    protocol    : raw_tcp\n    port        : __PORT__\n    max_request : {b}\n  handler: probe3\n",
                 b = bound, body = body
             )
         };
-        // Index in the CONDITION: nothing is streamed before the abort.
+        // Index in the CONDITION: nothing is streamed before the abort. The
+        // 1-byte frame sits BETWEEN two in-range frames.
         let src = probe(
             "if byte_at(req.data, 3) == 1 then concat(b\"\\x01\", le32(1)) else concat(b\"\\x00\", le32(0))",
             64,
         );
-        let run = raw_tcp_drive(&src, "oob", "oob_cond", &[b"\x00\x00\x00\x01", b"\x00\x00\x00\x02", b"\x01"]);
+        let run = raw_tcp_drive(&src, "oob", "oob_cond", &[b"\x00\x00\x00\x01", b"\x01", b"\x00\x00\x00\x02"]);
         assert_eq!(run.replies[0], vec![1, 1, 0, 0, 0], "in range, byte 3 == 1");
-        assert_eq!(run.replies[1], vec![0, 0, 0, 0, 0], "in range, byte 3 == 2");
-        assert!(run.replies[2].is_empty(), "index 3 of a 1-byte frame: no response byte");
-        assert_eq!(run.exit, Some(1), "byte_at's bound is fail-closed: sys_exit(1) of the server");
+        assert!(run.replies[1].is_empty(), "index 3 of a 1-byte frame: no response byte");
+        assert_eq!(run.replies[2], vec![0, 0, 0, 0, 0], "the NEXT connection is answered: the listener survived");
+        assert_eq!(run.exit, None, "a client-tripped bound must not exit the listener");
         assert!(run.stdout.is_empty());
 
         // Index as a concat ARGUMENT after a literal: the literal prefix is
         // already on the wire when the abort fires (streaming ABI).
         let src = probe("concat(b\"\\x01\", le32(byte_at(req.data, 3)))", 64);
-        let run = raw_tcp_drive(&src, "oob", "oob_arg", &[b"\x00\x00\x00\x07", b"\x01"]);
+        let run = raw_tcp_drive(&src, "oob", "oob_arg", &[b"\x00\x00\x00\x07", b"\x01", b"\x00\x00\x00\x09"]);
         assert_eq!(run.replies[0], vec![1, 7, 0, 0, 0]);
-        assert_eq!(run.replies[1], vec![1], "the streamed literal prefix reaches the client before the abort");
-        assert_eq!(run.exit, Some(1));
+        assert_eq!(run.replies[1], vec![1], "the streamed literal prefix reaches the client before the close");
+        assert_eq!(run.replies[2], vec![1, 9, 0, 0, 0], "listener alive after a mid-stream client abort");
+        assert_eq!(run.exit, None);
+    }
+
+    // ═══ Slice svc-client-abort-1 (2026-09-03): client aborts close the ═══
+    // ═══ connection; operator aborts still exit 1                       ═══
+
+    /// Count the 16-byte `mov rax,60 ; mov rdi,1 ; syscall` sequences in an
+    /// emitted binary. A service whose only fail-closed sites are CLIENT
+    /// class must carry ZERO of them after this slice (each was an inline
+    /// exit the primitive no longer emits); a service with an OPERATOR abort
+    /// (resource / log `abort`) must still carry exactly one — the shared
+    /// tail. Structural, so it is checkable without a network.
+    fn count_exit1_sequences(bytes: &[u8]) -> usize {
+        const EXIT1: [u8; 16] = [
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, // mov rax, 60
+            0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
+            0x0F, 0x05,                               // syscall
+        ];
+        bytes.windows(EXIT1.len()).filter(|w| *w == EXIT1).count()
+    }
+
+    struct ClientAbortRun {
+        /// Bytes each connection received, in request order.
+        replies: Vec<Vec<u8>>,
+        /// `None` while the listener was still running after the LAST request
+        /// (it is then killed); `Some(code)` if it had exited on its own.
+        exit: Option<i32>,
+        /// Open fds of the listener after the last request (Linux /proc), or
+        /// 0 if it was gone. A sequential service that serves N requests and
+        /// closes every fd it opened sits at 4: stdin/out/err + the socket.
+        fds_after: usize,
+        /// `count_exit1_sequences` over the emitted ELF.
+        exit1_sites: usize,
+    }
+
+    /// Drive an HTTP/1.0 service over real TCP with RAW request bytes — one
+    /// connection per request, `read_to_end` on each — and report what each
+    /// connection got plus whether the listener was still there afterwards.
+    /// `text_state_drive`'s shape with the request bytes made explicit, so a
+    /// TRIPPING request and a GOOD one can sit in the same run.
+    fn client_abort_drive(
+        src_template: &str,
+        service_name: &str,
+        tag: &str,
+        requests: &[&[u8]],
+    ) -> ClientAbortRun {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            l.local_addr().unwrap().port()
+        };
+        let src = src_template.replace("__PORT__", &port.to_string());
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "fixture '{}' must verify clean: {:?}", tag, errs);
+        let out = std::env::temp_dir().join(format!("verbosec_test_clientabort_{}", tag));
+        compile_service(&program, service_name, out.to_str().unwrap())
+            .expect("service should compile");
+        let exit1_sites = count_exit1_sequences(&std::fs::read(&out).expect("read elf"));
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut bound = false;
+        for _ in 0..100 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "service never bound on port {}", port);
+
+        let mut replies = Vec::new();
+        for req in requests {
+            let mut buf = Vec::new();
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                Ok(mut s) => {
+                    s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    // A dead listener may refuse the write: record nothing.
+                    if s.write_all(req).is_ok() {
+                        let _ = s.read_to_end(&mut buf);
+                    }
+                }
+                Err(_) => {}
+            }
+            replies.push(buf);
+        }
+
+        std::thread::sleep(Duration::from_millis(150));
+        let (exit, fds_after) = match child.try_wait().expect("try_wait") {
+            Some(status) => (status.code(), 0),
+            None => {
+                let fds = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+                    .map(|d| d.count())
+                    .unwrap_or(0);
+                let _ = child.kill();
+                (None, fds)
+            }
+        };
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&out);
+        ClientAbortRun { replies, exit, fds_after, exit1_sites }
+    }
+
+    /// One-rule HTTP/1.0 service whose body is `concat("b:", <expr>)` — the
+    /// three probes the defect was measured with — plus optional extra
+    /// listen lines (`concurrency : forked`), a `log:` block, and a top-level
+    /// preamble (a `connection` / `resource` declaration).
+    fn client_abort_http_src(body: &str, reads: &str, listen_extra: &str, log: &str, pre: &str) -> String {
+        format!(
+            "@verbose 0.1.0\n{pre}\nrule h\n  @intention: \"probe\"\n  @source: tag_probe.intent:1\n\n  input:\n    req : HttpRequest\n\n  output:\n    resp : HttpResponse\n\n  logic:\n    resp = HttpResponse {{ status: 200, body: {body} }}\n\n  proofs:\n    purity:\n      reads : {reads}\n      calls : []\n    termination:\n      bound : 12\n\n\nservice svc\n  @intention: \"probe service\"\n  @source: tag_probe.intent:2\n\n  listen:\n    protocol    : http_1_0\n    port        : __PORT__\n    max_request : 4096\n{listen_extra}{log}\n  handler: h\n",
+            pre = pre, body = body, reads = reads, listen_extra = listen_extra, log = log
+        )
+    }
+
+    const TRIP: &[u8] = b"GET /ab HTTP/1.0\r\n\r\n";
+    const GOOD_LONG: &[u8] = b"GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.0\r\n\r\n";
+    const GOOD_NUM: &[u8] = b"GET /42xyz HTTP/1.0\r\n\r\n";
+
+    fn http_body(reply: &[u8]) -> String {
+        let s = String::from_utf8_lossy(reply).to_string();
+        match s.find("\r\n\r\n") {
+            Some(i) => s[i + 4..].to_string(),
+            None => s,
+        }
+    }
+
+    /// THE DEFECT, per primitive, over real TCP. Measured on `5c2377d` with
+    /// exactly these three services and exactly `GET /ab HTTP/1.0`: each one
+    /// exited 1 on that single request and the next connection found no
+    /// listener (`rc=1`, 1028 / 1027 / 1172 B). After: the tripping
+    /// connection receives NO bytes, a good request on a NEW connection is
+    /// answered, the process is still running (1007 / 1006 / 1133 B — each
+    /// exactly the inline exits it no longer carries: 21 B per `byte_at` /
+    /// `substring` site, 18 per `parse_int`), and the ELF contains ZERO
+    /// `mov rax,60 ; mov rdi,1 ; syscall` sequences — there is no exit(1) in
+    /// the binary for a client to reach.
+    ///
+    /// The tripping request comes FIRST, so "answered after" is measured on
+    /// the process that survived it, not on a fresh one.
+    #[test]
+    fn service_client_abort_closes_connection_and_listener_survives() {
+        let cases: [(&str, &str, &[u8], &str); 3] = [
+            ("byte_at", "concat(\"b:\", byte_at(req.path, 50))", GOOD_LONG, "b:97"),
+            ("substring", "concat(\"b:\", substring(req.path, 0, 50))", GOOD_LONG,
+             "b:/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("parse_int", "concat(\"b:\", parse_int(substring(req.path, 1, 3)))", GOOD_NUM, "b:42"),
+        ];
+        for (tag, body, good, expected) in cases {
+            let src = client_abort_http_src(body, "[req.path]", "", "", "");
+            let run = client_abort_drive(&src, "svc", tag, &[TRIP, good]);
+            assert!(run.replies[0].is_empty(), "{}: the tripping connection must receive NO bytes; got {:?}", tag, run.replies[0]);
+            assert_eq!(run.exit, None, "{}: the listener must survive a client-tripped {} check", tag, tag);
+            assert_eq!(http_body(&run.replies[1]), expected, "{}: a good request on a NEW connection is answered", tag);
+            assert_eq!(run.exit1_sites, 0, "{}: no sys_exit(1) sequence may remain in a client-only service", tag);
+            assert_eq!(run.fds_after, 4, "{}: the tripping connection's fd was closed (stdin/out/err + socket)", tag);
+        }
+    }
+
+    /// `after:` block: a `set` source is request data too. The response is
+    /// already on the wire when the set's `substring` trips, so the client
+    /// gets its answer, the state stays unchanged for that request, and the
+    /// listener survives — the next request sees the previous GOOD value.
+    #[test]
+    fn service_client_abort_in_after_block_keeps_state_and_listener() {
+        let src = "@verbose 0.1.0\n\nrule h\n  @intention: \"probe\"\n  @source: tag_probe.intent:1\n\n  input:\n    req : HttpRequest\n\n  output:\n    resp : HttpResponse\n\n  logic:\n    resp = HttpResponse { status: 200, body: concat(\"prev:\", state.last) }\n\n  proofs:\n    purity:\n      reads : [state.last]\n      calls : []\n    termination:\n      bound : 12\n\n\nservice svc\n  @intention: \"probe service\"\n  @source: tag_probe.intent:2\n\n  listen:\n    protocol    : http_1_0\n    port        : __PORT__\n    max_request : 4096\n\n  state:\n    last : text [..256] = \"none\"\n\n  handler: h\n\n  after:\n    set last = substring(req.path, 0, 5)\n";
+        let run = client_abort_drive(src, "svc", "after_set",
+            &[b"GET /abcdef HTTP/1.0\r\n\r\n", TRIP, b"GET /zzzzzz HTTP/1.0\r\n\r\n"]);
+        assert_eq!(http_body(&run.replies[0]), "prev:none");
+        assert_eq!(http_body(&run.replies[1]), "prev:/abcd", "the response is written BEFORE the after block trips");
+        assert_eq!(http_body(&run.replies[2]), "prev:/abcd", "the tripped set left the state unchanged");
+        assert_eq!(run.exit, None, "listener survives a client-tripped after-block check");
+        // Exactly ONE exit(1) sequence remains, and it is not the substring's:
+        // the text-state `set` carries slice text-state-1's 13-byte overflow
+        // BACKSTOP (`cmp rdx, N ; ja abort`), unreachable by construction and
+        // operator class — it keeps the shared tail. The substring's two `ja`
+        // sites went to the close label; a leftover inline exit would make
+        // this 2.
+        assert_eq!(run.exit1_sites, 1, "only the text-state backstop's operator tail remains");
+    }
+
+    /// `concurrency: forked`: fork already isolated the parent, so the
+    /// listener survived on `5c2377d` too (measured, 1186 B). What changes is
+    /// the CHILD's exit — it takes its normal tail (`sys_exit(0)`) through
+    /// the close path instead of `sys_exit(1)`, and the binary no longer
+    /// carries an exit(1) at all (1165 B).
+    #[test]
+    fn service_client_abort_under_forked_takes_the_child_tail() {
+        let src = client_abort_http_src("concat(\"b:\", byte_at(req.path, 50))", "[req.path]",
+            "  concurrency : forked\n", "", "");
+        let run = client_abort_drive(&src, "svc", "forked", &[TRIP, GOOD_LONG, TRIP, GOOD_LONG]);
+        assert!(run.replies[0].is_empty());
+        assert_eq!(http_body(&run.replies[1]), "b:97");
+        assert!(run.replies[2].is_empty());
+        assert_eq!(http_body(&run.replies[3]), "b:97");
+        assert_eq!(run.exit, None);
+        assert_eq!(run.exit1_sites, 0, "forked: the child's abort is the close path + sys_exit(0), no exit(1) in the ELF");
+    }
+
+    /// The request bytes of a handler `fetch` are built from `req.*` (slice
+    /// 11.3), so `byte_at(req.path, 50)` inside them is client-abortable —
+    /// and it fires AFTER socket + connect, with the upstream fd live in
+    /// r15. Those sites take the r15 close stub, not the bare close path:
+    /// asserted by the fd count after the trip (4 = stdin/out/err + the
+    /// listening socket; a leaked upstream socket would make it 5). The
+    /// upstream is a real TcpListener on this side answering `UP:<path>`.
+    #[test]
+    fn service_client_abort_inside_fetch_request_closes_upstream_fd() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let up = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let uport = up.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in up.incoming() {
+                if let Ok(mut c) = c {
+                    let mut b = [0u8; 512];
+                    let n = c.read(&mut b).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&b[..n]).to_string();
+                    let path = req.split(' ').nth(1).unwrap_or("?").to_string();
+                    let _ = c.write_all(format!("UP:{}", path).as_bytes());
+                }
+            }
+        });
+        let pre = format!(
+            "\nconnection upstream\n  @intention: \"upstream\"\n  @source: tag_probe.intent:1\n  host: \"127.0.0.1\"\n  port: {}\n  max_response: 1024\n  on_connect_error: abort\n",
+            uport
+        );
+        let src = client_abort_http_src(
+            "fetch(upstream, concat(\"GET /\", byte_at(req.path, 50), \" HTTP/1.0\\r\\n\\r\\n\"))",
+            "[req.path, upstream]", "", "", &pre,
+        );
+        let run = client_abort_drive(&src, "svc", "fetch_byte_at", &[TRIP, GOOD_LONG]);
+        assert!(run.replies[0].is_empty(), "tripping request: no response");
+        assert_eq!(http_body(&run.replies[1]), "UP:/97", "the good request reached the upstream and came back");
+        assert_eq!(run.exit, None, "listener survives a client abort inside the fetch request bytes");
+        assert_eq!(run.fds_after, 4, "the upstream socket opened before the abort was CLOSED by the r15 stub");
+        // The connect/write/read failures of the same fetch stay operator
+        // class: the shared exit(1) tail is still there, exactly once.
+        assert_eq!(run.exit1_sites, 1);
+    }
+
+    /// The `log:` grammar admits `parse_int(req.path)` and the log fd is open
+    /// in r15 while the content evaluates, so a client-tripped parse_int
+    /// there must close r15 first — the same stub. `parse_int(req.path)`
+    /// trips on EVERY request (the path starts with `/`), which makes this
+    /// service useless and the measurement exact: no request is answered,
+    /// the listener survives all of them, the fd count stays at 4 (the log
+    /// fd was closed each time, not leaked), and the log file was created
+    /// but never written. On `5c2377d` the same service exited 1 on its
+    /// first request (1282 B; now 1281: −18 for the parse_int exit, +17 for
+    /// the stub).
+    #[test]
+    fn service_client_abort_inside_log_content_closes_log_fd() {
+        let log_path = std::env::temp_dir().join("verbosec_test_clientabort_log.txt");
+        let _ = std::fs::remove_file(&log_path);
+        let log = format!(
+            "\n  log:\n    append_file \"{}\" concat(\"n=\", parse_int(req.path), \"\\n\")\n",
+            log_path.display()
+        );
+        let src = client_abort_http_src("concat(\"b:\", req.path)", "[req.path]", "", &log, "");
+        let run = client_abort_drive(&src, "svc", "log_parse_int", &[TRIP, GOOD_LONG, GOOD_NUM]);
+        assert!(run.replies.iter().all(|r| r.is_empty()), "every request trips the log's parse_int: no response");
+        assert_eq!(run.exit, None, "listener survives three client-tripped log checks");
+        assert_eq!(run.fds_after, 4, "the log fd was closed by the r15 stub on every trip");
+        assert_eq!(std::fs::read(&log_path).expect("the log file was opened"), b"", "nothing was appended");
+        assert_eq!(run.exit1_sites, 0);
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// OVER-FIX GUARD: operator aborts are untouched. (1) A `resource` under
+    /// `on_read_error: abort` whose file is MISSING must still take the
+    /// whole listener down with status 1 on its first request — a deployment
+    /// condition, not client input. (2) A `log:` block with `on_error: abort`
+    /// on an unopenable path likewise. Both binaries still carry exactly one
+    /// exit(1) sequence — the shared operator tail.
+    #[test]
+    fn service_operator_aborts_still_exit_1() {
+        let missing = std::env::temp_dir().join("verbosec_test_clientabort_missing_resource.txt");
+        let _ = std::fs::remove_file(&missing);
+        let pre = format!(
+            "\nresource cfg\n  @intention: \"cfg\"\n  @source: tag_probe.intent:1\n  path: \"{}\"\n  max: 64\n  on_read_error: abort\n",
+            missing.display()
+        );
+        let src = client_abort_http_src("concat(\"c:\", read(cfg))", "[cfg]", "", "", &pre);
+        let run = client_abort_drive(&src, "svc", "resource_abort", &[GOOD_LONG, GOOD_LONG]);
+        assert!(run.replies[0].is_empty());
+        assert_eq!(run.exit, Some(1), "a missing resource under on_read_error: abort is an OPERATOR abort: the listener exits 1");
+        assert_eq!(run.exit1_sites, 1);
+
+        let log = "\n  log:\n    append_file \"/nonexistent_verbose_dir_9f3a/audit.log\" concat(\"x\", \"\\n\")\n    on_error: abort\n";
+        let src = client_abort_http_src("concat(\"b:\", req.path)", "[req.path]", "", log, "");
+        let run = client_abort_drive(&src, "svc", "log_abort", &[GOOD_LONG, GOOD_LONG]);
+        assert!(run.replies[0].is_empty());
+        assert_eq!(run.exit, Some(1), "an unopenable log under on_error: abort is an OPERATOR abort: the listener exits 1");
+        assert_eq!(run.exit1_sites, 1);
+    }
+
+    /// The scope cannot leak. A service emitter that returns early through
+    /// `?` after opening a `ClientAbortScope` drops it, and the drop must
+    /// restore the previous state — otherwise the NEXT compile on this
+    /// thread (every test runs on one thread) would route a RULE binary's
+    /// aborts to a label that does not exist. Provoked with a handler let
+    /// the service path refuses (a record-valued let, slice agg-svc-1's
+    /// breadcrumb), then a plain rule is compiled and must still carry its
+    /// inline exit(1) — and, driven, must still exit 1 on an out-of-range
+    /// index.
+    #[test]
+    fn client_abort_scope_is_restored_after_a_refused_service() {
+        // The RULE binary, compiled BEFORE any service on this thread: the
+        // reference bytes a leaked scope would move.
+        let rule = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: tag_probe.intent:1\n  fields:\n    s : text [..64]\n\nrule pick\n  @intention: \"pick\"\n  @source: tag_probe.intent:1\n  input:\n    t : T\n  output:\n    out : number\n  logic:\n    out = byte_at(t.s, 5)\n  proofs:\n    purity:\n      reads : [t.s]\n      calls : []\n    termination:\n      bound : 3\n";
+        let compile_rule = |tag: &str| -> (std::path::PathBuf, Vec<u8>) {
+            let tokens = crate::lexer::Lexer::new(rule).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            let out = std::env::temp_dir().join(format!("verbosec_test_clientabort_rule_{}", tag));
+            compile_native(&program, "pick", out.to_str().unwrap(), false, false).expect("rule compiles");
+            let bytes = std::fs::read(&out).unwrap();
+            (out, bytes)
+        };
+        let (out_before, before) = compile_rule("before");
+        let _ = std::fs::remove_file(&out_before);
+
+        let refused ="@verbose 0.1.0\n\nconcept In\n  @intention: \"in\"\n  @source: tag_probe.intent:1\n  fields:\n    a : number\n\nconcept Out\n  @intention: \"out\"\n  @source: tag_probe.intent:1\n  fields:\n    x : number\n\nrule mk\n  @intention: \"mk\"\n  @source: tag_probe.intent:1\n  input:\n    i : In\n  output:\n    o : Out\n  logic:\n    o = Out { x: i.a }\n  proofs:\n    purity:\n      reads : [i.a]\n      calls : []\n    termination:\n      bound : 3\n\nrule h\n  @intention: \"probe\"\n  @source: tag_probe.intent:1\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    let q = mk(In { a: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"b:\", byte_at(req.path, 50)) }\n  proofs:\n    purity:\n      reads : [req.path]\n      calls : [mk]\n    termination:\n      bound : 12\n\nservice svc\n  @intention: \"svc\"\n  @source: tag_probe.intent:2\n  listen:\n    protocol    : http_1_0\n    port        : 18999\n    max_request : 4096\n  handler: h\n";
+        let tokens = crate::lexer::Lexer::new(refused).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_clientabort_refused_svc");
+        let err = compile_service(&program, "svc", out.to_str().unwrap())
+            .expect_err("a record-valued handler let is refused on the service path");
+        assert!(err.message.contains("record-valued `let`"), "{}", err.message);
+        assert!(
+            CLIENT_ABORT_SITES.with(|s| s.borrow().is_none()),
+            "the ClientAbortScope opened before the refusal must have been dropped and restored"
+        );
+
+        // The SAME rule binary AFTER the refusal: byte-identical to the one
+        // compiled before it, still carrying byte_at's inline exit(1) (the
+        // count is > 0 rather than == 1 because a bounded text field adds
+        // its own field-load abort tail), and still exiting 1 on an
+        // out-of-range index when run.
+        let (out_after, after) = compile_rule("after");
+        assert_eq!(before, after, "a refused service must not change how the next RULE binary compiles");
+        assert!(count_exit1_sequences(&after) >= 1, "a rule binary keeps byte_at's inline sys_exit(1)");
+        let r = std::process::Command::new(&out_after).arg("ab").output().expect("run");
+        assert_eq!(r.status.code(), Some(1), "out-of-range index in a RULE binary still exits 1");
+        assert!(r.stdout.is_empty());
+        let r = std::process::Command::new(&out_after).arg("abcdefgh").output().expect("run");
+        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "102");
+        let _ = std::fs::remove_file(&out_after);
     }
 
     /// Design §4.6-4: the identity-shaped service keeps `emit_raw_tcp_echo_bytes`
