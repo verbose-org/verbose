@@ -19,10 +19,14 @@
 -- `byte_at(req.data, 0)` and `length(req.data)` read the field through the
 -- same (ptr, len) pair a `read(<resource>)` uses: the pointer is the read
 -- buffer, the length is the `read` syscall's return value stored in a slot
--- the emitter owns. byte_at's fail-closed bound (index >= length →
--- sys_exit(1)) therefore runs against a RUNTIME length here for the first
--- time. `le32` turns a Number into bytes; the bytes `concat` streams each
--- piece to the client fd in order — no buffer, no sizing pass.
+-- the emitter owns. byte_at's fail-closed bound (index >= length) therefore
+-- runs against a RUNTIME length here for the first time — and inside a
+-- service it CLOSES THE CONNECTION without a response instead of
+-- sys_exit(1)ing the listener (slice svc-client-abort-1, 2026-09-03: a
+-- client that sends fewer bytes than the handler indexes must not be a
+-- remote kill switch; a rule binary keeps the exit). `le32` turns a Number
+-- into bytes; the bytes `concat` streams each piece to the client fd in
+-- order — no buffer, no sizing pass.
 
 
 concept Frame
