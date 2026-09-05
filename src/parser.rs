@@ -2029,15 +2029,18 @@ impl Parser {
                         // §5.5 (was text-state-1's #11, whose reason — "a
                         // service has no bytes-valued position" — stopped
                         // being true when a raw_tcp response became one).
-                        // Two prerequisites, both named, neither built.
+                        // Two prerequisites: the typing one shipped (slice
+                        // state-read-typing, §6.2), the materialisation
+                        // one (W2) has not.
                         Type::Bytes => {
                             return Err(self.error(&format!(
-                                "state field '{}': bytes state is deferred. It needs (a) a bytes source \
-                                 that can be COPIED — every bytes value today is streamed, not \
-                                 materialised (emit_streaming_bytes_body, native.rs) — and (b) the state \
-                                 read path threaded into infer_expr_type, without which \
-                                 concat(\"k=\", state.{}) over a bytes field passes the verifier and is \
-                                 emitted as text. Slice multistep-2, gated on slice state-read-typing",
+                                "state field '{}': bytes state is deferred. It needs a bytes source that \
+                                 can be COPIED — every bytes value today is streamed, not materialised \
+                                 (emit_streaming_bytes_body, native.rs). Slice multistep-2, gated on that \
+                                 alone: its other prerequisite, the state read path threaded into \
+                                 infer_expr_type, is slice state-read-typing and has shipped, so \
+                                 concat(\"k=\", state.{}) over a bytes field would now be refused at \
+                                 verify time (the text concat's bytes refusal) rather than emitted as text",
                                 fname, fname
                             )));
                         }

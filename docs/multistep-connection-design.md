@@ -659,7 +659,7 @@ mandatory on a multi-step service, so the declared per-connection ceiling is
 | **4** | `max_steps` on an `http_1_0` service | `service 'S': max_steps applies to raw_tcp multi-step services; http_1_0 is one request per connection. HTTP/1.1 keep-alive is a later slice.` |
 | **5** | `after: set f = concat(state.f, …)` (append) | `after: set 'f': append-accumulation into a state buffer has no compile-time worst case; it needs a declared overflow policy — slice text-state-2.` (inherited verbatim from `docs/text-state-fields-design.md` §6.2 #6) |
 | **6** | an `after:` source with no compile-time bound | inherited from `text_source_worst_case` (`src/verifier.rs:1666`); the message gains `req.<field>` to its accepted-source list. |
-| **7** | a `bytes`-typed state field | `state field 'f': bytes state is deferred. It needs (a) a bytes source that can be COPIED — every bytes value today is streamed, not materialised (native.rs:7627) — and (b) the state read path threaded into infer_expr_type, without which concat("k=", state.f) over a bytes field passes the verifier and is emitted as text. Slice multistep-2, gated on slice state-read-typing.` (§6.4) |
+| **7** | a `bytes`-typed state field | `state field 'f': bytes state is deferred. It needs a bytes source that can be COPIED — every bytes value today is streamed, not materialised (emit_streaming_bytes_body, native.rs). Slice multistep-2, gated on that alone: its other prerequisite, the state read path threaded into infer_expr_type, is slice state-read-typing and has shipped, so concat("k=", state.f) over a bytes field would now be refused at verify time (the text concat's bytes refusal) rather than emitted as text` (§6.4; reworded 2026-09-05 when the typing prerequisite shipped — §6.2) |
 | **8** | `state.<f>` in `starts_with` / `substring` / `json_escape` / `parse_int` / text `==` | inherited unchanged — `docs/text-state-fields-design.md` §6.2 #8/#9. Worth restating: `emit_starts_with_load_text` (`src/native.rs:17852-18118`) has **no** `state` arm (measured: zero `"state"` occurrences in that range), while `emit_length` does (`:17480`). So `length(state.f)` works and `byte_at(state.f, i)` does not, because `byte_at` loads through the former. |
 | **9** | a declared framing block | `service 'S': declared framing is slice multistep-3; slice 1 is one frame per read.` |
 | **10** | `random(k)` in a multi-step handler | unchanged — `src/native.rs:20481`, naming `entropy-2`. And see §7 item 4: even once `entropy-2` lands, the **sampling unit** for a step loop is undesigned. |
@@ -875,6 +875,28 @@ Note what this also means for slice 1 as shipped: text and Number state on `raw_
 *because* the emitter refuses what the verifier misses, which is a fail-closed accident, not a
 design. It is fine to ship on, and it is not fine to build bytes on.
 
+**SATISFIED 2026-09-05 (slice `state-read-typing`).** `verify_program` builds one `StateScope`
+per service — the same `service_state_concept` the `after:` check binds — and hands it to
+`verify_rule` for the rule the service names as `handler:`; the handler's type check runs once as
+before and once more with `state` bound, and what the binding ADDS is reported attributed to the
+service, the handler and the field's declared type. A handler two services name is checked against
+each service's declaration (per service, as `compile_service` is). `state.<f>` outside a handler,
+or in the handler of a stateless service, is refused as unresolved. Zero emitted bytes (1390/1390
+targets identical, control empty). The "fail-closed accident" paragraph above is therefore history
+for text and Number state: the verifier now refuses what the emitter refused, first. Two things the
+measurement surfaced are recorded in `CLAUDE.md`'s security bullets: the one state cell the emitter
+EMITTED (`if state.<number> then …`, a number as a truth value — a silent wrong answer, not a
+disclosure), and the input-field twin `concat("p:", req.path * 2)`, which verified clean and served
+2 × the read-buffer address over TCP — closed by the same slice (concat arguments are now recursed
+into, scalar `let` names carry their type).
+
+**What bytes state is gated on now: W2 alone.** With the typing prerequisite gone, refusal #7 keeps
+exactly one reason — a bytes source that can be COPIED into the state buffer, and every bytes value
+today is streamed, never materialised (§3 W2). The parser's refusal message says so. Were a bytes
+state field declarable today, `concat("k=", state.key)` would be refused at verify time by the text
+concat's existing bytes refusal, not emitted as text: the isolation argument in §6.5 no longer rests
+on an accident. Not implemented here — `multistep-2` is the slice.
+
 ### 6.3 The TLS sketch, rewritten so every line is annotated
 
 Revision 1's sketch violated four shipped rules: two-argument rule calls (arity is exactly 1,
@@ -1047,8 +1069,8 @@ slice" — noted, not done, because this note does not edit that file.
 | slice | lifts | why separate |
 |---|---|---|
 | **`rawtcp-inspect-0b`** | a bytes `substring`; a bytes-typed handler `let` | produces a bytes VALUE, whose sinks are streamed with no sizing pass (§4.2) |
-| **`state-read-typing`** | `state.<f>` visible to `infer_expr_type` (thread the synthetic concept into `verify_rule`) | a prerequisite of bytes state, and a different plumbing point from `verify_service` (§6.2) |
-| **`multistep-2`** | `bytes [..N]` state fields | gated on both `state-read-typing` and a materialisable bytes value (§6.4, refusal #7) |
+| **`state-read-typing`** | **SHIPPED 2026-09-05** — `state.<f>` visible to `infer_expr_type` (the synthetic concept threaded into `verify_rule`), plus concat-argument recursion and scalar-`let` typing | was a prerequisite of bytes state, and a different plumbing point from `verify_service` (§6.2) |
+| **`multistep-2`** | `bytes [..N]` state fields | gated on a materialisable bytes value ONLY (W2 — §6.4, refusal #7); the typing prerequisite shipped |
 | **`multistep-3`** | declared framing + emitter-owned reassembly | a length-field parser and a partial-frame accumulator (§6.4) |
 | **`text-state-2`** | `set f = concat(state.f, …)` with `on_overflow:` | inherited unchanged; the transcript buffer needs it |
 | **write-stall policy** | `SO_SNDTIMEO`, or a partial-write semantics for a streamed response | §5.4's named residual; "what does a partial write mean when the bytes are gone" is a semantic question |

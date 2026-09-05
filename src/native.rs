@@ -36025,8 +36025,17 @@ rule check
             assert!(err.contains("output: bytes concat") && err.contains("entropy-2"), "row 12: {}", err);
         }
         // the number / value-position arm: a bytes-typed `let`
+        //
+        // The body consumes a SECOND draw rather than `s`. Since slice
+        // `state-read-typing` a scalar `let` carries its RHS's type, so
+        // `length(s)` on a bytes-typed let is refused by the VERIFIER's
+        // byte-addressable gate ("a bytes identifier has no length the
+        // emitter can load") before the emitter's entropy-4 arm is ever
+        // reached — the right order, and not the arm this probe pins. The
+        // let itself is still evaluated eagerly by the prologue, which is
+        // exactly where entropy-4's refusal fires.
         {
-            let src = entropy_probe(&block, "t.n, k", "t.n + length(s)")
+            let src = entropy_probe(&block, "t.n, k", "t.n + length(random(k))")
                 .replace("  logic:\n    o = ", "  logic:\n    let s = random(k)\n    o = ");
             verify_clean(&src);
             let err = entropy_native(&src, "f", "t7_let", false).unwrap_err();
@@ -43761,8 +43770,9 @@ service shadow
             .replace("  handler: handle", "  concurrency: forked\n  handler: handle");
         let e = verify_source_for_test(&http_forked).join("\n");
         assert!(e.contains("write-only") && e.contains("max_steps + read_timeout"), "re-keyed #194: {}", e);
-        // #7 — a bytes state field, refused at PARSE time with the design's
-        // two prerequisites named.
+        // #7 — a bytes state field, refused at PARSE time naming the one
+        // prerequisite still open (W2) and the one that shipped
+        // (state-read-typing).
         let bytes_state = good.replace("seq : number = 0", "key : bytes [..16] = b\"\"");
         let tokens = crate::lexer::Lexer::new(&bytes_state.replace("__PORT__", "18999")).tokenize().expect("tokenize");
         let err = crate::parser::Parser::new(tokens).parse_program().err().expect("bytes state must be a parse error");
@@ -45085,6 +45095,272 @@ service memo
             errs.is_empty(),
             "examples/last_path_service.verbose must still verify; got {errs:#?}",
         );
+    }
+
+    /// Slice `state-read-typing`: `state.<f>` in a service HANDLER now has
+    /// its declared type at verify time — and, measured while closing it, so
+    /// does every scalar `let`, and every argument INSIDE a `concat`.
+    ///
+    /// The last of those is a REMOTELY reachable ASLR disclosure on
+    /// `6eaa6be`, found by the input-field twin of a state cell. PR #182's
+    /// operand check recursed into `+ - * / %` operands; `concat`'s text arm
+    /// INFERRED each argument's outer type and stopped. So in
+    /// `concat("p:", req.path * 2)` the `*` typed as number (fine for
+    /// concat), nobody looked inside it, the handler verified clean, and
+    /// `compile_service` emitted a 949-byte listener answering every request
+    /// with 2 × the address of its HTTP read buffer — measured
+    /// `p:281471329983000` = 2 × 0x7fff9351ad0c, the same disclosure PR #182
+    /// closed on stdout, now served over TCP.
+    ///
+    /// Four parts, each asking the EMITTER directly so the refusals are
+    /// proved load-bearing rather than decorative:
+    ///   1. the disclosure, CLI and HTTP — verifier refuses, emitter
+    ///      (bypassing `verify_program`) still leaks;
+    ///   2. the state cells the emitter refuses — verifier refuses FIRST,
+    ///      emitter still refuses: first gate, not the only one;
+    ///   3. the state cell the emitter EMITS — `if state.count then …`, a
+    ///      number as a truth value, measured 404 / 200 / 200 on
+    ///      `6eaa6be`: the verifier is the ONLY gate;
+    ///   4. the corrected twins — the three stateful examples still verify
+    ///      and the counter still counts.
+    #[test]
+    fn state_and_input_reads_are_typed_before_the_emitter_can_leak() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let parse = |src: &str| {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+            crate::parser::Parser::new(tokens).parse_program().expect("parse")
+        };
+        let verify = |src: &str| {
+            crate::verifier::verify_program(&parse(src), std::path::Path::new("examples"))
+        };
+
+        // ── 1a. THE DISCLOSURE, CLI: a text field in arithmetic INSIDE concat
+        let cli_src = |body: &str, reads: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    n : number [0, 1000]
+    s : text [..32]
+
+rule probe
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    out : text
+  logic:
+    out = {body}
+  proofs:
+    purity:
+      reads   : [{reads}]
+      calls   : []
+    termination:
+      bound : 6
+"#
+            )
+        };
+        let leak = cli_src("concat(\"n:\", t.s * 2)", "t.s");
+        let errs = verify(&leak);
+        assert!(
+            errs.iter().any(|e| e.context == "rule 'probe' / logic"
+                && e.message.contains("has type 'text' but context expects 'number'")),
+            "`concat(\"n:\", t.s * 2)` must be refused at verify time; got {errs:#?}",
+        );
+        let out = std::env::temp_dir().join("verbosec_test_concat_aslr_cli");
+        compile_native(&parse(&leak), "probe", out.to_str().unwrap(), false, false)
+            .expect("the emitter accepts this shape; only the verifier refuses it");
+        let printed = String::from_utf8_lossy(
+            &Command::new(&out).args(["5", "ab"]).output().expect("spawn").stdout,
+        )
+        .trim_end_matches('\n')
+        .to_string();
+        let value: i64 = printed
+            .strip_prefix("n:")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("expected `n:<number>`, got {printed:?}"));
+        assert!(
+            value >= (1i64 << 40),
+            "the emitter must still print 2 × an argv pointer here, or part 1 proves \
+             nothing: got {value}",
+        );
+        let _ = std::fs::remove_file(&out);
+        let twin = cli_src("concat(\"n:\", t.n * 2)", "t.n");
+        assert!(verify(&twin).is_empty(), "the number twin must still verify");
+        let out = std::env::temp_dir().join("verbosec_test_concat_aslr_cli_twin");
+        compile_native(&parse(&twin), "probe", out.to_str().unwrap(), false, false).expect("twin compiles");
+        let printed = String::from_utf8_lossy(
+            &Command::new(&out).args(["5", "ab"]).output().expect("spawn").stdout,
+        )
+        .trim_end_matches('\n')
+        .to_string();
+        assert_eq!(printed, "n:10");
+        let _ = std::fs::remove_file(&out);
+
+        // ── 1b. THE DISCLOSURE, HTTP: served to a remote client ──────
+        let svc_src = |body: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+rule echo
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse {{ status: 200, body: {body} }}
+  proofs:
+    purity:
+      reads : [req.path]
+      calls : []
+    termination:
+      bound : 6
+
+service memo
+  @intention: "x"
+  @source: invoices.intent:1
+  listen:
+    protocol    : http_1_0
+    port        : __PORT__
+    max_request : 4096
+  handler: echo
+"#
+            )
+        };
+        let leak = svc_src("concat(\"p:\", req.path * 2)");
+        let errs = verify(&leak.replace("__PORT__", "18999"));
+        assert!(
+            errs.iter().any(|e| e.context == "rule 'echo' / logic"
+                && e.message.contains("has type 'text' but context expects 'number'")),
+            "`concat(\"p:\", req.path * 2)` in a handler must be refused at verify time; got {errs:#?}",
+        );
+        let bodies = text_state_drive(&leak, "memo", "concat_aslr_http", &["/a", "/b"]);
+        for b in &bodies {
+            let v: i64 = b
+                .strip_prefix("p:")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("expected `p:<number>` from the listener, got {b:?}"));
+            assert!(
+                v >= (1i64 << 40),
+                "the listener must still serve 2 × its read-buffer address, or the \
+                 refusal above is decoration: got {v} in {bodies:?}",
+            );
+        }
+        let twin = svc_src("concat(\"p:\", req.path)");
+        assert!(verify(&twin.replace("__PORT__", "18999")).is_empty(), "the twin must verify");
+        let bodies = text_state_drive(&twin, "memo", "concat_http_twin", &["/a", "/b"]);
+        assert_eq!(bodies, vec!["p:/a".to_string(), "p:/b".to_string()]);
+
+        // ── 2. STATE CELLS THE EMITTER REFUSES: verifier is the FIRST gate
+        let last_path = std::fs::read_to_string("examples/last_path_service.verbose")
+            .expect("examples/last_path_service.verbose");
+        let counter = std::fs::read_to_string("examples/counter_service.verbose")
+            .expect("examples/counter_service.verbose");
+        let l_body = "resp = HttpResponse { status: 200, body: concat(\"prev:\", state.last) }";
+        let c_body = "resp = HttpResponse { status: 200, body: concat(\"count:\", state.count) }";
+        assert!(last_path.contains(l_body) && counter.contains(c_body), "fixture lines moved");
+        let cells: [(&String, &str, &str, &str, &str, &str, &str); 3] = [
+            (&last_path, l_body, "resp = HttpResponse { status: 200, body: concat(\"prev:\", state.last * 2) }",
+             "memo", "recall", "state.last is declared 'text [..256]' by service 'memo'", "unknown field 'last'"),
+            (&last_path, l_body, "resp = HttpResponse { status: state.last, body: \"x\" }",
+             "memo", "recall", "state.last is declared 'text [..256]' by service 'memo'", "unknown field 'last'"),
+            (&counter, c_body, "resp = HttpResponse { status: 200, body: concat(\"count:\", length(state.count)) }",
+             "counter", "handle", "state.count is declared 'number' by service 'counter'", "length:"),
+        ];
+        for (base, from, to, service, handler, note, emitter_needle) in cells {
+            let src = base.replace(from, to).replace("bound : 3", "bound : 8");
+            let errs = verify(&src);
+            let ctx = format!("service '{service}' / handler '{handler}' / logic");
+            assert!(
+                errs.iter().any(|e| e.context == ctx && e.message.contains(note)),
+                "`{to}` must be refused at verify time naming the service, handler, \
+                 field and declared type; got {errs:#?}",
+            );
+            let out = std::env::temp_dir().join(format!("verbosec_test_srt_{handler}_{}", errs.len()));
+            let err = compile_service(&parse(&src), service, out.to_str().unwrap())
+                .expect_err("the emitter still refuses this cell — the verifier is the first gate, not the only one");
+            assert!(
+                err.message.contains(emitter_needle),
+                "the emitter's own refusal for `{to}` is expected to say `{emitter_needle}`; got {}",
+                err.message
+            );
+            let _ = std::fs::remove_file(&out);
+        }
+
+        // ── 3. THE STATE CELL THE EMITTER EMITS: verifier is the ONLY gate
+        let as_bool = counter
+            .replace(c_body, "resp = HttpResponse { status: if state.count then 200 else 404, body: \"x\" }")
+            .replace("bound : 3", "bound : 8")
+            .replace("18950", "__PORT__");
+        let errs = verify(&as_bool.replace("__PORT__", "18999"));
+        assert!(
+            errs.iter().any(|e| e.context == "service 'counter' / handler 'handle' / logic"
+                && e.message.contains("has type 'number' but context expects 'bool'")
+                && e.message.contains("state.count is declared 'number' by service 'counter'")),
+            "`if state.count then …` must be refused at verify time; got {errs:#?}",
+        );
+        // Drive the binary `compile_service` still builds: the `if` tests
+        // rax for nonzero, so the number is a truth value — 0 → 404, then
+        // 200 for every later request. Plausible output at rc 0 and no
+        // diagnostic anywhere: the silent-wrong-answer class.
+        let port: u16 = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            l.local_addr().unwrap().port()
+        };
+        let src = as_bool.replace("__PORT__", &port.to_string());
+        let out = std::env::temp_dir().join("verbosec_test_srt_if_number");
+        compile_service(&parse(&src), "counter", out.to_str().unwrap())
+            .expect("the emitter accepts a number as an `if` condition; only the verifier refuses it");
+        let mut child = Command::new(&out).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut bound = false;
+        for _ in 0..100 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "service never bound on port {port}");
+        let mut statuses = Vec::new();
+        for path in ["/a", "/b", "/c"] {
+            let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes()).expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let response = String::from_utf8_lossy(&buf).to_string();
+            let status = response.split("\r\n").next().unwrap_or("").split(' ').nth(1).unwrap_or("").to_string();
+            statuses.push(status);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(
+            statuses,
+            vec!["404".to_string(), "200".to_string(), "200".to_string()],
+            "the emitter must still build this binary and treat the counter as a truth \
+             value, or part 3 proves nothing about the verifier being the only gate",
+        );
+
+        // ── 4. THE CORRECTED TWINS ───────────────────────────────────
+        for f in ["examples/counter_service.verbose", "examples/last_path_service.verbose", "examples/step_counter.verbose"] {
+            let src = std::fs::read_to_string(f).expect(f);
+            let errs = verify(&src);
+            assert!(errs.is_empty(), "{f} must still verify — an over-strict check would reject a valid program; got {errs:#?}");
+        }
+        let bodies = text_state_drive(&counter.replace("18950", "__PORT__"), "counter", "srt_twin", &["/a", "/b", "/c"]);
+        assert_eq!(bodies, vec!["count:0".to_string(), "count:1".to_string(), "count:2".to_string()]);
     }
 
     /// `HttpRequest.body`'s declared `[..N]` bound TRACKS the service's

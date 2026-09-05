@@ -119,6 +119,30 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
         })
         .collect();
 
+    // Slice `state-read-typing`: the `state:` scope each service hands its
+    // handler, built once per service here — from the item list, so in
+    // declaration order — and threaded into `verify_rule` for the rule the
+    // service names. A rule no service names gets an empty slice, and every
+    // `state.<f>` in it is refused as unresolved: a plain rule has no state.
+    // A rule two services name gets both scopes, and is checked once against
+    // each — `state.<f>` means what the service being compiled declares,
+    // which is `compile_service`'s notion too (it is per service).
+    let state_scopes: Vec<StateScope> = program
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Service(s) => Some(StateScope { service: s, concept: service_state_concept(s) }),
+            _ => None,
+        })
+        .collect();
+    let mut handler_scopes: HashMap<&str, Vec<&StateScope>> = HashMap::new();
+    for scope in &state_scopes {
+        handler_scopes
+            .entry(scope.service.handler.as_str())
+            .or_default()
+            .push(scope);
+    }
+
     // A rule may not be named after a built-in expression primitive.
     //
     // `parse_primary` special-cases every name in `PRIMITIVE_CALL_NAMES` when
@@ -325,7 +349,11 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                 // types — type-checking against `Type::Named(C)` where
                 // C is in a group works through the program-wide
                 // namespace already shared by B.1.
-                verify_rule(r, &concepts, &all_rules, &all_resources, &all_connections, &all_entropies, &group_concept_owner, base_dir, &mut errors);
+                let scopes: &[&StateScope] = handler_scopes
+                    .get(r.name.as_str())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                verify_rule(r, &concepts, &all_rules, &all_resources, &all_connections, &all_entropies, &group_concept_owner, scopes, base_dir, &mut errors);
                 // Phase 9 slice 1: every read(name) in the rule's logic
                 // must resolve to a declared resource. This is a separate
                 // pass to keep check_expr_against's signature stable; the
@@ -458,7 +486,7 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                             // the rule's `logic:` block, so the trigger rule's
                             // `let` bindings are not in scope for it. Only the
                             // input concept is, and that is passed above.
-                            let no_bindings: HashMap<String, &Concept> = HashMap::new();
+                            let no_bindings = Bindings::default();
                             check_expr_against(
                                 content,
                                 &Type::Text,
@@ -1559,23 +1587,12 @@ fn verify_service(
     let state_type_errors: HashSet<&str> = if s.state_fields.is_empty() {
         HashSet::new()
     } else {
-        let state_concept = Concept {
-            name: "<service state>".to_string(),
-            intention: String::new(),
-            source: SourceRef { file: "<builtin>".to_string(), line: 0 },
-            fields: s
-                .state_fields
-                .iter()
-                .map(|sf| Field {
-                    name: sf.name.clone(),
-                    ty: sf.ty.clone(),
-                    range: sf.max_bytes.map(|n| (0, n)),
-                })
-                .collect(),
-            variants: vec![],
-        };
-        let mut set_bindings: HashMap<String, &Concept> = HashMap::new();
-        set_bindings.insert("state".to_string(), &state_concept);
+        // The SAME synthetic concept `verify_rule` binds under `state` for
+        // the handler's reads (slice `state-read-typing`) — one construction,
+        // one meaning of `state.<f>`. See `service_state_concept`.
+        let state_concept = service_state_concept(s);
+        let mut set_bindings = Bindings::default();
+        set_bindings.records.insert("state".to_string(), &state_concept);
         let handler_input_concept = match &handler.input_ty {
             Type::Named(n) => concepts.get(n).copied(),
             _ => None,
@@ -1726,26 +1743,153 @@ fn verify_service(
         check_state_text_read_positions(s, handler, errors);
     }
 
-    // Cross-check: handler's `reads:` paths of the form `state.X` must
-    // reference actual state fields declared in this service.
-    if !s.state_fields.is_empty() {
-        let handler_facts = collect_logic_facts(&handler.logic);
-        for path in &handler_facts.reads {
-            if path.len() == 2 && path[0] == "state" {
-                let field_name = &path[1];
-                if !s.state_fields.iter().any(|sf| &sf.name == field_name) {
-                    errors.push(VerifyError {
-                        context: format!("service '{}' / handler '{}' / reads", s.name, s.handler),
-                        message: format!(
-                            "handler reads state.{} but service declares no state field '{}'; declared: [{}]",
-                            field_name,
-                            field_name,
-                            s.state_fields.iter().map(|sf| sf.name.as_str()).collect::<Vec<_>>().join(", ")
-                        ),
-                    });
-                }
-            }
+    // The handler's `state.<f>` reads — field existence AND type — are
+    // checked by `verify_rule`, which `verify_program` hands this service's
+    // `StateScope` (slice `state-read-typing`). The cross-check that used to
+    // live here ("handler reads state.X but service declares no state field")
+    // is now `check_state_read_path`, reached for EVERY handler — including
+    // one whose service declares no `state:` block at all, which this site
+    // skipped.
+}
+
+/// The `state:` scope a service hands its handler.
+///
+/// Built once per service in `verify_program` and threaded into `verify_rule`
+/// for the rule the service names as `handler:`. `concept` is the synthetic
+/// record `service_state_concept` builds; `service` is kept so a diagnostic
+/// can name it and list its declared fields.
+struct StateScope<'a> {
+    service: &'a Service,
+    concept: Concept,
+}
+
+/// The synthetic record concept a service's `state:` block declares: one
+/// field per state field, carrying its declared type and, for text, its
+/// `[..N]` bound as the field range.
+///
+/// ONE construction, consumed by BOTH the `after:` block's type check
+/// (`verify_service`, bound under the name `state` in `set_bindings`) and
+/// the handler's type check (`verify_rule`, bound under the same name in its
+/// `bindings` — slice `state-read-typing`). That is the point, not a
+/// convenience: PR #197's hole existed because the `after:` RHS was the one
+/// expression position with no notion of what `state.<f>` means, and the
+/// handler's READ side was the residual it named. Both sides now resolve
+/// `state.<f>` through `infer_expr_type`'s ordinary `Field(Ident(b), f)`
+/// lookup in the bindings map, so no arm anywhere knows `state` is special
+/// and there is no second place for the two to disagree.
+fn service_state_concept(s: &Service) -> Concept {
+    Concept {
+        name: format!("<state of service '{}'>", s.name),
+        intention: String::new(),
+        source: SourceRef { file: "<builtin>".to_string(), line: 0 },
+        fields: s
+            .state_fields
+            .iter()
+            .map(|sf| Field {
+                name: sf.name.clone(),
+                ty: sf.ty.clone(),
+                range: sf.max_bytes.map(|n| (0, n)),
+            })
+            .collect(),
+        variants: vec![],
+    }
+}
+
+/// A `state...` read path in a rule's logic, checked against the state
+/// scope(s) of the service(s) that name the rule as their handler.
+///
+/// Three refusals, each naming what it can: a rule that is NOT a handler
+/// (there is no state to read — the emitter's `unknown field` refusal, moved
+/// to verify time); a path that is not exactly `state.<field>`; and a field
+/// the service does not declare — whether its `state:` block lacks it or
+/// the service has no `state:` block at all (the latter verified clean
+/// before this slice and was refused by the emitter alone).
+fn check_state_read_path(
+    path: &[String],
+    rule: &Rule,
+    state_scopes: &[&StateScope],
+    errors: &mut Vec<VerifyError>,
+) {
+    let joined = path.join(".");
+    if state_scopes.is_empty() {
+        errors.push(VerifyError {
+            context: format!("rule '{}' / logic", rule.name),
+            message: format!(
+                "unknown binding 'state' in path '{}': `state` is the mutable-state scope a \
+                 service hands its handler, and rule '{}' is not the handler of any service",
+                joined, rule.name
+            ),
+        });
+        return;
+    }
+    if path.len() != 2 {
+        for scope in state_scopes {
+            errors.push(VerifyError {
+                context: format!("service '{}' / handler '{}' / reads", scope.service.name, rule.name),
+                message: format!("state is read as exactly `state.<field>`; got '{}'", joined),
+            });
         }
+        return;
+    }
+    let field_name = &path[1];
+    for scope in state_scopes {
+        let s = scope.service;
+        if s.state_fields.iter().any(|sf| &sf.name == field_name) {
+            continue;
+        }
+        let message = if s.state_fields.is_empty() {
+            format!(
+                "handler reads state.{} but service '{}' declares no state: block",
+                field_name, s.name
+            )
+        } else {
+            format!(
+                "handler reads state.{} but service declares no state field '{}'; declared: [{}]",
+                field_name,
+                field_name,
+                s.state_fields.iter().map(|sf| sf.name.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        };
+        errors.push(VerifyError {
+            context: format!("service '{}' / handler '{}' / reads", s.name, rule.name),
+            message,
+        });
+    }
+}
+
+/// `count : number` / `last : text [..256]` — a state field as its
+/// declaration reads, for diagnostics.
+fn state_field_display(sf: &StateField) -> String {
+    match sf.max_bytes {
+        Some(n) => format!("{} [..{}]", type_display(&sf.ty), n),
+        None => type_display(&sf.ty),
+    }
+}
+
+/// The attribution appended to every type error the `state` binding is
+/// responsible for: which state field(s) the rule reads, each with its
+/// declared type, and which service declares them. Fields are taken from
+/// the rule's read facts (so a `let` RHS counts), sorted for a stable
+/// message; a field the service does not declare was already reported by
+/// `check_state_read_path` and is simply absent here.
+fn state_scope_note(facts: &LogicFacts, scope: &StateScope) -> String {
+    let mut fields: Vec<&str> = facts
+        .reads
+        .iter()
+        .filter(|p| p.len() == 2 && p[0] == "state")
+        .map(|p| p[1].as_str())
+        .collect();
+    fields.sort();
+    fields.dedup();
+    let decls: Vec<String> = fields
+        .iter()
+        .filter_map(|f| scope.service.state_fields.iter().find(|sf| sf.name == *f))
+        .map(|sf| format!("state.{} is declared '{}'", sf.name, state_field_display(sf)))
+        .collect();
+    if decls.is_empty() {
+        format!("`state` is the state scope of service '{}'", scope.service.name)
+    } else {
+        format!("{} by service '{}'", decls.join(", "), scope.service.name)
     }
 }
 
@@ -2751,6 +2895,7 @@ fn verify_rule(
     all_connections: &HashSet<String>,
     all_entropies: &HashSet<String>,
     group_concept_owner: &HashMap<String, String>,
+    state_scopes: &[&StateScope],
     base_dir: &StdPath,
     errors: &mut Vec<VerifyError>,
 ) {
@@ -2797,7 +2942,7 @@ fn verify_rule(
     // binding plus each typeable top-level `let`. Consulted both by the
     // field-existence loop below and, through `check_expr_against`, by
     // `infer_expr_type`, so the two halves of the check agree by construction.
-    let bindings = collect_binding_concepts(rule, all_rules, input_concept, concepts);
+    let bindings = collect_binding_concepts(rule, all_rules, input_concept, concepts, None);
 
     let mut facts = collect_logic_facts(&rule.logic);
     // Transitive resource/connection reads via `match_result` chains.
@@ -2812,7 +2957,18 @@ fn verify_rule(
         rule, all_rules, all_resources, all_connections, all_entropies, &mut facts,
     );
 
-    for path in &facts.reads {
+    // Sorted so a diagnostic's order does not depend on hash iteration.
+    let mut read_paths: Vec<&Vec<String>> = facts.reads.iter().collect();
+    read_paths.sort();
+    for path in read_paths {
+        // `state...` is the one base that resolves through a SERVICE, not
+        // through the rule: checked against the scope(s) of the service(s)
+        // naming this rule as handler — and refused outright when there are
+        // none.
+        if path.first().map(String::as_str) == Some("state") {
+            check_state_read_path(path, rule, state_scopes, errors);
+            continue;
+        }
         if let Some(msg) = validate_read_path(
             path,
             rule,
@@ -2840,7 +2996,7 @@ fn verify_rule(
         if path.len() < 2 {
             continue;
         }
-        if let Some(c) = bindings.get(path[0].as_str()) {
+        if let Some(c) = bindings.records.get(path[0].as_str()) {
             if let Some(msg) = concept_field_error(c, &path[1], path) {
                 errors.push(VerifyError {
                     context: format!("rule '{}' / logic", rule.name),
@@ -2878,6 +3034,72 @@ fn verify_rule(
         check_layer_discipline(rule, caller_layer, &facts, all_rules, errors);
     }
 
+    // ── The type check — and the SAME check with `state` in scope ────
+    //
+    // The baseline run is the check every rule always got, reported exactly
+    // as it always was. A handler then gets ONE MORE run per service that
+    // names it, with `state` bound to that service's synthetic state concept
+    // (`service_state_concept`); what that run ADDS over the baseline is
+    // exactly the set of errors the binding is responsible for, and those
+    // are reported attributed to the service, the handler and the state
+    // field(s) the rule reads with their declared types. Diffing against the
+    // baseline, rather than re-contexting every error of a handler, is what
+    // keeps every pre-existing diagnostic byte-identical.
+    //
+    // Per service, not per rule, because a handler two services name is
+    // legal and compiles to one binary per service (`compile_service` is
+    // per service — measured: the same `concat("count:", state.count)`
+    // handler serves a `count : number` service and a `count : text`
+    // service, both correct). So `state.<f>` is checked against EACH
+    // service's declaration, which is the emitter's notion of what it means.
+    let mut baseline: Vec<VerifyError> = Vec::new();
+    check_rule_types(rule, all_rules, input_concept, concepts, None, &mut baseline);
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    for e in &baseline {
+        *seen.entry((e.context.clone(), e.message.clone())).or_insert(0) += 1;
+    }
+    errors.extend(baseline);
+    for scope in state_scopes {
+        let mut scoped: Vec<VerifyError> = Vec::new();
+        check_rule_types(rule, all_rules, input_concept, concepts, Some(&scope.concept), &mut scoped);
+        let mut budget = seen.clone();
+        let note = state_scope_note(&facts, scope);
+        for e in scoped {
+            if let Some(n) = budget.get_mut(&(e.context.clone(), e.message.clone())) {
+                if *n > 0 {
+                    *n -= 1;
+                    continue;
+                }
+            }
+            errors.push(VerifyError {
+                context: format!("service '{}' / handler '{}' / logic", scope.service.name, rule.name),
+                message: format!("{}; {}", e.message, note),
+            });
+        }
+    }
+}
+
+/// The bidirectional type check over a rule's `let` RHSes and its body,
+/// against the binding scope the rule has.
+///
+/// `state_concept` is `Some` exactly when the rule is being checked AS THE
+/// HANDLER of a service: the name `state` is then bound to that service's
+/// synthetic state concept, so `infer_expr_type` answers the DECLARED type
+/// for `state.<f>` and `check_expr_against` refuses a mistyped use through
+/// the arms it already has — a text state field in arithmetic, as a
+/// `status`, as an `if` condition, in a bytes concat; a number state field
+/// in `starts_with` / `length` / as a text `body`. No arm knows `state`
+/// exists. `None` is every other rule, and the check the verifier always ran.
+fn check_rule_types(
+    rule: &Rule,
+    all_rules: &[&Rule],
+    input_concept: Option<&Concept>,
+    concepts: &HashMap<String, &Concept>,
+    state_concept: Option<&Concept>,
+    errors: &mut Vec<VerifyError>,
+) {
+    let bindings = collect_binding_concepts(rule, all_rules, input_concept, concepts, state_concept);
+
     // The binding map the TYPE CHECK gets, with every name that is also a
     // lambda / `match` arm binder somewhere in the logic removed.
     //
@@ -2896,12 +3118,20 @@ fn verify_rule(
     for (_, rhs) in &rule.logic.bindings {
         shadowed.extend(collect_lambda_bound_names(rhs));
     }
-    let typed_bindings: HashMap<String, &Concept> = bindings
-        .iter()
-        .filter(|(name, _)| !shadowed.contains(name.as_str()))
-        .map(|(name, c)| (name.clone(), *c))
-        .collect();
-    let bindings = typed_bindings;
+    let bindings = Bindings {
+        records: bindings
+            .records
+            .iter()
+            .filter(|(name, _)| !shadowed.contains(name.as_str()))
+            .map(|(name, c)| (name.clone(), *c))
+            .collect(),
+        scalars: bindings
+            .scalars
+            .iter()
+            .filter(|(name, _)| !shadowed.contains(name.as_str()))
+            .map(|(name, t)| (name.clone(), t.clone()))
+            .collect(),
+    };
 
     // Every `let` RHS, checked against ITS OWN inferred type.
     //
@@ -2999,7 +3229,7 @@ fn refuse_bytes_in_text_prim(
     rule: &Rule,
     all_rules: &[&Rule],
     input_concept: Option<&Concept>,
-    bindings: &HashMap<String, &Concept>,
+    bindings: &Bindings,
     errors: &mut Vec<VerifyError>,
 ) -> bool {
     match infer_expr_type(operand, rule, all_rules, input_concept, bindings) {
@@ -3035,7 +3265,7 @@ fn refuse_bytes_substring(
     rule: &Rule,
     all_rules: &[&Rule],
     input_concept: Option<&Concept>,
-    bindings: &HashMap<String, &Concept>,
+    bindings: &Bindings,
     errors: &mut Vec<VerifyError>,
 ) -> bool {
     match infer_expr_type(operand, rule, all_rules, input_concept, bindings) {
@@ -3100,7 +3330,7 @@ fn check_byte_addressable_operand(
     all_rules: &[&Rule],
     input_concept: Option<&Concept>,
     all_concepts: &HashMap<String, &Concept>,
-    bindings: &HashMap<String, &Concept>,
+    bindings: &Bindings,
     errors: &mut Vec<VerifyError>,
 ) {
     // A `b"..."` literal and a `random(<entropy>)` draw have a COMPILE-TIME
@@ -3171,7 +3401,7 @@ fn check_equality_operands(
     all_rules: &[&Rule],
     input_concept: Option<&Concept>,
     all_concepts: &HashMap<String, &Concept>,
-    bindings: &HashMap<String, &Concept>,
+    bindings: &Bindings,
     errors: &mut Vec<VerifyError>,
 ) {
     let comparable = |t: &Type| matches!(t, Type::Number | Type::Text);
@@ -3239,7 +3469,7 @@ fn check_expr_against(
     all_rules: &[&Rule],
     input_concept: Option<&Concept>,
     all_concepts: &HashMap<String, &Concept>,
-    bindings: &HashMap<String, &Concept>,
+    bindings: &Bindings,
     errors: &mut Vec<VerifyError>,
 ) {
     match (expr, expected) {
@@ -3657,7 +3887,20 @@ fn check_expr_against(
             for arg in args {
                 if let Some(inferred) = infer_expr_type(arg, rule, all_rules, input_concept, bindings) {
                     match inferred {
-                        Type::Number | Type::Bool | Type::Text => {}
+                        Type::Number | Type::Bool | Type::Text => {
+                            // Recurse against the arg's OWN inferred type. The
+                            // outer comparison is then true by construction
+                            // and the whole effect is to check the arg's
+                            // sub-expressions — the same move the `let` RHS
+                            // check makes. Until slice `state-read-typing`
+                            // this arm INFERRED each arg and stopped, so
+                            // `concat("n:", length(state.count))` and
+                            // `concat("p:", state.last * 2)` (a number in
+                            // `length`, a text in arithmetic) both verified
+                            // clean: the arg's outer type was fine and nothing
+                            // ever looked inside it.
+                            check_expr_against(arg, &inferred, rule, all_rules, input_concept, all_concepts, bindings, errors);
+                        }
                         Type::Bytes => {
                             errors.push(VerifyError {
                                 context: format!("rule '{}' / logic", rule.name),
@@ -4113,7 +4356,7 @@ fn infer_expr_type(
     rule: &Rule,
     all_rules: &[&Rule],
     concept: Option<&Concept>,
-    bindings: &HashMap<String, &Concept>,
+    bindings: &Bindings,
 ) -> Option<Type> {
     match expr {
         Expr::Number(_) => Some(Type::Number),
@@ -4150,7 +4393,19 @@ fn infer_expr_type(
         // The names in the map are pre-filtered by `verify_rule` against
         // every lambda / match binder in the logic, so a binder that SHADOWS
         // a record let cannot be misread as that let.
-        Expr::Ident(name) => bindings.get(name.as_str()).map(|c| Type::Named(c.name.clone())),
+        //
+        // Slice `state-read-typing` widens the same arm to SCALAR lets, and
+        // for the same reason: `let p = state.last` then `p * 2` (and the
+        // input-field twin `let p = req.path` then `p * 2`) verified clean
+        // because a scalar `let` name had no type here, so a text value
+        // reached arithmetic one `let` away from the operand check. The
+        // scalar map is filled by `collect_binding_concepts` from each RHS's
+        // own inferred type — the type the RHS was already checked against.
+        Expr::Ident(name) => bindings
+            .records
+            .get(name.as_str())
+            .map(|c| Type::Named(c.name.clone()))
+            .or_else(|| bindings.scalars.get(name.as_str()).cloned()),
         Expr::Field(base, field_name) => {
             if let Expr::Ident(n) = base.as_ref() {
                 if n == &rule.input_name {
@@ -4171,7 +4426,7 @@ fn infer_expr_type(
                 //
                 // `bindings` is empty for every caller with no such scope, so
                 // this arm is inert there.
-                if let Some(c) = bindings.get(n.as_str()) {
+                if let Some(c) = bindings.records.get(n.as_str()) {
                     return c
                         .fields
                         .iter()
@@ -5122,13 +5377,11 @@ fn validate_read_path(
     if path.len() == 1 && base == "now" {
         return None;
     }
-    // `state.field` accesses for service mutable state. The base `state`
-    // is a reserved synthetic scope — the service verification cross-checks
-    // that each referenced field actually exists in the service's
-    // `state_fields` declaration. Accepted as length-2 path only.
-    if base == "state" && path.len() == 2 {
-        return None;
-    }
+    // `state...` never reaches here: `verify_rule` routes every path with
+    // that base to `check_state_read_path`, which resolves it through the
+    // service(s) naming the rule as handler — or refuses it when there are
+    // none. Until slice `state-read-typing` this function accepted
+    // `state.<f>` for ANY rule, handler or not.
     if !is_input && !is_context {
         let scope = if let Some(cn) = &rule.context_name {
             format!("'{}' and '{}'", rule.input_name, cn)
@@ -5194,6 +5447,28 @@ fn concept_field_error(c: &Concept, field_name: &str, path: &[String]) -> Option
 /// arm-binder scope is not tracked by the walks that use this. Reporting "has
 /// no field" for every access on one would be a new refusal class rather than
 /// the mirror of the input-field check, so those stay silent.
+/// The names in scope for a rule's type check, beyond the rule's input.
+///
+/// `records` — names bound to a RECORD concept: the `context:` binding,
+/// `state` in a service handler (slice `state-read-typing`), and each `let`
+/// whose RHS types to a record concept. Consulted for `<name>.<field>`.
+///
+/// `scalars` — names bound to a scalar type (number / text / bool / bytes /
+/// Result / collection): each `let` whose RHS infers to one. Consulted for a
+/// bare `<name>`. Until slice `state-read-typing` a scalar `let` had no type
+/// anywhere in this pass, so `let p = state.last` then `p * 2` — and the
+/// input-field twin `let p = req.path` then `p * 2` — verified clean: the
+/// operand check (PR #182) looked at `p`, found nothing, and stayed silent.
+///
+/// Both maps are built by `collect_binding_concepts` in source order, then
+/// filtered by `check_rule_types` against every lambda / `match` binder in
+/// the logic, so a binder shadowing a `let` is never misread as that `let`.
+#[derive(Default, Clone)]
+struct Bindings<'a> {
+    records: HashMap<String, &'a Concept>,
+    scalars: HashMap<String, Type>,
+}
+
 fn record_concept_of<'a>(
     ty: &Type,
     all_concepts: &HashMap<String, &'a Concept>,
@@ -5207,8 +5482,9 @@ fn record_concept_of<'a>(
     }
 }
 
-/// Every binding in a rule's scope whose type is a known RECORD concept:
-/// the `context:` binding, and each `let` the pass can type.
+/// Every binding in a rule's scope this pass can type: the `context:`
+/// binding and `state` (record concepts), and each `let` — a record concept
+/// or, since slice `state-read-typing`, a scalar type.
 ///
 /// This is what `infer_expr_type` consults for a `.field` access whose base is
 /// not the input, and what `verify_rule` consults to check that such a field
@@ -5231,12 +5507,21 @@ fn collect_binding_concepts<'a>(
     all_rules: &[&Rule],
     input_concept: Option<&'a Concept>,
     all_concepts: &HashMap<String, &'a Concept>,
-) -> HashMap<String, &'a Concept> {
-    let mut env: HashMap<String, &'a Concept> = HashMap::new();
+    state_concept: Option<&'a Concept>,
+) -> Bindings<'a> {
+    let mut env: Bindings<'a> = Bindings::default();
+
+    // Slice `state-read-typing`: a service handler sees `state` as the
+    // service's synthetic state concept (`service_state_concept`). Seeded
+    // FIRST so a later `let` can be typed through it, and so a `let` named
+    // `state` shadows it exactly as it would shadow any other binding.
+    if let Some(c) = state_concept {
+        env.records.insert("state".to_string(), c);
+    }
 
     if let (Some(cn), Some(cty)) = (&rule.context_name, &rule.context_ty) {
         if let Some(c) = record_concept_of(cty, all_concepts) {
-            env.insert(cn.clone(), c);
+            env.records.insert(cn.clone(), c);
         }
     }
 
@@ -5248,35 +5533,47 @@ fn collect_binding_concepts<'a>(
         // deciding which of the two the author meant is precisely the kind of
         // guess the compiler must not make.
         if name == &rule.input_name || rule.context_name.as_deref() == Some(name.as_str()) {
-            env.remove(name.as_str());
+            env.records.remove(name.as_str());
+            env.scalars.remove(name.as_str());
             continue;
         }
 
-        // A bare alias (`let r2 = r1`, or `let r = p`). Resolved here rather
-        // than by teaching `infer_expr_type`'s `Expr::Ident` arm about
-        // bindings: that arm feeds every `Ident` position in the bidirectional
-        // check, so widening it would add strictness far beyond a `.field`
-        // access. This adds none — it only propagates a concept the map
-        // already holds.
+        // A bare alias of the INPUT (`let r = i`): the input is not in either
+        // map — `infer_expr_type` answers it from `rule.input_ty` — so it is
+        // resolved here. Every other alias (`let r2 = r1`, `let q = p`) goes
+        // through `infer_expr_type` below like any other RHS, since the
+        // `Ident` arm now answers from both maps.
         if let Expr::Ident(src) = rhs {
-            let resolved = if src == &rule.input_name {
-                input_concept.filter(|c| c.variants.is_empty())
-            } else {
-                env.get(src.as_str()).copied()
-            };
-            match resolved {
-                Some(c) => env.insert(name.clone(), c),
-                None => env.remove(name.as_str()),
-            };
-            continue;
+            if src == &rule.input_name {
+                env.scalars.remove(name.as_str());
+                match input_concept.filter(|c| c.variants.is_empty()) {
+                    Some(c) => env.records.insert(name.clone(), c),
+                    None => env.records.remove(name.as_str()),
+                };
+                continue;
+            }
         }
 
-        match infer_expr_type(rhs, rule, all_rules, input_concept, &env)
-            .and_then(|t| record_concept_of(&t, all_concepts))
-        {
-            Some(c) => env.insert(name.clone(), c),
-            None => env.remove(name.as_str()),
-        };
+        // The RHS's own inferred type — the type `check_rule_types` checks
+        // the RHS against — is the name's type. A RECORD concept goes to
+        // `records` (a sum type is filtered out by `record_concept_of` and
+        // stays untyped: a sum-type value is consumed by `match`, whose
+        // scrutinee inference is a separate slice); everything else scalar
+        // goes to `scalars`; an un-inferable RHS leaves the name untyped,
+        // which is the conservative silence this pass always kept.
+        env.records.remove(name.as_str());
+        env.scalars.remove(name.as_str());
+        match infer_expr_type(rhs, rule, all_rules, input_concept, &env) {
+            Some(Type::Named(n)) => {
+                if let Some(c) = record_concept_of(&Type::Named(n), all_concepts) {
+                    env.records.insert(name.clone(), c);
+                }
+            }
+            Some(t) => {
+                env.scalars.insert(name.clone(), t);
+            }
+            None => {}
+        }
     }
 
     env
@@ -9919,5 +10216,538 @@ service s
 "#;
         let errs = verify_str(src);
         assert!(errs.is_empty(), "valid counter service should verify cleanly, got: {:#?}", errs);
+    }
+
+    // ── Slice `state-read-typing` ─────────────────────────────────────────
+
+    /// An HTTP service `s` whose handler `h` reads state. `__LOGIC__` is the
+    /// whole indented `logic:` body (one or more lines), `__STATE__` the
+    /// `state:` block (or empty), `__AFTER__` the `after:` block (or empty).
+    const STATE_SERVICE_TEMPLATE: &str = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+__LOGIC__
+  proofs:
+    purity:
+      reads : [__READS__]
+      calls : []
+    termination:
+      bound : 12
+
+service s
+  @intention: "test"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+__STATE____AFTER__"#;
+
+    const NUMBER_STATE: &str = "  state:\n    count : number = 0\n";
+    const NUMBER_AFTER: &str = "  after:\n    set count = state.count + 1\n";
+    const TEXT_STATE: &str = "  state:\n    last : text [..256] = \"none\"\n";
+    const TEXT_AFTER: &str = "  after:\n    set last = req.path\n";
+
+    fn state_service(logic: &str, reads: &str, state: &str, after: &str) -> String {
+        STATE_SERVICE_TEMPLATE
+            .replace("__LOGIC__", logic)
+            .replace("__READS__", reads)
+            .replace("__STATE__", state)
+            .replace("__AFTER__", after)
+    }
+
+    /// The raw_tcp sibling (`examples/step_counter.verbose`'s shape): a
+    /// `Frame` of bytes in and out, per-connection `seq : number` state.
+    fn raw_state_service(logic: &str) -> String {
+        format!(
+            r#"@verbose 0.1.0
+
+concept Frame
+  @intention: "a frame"
+  @source: invoices.intent:1
+  fields:
+    data : bytes [..256]
+
+rule step
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    req : Frame
+  output:
+    resp : Frame
+  logic:
+{logic}
+  proofs:
+    purity:
+      reads : [req.data, state.seq]
+      calls : []
+    termination:
+      bound : 12
+
+service s
+  @intention: "test"
+  @source: invoices.intent:1
+  listen:
+    protocol: raw_tcp
+    port: 9999
+    max_request: 256
+  concurrency: forked
+  max_steps: 100
+  read_timeout: 5
+  handler: step
+  state:
+    seq : number = 0
+  after:
+    set seq = state.seq + 1
+"#
+        )
+    }
+
+    /// Asserts one error attributed to service `s` / handler `handler`'s
+    /// LOGIC whose message carries every needle — the type mismatch AND
+    /// the state field's declared type — and that nothing else is reported
+    /// (so a refusal is one attributable error, not a cascade).
+    fn assert_state_type_error(src: &str, handler: &str, needles: &[&str]) {
+        let errs = verify_str(src);
+        let ctx = format!("service 's' / handler '{}' / logic", handler);
+        let hit = errs
+            .iter()
+            .find(|e| e.context == ctx && needles.iter().all(|n| e.message.contains(n)));
+        assert!(
+            hit.is_some(),
+            "expected a state-read type error in `{}` naming {:?}; got {:#?}\nsource:\n{}",
+            ctx, needles, errs, src
+        );
+        // Every error is attributed to this handler's logic — no cascade
+        // into another context. (A bytes `concat` reports a mistyped arg
+        // twice, from its recursion and from its mixing check; that is the
+        // arm's pre-existing shape, and both carry the attribution.)
+        assert!(
+            errs.iter().all(|e| e.context == ctx),
+            "a mistyped state read must be attributable to `{}` and nothing else; got {:#?}",
+            ctx, errs
+        );
+    }
+
+    fn assert_verifies(src: &str) {
+        let errs = verify_str(src);
+        assert!(errs.is_empty(), "must verify clean; got {:#?}\nsource:\n{}", errs, src);
+    }
+
+    /// `state.<f>` in a service handler has its DECLARED type at verify
+    /// time. Until this slice `infer_expr_type` answered None for it (its
+    /// base was neither the input nor a binding), so every mistyped use
+    /// verified clean and was refused by the emitter alone — or, for
+    /// `if state.count then …`, EMITTED (see
+    /// `native::tests::state_and_input_reads_are_typed_before_the_emitter_can_leak`).
+    ///
+    /// Every refused cell names the service, the handler, the field and
+    /// its declared type next to the expected/found pair; every legal cell
+    /// still verifies. Number state, text state (with its `[..N]`), and a
+    /// raw_tcp Number state each get their own rows, and the `let`
+    /// indirection is a row of its own because it was the cell PR #197
+    /// named as the residual.
+    #[test]
+    fn service_handler_state_reads_are_typed() {
+        // ── Number state ──────────────────────────────────────────────
+        let num = |logic: &str| state_service(logic, "state.count", NUMBER_STATE, NUMBER_AFTER);
+        let declared_number = "state.count is declared 'number' by service 's'";
+        assert_state_type_error(
+            &num("    resp = HttpResponse { status: if starts_with(state.count, \"a\") then 200 else 404, body: \"x\" }"),
+            "h", &["has type 'number' but context expects 'text'", declared_number],
+        );
+        assert_state_type_error(
+            &num("    resp = HttpResponse { status: 200, body: concat(\"n:\", length(state.count)) }"),
+            "h", &["has type 'number' but context expects 'text'", declared_number],
+        );
+        assert_state_type_error(
+            &num("    resp = HttpResponse { status: 200, body: state.count }"),
+            "h", &["has type 'number' but context expects 'text'", declared_number],
+        );
+        assert_state_type_error(
+            &num("    resp = HttpResponse { status: if state.count then 200 else 404, body: \"x\" }"),
+            "h", &["has type 'number' but context expects 'bool'", declared_number],
+        );
+        // legal: a number in concat, a number equality, a computed status
+        assert_verifies(&num("    resp = HttpResponse { status: 200, body: concat(\"count:\", state.count) }"));
+        assert_verifies(&num("    resp = HttpResponse { status: if state.count == 1 then 200 else 404, body: \"x\" }"));
+        assert_verifies(&num("    resp = HttpResponse { status: state.count, body: \"x\" }"));
+
+        // ── Text state ────────────────────────────────────────────────
+        let txt = |logic: &str| state_service(logic, "state.last", TEXT_STATE, TEXT_AFTER);
+        let declared_text = "state.last is declared 'text [..256]' by service 's'";
+        assert_state_type_error(
+            &txt("    resp = HttpResponse { status: 200, body: concat(\"p:\", state.last * 2) }"),
+            "h", &["has type 'text' but context expects 'number'", declared_text],
+        );
+        assert_state_type_error(
+            &txt("    resp = HttpResponse { status: state.last, body: \"x\" }"),
+            "h", &["has type 'text' but context expects 'number'", declared_text],
+        );
+        assert_state_type_error(
+            &txt("    resp = HttpResponse { status: state.last + 1, body: \"x\" }"),
+            "h", &["has type 'text' but context expects 'number'", declared_text],
+        );
+        assert_state_type_error(
+            &txt("    resp = HttpResponse { status: if state.last then 200 else 404, body: \"x\" }"),
+            "h", &["has type 'text' but context expects 'bool'", declared_text],
+        );
+        // the indirection through a `let` — PR #197's named residual
+        assert_state_type_error(
+            &txt("    let p = state.last\n    resp = HttpResponse { status: 200, body: concat(\"x\", p * 2) }"),
+            "h", &["has type 'text' but context expects 'number'", declared_text],
+        );
+        assert_state_type_error(
+            &txt("    let p = state.last\n    resp = HttpResponse { status: p + 1, body: \"x\" }"),
+            "h", &["has type 'text' but context expects 'number'", declared_text],
+        );
+        // legal: text in concat, its length, the let used as text
+        assert_verifies(&txt("    resp = HttpResponse { status: 200, body: concat(\"p:\", state.last) }"));
+        assert_verifies(&txt("    resp = HttpResponse { status: 200, body: concat(\"n:\", length(state.last)) }"));
+        assert_verifies(&txt("    let p = state.last\n    resp = HttpResponse { status: 200, body: concat(\"x\", p) }"));
+
+        // ── raw_tcp Number state (the multistep-1 handler shape) ──────
+        assert_state_type_error(
+            &raw_state_service("    resp = Frame { data: concat(state.seq, le32(length(req.data))) }"),
+            "step", &["has type 'number' but context expects 'bytes'", "state.seq is declared 'number' by service 's'"],
+        );
+        assert_state_type_error(
+            &raw_state_service("    resp = Frame { data: concat(le32(length(state.seq)), le32(length(req.data))) }"),
+            "step", &["has type 'number' but context expects 'text'", "state.seq is declared 'number' by service 's'"],
+        );
+        assert_verifies(&raw_state_service("    resp = Frame { data: concat(le32(state.seq), le32(length(req.data))) }"));
+    }
+
+    /// `state` resolves through the SERVICE that names the rule as its
+    /// handler, and through nothing else: a plain rule has no state, a
+    /// service with no `state:` block has none either, the path is exactly
+    /// `state.<field>`, and a handler two services name is checked against
+    /// EACH service's declaration (it compiles to one binary per service).
+    /// The purity proof sees a state path like any other, both ways.
+    #[test]
+    fn state_reads_resolve_only_through_the_service_naming_the_handler() {
+        // a plain rule, no service anywhere
+        let plain = r#"@verbose 0.1.0
+
+concept N
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 100]
+
+rule f
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = state.count + n.v
+  proofs:
+    purity:
+      reads : [state.count, n.v]
+      calls : []
+    termination:
+      bound : 3
+"#;
+        let errs = verify_str(plain);
+        assert!(
+            errs.iter().any(|e| e.context == "rule 'f' / logic"
+                && e.message.contains("unknown binding 'state' in path 'state.count'")
+                && e.message.contains("rule 'f' is not the handler of any service")),
+            "a plain rule has no state; got {:#?}",
+            errs
+        );
+
+        // a rule that is not the handler, in a file that has a stateful service
+        let mut other = state_service(
+            "    resp = HttpResponse { status: 200, body: concat(\"count:\", state.count) }",
+            "state.count", NUMBER_STATE, NUMBER_AFTER,
+        );
+        other.push_str(
+            r#"
+rule other
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    out : number
+  logic:
+    out = state.count + 1
+  proofs:
+    purity:
+      reads : [state.count]
+      calls : []
+    termination:
+      bound : 3
+"#,
+        );
+        let errs = verify_str(&other);
+        assert!(
+            errs.iter().any(|e| e.context == "rule 'other' / logic"
+                && e.message.contains("rule 'other' is not the handler of any service")),
+            "only the handler sees the service's state; got {:#?}",
+            errs
+        );
+        assert!(
+            !errs.iter().any(|e| e.context.contains("handler 'h'")),
+            "the real handler is untouched; got {:#?}",
+            errs
+        );
+
+        // the handler of a service with NO state: block
+        let stateless = state_service(
+            "    resp = HttpResponse { status: 200, body: concat(\"count:\", state.count) }",
+            "state.count", "", "",
+        );
+        let errs = verify_str(&stateless);
+        assert!(
+            errs.iter().any(|e| e.context == "service 's' / handler 'h' / reads"
+                && e.message.contains("handler reads state.count but service 's' declares no state: block")),
+            "no state: block means no state; got {:#?}",
+            errs
+        );
+
+        // a field the state: block does not declare
+        let unknown = state_service(
+            "    resp = HttpResponse { status: 200, body: concat(\"count:\", state.nope) }",
+            "state.nope", NUMBER_STATE, NUMBER_AFTER,
+        );
+        let errs = verify_str(&unknown);
+        assert!(
+            errs.iter().any(|e| e.context == "service 's' / handler 'h' / reads"
+                && e.message.contains("handler reads state.nope but service declares no state field 'nope'; declared: [count]")),
+            "an undeclared state field is named with the declared list; got {:#?}",
+            errs
+        );
+
+        // a bare `state`, and a path deeper than one field
+        for (logic, reads, got) in [
+            ("    resp = HttpResponse { status: 200, body: concat(\"x\", state) }", "state", "'state'"),
+            ("    resp = HttpResponse { status: 200, body: concat(\"x\", state.count.zzz) }", "state.count.zzz", "'state.count.zzz'"),
+        ] {
+            let errs = verify_str(&state_service(logic, reads, NUMBER_STATE, NUMBER_AFTER));
+            assert!(
+                errs.iter().any(|e| e.context == "service 's' / handler 'h' / reads"
+                    && e.message.contains("state is read as exactly `state.<field>`")
+                    && e.message.contains(got)),
+                "{} must be refused as a malformed state path; got {:#?}",
+                got, errs
+            );
+        }
+
+        // a handler two services name, whose state: blocks DIFFER in type
+        let second = r#"
+service s2
+  @intention: "test"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9998
+    max_request: 4096
+  handler: h
+  state:
+    count : text [..8] = "0"
+  after:
+    set count = "1"
+"#;
+        // a use that is legal under BOTH declarations verifies for both
+        let mut shared_ok = state_service(
+            "    resp = HttpResponse { status: 200, body: concat(\"count:\", state.count) }",
+            "state.count", NUMBER_STATE, NUMBER_AFTER,
+        );
+        shared_ok.push_str(second);
+        assert_verifies(&shared_ok);
+        // a use legal under ONE declaration is refused naming ONLY the other
+        let mut shared_bad = state_service(
+            "    resp = HttpResponse { status: state.count * 2, body: \"x\" }",
+            "state.count", NUMBER_STATE, NUMBER_AFTER,
+        );
+        shared_bad.push_str(second);
+        let errs = verify_str(&shared_bad);
+        assert!(
+            errs.iter().any(|e| e.context == "service 's2' / handler 'h' / logic"
+                && e.message.contains("has type 'text' but context expects 'number'")
+                && e.message.contains("state.count is declared 'text [..8]' by service 's2'")),
+            "the text-state service refuses the arithmetic; got {:#?}",
+            errs
+        );
+        assert!(
+            !errs.iter().any(|e| e.context.starts_with("service 's' /")),
+            "the number-state service accepts it, and must not be named; got {:#?}",
+            errs
+        );
+
+        // purity: a state path is declared and performed like any other
+        let extra = state_service(
+            "    resp = HttpResponse { status: 200, body: \"x\" }",
+            "state.count", NUMBER_STATE, NUMBER_AFTER,
+        );
+        let errs = verify_str(&extra);
+        assert!(
+            errs.iter().any(|e| e.context == "rule 'h' / purity.reads" && e.message.contains("extra: [state.count]")),
+            "a declared-but-unperformed state read is an extra; got {:#?}",
+            errs
+        );
+        let missing = state_service(
+            "    resp = HttpResponse { status: 200, body: concat(\"count:\", state.count) }",
+            "", NUMBER_STATE, NUMBER_AFTER,
+        );
+        let errs = verify_str(&missing);
+        assert!(
+            errs.iter().any(|e| e.context == "rule 'h' / purity.reads" && e.message.contains("missing: [state.count]")),
+            "a performed-but-undeclared state read is missing; got {:#?}",
+            errs
+        );
+    }
+
+    /// A plain-rule probe for the two GENERAL widenings the state slice
+    /// needed: `__LETS__` are `let` lines, `__BODY__` the body expression.
+    const SCALAR_PROBE: &str = r#"@verbose 0.1.0
+
+concept Item
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 100]
+
+concept N
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 100]
+    name : text [..16]
+    items : collection(Item)
+
+rule validate
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    r : Result(number, text)
+  logic:
+    r = if n.v > 50 then Err("big") else Ok(n.v)
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : []
+    termination:
+      bound : 6
+
+rule g
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : __OUT__
+  logic:
+__LETS__    out = __BODY__
+  proofs:
+    purity:
+      reads : [__READS__]
+      calls : [__CALLS__]
+    termination:
+      bound : 12
+"#;
+
+    fn scalar_probe(out: &str, lets: &str, body: &str, reads: &str, calls: &str) -> String {
+        SCALAR_PROBE
+            .replace("__OUT__", out)
+            .replace("__LETS__", lets)
+            .replace("__BODY__", body)
+            .replace("__READS__", reads)
+            .replace("__CALLS__", calls)
+    }
+
+    /// A scalar `let` name carries its RHS's inferred type — the type the
+    /// RHS was already checked against — so a text `let` used in arithmetic
+    /// is refused where, until this slice, `infer_expr_type(Ident)` answered
+    /// None and the operand check stayed silent. Measured on `6eaa6be`:
+    /// `let p = n.name` then `concat("n:", p + 1)` verified clean (the
+    /// emitter refused it with `unresolved identifier 'p'`, fail-closed).
+    /// The lambda-binder filter still applies: a `match_result` arm binder
+    /// shadowing a scalar `let` is NOT read as that `let`.
+    #[test]
+    fn scalar_let_names_carry_their_rhs_type() {
+        let refused = |src: &str, needle: &str| {
+            let errs = verify_str(src);
+            assert!(
+                errs.iter().any(|e| e.context == "rule 'g' / logic" && e.message.contains(needle)),
+                "expected `{}`; got {:#?}\nsource:\n{}",
+                needle, errs, src
+            );
+        };
+        refused(
+            &scalar_probe("text", "    let p = n.name\n", "concat(\"n:\", p + 1)", "n.name", ""),
+            "has type 'text' but context expects 'number'",
+        );
+        // an alias chain
+        refused(
+            &scalar_probe("number", "    let p = n.name\n    let q = p\n", "q + 1", "n.name", ""),
+            "has type 'text' but context expects 'number'",
+        );
+        // a bool let as an `if` condition is fine; a number let is not
+        assert_verifies(&scalar_probe("number", "    let big = n.v > 1\n", "if big then 1 else 2", "n.v", ""));
+        refused(
+            &scalar_probe("number", "    let big = n.v\n", "if big then 1 else 2", "n.v", ""),
+            "has type 'number' but context expects 'bool'",
+        );
+        // legal: each let used as its own type
+        assert_verifies(&scalar_probe(
+            "text", "    let p = n.name\n    let q = n.v\n", "concat(\"n:\", p, q + 1)", "n.name, n.v", "",
+        ));
+        // the shadow guard: `v` is a text let AND the ok-arm binder; the arm
+        // body `v + 1` must read the binder (a number), not the let
+        assert_verifies(&scalar_probe(
+            "number",
+            "    let v = n.name\n",
+            "match_result(validate(n), v => v + 1, e => 0)",
+            "n.name, n",
+            "validate",
+        ));
+    }
+
+    /// `concat`'s text arm INFERRED each argument's outer type and stopped,
+    /// so nothing inside an argument was ever checked: `concat("n:",
+    /// length(n.v))` (a number in `length`) and `concat("n:", n.name * 2)`
+    /// (a text in arithmetic — PR #182's leak, one `concat` away from its
+    /// operand check) both verified clean on `6eaa6be`. The second EMITS a
+    /// binary that prints 2 × an argv pointer; see
+    /// `native::tests::state_and_input_reads_are_typed_before_the_emitter_can_leak`.
+    #[test]
+    fn concat_arguments_are_checked_inside() {
+        let refused = |body: &str, reads: &str, needle: &str| {
+            let src = scalar_probe("text", "", body, reads, "");
+            let errs = verify_str(&src);
+            assert!(
+                errs.iter().any(|e| e.context == "rule 'g' / logic" && e.message.contains(needle)),
+                "`{}`: expected `{}`; got {:#?}",
+                body, needle, errs
+            );
+        };
+        refused("concat(\"n:\", length(n.v))", "n.v", "has type 'number' but context expects 'text'");
+        refused("concat(\"n:\", n.name * 2)", "n.name", "has type 'text' but context expects 'number'");
+        refused("concat(\"n:\", if n.v then \"a\" else \"b\")", "n.v", "has type 'number' but context expects 'bool'");
+        refused("concat(\"n:\", byte_at(n.v, 0))", "n.v", "has type 'number' but context expects 'text'");
+        for ok in [
+            ("concat(\"n:\", n.v)", "n.v"),
+            ("concat(\"n:\", n.name, n.v + 1)", "n.name, n.v"),
+            ("concat(\"n:\", if n.v > 1 then \"a\" else \"b\")", "n.v"),
+            ("concat(\"n:\", length(n.name), substring(n.name, 0, 1))", "n.name"),
+        ] {
+            assert_verifies(&scalar_probe("text", "", ok.0, ok.1, ""));
+        }
     }
 }
