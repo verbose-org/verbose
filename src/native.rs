@@ -2747,6 +2747,33 @@ struct ServiceAggLet<'a> {
     layout: Vec<(String, i32)>,
 }
 
+fn service_callee_unguarded_failure(expr: &Expr) -> Option<&'static str> {
+    // Callees use their own rbp: a handler close label cannot unwind them.
+    // Admit byte_at only when its literal bounds are established here. The
+    // general runtime-error propagation ABI is deferred to agg-svc-2.
+    match expr {
+        Expr::ByteAt(value, index) => {
+            let len = match value.as_ref() {
+                Expr::Bytes(b) => Some(b.len()),
+                Expr::Text(t) => Some(t.len()),
+                _ => None,
+            };
+            if !matches!((len, index.as_ref()), (Some(n), Expr::Number(i)) if *i >= 0 && (*i as u64) < n as u64) {
+                return Some("byte_at");
+            }
+        }
+        Expr::Substring(_, _, _) => return Some("substring"),
+        Expr::ParseInt(_) => return Some("parse_int"),
+        _ => {}
+    }
+    let mut failure = None;
+    crate::verifier::walk_expr_children(expr, &mut |child| {
+        if failure.is_none() { failure = service_callee_unguarded_failure(child); }
+    });
+    failure
+}
+
+
 /// Slice agg-svc-1 — the shape gate for a record-valued `let` inside an HTTP
 /// service handler: one `Option` per handler binding (`Some` for a `let`
 /// whose RHS is a call to a plain-record-returning rule), or the refusal.
@@ -2963,6 +2990,21 @@ fn check_service_aggregate_lets<'a>(
                     message: format!(
                         "{}: callee '{}' constructs a variant in its body; the arena is the rule path's and the service frame has none — slice agg-svc-2",
                         site(let_name), callee.name
+                    ),
+                });
+            }
+        }
+        for expr in callee.logic.bindings.iter().map(|(_, e)| e)
+            .chain(std::iter::once(&callee.logic.value))
+        {
+            if let Some(primitive) = service_callee_unguarded_failure(expr) {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: callee '{}' contains {} with a potentially failing runtime check; \
+                         a failure inside the callee would stop the listener. Move the check \
+                         into a handler constructor argument, where it closes only the client, \
+                         or wait for callee error propagation in agg-svc-2",
+                        site(let_name), callee.name, primitive,
                     ),
                 });
             }
@@ -23135,8 +23177,9 @@ fn emit_http10_dynamic_bytes(
     // inline `sys_exit(1)`. That is REQUIRED, not merely tolerated: the
     // close path does `lea rsp, [rbp - frame_size]` with the HANDLER's rbp,
     // and inside the callee rbp is the callee's own frame — a site recorded
-    // into the handler's scope would unwind the wrong frame. The residual
-    // that leaves is stated at the emit site of the call below.
+    // into the handler's scope would unwind the wrong frame. The aggregate
+    // gate refuses potentially failing checks until an error propagation
+    // ABI exists; known-safe literal byte accesses remain admitted.
     //
     // REGISTER AUDIT (what the callee may clobber vs what the service keeps
     // live across the `call`): the ONLY register the accept loop keeps live
@@ -23695,18 +23738,11 @@ fn emit_http10_dynamic_bytes(
             // rbp live, so its recorded site unwinds to the close label and
             // the listener survives (pinned). Inside the CALLEE nothing can
             // record: the callables were emitted before the scope opened,
-            // and — the residual, stated so it is findable — a bound tripped
-            // INSIDE a called rule would still `sys_exit(1)` the listener.
-            // In slice agg-svc-1 that residual is VACUOUS BY CONSTRUCTION:
-            // only Numbers cross the call (Number-only input, gated), and
-            // the callee is gated to no text / bytes source at all (no text
-            // field, no read / fetch / random, no text let), so the only
-            // `byte_at` / `length` a callee can contain indexes a `b"…"`
-            // LITERAL with a client-influenced Number — an out-of-range
-            // index there IS reachable from the network and is an operator
-            // exit, not a connection close. Routing it to `close` needs an
-            // abort target threaded through `emit_eval_expr` (the refactor
-            // svc-client-abort-1 declined); named as slice agg-svc-2's.
+            // so potentially failing callee checks are refused by
+            // check_service_aggregate_lets before emission. Only a literal
+            // byte_at with a constant in-range index is admitted there.
+            // Runtime checks may instead run in the constructor argument,
+            // where this client scope has the correct frame to close.
             if let Some(agg) = &agg_lets[idx] {
                 let n = agg.layout.len() as i32;
                 let dest_base = let_cursor - 8 * (n - 1);
@@ -38827,6 +38863,52 @@ rule probe
         assert_eq!(bodies, vec!["p:8 m:4 len:4".to_string(), "p:14 m:4 len:7".to_string()]);
     }
 
+    #[test]
+    fn service_record_callee_failing_checks_are_refused_before_emission() {
+        let out = std::env::temp_dir().join("verbosec_test_service_callee_guard");
+        for (expr, primitive) in [
+            ("byte_at(b\"abc\", i.a)", "byte_at"),
+            ("byte_at(b\"abc\", 3)", "byte_at"),
+            ("byte_at(b\"abc\", -1)", "byte_at"),
+            ("byte_at(b\"\", 0)", "byte_at"),
+            ("parse_int(\"bad\")", "parse_int"),
+            ("length(substring(\"abc\", 0, i.a))", "substring"),
+        ] {
+            for in_let in [false, true] {
+                let callee = if in_let {
+                    AGG_SVC_SWAP2.replace("    p = Pair { x: i.b, y: i.a }",
+                        &format!("    let checked = {expr}\n    p = Pair {{ x: checked, y: i.a }}"))
+                } else {
+                    AGG_SVC_SWAP2.replace("Pair { x: i.b, y: i.a }",
+                        &format!("Pair {{ x: 1 + {expr}, y: i.a }}"))
+                };
+                let src = agg_svc_src(AGG_SVC_CONCEPTS, &callee,
+                    "    let q = swap2(In { a: length(req.path), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x) }",
+                    "req.path", "swap2", "").replace("__PORT__", "18966");
+                let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("lex");
+                let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+                let _ = std::fs::remove_file(&out);
+                let err = compile_service(&program, "s", out.to_str().unwrap())
+                    .expect_err("a callee failure must not be able to terminate the listener").message;
+                for needle in ["callee 'swap2'", primitive, "stop the listener", "handler constructor argument", "agg-svc-2"] {
+                    assert!(err.contains(needle), "{expr} / let={in_let}: {err}");
+                }
+                assert!(!out.exists(), "refusal must emit no executable");
+            }
+        }
+    }
+
+    #[test]
+    fn service_record_callee_literal_byte_at_stays_admitted() {
+        let callee = AGG_SVC_SWAP2.replace("Pair { x: i.b, y: i.a }", "Pair { x: byte_at(b\"abc\", 1), y: i.a }")
+            .replace("reads : [i.a, i.b]", "reads : [i.a]").replace("bound : 3", "bound : 5");
+        let src = agg_svc_src(AGG_SVC_CONCEPTS, &callee,
+            "    let q = swap2(In { a: length(req.path), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x) }",
+            "req.path", "swap2", "");
+        let answers = text_state_drive(&src, "s", "callee_literal_guard", &["/one", "/two", "/three"]);
+        for answer in answers { assert!(answer.ends_with("x:98"), "{answer}"); }
+    }
+
     /// Slice agg-svc-1 — the CLIENT-ABORT SCOPE and a record let. A
     /// `byte_at(req.path, 3)` as a CONSTRUCTOR ARGUMENT is request data
     /// evaluated BEFORE the `call`, with the handler's rbp live, so its
@@ -39021,28 +39103,17 @@ rule swap2
         refuse("9 in an after set", &src, &["'swap2'", "after: set count", "agg-svc-2"]);
 
         // ── 10. a non-constructor ARGUMENT ──────────────────────────────
-        // FINDING, measured while writing this cell and pinned AS-IS: the
-        // verifier does NOT compare a call argument's concept to the
-        // callee's declared input — `swap2(req)` with `swap2 : In -> Pair`
-        // verifies clean (`all proofs check out`), on the service path AND
-        // on the rule path (a `rule g(j : B)` whose body is `f(j)` with
-        // `f : A -> number` verifies, runs under `--run` and is refused by
-        // `--native` only at the emitter, with `unknown field`). Pre-existing
-        // (identical on the `e4469c8` compiler), the arity check of PR #157
-        // is the only thing `check_call_arity` looks at, and closing it is a
-        // verifier slice of its own. Until then the EMITTER is the only
-        // gate for this cell, which is exactly why the cell exists.
+        // The verifier now rejects the wrong concept independently of the
+        // emitter's narrower constructor-only calling convention.
         let src = agg_svc_src(
             AGG_SVC_CONCEPTS, AGG_SVC_SWAP2,
             "    let q = swap2(req)\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x) }",
             "req", "swap2", "",
         ).replace("__PORT__", "18966");
-        assert!(
-            verify(&src).is_empty(),
-            "[10] MEASURED: the verifier accepts a call argument of the wrong concept; if this \
-             starts failing the verifier grew the check — move this cell to the 'verifier refuses \
-             too' group and record it"
-        );
+        assert!(verify(&src).iter().any(|e|
+            e.message.contains("argument to rule 'swap2' has type 'HttpRequest'")
+                && e.message.contains("expects 'In'")),
+            "[10] wrong-concept call must be refused by the verifier");
         refuse("10 non-constructor argument", &src, &["'swap2'", "constructor", "agg-svc-2"]);
 
         // ── 11. the binding used as a SCALAR (verifier refuses: PR #182) ─

@@ -3133,6 +3133,33 @@ fn check_rule_types(
             .collect(),
     };
 
+    // Keep the call check's top-level environment in source order. The
+    // existing result-type pass below uses the final, filtered environment.
+    let mut call_bindings = bindings.clone();
+    for (name, _) in &rule.logic.bindings {
+        call_bindings.records.remove(name);
+        call_bindings.scalars.remove(name);
+    }
+    let mut call_shadowed = Vec::new();
+    for (name, rhs) in &rule.logic.bindings {
+        check_call_argument_types(rhs, rule, all_rules, input_concept, concepts, &call_bindings, &call_shadowed, errors);
+        let ty = if expr_mentions_names(rhs, &call_shadowed) { None } else {
+            infer_expr_type(rhs, rule, all_rules, input_concept, &call_bindings)
+        };
+        call_bindings.records.remove(name);
+        call_bindings.scalars.remove(name);
+        if name == &rule.input_name || rule.context_name.as_ref() == Some(name) {
+            call_shadowed.push(name.clone());
+        } else if let Some(ty) = ty {
+            if let Some(c) = record_concept_of(&ty, concepts) {
+                call_bindings.records.insert(name.clone(), c);
+            } else {
+                call_bindings.scalars.insert(name.clone(), ty);
+            }
+        }
+    }
+    check_call_argument_types(&rule.logic.value, rule, all_rules, input_concept, concepts, &call_bindings, &call_shadowed, errors);
+
     // Every `let` RHS, checked against ITS OWN inferred type.
     //
     // Until this landed, `check_expr_against` ran on `rule.logic.value` and
@@ -3183,6 +3210,119 @@ fn check_rule_types(
         &bindings,
         errors,
     );
+}
+
+fn expr_mentions_names(expr: &Expr, names: &[String]) -> bool {
+    if names.is_empty() { return false; }
+    if let Expr::Ident(name) = expr {
+        if names.contains(name) { return true; }
+    }
+    let mut found = false;
+    walk_expr_children(expr, &mut |e| found |= expr_mentions_names(e, names));
+    found
+}
+
+/// Check named rule inputs at every call site, including bodies whose result
+/// type the bidirectional checker cannot infer (reductions and match scrutinees).
+/// Local binders are deliberately left unknown; never borrow the type of an
+/// outer input/let that they shadow. Unknown is not a proof of compatibility.
+fn check_call_argument_types(
+    expr: &Expr,
+    rule: &Rule,
+    all_rules: &[&Rule],
+    input_concept: Option<&Concept>,
+    concepts: &HashMap<String, &Concept>,
+    bindings: &Bindings,
+    shadowed: &[String],
+    errors: &mut Vec<VerifyError>,
+) {
+    if let Expr::Call(name, args) = expr {
+        // Existence and arity have their own diagnostics. Check both
+        // branches: infer_expr_type(If) alone only reports the then type.
+        fn check_arg(
+            arg: &Expr, callee: &Rule, rule: &Rule, all_rules: &[&Rule],
+            input_concept: Option<&Concept>, concepts: &HashMap<String, &Concept>, bindings: &Bindings,
+            shadowed: &[String], errors: &mut Vec<VerifyError>,
+        ) {
+            if let Expr::If(cond, then_e, else_e) = arg {
+                // Branch compatibility does not establish that the selector
+                // is a boolean. Keep unknown local binders unknown here too.
+                if !expr_mentions_names(cond, shadowed) {
+                    check_expr_against(cond, &Type::Bool, rule, all_rules,
+                        input_concept, concepts, bindings, errors);
+                }
+                for branch in [then_e, else_e] {
+                    check_arg(branch, callee, rule, all_rules, input_concept, concepts, bindings, shadowed, errors);
+                }
+                return;
+            }
+            let mentions_local = expr_mentions_names(arg, shadowed);
+            // A constructor/call/operator's result type does not depend on
+            // its children's binder types. Only variable-derived types do.
+            let type_uses_local = mentions_local && matches!(arg,
+                Expr::Ident(_) | Expr::Field(_, _) | Expr::ArenaScope(_) | Expr::Concat(_));
+            if !type_uses_local {
+                if let Some(actual) = infer_expr_type(arg, rule, all_rules, input_concept, bindings) {
+                    if actual != callee.input_ty {
+                        errors.push(VerifyError {
+                            context: format!("rule '{}' / call '{}' / input", rule.name, callee.name),
+                            message: format!(
+                                "argument to rule '{}' has type '{}' but its declared input expects '{}'",
+                                callee.name, type_display(&actual), type_display(&callee.input_ty),
+                            ),
+                        });
+                    } else if !mentions_local {
+                        // A correctly named constructor must also contain
+                        // correctly typed fields (A { a: "text" } is not an A
+                        // value the numeric callee may safely consume).
+                        check_expr_against(arg, &callee.input_ty, rule, all_rules,
+                            input_concept, concepts, bindings, errors);
+                    }
+                }
+            }
+        }
+        if let (Some(callee), [arg]) = (all_rules.iter().find(|r| r.name == *name), args.as_slice()) {
+            check_arg(arg, callee, rule, all_rules, input_concept, concepts, bindings, shadowed, errors);
+        }
+    }
+    let mut visit = |child: &Expr, names: &[String]| {
+        check_call_argument_types(child, rule, all_rules, input_concept, concepts, bindings, names, errors);
+    };
+    let extend = |names: &[&str]| {
+        let mut scoped = shadowed.to_vec();
+        scoped.extend(names.iter().map(|n| n.to_string()));
+        scoped
+    };
+    match expr {
+        Expr::Quantifier(_, coll, name, body) | Expr::Map(coll, name, body)
+        | Expr::Filter(coll, name, body) => {
+            visit(coll, shadowed);
+            visit(body, &extend(&[name]));
+        }
+        Expr::Fold(coll, init, acc, item, body) => {
+            visit(coll, shadowed);
+            visit(init, shadowed);
+            visit(body, &extend(&[acc, item]));
+        }
+        Expr::FoldBytes(text, init, acc, byte, index, body) => {
+            visit(text, shadowed);
+            visit(init, shadowed);
+            visit(body, &extend(&[acc, byte, index]));
+        }
+        Expr::MatchResult(target, ok, ok_body, err, err_body) => {
+            visit(target, shadowed);
+            visit(ok_body, &extend(&[ok]));
+            visit(err_body, &extend(&[err]));
+        }
+        Expr::MatchVariant(target, arms) => {
+            visit(target, shadowed);
+            for arm in arms {
+                let names: Vec<&str> = arm.binders.iter().filter_map(|n| n.as_deref()).collect();
+                visit(&arm.body, &extend(&names));
+            }
+        }
+        _ => walk_expr_children(expr, &mut |child| visit(child, shadowed)),
+    }
 }
 
 /// Bidirectional type check. `expected` is the type the surrounding context
@@ -6376,6 +6516,168 @@ rule important_invoice
         let tokens = Lexer::new(src).tokenize().unwrap();
         let program = Parser::new(tokens).parse_program().unwrap();
         verify_program(&program, StdPath::new("examples"))
+    }
+
+    fn call_type_program(logic: &str, reads: &str, calls: &str, output: &str) -> String {
+        format!(r#"@verbose 0.1.0
+concept A
+  @intention: "first concept"
+  @source: invoices.intent:1
+  fields:
+    a : number
+concept B
+  @intention: "different nominal type"
+  @source: invoices.intent:1
+  fields:
+    b : number
+concept Batch
+  @intention: "collection input"
+  @source: invoices.intent:1
+  fields:
+    items : collection(A)
+rule f
+  @intention: "consume A"
+  @source: invoices.intent:1
+  input:
+    a : A
+  output:
+    out : number
+  logic:
+    out = a.a + 1
+  proofs:
+    purity:
+      reads : [a.a]
+      calls : []
+    termination:
+      bound : 2
+rule identity
+  @intention: "return B"
+  @source: invoices.intent:1
+  input:
+    b : B
+  output:
+    out : B
+  logic:
+    out = b
+  proofs:
+    purity:
+      reads : [b]
+      calls : []
+    termination:
+      bound : 1
+rule caller
+  @intention: "exercise rule-call input checking"
+  @source: invoices.intent:1
+  input:
+    i : B
+  output:
+    out : {output}
+  logic:
+{logic}
+  proofs:
+    purity:
+      reads : [{reads}]
+      calls : [{calls}]
+    termination:
+      bound : 100
+"#)
+    }
+
+    #[test]
+    fn rule_call_argument_types_reject_known_mismatches_and_accept_corrected_twins() {
+        for (bad, good, reads, calls, actual) in [
+            ("f(i)", "f(A { a: i.b })", "i", "f", "B"),
+            ("f(i.b)", "f(A { a: i.b })", "i.b", "f", "number"),
+            ("f(\"bad\")", "f(A { a: 1 })", "", "f", "text"),
+            ("f(i.b > 0)", "f(A { a: i.b })", "i.b", "f", "bool"),
+            ("f(B { b: 1 })", "f(A { a: 1 })", "", "f", "B"),
+
+        ] {
+            let src = call_type_program(&format!("    out = {bad}"), reads, calls, "number");
+            let errs = verify_str(&src);
+            assert!(errs.iter().any(|e| e.context.contains("call 'f'")
+                && e.message.contains(&format!("has type '{actual}'"))
+                && e.message.contains("expects 'A'")), "{bad}: {errs:?}");
+            let good_reads = if bad == "f(i)" { "i.b" } else { reads };
+            let good_src = call_type_program(&format!("    out = {good}"), good_reads, calls, "number");
+            let errs = verify_str(&good_src);
+            assert!(errs.is_empty(), "corrected {good}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn rule_call_argument_types_validate_conditional_selectors() {
+        for (condition, actual) in [("1", "number"), ("\"yes\"", "text")] {
+            let src = call_type_program(
+                &format!("    out = f(if {condition} then A {{ a: 1 }} else A {{ a: 2 }})"),
+                "", "f", "number");
+            let errors = verify_str(&src);
+            assert!(errors.iter().any(|e| e.message.contains(
+                &format!("has type '{actual}' but context expects 'bool'"))), "{errors:?}");
+        }
+        let src = call_type_program(
+            "    out = f(if i.b > 0 then A { a: 1 } else A { a: 2 })",
+            "i.b", "f", "number");
+        assert!(verify_str(&src).is_empty());
+    }
+
+    #[test]
+    fn rule_call_argument_types_validate_constructor_fields() {
+        for (arg, message) in [
+            ("A { a: \"bad\" }", "has type 'text' but context expects 'number'"),
+            ("A { }", "missing field 'a'"),
+            ("A { a: 1, extra: 2 }", "unknown field 'extra'"),
+        ] {
+            let src = call_type_program(&format!("    out = f({arg})"), "", "f", "number");
+            let errors = verify_str(&src);
+            assert!(errors.iter().any(|e| e.message.contains(message)), "{arg}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn rule_call_argument_types_walk_lets_results_concat_and_collection_bodies() {
+        for (logic, output, calls) in [
+            ("    out = f(identity(i))", "number", "f, identity"),
+            ("    out = f(if i.b > 0 then A { a: 1 } else i)", "number", "f"),
+            ("    let x = f(i)\n    out = x", "number", "f"),
+            ("    let alias = i\n    out = f(alias)", "number", "f"),
+            ("    out = concat(\"value:\", f(i))", "text", "f"),
+            ("    out = Ok(f(i))", "Result(number, text)", "f"),
+            ("    out = match_result(Ok(f(i)), x => x, e => 0)", "number", "f"),
+            ("    out = if i.b > 0 then f(i) else 0", "number", "f"),
+        ] {
+            let src = call_type_program(logic, "i, i.b", calls, output);
+            let errs = verify_str(&src);
+            assert!(errs.iter().any(|e| e.context.contains("call 'f'") && e.message.contains("has type 'B'")),
+                "{logic}: {errs:?}");
+        }
+        for expr in ["sum(i.items, x => f(i))", "fold(i.items, 0, acc, x => acc + f(i))"] {
+            let src = call_type_program(&format!("    out = {expr}"), "i, i.items", "f", "number")
+                .replace("    i : B", "    i : Batch");
+            let errs = verify_str(&src);
+            assert!(errs.iter().any(|e| e.context.contains("call 'f'") && e.message.contains("has type 'Batch'")),
+                "{expr}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn rule_call_argument_types_do_not_confuse_local_binders_with_outer_input() {
+        let src = call_type_program("    out = sum(i.items, i => f(i))", "i.items", "f", "number")
+            .replace("    i : B", "    i : Batch");
+        let errs = verify_str(&src);
+        assert!(errs.is_empty(), "lambda i is an A, not the outer Batch: {errs:?}");
+        let bad = call_type_program("    out = sum(i.items, i => f(B { b: i.a }))", "i.items", "f", "number")
+            .replace("    i : B", "    i : Batch");
+        assert!(verify_str(&bad).iter().any(|e| e.context.contains("call 'f'") && e.message.contains("has type 'B'")),
+            "a constructor's nominal type is known even when its child is a local binder");
+        let src = call_type_program(
+            "    out = match_result(Ok(A { a: 3 }), i => f(i), e => 0)", "", "f", "number");
+        let errs = verify_str(&src);
+        assert!(errs.is_empty(), "Result binder i must not inherit B: {errs:?}");
+        let src = call_type_program(
+            "    let x = A { a: 3 }\n    let y = f(x)\n    let x = i\n    out = y", "i", "f", "number");
+        let errs = verify_str(&src);
+        assert!(!errs.iter().any(|e| e.context.contains("call 'f'")), "later rebinding must not change earlier call: {errs:?}");
     }
 
     #[test]

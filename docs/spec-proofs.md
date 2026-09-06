@@ -67,6 +67,18 @@ The thing to refuse is a declaration that is **neither**: the compiler cannot ve
 |---|---|---|
 | `use "path"` | mechanical | Resolution happens at load time; the referenced `.verbose` must exist and parse. |
 
+### Rule-call arguments
+
+The Rust verifier compares known argument types with the called rule's declared
+input. Both branches of conditional arguments are checked, as are their boolean
+conditions when local binder types are not needed. Known constructors
+are checked for their required fields and field types. A separate traversal reaches
+calls in let RHSes, reduction bodies, and match scrutinees as well as the final
+expression. Top-level aliases are resolved
+in source order. A call using a locally bound lambda/match variable whose type
+is not tracked remains unchecked by this comparison; it must not inherit the
+type of a shadowed outer variable. Arity and callee existence have separate checks.
+
 ## Current interpretation and limitations
 
 This classification describes the Rust-written verifier. The self-hosted compiler
