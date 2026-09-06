@@ -1,6 +1,14 @@
 # Verbose examples
 
-Each `<name>.verbose` file is a self-contained program that compiles to native x86-64. The `<name>.intent` companion is the human-readable specification (one numbered point per intention) — `.verbose` evolves freely under the AI's transformation; `.intent` formalizes human intent.
+Examples show concrete language constructs, compiler entry points, and regression
+cases. Some require imports, resources, a particular backend/ABI, or test setup;
+files under `negative/` are intentionally rejected. Read each example's header
+and associated test for how to run it. Companion `.intent` files express the
+human-readable specification; a human or an LLM can author the `.verbose`.
+
+This index grew with the implementation slices. Byte sizes and broad feature
+summaries are milestone descriptions, not measurements of every current build.
+See [current status](../docs/current-status.md) for the implementation map.
 
 Every example here either:
 - pins a regression test (the test reads the `.verbose` file and asserts on the emitted binary), or

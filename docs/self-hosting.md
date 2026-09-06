@@ -1,5 +1,11 @@
 # Self-Hosting — a Verbose compiler written in Verbose, that compiles and verifies itself
 
+This is a milestone journal. Counts, byte sizes, memory measurements, and feature
+restrictions below belong to their recorded stages, including the opening
+snapshot. The self-hosting fixed point has been reached; the implementation has
+continued to grow since these measurements. Use [current status](current-status.md)
+for present orientation and the dedicated CI job for bootstrap reproduction.
+
 This document capitalizes the "self-hosting" arc: incremental bricks that built a complete
 compiler — front end, four-surface verifier, interpreter, and x86-64 back end — **entirely
 in Verbose**, living in [`examples/vexprparse.verbose`](../examples/vexprparse.verbose)
@@ -1177,7 +1183,7 @@ the source at the gate site). None of this is fine print to wave away: "gen1 ver
 source" means *verifies the four self-hosted proof surfaces*, exactly as the source
 comment says.
 
-## 17. Where it stands, and what remains
+## 17. Historical status after the self-verify arc
 
 The claim, assembled from the pinned tests and the live captures above:
 

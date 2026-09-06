@@ -12,9 +12,22 @@ but it is not trusted. The compiler mechanically checks its declarations against
 the program it actually received; a human or another AI can audit the complete
 artifact before anything is executed.
 
-AI-first does not mean human-excluded. Verbose is optimized for unambiguous machine
-generation and analysis rather than pleasant manual authorship, while deliberately
-remaining inspectable. The intended chain is:
+The language-design question that follows is: **what could a language ask
+its authors to express if it were designed for LLMs to write, beyond what a human
+would reasonably maintain by hand?** Verbose explores explicit dependencies,
+bounds, effects, and optimization intent as useful source material for the
+compiler. Verification, optimization, and human inspection all benefit from that
+additional information.
+
+The ambition is a language that any LLM can learn to produce from its specification
+and examples, independent of a model vendor. That is a design goal to evaluate,
+not a claim that every model already succeeds. The bundled generation tools
+currently use Claude; the language and compiler do not require that provider.
+
+Humans can write Verbose directly, develop it, study the generated instructions,
+and challenge its declarations. AI-first expands what authors can be asked to
+make explicit; human readability remains a deliberate part of the design. One
+intended workflow is:
 
 ```text
 human intent
@@ -41,18 +54,18 @@ gain one; the omission remains visible and must be challenged during review. The
 compiler does not decide whether the author asked for the right thing. It enforces
 the mechanically checkable part of the contract and refuses inconsistency.
 
-That separation is the architectural bet. Small statically linked binaries, no
-libc, fast compilation and direct x86-64/WASM generation matter, but they are not
-the headline. The headline is the **chain of accountability between intent, a
-machine-authored program, its verifier, its auditor, and the deployed artifact.**
+The language-design bet and this chain of accountability belong together:
+**explicit information should make programs more verifiable, more exploitable by
+the compiler, and easier to challenge.** Small native artifacts and direct
+x86-64/WASM generation are ways to explore that bet in executable programs.
 
 ## Rebuild, do not mutate
 
 Verbose does not aim to deploy a general-purpose engine containing dormant
 capabilities and then mutate its configuration forever. A Verbose program is a
-specialized artifact. Changing a route, a TLS policy, or a firewall rule means
-changing the declared intent, verifying it again, building a new binary, and
-replacing the running instance.
+specialized artifact. Changing source-defined routes, protocol choices, or allowed
+effects means changing the declarations, verifying them again, building a new
+binary, and replacing the running instance.
 
 ```text
 general-purpose service                 Verbose service
@@ -64,8 +77,15 @@ unused code remains present             undeclared capability is absent
 ```
 
 This is the same operational choice already made by immutable infrastructure and
-replaceable containers, pushed down to the program itself. Once an instance is
-started, its policy does not change underneath it. Reconfiguration is a rebuild.
+replaceable containers, pushed down to the program itself. The binary fixes the
+program logic and the declared capability structure.
+
+Runtime data can still affect decisions. A declared resource may supply an
+allowlist or threshold: `cache: true` reads it at service startup, while an
+uncached service resource can be read again for subsequent requests. Services can
+also declare mutable state. Changing those values need not rebuild the binary;
+adding a new resource or changing the logic that uses it does. An immutable
+artifact does not imply immutable inputs or identical decisions over its lifetime.
 
 The distinction is deliberate:
 
@@ -90,52 +110,55 @@ held for that program.
 
 ## The question that started Verbose
 
-> What happens when an AI can produce a native binary directly?
+> What if an LLM could produce a native binary directly?
 
-Generating bytes is not the difficult part. The difficult part is deciding whether
-those bytes should be allowed to run. A directly generated binary does not, by
-itself, tell an operator which effects were intended, which resources were
-authorized, which omissions are mistakes, or why a new version gained a capability.
+That thought experiment started the project. It raised a practical question:
+what would let us establish that the resulting program expresses the intended
+behavior, has acceptable capabilities, and handles execution constraints safely?
 
-Verbose explores that control layer before direct binary generation becomes
-ordinary. Today, the AI produces a `.verbose` program and the compiler verifies and
-lowers it:
+Verbose grew into a language and compiler to explore those requirements now.
+LLMs author explicit `.verbose` programs; a deterministic compiler checks the
+supported obligations and emits specialized native code or WebAssembly.
 
-```text
-human intent
-    ↓
-AI-generated Verbose contract
-    ↓
-deterministic verification
-    ↓
-compiler-generated native binary / WASM
-```
+**The concrete continuation is a compiler written in Verbose, developed and used
+by LLMs under human direction.** This has already begun: the self-hosted compiler
+compiles its own source and has a verifying emission path. Extending its coverage
+and exercising its guarantees applies the language's discipline to the toolchain
+itself.
 
-In a possible future, an AI may generate the binary itself. The lasting role of
-Verbose would then be the explicit contract against which that binary and its
-claimed capabilities are independently validated:
-
-```text
-approved Verbose contract ───────────────┐
-                                        ↓
-human intent → AI → binary + evidence → independent validator → execution
-```
-
-That future path is a research direction, not a guarantee implemented today. It
-would require a binary validator and evidence strong enough to connect machine code
-back to the approved contract. The architectural principle, however, already
-governs the project:
+Direct LLM generation of machine code remains an open possibility, with no assumed
+timeline. It is neither a prerequisite nor the next implementation milestone.
+Accepting arbitrary generated binaries against a contract would require a much
+stronger validator than the current instruction decoder.
 
 > **Generation may be probabilistic. Authorization to execute must be deterministic.**
 
-The AI is free to propose. It is never free to authorize itself.
+## Performance with deliberate safeguards
+
+The target is specialized machine code with as little unnecessary work as
+possible. Required safeguards belong to that target: they are part of the
+program's intended behavior. Declared bounds, arena allocation for recursive
+structures, and runtime guards make resource and failure behavior explicit on
+the supported paths.
+
+When a property can be established before execution, the compiler can use that
+information to specialize the program and avoid redundant work. When it depends
+on runtime inputs, the relevant checks must remain. Performance measurements
+therefore include the safeguards selected for the program.
+
+Fast compilation is also a design objective. Explicit declarations and direct
+emission provide a short path from source to binary. “The compiler never guesses”
+means it does not invent missing obligations or repair an author's intent; it
+still performs analysis, verification, and optimization. Compilation time depends
+on program size and structure and should be reported as a measurement, not a
+universal promise of instantaneous builds.
 
 ## How people use it
 
 - **Writing `.verbose` directly** — always valid. Someone who wants the upfront discipline of declaring reads, termination bounds, overflow ranges, and architectural layer can skip the AI entirely. Hand-written and AI-generated `.verbose` files go through the exact same verifier; the compiler treats them identically.
-- **Writing `.intent` first, generating `.verbose`** — the `.intent` file is a human thinking artifact: numbered sentences, one per concept or rule. An AI assistant (or a patient human) turns it into `.verbose`. The AI produces input the compiler then audits; it does not touch the compiler itself.
+- **Writing `.intent` first, generating `.verbose`** — the `.intent` file is a human thinking artifact: numbered sentences, one per concept or rule. An AI assistant (or a patient human) turns it into `.verbose`. In this generation workflow, the AI produces compiler input. Developing the compiler itself is a separate workflow, also open to LLM contributions under human direction.
 
-The `.intent → .verbose` step is **not** verified by the compiler. That bridge is the human's / AI's responsibility by design — asking a compiler to verify English against a formal spec would require solving NLP, and the mechanically-verified declarations could not stay mechanical under that demand. Instead, an auditor reads both files side by side, and the compiler guarantees the `.verbose` they see is exactly what the binary does.
+The `.intent → .verbose` step is **not** verified by the compiler. That bridge is the human's / AI's responsibility by design — asking a compiler to verify English against a formal spec would require solving NLP, and the mechanically-verified declarations could not stay mechanical under that demand. Instead, an auditor reads both files side by side. The compiler checks the supported declarations and compiles the accepted logic; correct lowering still depends on the optimizer and backend.
 
 ## Pipeline
 
@@ -147,7 +170,7 @@ The `.intent → .verbose` step is **not** verified by the compiler. That bridge
 compiler verifies                    reads / calls consistency, termination bound,
                                      overflow bounds, @source exists, layer discipline
         │
-compiler emits a binary              interpreter, native x86-64, or WASM
+compiler executes or emits           interpreter, native x86-64, or WASM
 ```
 
 ## What the compiler verifies (and what it does not)
@@ -169,8 +192,8 @@ trust boundary is:
 Verified mechanically, against the AST:
 
 - Declared `reads` / `calls` match the actual field accesses and rule invocations
-- `termination.bound` is ≥ the actual operation count in the logic
-- `overflow: [min, max]` covers the computed range (interval arithmetic)
+- `termination.bound` covers the structural AST operation count; recursion checks are separate, and this is not a total runtime step budget
+- `overflow: [min, max]` is checked against the interval when the analysis can compute one; an unknown interval is currently accepted without establishing the hint
 - `@layer` discipline (sealed subgraph: `domain → domain` only, etc.)
 - `@source: file:line` references an existing line in the named file
 - Reaction `append_file` paths are string literals — the auditor can grep every file the program can touch
@@ -182,7 +205,7 @@ Verified mechanically, against the AST:
 - Whether the program declares the right effects for its domain (e.g. an audit log is required for a regulated decision; the compiler does not impose this — the author does)
 - Whether the program's logic is *correct* for the business problem (only that it does what its declarations say)
 
-The compiler will verify that whatever the author declares is honored. **Whatever the author forgets to declare or asks for incorrectly is on the author**, and the omission is plainly visible in source — the auditor can grep, diff, and challenge. This is the right shape for delegated authorship: the AI (or teammate) is held to the spec, but the spec itself stays human-accountable.
+The compiler checks the supported obligations described above; acceptance is not a proof of every annotation or of toolchain correctness. **Whatever the author forgets to declare or asks for incorrectly is on the author**, and the omission is plainly visible in source — the auditor can grep, diff, and challenge. This is the right shape for delegated authorship: the AI (or teammate) is held to the spec, but the spec itself stays human-accountable.
 
 See `docs/spec-proofs.md` for a field-by-field classification of *mechanical* (consistency-checked against the AST) vs *semantic* (carrying information the AST cannot encode) declarations. See `docs/vision-journal.md` for positioning rationale and decision trail.
 
@@ -196,17 +219,22 @@ See `docs/spec-proofs.md` for a field-by-field classification of *mechanical* (c
 
 ## Why self-hosting matters here
 
-Self-hosting is not pursued merely as a language milestone. The long-term goal is
-for the compiler enforcing explicit effects, bounded structures, and auditable
-behavior to be subject to the same language constraints itself. That shortens the
-trust chain and makes more of the toolchain open to the same human and independent-
-AI review as ordinary Verbose programs.
+Self-hosting is the concrete next stage of the project, already underway. The
+compiler enforcing explicit effects, bounded structures, and auditable behavior
+is itself being written in that language. LLMs can develop and maintain both
+applications and their compiler through the same explicit representation, under
+human direction. This brings more of the toolchain within the language's checks
+and review discipline; it does not by itself remove the trust placed in it.
 
-This work is in progress, not a completed trust proof. Today the Verbose-written
-compiler front end parses and checks substantial real-language surface, and its
-back end emits native executables for a widening closed subset. It does not yet
-compile its entire own source end-to-end. The exact boundary, milestones, and
-remaining gaps are documented in [`docs/self-hosting.md`](docs/self-hosting.md).
+The Verbose-written compiler in `examples/vexprparse.verbose` compiles its entire
+own source. The bootstrap checks that gen1 and gen2 are byte-for-byte identical;
+a dedicated CI job also exercises verification refusals and compiled programs.
+This is self-hosting for a substantial subset of Verbose, not full parity with the
+Rust-written `verbosec` and not a proof that either compiler is bug-free.
+
+Start with the [current status](docs/current-status.md) for the supported paths
+and trust boundary. The [self-hosting journal](docs/self-hosting.md) records the
+milestones, measurements, and restrictions at each stage.
 
 ## Try it in 5 minutes — the synthesis demo
 
@@ -360,31 +388,21 @@ The native backend emits complete long-running network services from a `.verbose
 
 Each binary is zero-dependency native x86-64 (`ldd` shows nothing), the `.verbose` source is the complete program including socket / bind / accept / read / HTTP parse / handler dispatch / response / log / close loop, plus any declared file I/O and outbound fetches. Full slice-by-slice rollout in [`docs/phase-7-design.md`](docs/phase-7-design.md), [`docs/effect-model.md`](docs/effect-model.md), and the dated entries in [`docs/vision-journal.md`](docs/vision-journal.md). Index of all 70+ examples in [`examples/README.md`](examples/README.md).
 
-## Numbers
+## Measurements and current status
 
-| | |
-|---|---|
-| Lines of Rust | ~61,000, zero external dependencies |
-| Tests | 462 unit tests |
-| Native binary size | **~360 B – ~1.5 KB** for business logic, TCP echo, HTTP services |
-| WASM module size | **58–73 bytes** for browser execution (scalar rules) |
-| Proof checks | Zero-trust verifications against the AST — see `docs/spec-proofs.md` |
-| `.verbose` examples | 40+ files spanning business rules, finance, collections, streaming detection, reactions, TCP & HTTP services with logging |
+The Rust compiler has no third-party Cargo dependencies and provides three
+execution/output paths: interpreter, native x86-64, and WebAssembly. Support varies
+by backend. The separate compiler written in Verbose emits native x86-64 for its
+own growing subset.
 
-## Verbose vs gcc -O3
+See [current status](docs/current-status.md) for the implementation map and test
+commands. Example byte sizes in this README are measurements from their feature
+milestones; rebuild the example to measure the current checkout.
 
-Same logic (`amount > 10000`), same input, same output:
-
-| | gcc -O3 -s (production, stripped) | Verbose native |
-|---|---|---|
-| Binary size | 14,472 bytes | **589 bytes** (24x smaller) |
-| Dependencies | 3 shared libraries (libc) | **Zero** |
-| Proofs | None | Purity, termination |
-| Overflow safety | Undefined behavior | Proven via interval arithmetic |
-| SIMD | Must analyze (may miss) | Declared + verified (`pcmpgtq`) |
-| Traceability | None | Every instruction → source intention |
-
-gcc has 20 years of register allocation and instruction scheduling. Verbose has domain knowledge that gcc will never have.
+The [benchmark report](docs/benchmarks.md) compares startup, binary size, memory,
+and computation separately, including cases where the native backend loses.
+Its commands and dated measurements provide the context needed to assess the
+results. A small executable alone establishes neither correctness nor throughput.
 
 ## Three Axioms
 
@@ -437,24 +455,26 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | Check | What it verifies |
 |---|---|
 | Purity reads | Declared reads == actual field accesses in AST |
-| Purity writes | Declared writes == actual mutations (must be empty for pure) |
 | Purity calls | Declared calls == actual rule invocations in AST |
-| Termination bound | Declared bound ≥ actual operation count |
+| Termination bound | Declared bound ≥ structural AST operation count; not total runtime work |
 | Source traceability | `@source: file:line` points to existing line |
 | Field existence | Accessed fields exist on the input concept |
 | Logic/output coherence | Logic target matches declared output name |
 | Called rules exist | All called rules are defined in the program |
-| Overflow bounds | Interval arithmetic proves declared range |
+| Overflow bounds | Checks declared range when an interval is computable; see [limits](docs/spec-proofs.md) |
 | Stack depth | Expression nesting within safety limits |
 
-### Optimization Hints (Exploited by Compiler)
+### Optimization hints and declared ranges
 
-| Hint | What the compiler does | Why gcc can't |
-|---|---|---|
-| `vectorizable: "reason"` | Emits SSE4.2 `pcmpgtq` — 2 values per CPU cycle | Requires costly loop analysis |
-| `parallel: "reason"` | Uses `fork()` — real multi-core parallelism | Developer must do it manually |
-| `overflow: [min, max]` | Proves safe via interval arithmetic — no runtime check | C = undefined behavior, Rust = runtime panic |
-| `field [min, max]` | Eliminates impossible branches from binary | Doesn't know value bounds |
+| Declaration | Compiler use on supported paths |
+|---|---|
+| `vectorizable: "reason"` | Checks independence restrictions; eligible native scalar paths can emit SIMD |
+| `parallel: "reason"` | Eligible native paths can distribute work using `fork()` |
+| `overflow: [min, max]` | Requests a range check against the computable interval; an unknown result is not a proof |
+| `field [min, max]` | Supplies range information for analysis and elimination of impossible branches |
+
+A hint's explanation is audit material. Declaring a hint does not mean every
+backend applies that optimization; see [proof classification](docs/spec-proofs.md).
 
 ### Compile-Time Optimizations
 
@@ -468,13 +488,13 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | Let binding CSE | `let tax = expr` → compute once, load N times | No redundant work |
 | Peephole optimization | Redundant push/pop eliminated | Smaller binary |
 
-### Four Backends
+### Three execution/output paths
 
 | Backend | Command | Output |
 |---|---|---|
 | Interpreter | `--run rule --input data.json` | Executes directly on JSON data |
-| Native x86-64 | `--native output --run rule` | ELF binary, zero dependencies (~400-700 bytes) |
-| WebAssembly | `--wasm output.wasm --run rule` | WASM module for browsers (~60 bytes) |
+| Native x86-64 | `--native output --run rule` | Linux ELF executable; size depends on the program |
+| WebAssembly | `--wasm output.wasm --run rule` | Module for supported rule shapes; requires a WASM host |
 
 ## Inspect the Machine Code
 
@@ -524,14 +544,14 @@ cd examples && python3 -m http.server 8000
 
 Who writes the `.verbose` files?
 
-**An AI does.** Not the compiler — a separate AI (Claude, GPT, or any future model). The human writes the `.intent` file (plain language), the AI generates the `.verbose` IR with all its proofs and hints, and the compiler verifies everything.
+**A human or an LLM authors it.** In the bundled generation workflow, the human writes `.intent` prose and an LLM proposes `.verbose` with its declarations and hints. The compiler checks the supported obligations; it does not translate prose intent.
 
 ```text
 AI (non-deterministic)        generates .verbose — may hallucinate, may be wrong
 verbosec (deterministic)      verifies and compiles — never trusts, never guesses
 ```
 
-The compiler will never generate code. It will never "help" the AI by inferring missing proofs. It verifies, or it rejects. Like a financial auditor: if the accountant and the auditor are the same person, the audit is worthless.
+The compiler generates machine code from accepted source. It does not author the source contract or fill in missing proof declarations to make it pass. LLM-assisted development of the compiler must preserve that separation between proposing a program and defining its acceptance rules.
 
 ### The generator pipeline
 
@@ -660,9 +680,9 @@ The concern is real: a language isolated from every existing ecosystem is hard t
 
 The healthier answers to the same concern:
 
-- **Binary interop** — Verbose already emits ELF. Verbose binaries can be linked from Rust/Go via FFI. Users keep their language and call Verbose code for the parts where verification matters (business rules, critical paths).
+- **Process integration today** — invoke a native executable through its supported argv/stdin/stdout interface. Emitting an ELF executable does not by itself provide a linkable library or a stable FFI.
 - **Assisted generation, not automatic translation** — a tool that reads a function in another language and *suggests* a Verbose equivalent with proof slots to be completed by a human or an AI. The proofs remain declared and verified, not inferred.
-- **Manual module bindings** — importing external functions through an explicit Verbose declaration that states the proofs on our side. The declaration is human-audited, not machine-derived.
+- **Manual module bindings as a research direction** — external-function imports would need an explicit interface and a defined trust boundary. This is not an implemented general FFI.
 
 The rule stays the same across both questions (LLVM and transpilation from existing languages): **if the proof is not declared, it does not exist**. Anything that fabricates proofs to make the pipeline work is a fiction that corrupts the model.
 
@@ -672,11 +692,15 @@ Rejecting LLVM and rejecting source-language ingestion will read as arrogant to 
 
 ## On Human Readers
 
-Verbose is designed **by and for** AI. That reorders the human role — it does not remove it. Humans sit second in the *writing* seat, and first in the *auditing* seat.
+Verbose is designed for LLM authorship and LLM-assisted development, with humans
+participating as designers, authors, reviewers, and users. Its explicitness can
+go beyond what is comfortable to maintain by hand; its meaning must remain
+inspectable.
 
-A language built purely for machines could have been opaque: bytecode, s-expressions, a dense IR with no concession to legibility. Verbose is none of those. The syntax is indented and named, every block carries an `@intention`, every declaration traces back to a numbered line of a plain-language `.intent` file. That readable surface is deliberate — it is where the human disagrees when they should.
-
-Will humans write Verbose directly tomorrow? Probably yes. Not because it is natural, but because it is learnable — the way reading JSON, regex, or unified diffs became learnable for a generation of developers who had never seen them before. The shift required is in how we *think* about code (declaring proofs, bounds, and effects), not in how we *read* it. Verbose does not ask humans to disappear; it asks them to move from authors to auditors, and it makes that move legible on purpose.
+Named concepts, indentation, `@intention`, and source references give humans a
+way to follow the program and challenge its choices. Human authorship is already
+valid and uses the same compiler checks. The language expands what can be asked
+of an author without prescribing a single role for every human involved.
 
 ## On Evolving the Language
 
@@ -738,7 +762,9 @@ The compiler remains the final arbiter.
 
 ## Status
 
-**POC / R&D.** 0 dependencies, 4 backends, 84+ tests. All claims backed by code.
+**Experimental / R&D.** Three execution/output paths in `verbosec`, a self-hosted
+native compiler for a subset of the language, and ongoing verification and codegen
+work. See [current status](docs/current-status.md) for scope and validation commands.
 
 ```bash
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice
@@ -761,7 +787,7 @@ If you've never seen assembly before, you just learned three instructions. That'
 
 This project started as an open question: *"If AI writes code now, do we still need languages designed for humans?"*
 
-A few hours later, the question had become a working compiler with verified proofs, four backends, SIMD optimization, and a 498-byte HTTP server — the last item being a hand-emitted feasibility probe that proves the native backend *can* produce networked binaries at that size; describing network syscalls from within `.verbose` itself is a future phase (see `docs/known-gaps.md`).
+A few hours later, the question had become a working compiler with verified proofs, four backends, SIMD optimization, and a 498-byte HTTP server — the last item being a hand-emitted feasibility probe that proves the native backend *can* produce networked binaries at that size; at that early stage, source-declared networking was still future work. Today, `service` and `connection` declarations describe supported inbound and outbound networking; see [current status](docs/current-status.md).
 
 No spec committee. No funding. No team. One human with a vision, one AI that codes, and a question that turned out to have a very concrete answer.
 

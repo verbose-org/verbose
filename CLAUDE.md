@@ -1,5 +1,10 @@
 # Verbose Compiler (verbosec)
 
+For present implementation scope, start with [docs/current-status.md](docs/current-status.md)
+and [ARCHITECTURE.md](ARCHITECTURE.md). This file also preserves a long design
+journal: counts, restrictions, and future-tense statements inside milestone
+entries describe that stage, not necessarily the current compiler.
+
 ## Vision
 
 Verbose is a language where:
@@ -8,7 +13,16 @@ Verbose is a language where:
 - **the compiler verifies, never guesses** — proofs are checked against the AST, not trusted
 - **the compiler exploits declarations for optimization** — not just safety, also performance
 
-The identity is: **explicit + verified + optimized**. Without optimization, it's just Coq with better syntax. Without verification, it's just a transpiler. Both halves matter.
+The identity is: **explicit + verified + optimized**. Declarations should provide
+useful information for verification, optimization, and inspection. Performance
+includes the safeguards chosen for the program.
+
+Current direction (2026-09-05): the founding thought experiment was an LLM
+producing a binary directly. The concrete continuation is the already-started
+compiler written in Verbose, developed and used by LLMs under human direction.
+Humans can also author programs directly. Direct LLM binary generation has no
+assumed timetable and is not the next milestone. Fast compilation is an objective
+to measure; “never guesses” means no invented obligations, not absence of analysis.
 
 ## Design Priorities
 

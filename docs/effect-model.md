@@ -1,6 +1,10 @@
 # Effect Model — declared capabilities, bounded surface, audit visibility
 
-Every interaction a Verbose binary has with the world outside its own stack frame is **declared, bounded, proved, and visible in the source**. This doc enumerates the effects that exist today, the rules they share, and the closed list of refusals that bound the surface.
+Verbose exposes supported external effects through source declarations so they
+can be checked and inspected. This document records the effect model and its
+implementation slices; catalogue restrictions and error behavior may belong to
+an earlier stage. Start with [current status](current-status.md) for present scope
+and consult the relevant tests for a specific emission path.
 
 It serves three audiences:
 - The author of a `.verbose` file who needs to know what they can declare and what shape the declaration must take.
@@ -9,9 +13,15 @@ It serves three audiences:
 
 ## The effect model in one sentence
 
-> A Verbose binary has no capability it has not explicitly declared in its source; every declared capability is bounded at compile time; every bound is verified before emission; the auditor reads the source (or `strings` the binary) and sees the complete list.
+> Supported effect declarations identify resources and operations in source;
+> the verifier checks their supported restrictions and the backend implements them.
 
-This is downstream of two project axioms (see [Design Priorities](../README.md#design-priorities) in the README): the compiler controls and applies, never guesses; and there are no layers between intent and machine code. The effect model is what makes the verifier's "no undeclared interaction" claim concrete.
+This applies to source-declared programs, not hand-emitted demo shortcuts. Runtime
+plumbing and correct lowering remain trusted implementation. `strings` can help
+inspection but does not certify a binary's complete capability set. Bounds name
+specific resources or operations; they do not establish an overall runtime budget.
+
+This is downstream of two project axioms (see [Design Priorities](../README.md#design-priorities) in the README): the compiler controls and applies, never guesses; and there are no layers between intent and machine code. The effect model makes the intended capability boundary concrete at the source level.
 
 ## Catalogue of effects
 
