@@ -2736,6 +2736,376 @@ fn collect_field_reads_of(expr: &Expr, name: &str, f: &mut dyn FnMut(&str)) {
     }
 }
 
+/// Slice agg-svc-1 — one record-valued handler `let`, resolved: the callee
+/// the service will emit as a CALLABLE, its input concept (the fields-struct
+/// the call site marshals), and the destination layout the caller's slot
+/// group takes (`record_return_layout` of the returned concept — declaration
+/// order, `concept.fields` is a Vec).
+struct ServiceAggLet<'a> {
+    callee: &'a Rule,
+    callee_input: &'a Concept,
+    layout: Vec<(String, i32)>,
+}
+
+/// Slice agg-svc-1 — the shape gate for a record-valued `let` inside an HTTP
+/// service handler: one `Option` per handler binding (`Some` for a `let`
+/// whose RHS is a call to a plain-record-returning rule), or the refusal.
+///
+/// The service path has NEVER called a rule before this slice — its emitter
+/// is handed an EMPTY rules map on purpose (`compile_http10_dynamic_service`),
+/// because a callee inlined the way the rule path inlines would resolve its
+/// fields against the handler's `HttpRequest` offsets. What this slice does
+/// instead is emit the callee as a self-contained CALLABLE (`emit_callable_into`,
+/// the same prologue / sret spill / `emit_record_to_sret` body agg-1 ships on
+/// the rule path) placed BEFORE the service prologue behind a leading `jmp`,
+/// and give the caller a slot GROUP in the handler frame — `emit_eval_expr`'s
+/// Call arm then does the marshalling, the `lea rsi` LAST, the `call rel32`
+/// and the `add rsp` exactly as it does for a rule-path caller.
+///
+/// Every refusal names the offender and slice `agg-svc-2`, and each has a
+/// corrected twin in the tests. The admitted callee is deliberately the
+/// TIGHTEST shape the callable emitter already serves without a frame
+/// extension: Number-only input fields, Number-only output fields, no
+/// recursion, no callees of its own, no effect (`read` / `fetch` /
+/// `random` / `now_unix`), number lets only, no variant construction.
+/// Those five are what keep the register audit below one paragraph — see
+/// the CLIENT-ABORT and REGISTER notes at the emit site.
+fn check_service_aggregate_lets<'a>(
+    service: &Service,
+    handler: &'a Rule,
+    program_rules: &HashMap<&'a str, &'a Rule>,
+    concepts: &[&'a Concept],
+) -> Result<Vec<Option<ServiceAggLet<'a>>>, NativeError> {
+    let site = |let_name: &str| {
+        format!(
+            "service '{}' / handler '{}' / let '{}'",
+            service.name, handler.name, let_name
+        )
+    };
+    // Every plain-record-returning rule in the program: the callee set an
+    // aggregate call can name, and the set refusal #4's mirror walks for.
+    let record_rules: HashSet<&str> = program_rules
+        .iter()
+        .filter(|(_, r)| plain_record_concept(&r.output_ty, concepts).is_some())
+        .map(|(n, _)| *n)
+        .collect();
+    let calls_a_record_rule = |e: &Expr| -> Option<String> {
+        let mut callees: Vec<String> = Vec::new();
+        collect_native_callees(e, &mut callees);
+        callees.into_iter().find(|c| record_rules.contains(c.as_str()))
+    };
+    let any_call = |e: &Expr| -> Option<String> {
+        let mut callees: Vec<String> = Vec::new();
+        collect_native_callees(e, &mut callees);
+        callees.into_iter().next()
+    };
+
+    let mut out: Vec<Option<ServiceAggLet<'a>>> = Vec::with_capacity(handler.logic.bindings.len());
+    let mut record_lets: Vec<(&str, &Concept)> = Vec::new();
+    for (let_name, rhs) in &handler.logic.bindings {
+        let (callee_name, args) = match rhs {
+            Expr::Call(c, a) if record_rules.contains(c.as_str()) => (c, a),
+            other => {
+                // Refusal #4's mirror — an aggregate call NESTED in a let RHS
+                // is not the entire RHS.
+                if let Some(inner) = calls_a_record_rule(other) {
+                    return Err(NativeError {
+                        message: format!(
+                            "{}: the call to record-returning rule '{}' must be the ENTIRE right-hand side of the let (found it nested inside the RHS); a nested aggregate call needs an expression-scoped destination — slice agg-svc-2",
+                            site(let_name), inner
+                        ),
+                    });
+                }
+                out.push(None);
+                continue;
+            }
+        };
+        let callee: &'a Rule = program_rules[callee_name.as_str()];
+        let callee_output: &'a Concept = plain_record_concept(&callee.output_ty, concepts)
+            .expect("record_rules membership implies a plain record output");
+        // The let's NAME must not shadow a base the Field arm resolves
+        // specially: `state.<f>` is keyed `__state_<f>` BEFORE the `__agg_`
+        // probe runs, and the input name is the request itself.
+        if let_name == "state" || let_name == &handler.input_name {
+            return Err(NativeError {
+                message: format!(
+                    "{}: a record-valued let may not be named '{}' — that base name is resolved as the {} in the handler scope, so '{}.<field>' would never reach the aggregate's slot group; rename the let",
+                    site(let_name), let_name,
+                    if let_name == "state" { "service state block" } else { "request" },
+                    let_name
+                ),
+            });
+        }
+        // ── the callee's INPUT ──────────────────────────────────────────
+        let callee_input: &'a Concept = match &callee.input_ty {
+            Type::Named(n) => concepts.iter().copied().find(|c| c.name == *n).ok_or_else(|| NativeError {
+                message: format!("{}: callee '{}' input concept '{}' not found", site(let_name), callee.name, n),
+            })?,
+            other => {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: callee '{}' input must be a named concept (got {:?}); slice agg-svc-2",
+                        site(let_name), callee.name, other
+                    ),
+                });
+            }
+        };
+        if !callee_input.variants.is_empty() {
+            return Err(NativeError {
+                message: format!(
+                    "{}: callee '{}' takes the sum-type concept '{}' as input; a service-called callee marshals a plain record of Number fields in slice agg-svc-1 — a concept_group / variants input needs the arena (slice agg-svc-2)",
+                    site(let_name), callee.name, callee_input.name
+                ),
+            });
+        }
+        for f in &callee_input.fields {
+            if f.ty != Type::Number {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: callee '{}' input field '{}' has type {:?}; the service call site marshals NUMBER fields only in slice agg-svc-1 — a text field needs the (ptr, len) pair and a bool field its own slot convention (slice agg-svc-2)",
+                        site(let_name), callee.name, f.name, f.ty
+                    ),
+                });
+            }
+        }
+        // ── the callee's OUTPUT (refusal #2's mirror) ───────────────────
+        for f in &callee_output.fields {
+            if f.ty != Type::Number {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: callee '{}' returns concept '{}' whose field '{}' has type {:?}; slice agg-svc-1 returns number fields only — text fields need the (ptr, len) pair convention (slice agg-3 on the rule path, agg-svc-2 here), and bool record fields do not emit in any native path today",
+                        site(let_name), callee.name, callee_output.name, f.name, f.ty
+                    ),
+                });
+            }
+        }
+        // ── the callee's BODY: self-contained, effect-free, number lets ──
+        if rule_is_in_cycle(callee, program_rules) {
+            return Err(NativeError {
+                message: format!(
+                    "{}: callee '{}' is recursive (it is in a call cycle); a recursive callee under a service handler needs emit_self_recursive_program's SCC machinery applied to the service frame — slice agg-svc-2",
+                    site(let_name), callee.name
+                ),
+            });
+        }
+        {
+            let mut inner: Vec<String> = Vec::new();
+            for (_, e) in &callee.logic.bindings {
+                collect_native_callees(e, &mut inner);
+            }
+            collect_native_callees(&callee.logic.value, &mut inner);
+            if let Some(x) = inner.first() {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: callee '{}' itself calls '{}'; slice agg-svc-1 emits the callee as ONE self-contained callable — a callee with callees of its own (a second callable and a cross-callable `call`) is slice agg-svc-2",
+                        site(let_name), callee.name, x
+                    ),
+                });
+            }
+        }
+        if let Some(r) = collect_rule_read_names(callee).first() {
+            return Err(NativeError {
+                message: format!(
+                    "{}: callee '{}' performs `read({})`; an effect inside a service-called callee needs a per-callable effect block (the resource / connection / entropy triples live in the SERVICE frame, which the callee's rbp does not reach) — slice agg-svc-2",
+                    site(let_name), callee.name, r
+                ),
+            });
+        }
+        if let Some(c) = collect_rule_fetch_names(callee).first() {
+            return Err(NativeError {
+                message: format!(
+                    "{}: callee '{}' performs `fetch({}, …)`; an effect inside a service-called callee needs a per-callable effect block — slice agg-svc-2",
+                    site(let_name), callee.name, c
+                ),
+            });
+        }
+        if let Some(k) = collect_rule_random_names_transitive(callee, program_rules).first() {
+            return Err(NativeError {
+                message: format!(
+                    "{}: callee '{}' draws `random({})`; a draw on the callable path is slice entropy-4, and under a service handler slice agg-svc-2",
+                    site(let_name), callee.name, k
+                ),
+            });
+        }
+        if expr_uses_now_unix(&callee.logic.value)
+            || callee.logic.bindings.iter().any(|(_, e)| expr_uses_now_unix(e))
+        {
+            return Err(NativeError {
+                message: format!(
+                    "{}: callee '{}' reads `now_unix()`; the clock slot is a prologue capture the callable frame does not have — slice agg-svc-2",
+                    site(let_name), callee.name
+                ),
+            });
+        }
+        {
+            let mut seen_text: HashSet<&str> = HashSet::new();
+            for (ln, e) in &callee.logic.bindings {
+                if callable_let_is_text_for_frame_ctx(e, callee_input, &seen_text) {
+                    return Err(NativeError {
+                        message: format!(
+                            "{}: callee '{}' let '{}' is text-typed; a service-called callee admits NUMBER lets only in slice agg-svc-1 (the callable let prologue's text arms are allocation-free field pass-throughs, none of which a Number-only input can produce) — slice agg-svc-2",
+                            site(let_name), callee.name, ln
+                        ),
+                    });
+                }
+                let _ = seen_text.insert(ln.as_str());
+                if body_contains_variant_construct(e) {
+                    return Err(NativeError {
+                        message: format!(
+                            "{}: callee '{}' let '{}' constructs a variant; the arena is the rule path's and the service frame has none — slice agg-svc-2",
+                            site(let_name), callee.name, ln
+                        ),
+                    });
+                }
+            }
+            if body_contains_variant_construct(&callee.logic.value) {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: callee '{}' constructs a variant in its body; the arena is the rule path's and the service frame has none — slice agg-svc-2",
+                        site(let_name), callee.name
+                    ),
+                });
+            }
+        }
+        // ── the ARGUMENT: a constructor of the callee's input concept ────
+        let fields = match args.as_slice() {
+            [Expr::Record(cname, fields)] if *cname == callee_input.name => fields,
+            [Expr::Record(cname, _)] => {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: the argument to '{}' constructs '{}' but the callee takes '{}'",
+                        site(let_name), callee.name, cname, callee_input.name
+                    ),
+                });
+            }
+            [other] => {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: the argument to record-returning rule '{}' must be a `{} {{ field: expr, … }}` constructor in slice agg-svc-1 (got {}); passing a whole record binding is a struct-to-struct copy — slice agg-svc-2",
+                        site(let_name), callee.name, callee_input.name, expr_kind(other)
+                    ),
+                });
+            }
+            _ => {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: record-returning rule '{}' takes exactly one argument (got {})",
+                        site(let_name), callee.name, args.len()
+                    ),
+                });
+            }
+        };
+        for (fname, fexpr) in fields {
+            if !callee_input.fields.iter().any(|f| f.name == *fname) {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: constructor field '{}' is not a field of '{}'",
+                        site(let_name), fname, callee_input.name
+                    ),
+                });
+            }
+            if let Some(inner) = any_call(fexpr) {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: constructor field '{}' of the call to '{}' contains a call to '{}'; a rule call as a constructor ARGUMENT is not lowered on the service path (the service inlines no rule, and a nested aggregate call needs an expression-scoped destination) — slice agg-svc-2",
+                        site(let_name), fname, callee.name, inner
+                    ),
+                });
+            }
+        }
+        for f in &callee_input.fields {
+            if !fields.iter().any(|(n, _)| *n == f.name) {
+                return Err(NativeError {
+                    message: format!(
+                        "{}: the constructor for '{}' is missing field '{}'",
+                        site(let_name), callee_input.name, f.name
+                    ),
+                });
+            }
+        }
+        record_lets.push((let_name.as_str(), callee_output));
+        out.push(Some(ServiceAggLet {
+            callee,
+            callee_input,
+            layout: record_return_layout(callee_output),
+        }));
+    }
+
+    // Refusal #4's mirror in every OTHER expression position the service
+    // evaluates: the handler body, each `after:` set source, each `log:`
+    // block's content. An aggregate call there has no slot group to land in.
+    let positions: Vec<(&Expr, String)> = {
+        let mut v: Vec<(&Expr, String)> = vec![(&handler.logic.value, "the handler body".to_string())];
+        for s in &service.after_sets {
+            v.push((&s.value, format!("`after: set {}`", s.field_name)));
+        }
+        for lb in &service.logs {
+            if let Effect::AppendFile { content, .. } = &lb.effect {
+                v.push((content, "a `log:` block's content".to_string()));
+            }
+        }
+        v
+    };
+    for (e, where_) in &positions {
+        if let Some(inner) = calls_a_record_rule(e) {
+            return Err(NativeError {
+                message: format!(
+                    "service '{}' / handler '{}': the call to record-returning rule '{}' appears in {}; on the service path an aggregate call must be the ENTIRE right-hand side of a handler let (`let q = {}(…)`), because only a handler let has a slot group for the returned record — slice agg-svc-2",
+                    service.name, handler.name, inner, where_, inner
+                ),
+            });
+        }
+    }
+    // Refusal #5's mirror: a record-typed binding may only be READ with
+    // `.field`, and every read must name a declared field. The verifier
+    // refuses both since PR #178 / #182; the emitter must not depend on
+    // that, because a missing composite key falls back to the BARE-NAME
+    // lookup — and `HttpRequest` has `path` / `method` / `body`.
+    for (p, rc) in &record_lets {
+        let mut bad = expr_uses_ident_outside_field(&handler.logic.value, p);
+        for (bn, e) in &handler.logic.bindings {
+            if bn != p && expr_uses_ident_outside_field(e, p) {
+                bad = true;
+            }
+        }
+        for s in &service.after_sets {
+            if expr_uses_ident_outside_field(&s.value, p) {
+                bad = true;
+            }
+        }
+        if bad {
+            return Err(NativeError {
+                message: format!(
+                    "{}: binding '{}' of record type '{}' may only be read with '.field' in slice agg-svc-1; passing the whole record on is slice agg-svc-2",
+                    site(p), p, rc.name
+                ),
+            });
+        }
+        let mut missing: Option<String> = None;
+        let mut note = |f: &str| {
+            if missing.is_none() && !rc.fields.iter().any(|cf| cf.name == f) {
+                missing = Some(f.to_string());
+            }
+        };
+        collect_field_reads_of(&handler.logic.value, p, &mut note);
+        for (_, e) in &handler.logic.bindings {
+            collect_field_reads_of(e, p, &mut note);
+        }
+        for s in &service.after_sets {
+            collect_field_reads_of(&s.value, p, &mut note);
+        }
+        if let Some(f) = missing {
+            return Err(NativeError {
+                message: format!(
+                    "{}: binding '{}' of record type '{}' has no field '{}'; the destination slots are keyed '__agg_<let>_<field>' so an unknown field cannot fall back to a request field of the same name",
+                    site(p), p, rc.name, f
+                ),
+            });
+        }
+    }
+    Ok(out)
+}
+
 fn collect_transitive_recursive_callees(
     entry: &Rule,
     all_rules: &HashMap<&str, &Rule>,
@@ -8239,6 +8609,10 @@ fn classify_concat_arg(
     concept: &Concept,
     input_name: &str,
     text_bindings: &TextBindings<'_>,
+    // Slice agg-svc-1: the scope's Number slots, consulted for ONE probe —
+    // a `<let>.<field>` read of a record-valued let, registered under the
+    // composite key `__agg_<let>_<field>`. Every other arm ignores it.
+    offsets: &HashMap<&str, i32>,
 ) -> Option<ConcatArgKind> {
     match expr {
         Expr::Text(_) => Some(ConcatArgKind::Text),
@@ -8292,7 +8666,7 @@ fn classify_concat_arg(
         // (callers can either restructure their code or fall back to
         // interpreter for those shapes).
         Expr::JsonEscape(inner) | Expr::BitNot(inner) => {
-            let inner_kind = classify_concat_arg(inner, concept, input_name, text_bindings)?;
+            let inner_kind = classify_concat_arg(inner, concept, input_name, text_bindings, offsets)?;
             match inner_kind {
                 ConcatArgKind::Text | ConcatArgKind::BoundText => {
                     Some(ConcatArgKind::JsonEscapedText)
@@ -8328,6 +8702,16 @@ fn classify_concat_arg(
                 } else {
                     Some(ConcatArgKind::Number)
                 }
+            } else if matches!(base.as_ref(), Expr::Ident(b)
+                if offsets.contains_key(format!("__agg_{}_{}", b, field_name).as_str()))
+            {
+                // Slice agg-svc-1: `<let>.<field>` of a record-valued let.
+                // The slot group holds Number fields only (agg-1's refusal
+                // #2, mirrored on the service path), so the read is a
+                // Number arg; the fill pass hands it to `emit_eval_expr`,
+                // whose Field arm probes the same composite key. Absent the
+                // key this arm is inert, so no pre-existing program moves.
+                Some(ConcatArgKind::Number)
             } else {
                 None
             }
@@ -8521,7 +8905,7 @@ fn emit_concat_to_buffer_impl(
     // Map i-th arg → its CallText slot index in r11's array. -1 if not a Call.
     let mut call_slot_idx: Vec<i32> = Vec::with_capacity(args.len());
     for arg in args {
-        let kind = classify_concat_arg(arg, concept, input_name, text_bindings).ok_or_else(|| {
+        let kind = classify_concat_arg(arg, concept, input_name, text_bindings, offsets).ok_or_else(|| {
             NativeError {
                 message: "concat argument type not yet supported in native (text + number scalars, bound text var, or text-returning rule call; bool and others stay interpreter-only)".into(),
             }
@@ -13617,7 +14001,10 @@ fn emit_text_fold_program(
     // classifies as BoundText (slice 9.5b extension).
     let mut rest_kinds: Vec<ConcatArgKind> = Vec::with_capacity(rest_args.len());
     for arg in rest_args {
-        let k = classify_concat_arg(arg, elem_concept, item_name, &prebuilt_text_bindings).ok_or_else(|| NativeError {
+        // No record let can exist in a fold rule (a record-returning callee
+        // is refused on every non-callable path), so the composite-key
+        // probe has nothing to find here: an empty map is exact.
+        let k = classify_concat_arg(arg, elem_concept, item_name, &prebuilt_text_bindings, &HashMap::<&str, i32>::new()).ok_or_else(|| NativeError {
             message: "Phase 5b: fold-body concat arg must be a text literal, number expression, element text field, or read(<resource>)".into(),
         })?;
         if k == ConcatArgKind::BoundText {
@@ -21136,8 +21523,13 @@ fn emit_raw_tcp_dynamic_bytes(
     let mut prior_text_lets: HashSet<&str> = HashSet::new();
     let mut handler_binding_is_text: Vec<bool> = Vec::with_capacity(handler.logic.bindings.len());
     for (name, expr) in &handler.logic.bindings {
-        // Refusal #5 (design §4.4) — the agg-svc-1 breadcrumb PR #202 gave
-        // the HTTP let prologue, inherited verbatim: a record-valued let.
+        // Refusal #5 (design §4.4) — the breadcrumb PR #202 gave the HTTP let
+        // prologue, inherited: a record-valued let. Slice agg-svc-1 LIFTED
+        // it on the http_1_0 emitter (the callee becomes a callable ahead of
+        // the prologue, the let a slot group in the handler frame); the
+        // raw_tcp frame has neither, and the step loop / per-connection
+        // state make the lifetime question its own — so here it stays, and
+        // names the slice that owns it.
         if let Expr::Call(callee, _) = expr {
             if let Some(called) = diag_rules.get(callee.as_str()) {
                 if let Some(concept) = plain_record_concept(&called.output_ty, diag_concepts) {
@@ -21145,12 +21537,12 @@ fn emit_raw_tcp_dynamic_bytes(
                         message: format!(
                             "service '{}' / handler '{}' / let '{}': callee '{}' returns a record \
                              (plain record concept '{}', {} field(s)), and a record-valued `let` \
-                             inside a service handler is not lowered natively yet — the \
+                             inside a raw_tcp service handler is not lowered natively yet — the \
                              handler-let prologue lowers TEXT lets ((ptr, len) slots) and NUMBER \
-                             lets (one slot) only, and the service frame has no slot group for a \
-                             returned aggregate; slice agg-svc-1 lifts it (the caller-allocated \
-                             destination of slice agg-1, docs/bytes-value-return-design.md, \
-                             applied to the service frame)",
+                             lets (one slot) only, and the raw_tcp frame has no slot group for a \
+                             returned aggregate; slice agg-svc-1 lifted this for http_1_0 (the \
+                             caller-allocated destination of slice agg-1 applied to the service \
+                             frame), and the raw_tcp emitter is slice agg-svc-2",
                             service.name, handler.name, name, callee,
                             concept.name, concept.fields.len(),
                         ),
@@ -21963,16 +22355,16 @@ fn compile_http10_dynamic_service(
         _ => None,
     }).collect();
 
-    // DIAGNOSTIC-ONLY indexes (slice agg-svc-1's breadcrumb). `no_rules`
-    // above is what the emitter INLINES from, and it is empty ON PURPOSE:
-    // the service path lowers no rule call (a callee's fields would be
-    // resolved against the handler's `HttpRequest` offsets map — the
-    // `unknown field` failure tranche 5 hit on the rule path). The cost of
-    // that emptiness was that every rule call in a handler `let` was
-    // reported as `unknown rule '<callee>' for native inlining` — a rule
-    // the verifier had just resolved. These two indexes let the let
-    // prologue NAME a record-returning callee truthfully; nothing is
-    // emitted from them, so no byte of any accepted program can move.
+    // The program's REAL rules and concepts. `no_rules` above is what the
+    // emitter INLINES from, and it stays empty ON PURPOSE: the service path
+    // inlines no rule call (a callee's fields would be resolved against the
+    // handler's `HttpRequest` offsets map — the `unknown field` failure
+    // tranche 5 hit on the rule path). PR #202 introduced these two indexes
+    // for DIAGNOSTICS ONLY; slice agg-svc-1 now also EMITS from them — a
+    // record-returning rule a handler `let` binds is compiled as a
+    // CALLABLE (never inlined), placed ahead of the service prologue, and
+    // reached by a real `call`. A program with no such let emits nothing
+    // from them, so no byte of any pre-existing service moves (measured).
     let program_rules: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i {
         Item::Rule(r) => Some((r.name.as_str(), r)),
         _ => None,
@@ -22540,11 +22932,15 @@ fn emit_http10_dynamic_bytes(
     all_resources: &HashMap<&str, &Resource>,
     all_connections: &HashMap<&str, &Connection>,
     all_entropies: &HashMap<&str, &Entropy>,
-    // The program's REAL rules and concepts, used for DIAGNOSTICS ONLY
-    // (slice agg-svc-1's breadcrumb). `all_rules` is the empty map the
-    // service path inlines from — see `compile_http10_dynamic_service`.
-    diag_rules: &HashMap<&str, &Rule>,
-    diag_concepts: &[&Concept],
+    // The program's REAL rules and concepts. `all_rules` stays the EMPTY map
+    // the service path INLINES from (see `compile_http10_dynamic_service`);
+    // these two are consulted by the record-let gate and, since slice
+    // agg-svc-1, EMITTED from — a record-returning callee named by a handler
+    // `let` is compiled as a callable placed ahead of the service prologue.
+    // A program with no such let emits nothing from them (measured: every
+    // pre-existing service byte-identical).
+    program_rules: &HashMap<&str, &Rule>,
+    program_concepts: &[&Concept],
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
@@ -22666,9 +23062,23 @@ fn emit_http10_dynamic_bytes(
             is_text
         })
         .collect();
+    // Slice agg-svc-1 — the THIRD let class on the service path: a `let`
+    // whose RHS is a call to a plain-record-returning rule occupies one slot
+    // per field of the returned concept (its slot GROUP, the destination
+    // the callee writes through `rsi`). `check_service_aggregate_lets` is
+    // the shape gate; it runs before any byte is emitted so a refusal
+    // writes nothing. A record let is NOT text (`let_rhs_is_text`'s Call
+    // arm answers false on the empty `all_rules`), so the record class
+    // simply overrides the number default at the two sites below.
+    let agg_lets: Vec<Option<ServiceAggLet>> =
+        check_service_aggregate_lets(service, handler, program_rules, program_concepts)?;
     let handler_let_slots_bytes: i32 = handler_binding_is_text
         .iter()
-        .map(|t| if *t { 16i32 } else { 8 })
+        .zip(agg_lets.iter())
+        .map(|(t, agg)| match agg {
+            Some(a) => (a.layout.len() as i32) * 8,
+            None => if *t { 16i32 } else { 8 },
+        })
         .sum();
     // Pre-body fixed offset: where the optional timestamp lives.
     let body_pre_offset: i32 = if uses_timestamp { 56 } else { 48 };
@@ -22706,6 +23116,119 @@ fn emit_http10_dynamic_bytes(
     // `abort_patches` after the per-resource emit.
     let frame_size: u32 = (frame_base as u32) + max_request;
     let buf_offset_from_rbp: i32 = -(frame_base + max_request as i32);
+
+    // ═══ AGGREGATE CALLEES (slice agg-svc-1) ═══════════════════
+    // Every record-returning rule a handler `let` binds is emitted as a
+    // CALLABLE — `emit_callable_into`, the exact prologue / rsi spill /
+    // `emit_record_to_sret` body / epilogue agg-1 ships on the rule path —
+    // placed HERE, ahead of the service prologue behind a leading `jmp`,
+    // which is the layout `emit_self_recursive_program` uses for the same
+    // reason: the accept loop is closed (every tail is a `jmp` back or an
+    // exit), so nothing ever falls into a callable, and putting them FIRST
+    // means their offsets are known before the one `call rel32` per let is
+    // emitted — no post-patch of the call sites. A service with no record
+    // let emits none of this and is byte-for-byte what it was.
+    //
+    // CLIENT-ABORT SCOPE: the callables are emitted OUTSIDE every
+    // `ClientAbortScope` (the first `begin()` is hundreds of lines below),
+    // so a `byte_at` / `substring` / `parse_int` inside a callee keeps its
+    // inline `sys_exit(1)`. That is REQUIRED, not merely tolerated: the
+    // close path does `lea rsp, [rbp - frame_size]` with the HANDLER's rbp,
+    // and inside the callee rbp is the callee's own frame — a site recorded
+    // into the handler's scope would unwind the wrong frame. The residual
+    // that leaves is stated at the emit site of the call below.
+    //
+    // REGISTER AUDIT (what the callee may clobber vs what the service keeps
+    // live across the `call`): the ONLY register the accept loop keeps live
+    // is r12 (the listening socket, reloaded at `accept_top` and in the fork
+    // parent path); client_fd lives in the slot `[rbp-48]`, not a register;
+    // r15 (resource / upstream fd) is closed before the let prologue and
+    // the log fd is opened after it; rbx (the parse scan pointer) is dead
+    // once `body_ptr` is stored. A callable emitted here takes the ordinary
+    // slot prologue (`qualifies_rbx` is false for a record output — agg-1's
+    // NC-2), so its own frame is `push rbp / mov rbp, rsp / sub rsp` and
+    // its body is `emit_record_to_sret` over Number arithmetic, `if`, field
+    // loads and number lets: rax / rcx / rdx / rsi / rdi only — the A4 r15
+    // path is gated on `param_in_rbx`, which is None. So no callee-saved
+    // register the service relies on is written by any admitted callee,
+    // and NO save/restore is emitted around the call. Pinned by the
+    // three-request TCP drive (a clobbered r12 kills the accept loop after
+    // the first request — measured on a patched build, see the PR).
+    let agg_callees: Vec<(&Rule, &Concept)> = {
+        let mut v: Vec<(&Rule, &Concept)> = Vec::new();
+        for a in agg_lets.iter().flatten() {
+            if !v.iter().any(|(r, _)| r.name == a.callee.name) {
+                v.push((a.callee, a.callee_input));
+            }
+        }
+        v
+    };
+    let mut agg_arities: HashMap<&str, usize> = HashMap::new();
+    let mut agg_struct_layouts: HashMap<&str, Vec<(String, i32, bool)>> = HashMap::new();
+    let mut agg_record_returns: HashMap<&str, Vec<(String, i32)>> = HashMap::new();
+    let mut agg_labels: HashMap<&str, i32> = HashMap::new();
+    for a in agg_lets.iter().flatten() {
+        // Number-only input (gated above): one 8-byte struct slot per field
+        // in DECLARATION order — the layout the callable prologue copies out
+        // of `[rdi + off]`.
+        let layout: Vec<(String, i32, bool)> = a.callee_input.fields.iter().enumerate()
+            .map(|(i, f)| (f.name.clone(), (i as i32) * 8, false))
+            .collect();
+        agg_arities.insert(a.callee.name.as_str(), a.callee_input.fields.len());
+        agg_struct_layouts.insert(a.callee.name.as_str(), layout);
+        agg_record_returns.insert(a.callee.name.as_str(), a.layout.clone());
+    }
+    if !agg_callees.is_empty() {
+        // The admitted callee has no callees of its own (gated), so its
+        // bytes do not depend on the label table — one pass into scratch
+        // gives both the size and the final bytes. The placeholder ctx is
+        // still the two-pass shape emit_self_recursive_program uses, so a
+        // later slice that admits cross-callable calls extends it rather
+        // than replaces it.
+        let placeholder_labels: HashMap<&str, i32> = agg_callees.iter()
+            .map(|(r, _)| (r.name.as_str(), 0_i32))
+            .collect();
+        let placeholder_ctx = SelfCallCtx {
+            labels: &placeholder_labels,
+            arities: &agg_arities,
+            struct_layouts: &agg_struct_layouts,
+            param_in_rbx: None,
+            record_returns: &agg_record_returns,
+            sret_dest: None,
+        };
+        let mut sizes: Vec<usize> = Vec::with_capacity(agg_callees.len());
+        for (r, c) in &agg_callees {
+            let mut scratch = Vec::new();
+            emit_callable_into(&mut scratch, r, c, program_rules, all_resources, placeholder_ctx, None, false)?;
+            sizes.push(scratch.len());
+        }
+        // Leading `jmp rel32` over the callables; the service prologue is
+        // the jump's target.
+        code.push(0xE9);
+        let jmp_skip_patch = code.len();
+        code.extend_from_slice(&[0x00; 4]);
+        let mut next_offset = code.len() as i32;
+        for (i, (r, _)) in agg_callees.iter().enumerate() {
+            agg_labels.insert(r.name.as_str(), next_offset);
+            next_offset += sizes[i] as i32;
+        }
+        let final_ctx = SelfCallCtx {
+            labels: &agg_labels,
+            arities: &agg_arities,
+            struct_layouts: &agg_struct_layouts,
+            param_in_rbx: None,
+            record_returns: &agg_record_returns,
+            sret_dest: None,
+        };
+        for (r, c) in &agg_callees {
+            let before = code.len();
+            emit_callable_into(&mut code, r, c, program_rules, all_resources, final_ctx, None, false)?;
+            debug_assert_eq!(code.len() - before, sizes[agg_callees.iter().position(|(x, _)| x.name == r.name).unwrap()]);
+        }
+        let start_actual = code.len() as i32;
+        let rel = start_actual - (jmp_skip_patch as i32 + 4);
+        code[jmp_skip_patch..jmp_skip_patch + 4].copy_from_slice(&rel.to_le_bytes());
+    }
 
     // ═══ PROLOGUE: rbp frame ═══════════════════════════════════
     code.push(0x55);                                     // push rbp
@@ -23110,49 +23633,107 @@ fn emit_http10_dynamic_bytes(
         &mut handler_offsets,
         &mut http_text_bindings,
     );
+    // Slice agg-svc-1 — COMPOSITE KEYING, agg-1's refusal #9 on the service
+    // path, and here the collision is not hypothetical: the handler's own
+    // input is `HttpRequest`, whose fields `method` / `path` / `body` sit in
+    // `handler_offsets` under their BARE names, so a returned concept with
+    // a field named `path` read as `q.path` would — keyed bare — resolve to
+    // the request's `path` POINTER slot and itoa a stack address into the
+    // response body (a silent wrong answer AND an ASLR disclosure to a
+    // remote client). The keys are owned here, above the map that borrows
+    // them. Pinned by `service_record_let_field_named_like_a_request_field`.
+    let agg_keys: Vec<Vec<String>> = agg_lets
+        .iter()
+        .zip(handler.logic.bindings.iter())
+        .map(|(agg, (name, _))| match agg {
+            Some(a) => a.layout.iter().map(|(f, _)| format!("__agg_{}_{}", name, f)).collect(),
+            None => Vec::new(),
+        })
+        .collect();
     {
         let let_block_start: i32 = -(body_pre_offset + body_extra_bytes);
         let mut let_cursor: i32 = let_block_start - 8;
-        for ((name, expr), is_text) in
-            handler.logic.bindings.iter().zip(handler_binding_is_text.iter())
+        for (idx, ((name, expr), is_text)) in
+            handler.logic.bindings.iter().zip(handler_binding_is_text.iter()).enumerate()
         {
-            // Slice agg-svc-1 — a TRUTHFUL breadcrumb for a record-valued
-            // `let`. Before this check, `let q = swap2(In { … })` on a
-            // record-returning `swap2` reported `unknown rule 'swap2' for
-            // native inlining`: `let_rhs_is_text` classified the Call as a
-            // number (its Call arm consults `all_rules`, empty on the
-            // service path), the number arm below reached `emit_eval_expr`'s
-            // Call arm, and THAT looked the callee up in the same empty map.
-            // The rule exists and the verifier had just resolved it — the
-            // message was false. This names what is actually missing: a
-            // slot group in the service frame for a returned aggregate (the
-            // caller-allocated destination convention of slice agg-1, which
-            // the RULE path already has as a `let` slot group).
+            // Slice agg-svc-1 — a record-valued `let`: `let q = swap2(In {
+            // … })` on a plain-record-returning `swap2`. Until this slice
+            // the service path refused it (PR #202's breadcrumb, itself a
+            // correction of the false `unknown rule 'swap2'` the empty
+            // `all_rules` produced). The lowering is agg-1's caller side,
+            // verbatim, in the service frame:
             //
-            // Only a CALL whose callee returns a PLAIN RECORD concept takes
-            // this arm — `plain_record_concept` is the same predicate the
-            // rule path keys its sret slot on. Every other RHS falls
-            // through UNCHANGED, so no accepted program moves (measured:
-            // 1386/1386 corpus targets byte-identical).
-            if let Expr::Call(callee, _) = expr {
-                if let Some(called) = diag_rules.get(callee.as_str()) {
-                    if let Some(concept) = plain_record_concept(&called.output_ty, diag_concepts) {
-                        return Err(NativeError {
-                            message: format!(
-                                "service '{}' / handler '{}' / let '{}': callee '{}' returns a record \
-                                 (plain record concept '{}', {} field(s)), and a record-valued `let` \
-                                 inside an HTTP service handler is not lowered natively yet — the \
-                                 handler-let prologue lowers TEXT lets ((ptr, len) slots) and NUMBER \
-                                 lets (one slot) only, and the service frame has no slot group for a \
-                                 returned aggregate; slice agg-svc-1 lifts it (the caller-allocated \
-                                 destination of slice agg-1, docs/bytes-value-return-design.md, \
-                                 applied to the service frame)",
-                                service.name, handler.name, name, callee,
-                                concept.name, concept.fields.len(),
-                            ),
-                        });
-                    }
+            //   - the let's slot GROUP: N consecutive rbp slots, one per
+            //     Number field of the returned concept, field i at
+            //     `dest_base + 8*i`, so `dest_base` is the group's LOWEST
+            //     address (rbp slots descend, struct offsets ascend);
+            //   - `__agg_<let>_<field>` -> slot in `handler_offsets`, the
+            //     clone the `log:` scope does NOT see (a record let, like a
+            //     number let, is handler scope only);
+            //   - the Call arm of `emit_eval_expr`, handed a `SelfCallCtx`
+            //     whose `labels` name the callable emitted ahead of the
+            //     prologue and whose `sret_dest` is `Frame(dest_base)`:
+            //     `sub rsp, 8*n ; <eval each ctor field in SOURCE order,
+            //     store at its DECLARED struct offset> ; mov rdi, rsp ;
+            //     lea rsi, [rbp + dest_base] ; call <callee> ; add rsp`.
+            //
+            // THE `lea rsi` IS EMITTED LAST BY THE CALL ARM, and on the
+            // service path that is load-bearing for the flagship itself:
+            // `length(req.path)` as a constructor field loads the text
+            // through `emit_starts_with_load_text`, which leaves the pointer
+            // in rsi (then `emit_strlen` scans from it). A destination
+            // parked in rsi before the marshalling is gone by the `call` —
+            // measured on a patched build (NC-A in the PR): the callee
+            // stores through the request pointer and the response reads
+            // stale slots.
+            //
+            // CLIENT-ABORT SCOPE: this whole site sits inside `client_scope`,
+            // and that is correct for exactly the part of it that runs in
+            // the HANDLER's frame — the constructor arguments. A `byte_at(
+            // req.path, i)` or `parse_int(substring(req.path, …))` there is
+            // request data evaluated BEFORE the `call`, with the handler's
+            // rbp live, so its recorded site unwinds to the close label and
+            // the listener survives (pinned). Inside the CALLEE nothing can
+            // record: the callables were emitted before the scope opened,
+            // and — the residual, stated so it is findable — a bound tripped
+            // INSIDE a called rule would still `sys_exit(1)` the listener.
+            // In slice agg-svc-1 that residual is VACUOUS BY CONSTRUCTION:
+            // only Numbers cross the call (Number-only input, gated), and
+            // the callee is gated to no text / bytes source at all (no text
+            // field, no read / fetch / random, no text let), so the only
+            // `byte_at` / `length` a callee can contain indexes a `b"…"`
+            // LITERAL with a client-influenced Number — an out-of-range
+            // index there IS reachable from the network and is an operator
+            // exit, not a connection close. Routing it to `close` needs an
+            // abort target threaded through `emit_eval_expr` (the refactor
+            // svc-client-abort-1 declined); named as slice agg-svc-2's.
+            if let Some(agg) = &agg_lets[idx] {
+                let n = agg.layout.len() as i32;
+                let dest_base = let_cursor - 8 * (n - 1);
+                let_cursor -= 8 * n;
+                for (i, (_f, off)) in agg.layout.iter().enumerate() {
+                    handler_offsets.insert(agg_keys[idx][i].as_str(), dest_base + off);
                 }
+                let ctx = SelfCallCtx {
+                    labels: &agg_labels,
+                    arities: &agg_arities,
+                    struct_layouts: &agg_struct_layouts,
+                    param_in_rbx: None,
+                    record_returns: &agg_record_returns,
+                    sret_dest: Some(SretDest::Frame(dest_base)),
+                };
+                emit_eval_expr(
+                    &mut code,
+                    expr,
+                    &handler.input_name,
+                    &handler_offsets,
+                    all_rules,
+                    field_ranges,
+                    &http_text_bindings,
+                    Some(ctx),
+                    None,
+                )?;
+                continue;
             }
             if *is_text {
                 let ptr_slot = let_cursor;
@@ -37929,23 +38510,24 @@ service chained
         let _ = std::fs::remove_file(&out);
     }
 
-    /// Slice agg-svc-1 (DIAGNOSTIC ONLY — no lowering): a handler `let`
-    /// bound to a RECORD-returning rule is refused, and the refusal must
-    /// tell the truth. Before this pin it said `unknown rule 'swap2' for
-    /// native inlining` — false: the verifier had just resolved `swap2`.
-    /// The service path hands its emitter an EMPTY rules map (on purpose:
-    /// it inlines no rule call — `no_rules` in
-    /// `compile_http10_dynamic_service`), so `let_rhs_is_text` classified
-    /// the Call as a number and `emit_eval_expr`'s Call arm then failed the
-    /// SAME empty lookup. The breadcrumb now names the service, the
-    /// handler, the let, the callee, the record concept and the lifting
-    /// slice; the anti-assertion pins the old wording out. The twin — the
-    /// same handler with a NUMBER let in the record let's place — still
-    /// compiles, so the refusal is attributable to the record let and the
-    /// check is not "every handler let is refused". Verified to FAIL
-    /// against c5e46b0 (`unknown rule 'swap2' for native inlining`).
+    /// Slice agg-svc-1 — the pin PR #202 left for it, flipped. PR #202 made
+    /// the refusal of a record-valued handler `let` TRUTHFUL (it had said
+    /// `unknown rule 'swap2' for native inlining` about a rule the verifier
+    /// had just resolved — the service emitter's EMPTY rules map); this
+    /// slice LIFTS it. Three halves:
+    ///
+    ///   1. the exact fixture PR #202 asserted REFUSED now COMPILES — the
+    ///      callee becomes a callable ahead of the service prologue and the
+    ///      let a slot group in the handler frame;
+    ///   2. the refusal SURVIVES for a shape this slice does not lower — a
+    ///      callee returning a concept with a TEXT field — and still tells
+    ///      the truth: it names the service, the handler, the let, the
+    ///      callee, the concept, the field and slice `agg-svc-2`, and it
+    ///      never says `unknown rule`;
+    ///   3. the number-let twin still compiles, so neither gate is "every
+    ///      handler let".
     #[test]
-    fn record_valued_handler_let_is_refused_with_a_truthful_breadcrumb() {
+    fn record_valued_handler_let_compiles_and_a_text_field_callee_is_refused_truthfully() {
         let parse = |src: &str| {
             let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
             crate::parser::Parser::new(tokens).parse_program().expect("parse")
@@ -37976,7 +38558,7 @@ service chained
             )
         };
 
-        // ── 1. THE REFUSAL, and what it says ─────────────────────────
+        // ── 1. PR #202's REFUSED fixture now COMPILES ────────────────
         let record = fixture(
             "let q = swap2(In { a: 1, b: 2 })",
             "200",
@@ -37993,24 +38575,44 @@ service chained
         );
         let out = std::env::temp_dir().join("verbosec_test_agg_svc_1_record_let");
         let _ = std::fs::remove_file(&out);
+        compile_service(&program, "s", out.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("slice agg-svc-1 lowers a record-valued handler let: {}", e.message));
+        let bytes = std::fs::read(&out).expect("read the service binary");
+        assert!(!bytes.is_empty(), "the record-let service must be a real binary");
+        let _ = std::fs::remove_file(&out);
+
+        // ── 1b. THE REFUSAL SURVIVES for a TEXT-field callee, truthfully ──
+        // Same program with `Pair { x: number, y: text }` and a literal in
+        // the callee's `y`: the (ptr, len) pair convention is slice agg-3 on
+        // the rule path and agg-svc-2 here, and the breadcrumb says so.
+        let text_field = record
+            .replace("    y : number [0, 255]\n", "    y : text [..8]\n")
+            .replace("Pair { x: i.b, y: i.a }", "Pair { x: i.b, y: \"t\" }")
+            .replace("reads : [i.a, i.b]", "reads : [i.b]");
+        let program = parse(&text_field);
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "the text-field twin must verify clean; got {errs:#?}");
+        let out = std::env::temp_dir().join("verbosec_test_agg_svc_1_text_field_callee");
+        let _ = std::fs::remove_file(&out);
         let msg = compile_service(&program, "s", out.to_str().unwrap())
-            .expect_err("a record-valued handler let is not lowered yet (slice agg-svc-1); it must be REFUSED")
+            .expect_err("a callee returning a TEXT field is slice agg-svc-2; it must be REFUSED")
             .message;
         for needle in [
             "service 's'",
             "handler 'handle'",
             "let 'q'",
             "'swap2'",
-            "record",
             "'Pair'",
-            "agg-svc-1",
+            "field 'y'",
+            "Text",
+            "agg-svc-2",
         ] {
             assert!(msg.contains(needle), "breadcrumb must name {needle:?}; got {msg:?}");
         }
         assert!(
             !msg.contains("unknown rule"),
-            "the rule EXISTS and verified — `unknown rule` is the false breadcrumb this \
-             test exists to pin out; got {msg:?}",
+            "the rule EXISTS and verified — `unknown rule` is the false breadcrumb PR #202 \
+             pinned out, and it must stay out; got {msg:?}",
         );
         assert!(!out.exists(), "a refusal writes ZERO bytes; found {:?}", out);
 
@@ -38035,6 +38637,448 @@ service chained
         let bytes = std::fs::read(&out2).expect("read the twin's binary");
         assert!(!bytes.is_empty(), "the twin must produce a real service binary");
         let _ = std::fs::remove_file(&out2);
+    }
+
+    /// Slice agg-svc-1 — a fixture builder for the service-side aggregate
+    /// tests: two Number concepts (`In { a, b }` → `Pair { x, y }`), one or
+    /// more callee rules supplied verbatim, and a handler whose logic lines
+    /// are supplied verbatim. `@source` lines point at real files under
+    /// `examples/` so `verify_program`'s traceability check passes. The
+    /// service port is the `__PORT__` token `text_state_drive` substitutes.
+    fn agg_svc_src(
+        concepts: &str,
+        callees: &str,
+        handler_logic: &str,
+        reads: &str,
+        calls: &str,
+        service_tail: &str,
+    ) -> String {
+        format!(
+            "@verbose 0.1.0\n\n{concepts}\n{callees}\n\
+             rule handle\n  @intention: \"answer with fields of a returned aggregate\"\n  @source: counter_service.intent:3\n\
+             \x20 input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n{handler_logic}\n\
+             \x20 proofs:\n    purity:\n      reads : [{reads}]\n      calls : [{calls}]\n    termination:\n      bound : 20\n\n\
+             service s\n  @intention: \"HTTP front for an aggregate-returning rule\"\n  @source: counter_service.intent:5\n\
+             \x20 listen:\n    protocol    : http_1_0\n    port        : __PORT__\n    max_request : 4096\n  handler: handle\n{service_tail}",
+        )
+    }
+
+    const AGG_SVC_CONCEPTS: &str = "\
+concept In
+  @intention: \"two numbers\"
+  @source: aggregate_pair.intent:1
+  fields:
+    a : number [0, 4096]
+    b : number [0, 4096]
+
+concept Pair
+  @intention: \"two numbers back, as one record\"
+  @source: aggregate_pair.intent:2
+  fields:
+    x : number [0, 8192]
+    y : number [0, 8192]
+";
+
+    const AGG_SVC_SWAP2: &str = "\
+rule swap2
+  @intention: \"return both numbers swapped, as one record value\"
+  @source: aggregate_pair.intent:3
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = Pair { x: i.b, y: i.a }
+  proofs:
+    purity:
+      reads : [i.a, i.b]
+      calls : []
+    termination:
+      bound : 3
+";
+
+    /// Slice agg-svc-1, THE SLICE END TO END: `examples/pair_service.verbose`
+    /// driven over real TCP. `handle` binds `let q = stats(In { a:
+    /// length(req.path), b: 10 })` — a REQUEST-DEPENDENT constructor, so the
+    /// answer cannot be a constant the emitter happened to store — and
+    /// answers `concat("sum:", q.sum, " diff:", q.diff, " big:", q.big)`.
+    /// The callee carries a number `let` (PR #54's callable-let path, on a
+    /// service-called callee for the first time), a subtraction whose result
+    /// is NEGATIVE (the itoa's sign arm through a record slot), and `max`.
+    ///
+    /// FOUR requests, the last repeating the first: rows 1–3 pin the values,
+    /// row 4 pins that the accept loop SURVIVED the call — the register
+    /// audit's claim that no admitted callee clobbers r12 (the listening
+    /// socket), measured rather than argued. Negative control NC-B (a
+    /// `mov r12, 0` in the callable prologue, patched build): row 1 answers,
+    /// rows 2–4 never do. Negative control NC-A (the `lea rsi` emitted
+    /// BEFORE the input marshalling): every row answers `sum:0 diff:0
+    /// big:0` — `length(req.path)` leaves the request pointer in rsi, the
+    /// callee stores through it, and the slot group keeps its zeros. Both
+    /// run on this fixture and both bite; the flagship is not vacuous for
+    /// either.
+    ///
+    /// The callee as a RULE target is unchanged by the slice: `stats` still
+    /// compiles through `emit_record_program` and prints the same JSON.
+    #[test]
+    fn agg_svc_1_record_let_composes_over_real_tcp() {
+        let src = std::fs::read_to_string("examples/pair_service.verbose")
+            .expect("examples/pair_service.verbose");
+        let src = src.replace("18966", "__PORT__");
+        let tokens = crate::lexer::Lexer::new(&src.replace("__PORT__", "18966")).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "the worked example must verify clean; got {errs:#?}");
+
+        let bodies = text_state_drive(&src, "pair", "agg_svc_1_flagship", &["/abc", "/hello", "/a-longer-1", "/abc"]);
+        assert_eq!(
+            bodies,
+            vec![
+                "sum:14 diff:-6 big:10".to_string(),
+                "sum:16 diff:-4 big:10".to_string(),
+                "sum:21 diff:1 big:11".to_string(),
+                "sum:14 diff:-6 big:10".to_string(),
+            ],
+            "the three fields of the returned aggregate, request-dependent, and the loop alive after the call"
+        );
+
+        // The size pin: 1358 B for the flagship (the callable is 106 B of
+        // it). A move here is a real emitter change, not noise — the emit
+        // is deterministic.
+        let out = std::env::temp_dir().join("verbosec_test_agg_svc_1_size_pin");
+        let _ = std::fs::remove_file(&out);
+        compile_service(&program, "pair", out.to_str().unwrap()).expect("compile");
+        let bytes = std::fs::read(&out).expect("read");
+        assert_eq!(bytes.len(), 1358, "pair_service.verbose::pair size pin");
+        // The leading instruction of the code segment is the `jmp` over the
+        // callable (ELF header + program header = 120 B on these binaries).
+        assert_eq!(bytes[120], 0xE9, "the service code must begin with the jmp over the callable");
+        let _ = std::fs::remove_file(&out);
+
+        // The callee as a rule target: byte-identical to the baseline sweep
+        // (1011 B) and printing the record as JSON.
+        let rule_out = std::env::temp_dir().join("verbosec_test_agg_svc_1_stats_rule");
+        let _ = std::fs::remove_file(&rule_out);
+        compile_native(&program, "stats", rule_out.to_str().unwrap(), false, false).expect("compile stats");
+        let o = std::process::Command::new(&rule_out).args(["4", "10"]).output().expect("run stats");
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "{\"sum\":14,\"diff\":-6,\"big\":10}");
+        assert_eq!(o.status.code(), Some(0));
+        let _ = std::fs::remove_file(&rule_out);
+    }
+
+    /// Slice agg-svc-1 — COMPOSITE KEYING on the service path, where the
+    /// collision is REAL rather than hypothetical: the handler's input is
+    /// `HttpRequest`, whose `path` / `method` are registered in the offsets
+    /// map under their BARE names, so a returned concept with a field named
+    /// `path` read as `q.path` would — keyed bare — resolve to the request's
+    /// `path` POINTER slot and itoa a stack address into the response body:
+    /// a silent wrong answer AND an ASLR disclosure to a remote client, the
+    /// exact class PR #197 / #206 closed elsewhere. Keyed `__agg_q_path`, the
+    /// read is the aggregate's number, and `req.path` still resolves beside
+    /// it (the `len:` field would be wrong if the registration had
+    /// overwritten the request's slot instead).
+    #[test]
+    fn service_record_let_field_named_like_a_request_field() {
+        let concepts = "\
+concept In
+  @intention: \"two numbers\"
+  @source: aggregate_pair.intent:1
+  fields:
+    a : number [0, 4096]
+    b : number [0, 4096]
+
+concept Probe
+  @intention: \"fields deliberately named after HttpRequest's\"
+  @source: aggregate_pair.intent:2
+  fields:
+    path : number [0, 8192]
+    method : number [0, 8192]
+";
+        let callee = "\
+rule probe
+  @intention: \"a record whose field names collide with the request's\"
+  @source: aggregate_pair.intent:3
+  input:
+    i : In
+  output:
+    p : Probe
+  logic:
+    p = Probe { path: i.a * 2, method: i.b + 1 }
+  proofs:
+    purity:
+      reads : [i.a, i.b]
+      calls : []
+    termination:
+      bound : 5
+";
+        let src = agg_svc_src(
+            concepts,
+            callee,
+            "    let q = probe(In { a: length(req.path), b: 3 })\n    resp = HttpResponse { status: 200, body: concat(\"p:\", q.path, \" m:\", q.method, \" len:\", length(req.path)) }",
+            "req.path",
+            "probe",
+            "",
+        );
+        let tokens = crate::lexer::Lexer::new(&src.replace("__PORT__", "18966")).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "the collision fixture must verify clean; got {errs:#?}");
+        let bodies = text_state_drive(&src, "s", "agg_svc_1_collision", &["/abc", "/abcdef"]);
+        assert_eq!(bodies, vec!["p:8 m:4 len:4".to_string(), "p:14 m:4 len:7".to_string()]);
+    }
+
+    /// Slice agg-svc-1 — the CLIENT-ABORT SCOPE and a record let. A
+    /// `byte_at(req.path, 3)` as a CONSTRUCTOR ARGUMENT is request data
+    /// evaluated BEFORE the `call`, with the handler's rbp live, so its
+    /// recorded site takes the close path (svc-client-abort-1's contract):
+    /// `/ab` (three bytes, index 3 out of range) is closed with NO response
+    /// and the listener survives to answer `/abcd` on the next connection
+    /// (byte 3 is `c` = 99). The callable itself is emitted OUTSIDE the
+    /// scope, and in this slice nothing inside a callee can be reached by
+    /// request bytes at all (Number-only input, no text source in the
+    /// callee) — the residual stated at the emit site.
+    #[test]
+    fn service_record_let_ctor_argument_client_abort_closes_connection_only() {
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS,
+            AGG_SVC_SWAP2,
+            "    let q = swap2(In { a: byte_at(req.path, 3), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x, \" y:\", q.y) }",
+            "req.path",
+            "swap2",
+            "",
+        );
+        let tokens = crate::lexer::Lexer::new(&src.replace("__PORT__", "18966")).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
+        assert!(errs.is_empty(), "must verify clean; got {errs:#?}");
+        let bodies = text_state_drive(&src, "s", "agg_svc_1_client_abort", &["/ab", "/abcd", "/ab", "/xyz!"]);
+        assert_eq!(
+            bodies,
+            vec!["".to_string(), "x:1 y:99".to_string(), "".to_string(), "x:1 y:122".to_string()],
+            "a tripped constructor argument closes ONLY that connection; the listener answers the next one"
+        );
+    }
+
+    /// Slice agg-svc-1 — every refusal, each naming the offender and slice
+    /// `agg-svc-2`, each with the flagship shape as its corrected twin
+    /// (`AGG_SVC_SWAP2` compiles in cell 0). Refusals are probed through
+    /// `compile_service`, which BYPASSES `verify_program`, so the cells the
+    /// verifier ALSO refuses (marked) prove the emitter's backstop is not
+    /// vacuous — a verifier regression could not turn any of them into a
+    /// wrong binary. Every refusal writes ZERO bytes.
+    #[test]
+    fn service_record_let_refusals_name_agg_svc_2_with_corrected_twins() {
+        let parse = |src: &str| {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+            crate::parser::Parser::new(tokens).parse_program().expect("parse")
+        };
+        let verify = |src: &str| {
+            crate::verifier::verify_program(&parse(src), std::path::Path::new("examples"))
+        };
+        let out = std::env::temp_dir().join("verbosec_test_agg_svc_1_refusals");
+        let refuse = |label: &str, src: &str, needles: &[&str]| {
+            let _ = std::fs::remove_file(&out);
+            let msg = compile_service(&parse(src), "s", out.to_str().unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("[{label}] must be REFUSED"))
+                .message;
+            for n in needles {
+                assert!(msg.contains(n), "[{label}] breadcrumb must name {n:?}; got {msg:?}");
+            }
+            assert!(!out.exists(), "[{label}] a refusal writes ZERO bytes");
+        };
+        let handler_ok = "    let q = swap2(In { a: length(req.path), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x, \" y:\", q.y) }";
+
+        // ── 0. the corrected twin: the flagship shape compiles ──────────
+        let twin = agg_svc_src(AGG_SVC_CONCEPTS, AGG_SVC_SWAP2, handler_ok, "req.path", "swap2", "")
+            .replace("__PORT__", "18966");
+        assert!(verify(&twin).is_empty(), "the twin must verify clean");
+        let _ = std::fs::remove_file(&out);
+        compile_service(&parse(&twin), "s", out.to_str().unwrap()).expect("the twin must compile");
+        assert!(std::fs::read(&out).map(|b| !b.is_empty()).unwrap_or(false));
+        let _ = std::fs::remove_file(&out);
+
+        // ── 1. text INPUT field on the callee ───────────────────────────
+        let src = agg_svc_src(
+            &AGG_SVC_CONCEPTS.replace("    b : number [0, 4096]\n", "    b : text [..8]\n"),
+            &AGG_SVC_SWAP2.replace("Pair { x: i.b, y: i.a }", "Pair { x: i.a, y: i.a }").replace("reads : [i.a, i.b]", "reads : [i.a]"),
+            "    let q = swap2(In { a: length(req.path), b: \"t\" })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x) }",
+            "req.path", "swap2", "",
+        ).replace("__PORT__", "18966");
+        assert!(verify(&src).is_empty(), "[1] verifies clean (a text field is legal on the rule path)");
+        refuse("1 text input field", &src, &["let 'q'", "'swap2'", "input field 'b'", "Text", "agg-svc-2"]);
+
+        // ── 2. text OUTPUT field on the callee ──────────────────────────
+        let src = agg_svc_src(
+            &AGG_SVC_CONCEPTS.replace("    y : number [0, 8192]\n", "    y : text [..8]\n"),
+            &AGG_SVC_SWAP2.replace("Pair { x: i.b, y: i.a }", "Pair { x: i.b, y: \"t\" }").replace("reads : [i.a, i.b]", "reads : [i.b]"),
+            "    let q = swap2(In { a: length(req.path), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x) }",
+            "req.path", "swap2", "",
+        ).replace("__PORT__", "18966");
+        assert!(verify(&src).is_empty(), "[2] verifies clean");
+        refuse("2 text output field", &src, &["'swap2'", "'Pair'", "field 'y'", "Text", "agg-svc-2"]);
+
+        // ── 3. a RECURSIVE callee ───────────────────────────────────────
+        let rec = "\
+rule swap2
+  @intention: \"count a down to zero, then answer\"
+  @source: aggregate_pair.intent:3
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = if i.a == 0 then Pair { x: i.b, y: 0 } else swap2(In { a: i.a - 1, b: i.b })
+  proofs:
+    purity:
+      reads : [i.a, i.b]
+      calls : [swap2]
+    termination:
+      bound : 12
+      decreasing : a
+";
+        let src = agg_svc_src(AGG_SVC_CONCEPTS, rec, handler_ok, "req.path", "swap2", "").replace("__PORT__", "18966");
+        refuse("3 recursive callee", &src, &["'swap2'", "recursive", "agg-svc-2"]);
+
+        // ── 4. a callee with a callee of its own ────────────────────────
+        let helper_and_mk = "\
+rule helper
+  @intention: \"a number helper\"
+  @source: aggregate_pair.intent:3
+  input:
+    i : In
+  output:
+    out : number
+  logic:
+    out = i.a + 1
+  proofs:
+    purity:
+      reads : [i.a]
+      calls : []
+    termination:
+      bound : 2
+
+rule swap2
+  @intention: \"a record built through a helper call\"
+  @source: aggregate_pair.intent:3
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = Pair { x: helper(i), y: i.b }
+  proofs:
+    purity:
+      reads : [i, i.b]
+      calls : [helper]
+    termination:
+      bound : 4
+";
+        let src = agg_svc_src(AGG_SVC_CONCEPTS, helper_and_mk, handler_ok, "req.path", "swap2", "").replace("__PORT__", "18966");
+        refuse("4 callee with a callee", &src, &["'swap2'", "itself calls 'helper'", "agg-svc-2"]);
+
+        // ── 5. a callee that READS a resource ───────────────────────────
+        let reading = format!(
+            "resource cfg\n  @intention: \"a threshold file\"\n  @source: read_config.intent:1\n  path : \"/tmp/verbosec_agg_svc_cfg\"\n  max : 16\n  on_read_error : abort\n\n{}",
+            AGG_SVC_SWAP2
+                .replace("Pair { x: i.b, y: i.a }", "Pair { x: parse_int(read(cfg)), y: i.a }")
+                .replace("reads : [i.a, i.b]", "reads : [i.a, cfg]")
+                .replace("bound : 3", "bound : 5")
+        );
+        let src = agg_svc_src(AGG_SVC_CONCEPTS, &reading, handler_ok, "req.path", "swap2", "").replace("__PORT__", "18966");
+        refuse("5 callee reads a resource", &src, &["'swap2'", "read(cfg)", "agg-svc-2"]);
+
+        // ── 6. a TEXT let in the callee ─────────────────────────────────
+        let text_let = AGG_SVC_SWAP2.replace("  logic:\n    p = Pair", "  logic:\n    let tag = \"abc\"\n    p = Pair");
+        let src = agg_svc_src(AGG_SVC_CONCEPTS, &text_let, handler_ok, "req.path", "swap2", "").replace("__PORT__", "18966");
+        refuse("6 text let in the callee", &src, &["'swap2'", "let 'tag'", "text-typed", "agg-svc-2"]);
+
+        // ── 7. the aggregate call NESTED in a let RHS (verifier refuses too)
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS, AGG_SVC_SWAP2,
+            "    let z = 1 + swap2(In { a: 1, b: 2 })\n    resp = HttpResponse { status: 200, body: \"ok\" }",
+            "", "swap2", "",
+        ).replace("__PORT__", "18966");
+        assert!(!verify(&src).is_empty(), "[7] the verifier refuses a record in a Number operand (PR #182)");
+        refuse("7 nested in a let RHS", &src, &["let 'z'", "'swap2'", "ENTIRE right-hand side", "agg-svc-2"]);
+
+        // ── 8. the aggregate call in the handler BODY ───────────────────
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS, AGG_SVC_SWAP2,
+            "    resp = HttpResponse { status: 200, body: concat(\"x:\", swap2(In { a: 1, b: 2 })) }",
+            "", "swap2", "",
+        ).replace("__PORT__", "18966");
+        refuse("8 in the handler body", &src, &["'swap2'", "the handler body", "agg-svc-2"]);
+
+        // ── 9. the aggregate call in an `after:` set (verifier refuses too)
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS, AGG_SVC_SWAP2,
+            "    resp = HttpResponse { status: 200, body: \"ok\" }",
+            "", "",
+            "\n  state:\n    count : number = 0\n\n  after:\n    set count = swap2(In { a: 1, b: 2 })\n",
+        ).replace("__PORT__", "18966");
+        assert!(!verify(&src).is_empty(), "[9] the verifier refuses a record as a Number set source (PR #197)");
+        refuse("9 in an after set", &src, &["'swap2'", "after: set count", "agg-svc-2"]);
+
+        // ── 10. a non-constructor ARGUMENT ──────────────────────────────
+        // FINDING, measured while writing this cell and pinned AS-IS: the
+        // verifier does NOT compare a call argument's concept to the
+        // callee's declared input — `swap2(req)` with `swap2 : In -> Pair`
+        // verifies clean (`all proofs check out`), on the service path AND
+        // on the rule path (a `rule g(j : B)` whose body is `f(j)` with
+        // `f : A -> number` verifies, runs under `--run` and is refused by
+        // `--native` only at the emitter, with `unknown field`). Pre-existing
+        // (identical on the `e4469c8` compiler), the arity check of PR #157
+        // is the only thing `check_call_arity` looks at, and closing it is a
+        // verifier slice of its own. Until then the EMITTER is the only
+        // gate for this cell, which is exactly why the cell exists.
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS, AGG_SVC_SWAP2,
+            "    let q = swap2(req)\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x) }",
+            "req", "swap2", "",
+        ).replace("__PORT__", "18966");
+        assert!(
+            verify(&src).is_empty(),
+            "[10] MEASURED: the verifier accepts a call argument of the wrong concept; if this \
+             starts failing the verifier grew the check — move this cell to the 'verifier refuses \
+             too' group and record it"
+        );
+        refuse("10 non-constructor argument", &src, &["'swap2'", "constructor", "agg-svc-2"]);
+
+        // ── 11. the binding used as a SCALAR (verifier refuses: PR #182) ─
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS, AGG_SVC_SWAP2,
+            "    let q = swap2(In { a: 1, b: 2 })\n    resp = HttpResponse { status: q, body: \"ok\" }",
+            "", "swap2", "",
+        ).replace("__PORT__", "18966");
+        assert!(!verify(&src).is_empty(), "[11] the verifier refuses a record binding as a scalar");
+        refuse("11 record binding as a scalar", &src, &["binding 'q'", "'.field'", "agg-svc-2"]);
+
+        // ── 12. an UNKNOWN field (verifier refuses: PR #178) ────────────
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS, AGG_SVC_SWAP2,
+            "    let q = swap2(In { a: 1, b: 2 })\n    resp = HttpResponse { status: 200, body: concat(\"z:\", q.zz) }",
+            "", "swap2", "",
+        ).replace("__PORT__", "18966");
+        assert!(!verify(&src).is_empty(), "[12] the verifier refuses an undeclared field");
+        refuse("12 unknown field", &src, &["binding 'q'", "no field 'zz'", "__agg_"]);
+
+        // ── 13. a rule call INSIDE a constructor argument ───────────────
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS,
+            &format!("{}\n{}", helper_and_mk.split("\nrule swap2").next().unwrap(), AGG_SVC_SWAP2),
+            "    let q = swap2(In { a: helper(In { a: 1, b: 2 }), b: 2 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x) }",
+            "", "swap2, helper", "",
+        ).replace("__PORT__", "18966");
+        refuse("13 call inside a ctor argument", &src, &["constructor field 'a'", "'helper'", "agg-svc-2"]);
+
+        // ── 14. the let named `state` ───────────────────────────────────
+        let src = agg_svc_src(
+            AGG_SVC_CONCEPTS, AGG_SVC_SWAP2,
+            "    let state = swap2(In { a: 1, b: 2 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", state.x) }",
+            "", "swap2", "",
+        ).replace("__PORT__", "18966");
+        refuse("14 let named state", &src, &["let 'state'", "rename"]);
     }
 
     /// Phase 8 slice 8e: a service may declare MULTIPLE `log:` blocks,
@@ -44338,6 +45382,16 @@ service shadow
     /// breadcrumb), then a plain rule is compiled and must still carry its
     /// inline exit(1) — and, driven, must still exit 1 on an out-of-range
     /// index.
+    ///
+    /// The provoking shape was a record-valued let until slice agg-svc-1
+    /// LIFTED that refusal (the fixture below still binds one, and it now
+    /// compiles — which is itself worth having here: the callable is
+    /// emitted BEFORE the scope opens). The early `?` is now provoked by a
+    /// `let z = read(cfg)` as a whole let RHS — classified as a NUMBER let
+    /// (`let_rhs_is_text` has no Read arm, PR #202's producer matrix) and
+    /// refused by `emit_eval_expr`'s Read arm INSIDE the let prologue, i.e.
+    /// after `ClientAbortScope::begin()`, which is the position this test
+    /// needs the refusal to come from.
     #[test]
     fn client_abort_scope_is_restored_after_a_refused_service() {
         // The RULE binary, compiled BEFORE any service on this thread: the
@@ -44354,13 +45408,13 @@ service shadow
         let (out_before, before) = compile_rule("before");
         let _ = std::fs::remove_file(&out_before);
 
-        let refused ="@verbose 0.1.0\n\nconcept In\n  @intention: \"in\"\n  @source: tag_probe.intent:1\n  fields:\n    a : number\n\nconcept Out\n  @intention: \"out\"\n  @source: tag_probe.intent:1\n  fields:\n    x : number\n\nrule mk\n  @intention: \"mk\"\n  @source: tag_probe.intent:1\n  input:\n    i : In\n  output:\n    o : Out\n  logic:\n    o = Out { x: i.a }\n  proofs:\n    purity:\n      reads : [i.a]\n      calls : []\n    termination:\n      bound : 3\n\nrule h\n  @intention: \"probe\"\n  @source: tag_probe.intent:1\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    let q = mk(In { a: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"b:\", byte_at(req.path, 50)) }\n  proofs:\n    purity:\n      reads : [req.path]\n      calls : [mk]\n    termination:\n      bound : 12\n\nservice svc\n  @intention: \"svc\"\n  @source: tag_probe.intent:2\n  listen:\n    protocol    : http_1_0\n    port        : 18999\n    max_request : 4096\n  handler: h\n";
+        let refused ="@verbose 0.1.0\n\nresource cfg\n  @intention: \"cfg\"\n  @source: read_config.intent:1\n  path : \"/tmp/verbosec_test_clientabort_cfg\"\n  max : 16\n  on_read_error : abort\n\nconcept In\n  @intention: \"in\"\n  @source: tag_probe.intent:1\n  fields:\n    a : number\n\nconcept Out\n  @intention: \"out\"\n  @source: tag_probe.intent:1\n  fields:\n    x : number\n\nrule mk\n  @intention: \"mk\"\n  @source: tag_probe.intent:1\n  input:\n    i : In\n  output:\n    o : Out\n  logic:\n    o = Out { x: i.a }\n  proofs:\n    purity:\n      reads : [i.a]\n      calls : []\n    termination:\n      bound : 3\n\nrule h\n  @intention: \"probe\"\n  @source: tag_probe.intent:1\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    let q = mk(In { a: 1 })\n    let z = read(cfg)\n    resp = HttpResponse { status: 200, body: concat(\"b:\", byte_at(req.path, 50)) }\n  proofs:\n    purity:\n      reads : [req.path, cfg]\n      calls : [mk]\n    termination:\n      bound : 12\n\nservice svc\n  @intention: \"svc\"\n  @source: tag_probe.intent:2\n  listen:\n    protocol    : http_1_0\n    port        : 18999\n    max_request : 4096\n  handler: h\n";
         let tokens = crate::lexer::Lexer::new(refused).tokenize().expect("tokenize");
         let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
         let out = std::env::temp_dir().join("verbosec_test_clientabort_refused_svc");
         let err = compile_service(&program, "svc", out.to_str().unwrap())
-            .expect_err("a record-valued handler let is refused on the service path");
-        assert!(err.message.contains("record-valued `let`"), "{}", err.message);
+            .expect_err("a `let z = read(cfg)` as a whole number-classified let RHS is refused inside the let prologue");
+        assert!(err.message.contains("read() returns text"), "{}", err.message);
         assert!(
             CLIENT_ABORT_SITES.with(|s| s.borrow().is_none()),
             "the ClientAbortScope opened before the refusal must have been dropped and restored"
@@ -55318,8 +56372,30 @@ rule pick
         // `max_steps` / `read_timeout` never reach gen0's parser because
         // the protocol is refused first. The safe direction; EXPECTED_ACCEPTED
         // stays 97, the existing raw_tcp cell covers it.
+        //
+        // 160 -> 161 (2026-09-06, slice agg-svc-1): `pair_service.verbose`,
+        // the first HTTP service whose handler binds a record returned by a
+        // rule. MEASURED with a gen0 built from this branch (657831 B, the
+        // same bytes as before): REFUSED at index 0 (`stats`, the record-
+        // returning callee) AND at index 1 (`handle`), rc 1 and zero bytes
+        // both — and the refusal is NOT the record let. Bisected: the file
+        // with `rule handle` + the service deleted is ACCEPTED at index 0
+        // (906 B — gen0 compiles `stats` with its number let, its `max` and
+        // its negative-bounded field); the full file with the record let
+        // replaced by a NUMBER let (`let q = length(req.path)`) is refused;
+        // with the let deleted and the body `concat("n:", length(req.path))`
+        // refused; with the let deleted and the body `concat("n:",
+        // req.path)` ACCEPTED (3906 B). So gen0's gates here are a handler
+        // `let` and `length()` over a request field in a handler — both
+        // PRE-EXISTING (gen0 refuses `greeting_service` and `echo_path` at
+        // index 0 today for the same reason), independent of the aggregate,
+        // and both refusals emit zero bytes: the safe direction, NOT the
+        // `aggregate_pair::total` record-let SIGTRAP class. EXPECTED_ACCEPTED
+        // stays 97; no gaps-table row moves (the record-let row's declared-
+        // entry half is unreachable here because the handler gate fires
+        // first).
         const EXPECTED_ACCEPTED: usize = 97;
-        const EXPECTED_TOTAL: usize = 160;
+        const EXPECTED_TOTAL: usize = 161;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

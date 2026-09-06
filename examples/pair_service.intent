@@ -1,0 +1,5 @@
+1. Take two numbers, a and b.
+2. Produce their sum, their difference and the larger of the two, as one record.
+3. The helper: compute all three and return them as one record value.
+4. The HTTP handler: feed the helper the request path's length and a constant, bind the returned record to a name, and answer with its three fields.
+5. Serve it over HTTP/1.0 on port 18966.

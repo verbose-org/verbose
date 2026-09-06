@@ -105,6 +105,7 @@ If you want to know what a feature *looks like* in source, find it below and rea
 | `method_guard.verbose` | Slice 3e: `status` is a computed expression (`if cond then 200 else 405`). |
 | `prefix_router.verbose` | `starts_with(req.path, "/api/v1/")` for path-prefix routing without regex. |
 | `uri_size_gate.verbose` | `length(req.path) > parse_int(read(max))` — runtime-tunable input gate. |
+| `pair_service.verbose` | Slice agg-svc-1: the handler BINDS a record returned by a rule (`let q = stats(In { a: length(req.path), b: 10 })`) and answers with `q.sum` / `q.diff` / `q.big`. The callee is a real callable ahead of the service prologue; the let is a slot group in the handler frame. 1358 B. |
 | `raw_tcp_echo.verbose` | `Protocol::RawTcp` — bytes-in, bytes-out, no parsing. |
 
 ## HTTP audit logs (Phase 8 — per-request `log:` block)
