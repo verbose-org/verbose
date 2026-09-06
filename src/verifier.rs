@@ -3244,7 +3244,13 @@ fn check_call_argument_types(
             input_concept: Option<&Concept>, concepts: &HashMap<String, &Concept>, bindings: &Bindings,
             shadowed: &[String], errors: &mut Vec<VerifyError>,
         ) {
-            if let Expr::If(_, then_e, else_e) = arg {
+            if let Expr::If(cond, then_e, else_e) = arg {
+                // Branch compatibility does not establish that the selector
+                // is a boolean. Keep unknown local binders unknown here too.
+                if !expr_mentions_names(cond, shadowed) {
+                    check_expr_against(cond, &Type::Bool, rule, all_rules,
+                        input_concept, concepts, bindings, errors);
+                }
                 for branch in [then_e, else_e] {
                     check_arg(branch, callee, rule, all_rules, input_concept, concepts, bindings, shadowed, errors);
                 }
@@ -6597,6 +6603,22 @@ rule caller
             let errs = verify_str(&good_src);
             assert!(errs.is_empty(), "corrected {good}: {errs:?}");
         }
+    }
+
+    #[test]
+    fn rule_call_argument_types_validate_conditional_selectors() {
+        for (condition, actual) in [("1", "number"), ("\"yes\"", "text")] {
+            let src = call_type_program(
+                &format!("    out = f(if {condition} then A {{ a: 1 }} else A {{ a: 2 }})"),
+                "", "f", "number");
+            let errors = verify_str(&src);
+            assert!(errors.iter().any(|e| e.message.contains(
+                &format!("has type '{actual}' but context expects 'bool'"))), "{errors:?}");
+        }
+        let src = call_type_program(
+            "    out = f(if i.b > 0 then A { a: 1 } else A { a: 2 })",
+            "i.b", "f", "number");
+        assert!(verify_str(&src).is_empty());
     }
 
     #[test]
