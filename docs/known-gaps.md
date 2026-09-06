@@ -1,7 +1,14 @@
-# Known Gaps in Native Backend
+# Native backend — gap history
 
-Gaps discovered through project-driven testing. Each is a real user-facing
-limitation with a documented workaround. Ordered by impact.
+This is a historical record of gaps and their subsequent implementation slices.
+Some entries describe features before they landed. For present scope, start with
+[current status](current-status.md) and [architecture](../ARCHITECTURE.md).
+
+**Current orientation (2026-09-05):** source-declared HTTP/raw TCP services, file
+resources, and outbound connections exist. The pre-Phase-7 networking gap below
+is superseded for those supported constructs. Legacy `--http-server` and
+`--demo-http` entry points still have the distinct roles described below.
+Historical sizes and restrictions apply to the milestone where they were recorded.
 
 ## Three tiers of native output (important clarification)
 
@@ -12,7 +19,7 @@ discussions — hence this section.
 **Tier 1 — Fully described in Verbose.** Every `.verbose` rule compiled with
 `--native --run RULE [--stream | --stdin]` lives here. The rule logic AND the
 ELF layout both flow from the source through the verifier and the regular
-native codegen path. Verification applies end to end. Examples: every file in
+native codegen path. Source-level verification applies; the native lowering implementation remains trusted. Examples: every file in
 `examples/*.verbose` compiled to native, including `priv_failure.verbose` and
 the streaming `alert.verbose`.
 
@@ -40,15 +47,15 @@ emission body (`emit_raw_tcp_echo_bytes`), so the tier-1 and tier-3
 binaries are bit-for-bit identical (asserted by a regression test).
 `--echo-server` remains available as a tier-3 shortcut but no longer
 represents a capability the language itself lacks. The HTTP demo
-(`--demo-http`) is still tier 3; it collapses under Phase 7 slice 3
-when HTTP/1.0 protocol support lands.
+(`--demo-http`) remains a tier-3 shortcut. HTTP/1.0 is now also describable through
+a tier-1 `service`; the existence of the shortcut is not a language limitation.
 
 The long-term target is to collapse tiers 3 and 2 into tier 1, one syscall
 family at a time, under a future Phase 7+ that introduces declarable network
 primitives (see the *Network syscalls not describable in Verbose* gap below).
 Until that phase lands, all three tiers coexist and must be labeled as such.
 
-## Network syscalls not describable in Verbose (Phase 7+ target)
+## Historical gap: network syscalls not describable in Verbose (pre-Phase 7)
 
 **Symptom**: there is no `.verbose` syntax today for `socket`, `bind`, `listen`,
 `accept`, `read` from a socket, `write` to a socket, nor for the structured

@@ -18,20 +18,20 @@ The thing to refuse is a declaration that is **neither**: the compiler cannot ve
 
 | Field | Category | What the compiler does | Source |
 |---|---|---|---|
-| `reads: [...]` | mechanical | Walks the logic AST, collects every field access on input/context, diffs against the declaration. Drift is an error. | `src/verifier.rs:check_purity` |
+| `reads: [...]` | mechanical | Collects input/context accesses and supported resource, connection, and entropy dependencies from the AST, then compares them with the declaration. Drift is an error. | `src/verifier.rs:check_purity` |
 | `calls: [...]` | mechanical | Walks the AST, collects every rule call, diffs against the declaration. Drift is an error. | `src/verifier.rs:check_purity` |
 
 ### Termination block
 
 | Field | Category | What the compiler does | Source |
 |---|---|---|---|
-| `bound: N` | semantic | Verifier checks `N ≥ count_operations(logic)`. The claim is the auditor's yardstick: a bound much larger than the actual op count flags estimation error even if mechanically accepted. | `src/verifier.rs:check_termination`, `count_operations` |
+| `bound: N` | semantic | Checks `N ≥ count_operations(logic)`, a structural AST count. Calls and reductions do not expand into their total runtime work. Recursion declarations are checked separately. | `src/verifier.rs:check_termination`, `count_operations` |
 
 ### Hints block
 
 | Field | Category | What the compiler does | Source |
 |---|---|---|---|
-| `overflow: [min, max]` | semantic | Runs interval arithmetic on the logic, checks `[min, max]` covers the computed range. Verified hints let the native backend skip runtime overflow checks. | `src/verifier.rs:compute_range` |
+| `overflow: [min, max]` | semantic | Checks `[min, max]` covers the interval when analysis can compute it. An unknown interval is currently accepted without establishing the hint; see the limitations below. | `src/verifier.rs:compute_range` |
 | `vectorizable: "reason"` | semantic | Verifier enforces "no calls" (independence) + pure logic shape. Native can emit SIMD. The justification string is audit surface — why the AI / human believes SIMD is safe here. | `src/verifier.rs:check_hints` |
 | `parallel: "reason"` | semantic | Same pattern: independence claim, justification is audit surface. | `src/verifier.rs:check_hints` |
 | `cache_result: "reason"` | semantic | Memoization claim, justification is audit surface. | `src/verifier.rs:check_hints` |
@@ -67,6 +67,36 @@ The thing to refuse is a declaration that is **neither**: the compiler cannot ve
 |---|---|---|
 | `use "path"` | mechanical | Resolution happens at load time; the referenced `.verbose` must exist and parse. |
 
+## Current interpretation and limitations
+
+This classification describes the Rust-written verifier. The self-hosted compiler
+has its own coverage; see [current status](current-status.md) and the
+[self-hosting journal](self-hosting.md).
+
+`termination.bound` is a structural metric. A fold contributes its collection,
+initial value, and body expression counts once; a call contributes its arguments
+and one call node. It is not a bound on total instructions, iterations, elapsed
+time, or the lifetime of a service. The `structural`, `decreasing`, and `increasing`
+declarations are separate recursion checks.
+
+Overflow analysis can return no interval, including for unsupported expression
+shapes and arithmetic it cannot bound. `check_hints` currently accepts that case;
+an accepted hint is therefore not necessarily an established range. The global
+`all proofs check out` message must be read within this limitation.
+
+A **signed-modulo counterexample was reproduced on 2026-09-05**: with
+`value : number [-20, 20]`, a rule returning `value % 10` was accepted with
+`overflow: [0, 9]`, but returned `-1` for input `-1` in both the interpreter and
+the native binary. The interval implementation used a nonnegative remainder
+bound even for negative inputs. This records the observed defect, not a guarantee
+that it remains unfixed in a later checkout; check `compute_range` and regression
+tests when revisiting it.
+
+`@intention` and hint justification strings carry human-readable meaning. The
+compiler does not prove that those explanations are true. Likewise, a literal
+path makes a file operation visible in source; it does not establish that the
+operation was appropriate for the user's intention.
+
 ## What was refused (Phase A sanitize)
 
 Removed in commits `4bb640e`, `8ae62a9`, `94595f3`:
@@ -90,4 +120,4 @@ Before adding a field to any block, check:
 
 ## Scope boundary (by design)
 
-The verifier proves that the `.verbose` is internally consistent and that the emitted binary matches the logic expression. It does **not** verify that the `.verbose` is a faithful translation of its prose `.intent` — that bridge is a human / AI concern, by design. Asking the compiler to verify English prose against a formal spec would require solving NLP, and the declarations the compiler verifies could not stay mechanically-checkable under that demand. See the 2026-04-19 entry in `docs/vision-journal.md` for the thesis: the verifier is the floor that doesn't move; the `.intent → .verbose` translation rides the AI capability curve and is audited by humans reading both files side by side.
+The verifier checks the supported source-level obligations. Correct optimization and lowering remain part of the trusted implementation; the verifier does not independently prove that the emitted binary matches the logic expression. It does **not** verify that the `.verbose` is a faithful translation of its prose `.intent` — that bridge is a human / AI concern, by design. Asking the compiler to verify English prose against a formal spec would require solving NLP, and the declarations the compiler verifies could not stay mechanically-checkable under that demand. See the 2026-04-19 entry in `docs/vision-journal.md` for the thesis: the verifier is the floor that doesn't move; the `.intent → .verbose` translation rides the AI capability curve and is audited by humans reading both files side by side.

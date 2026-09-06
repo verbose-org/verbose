@@ -6,6 +6,39 @@ The vision is the author's. These entries are written by the AI assistant under 
 
 ---
 
+## 2026-09-05 — Origin, concrete continuation, and deliberate safeguards
+
+The author clarified the hierarchy after a review gave too much prominence to
+code auditing and a possible future of direct binary generation.
+
+The originating question was: *what if an LLM could produce a binary directly?*
+Verbose grew from that question into a language for explicit program descriptions
+and specialized output with deliberately retained safeguards. LLMs are intended
+to create, maintain, and use the language and its compiler under human direction;
+human authorship remains valid too.
+
+The concrete continuation is **the compiler written in Verbose**, which already
+compiles its own source. Extending that implementation and its verification is
+current work. Direct LLM generation of machine code is an open possibility with
+no assumed timetable, not a prerequisite or the next milestone.
+
+The performance goal includes the chosen safeguards. Arena bounds and runtime
+checks cost work where they are needed; compile-time analysis and specialization
+can remove unnecessary work elsewhere. Comparison with other toolchains should
+state the workload and guarantees rather than claim universal superiority.
+
+Fast compilation is part of the intended short path from explicit source to
+machine code. The no-guessing rule concerns missing declarations and intent;
+verification and optimization still perform analysis. Timing claims belong to
+measurements of a specified program and checkout.
+
+The end-to-end ambition is correspondence between need, source, binary, and
+execution. Present mechanical checks cover parts of that chain. Documentation
+must distinguish the ambition from the implemented guarantees while keeping the
+language-design and performance goals visible.
+
+---
+
 ## 2026-05-30 — The Zig contrast: same metal, opposite bet
 
 ### Context

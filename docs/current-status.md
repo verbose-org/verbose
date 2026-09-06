@@ -1,0 +1,109 @@
+# Current implementation status
+
+Documentation baseline reviewed against the checkout on **2026-09-05**. This page
+is the entry point for present implementation scope. Dated journals and slice
+designs record their own milestones; a statement that something is pending there
+is not automatically a current limitation.
+
+## The language-design goal
+
+Verbose asks how much useful information a language can require authors to make
+explicit when LLMs can write it: dependencies, bounds, effects, and optimization
+intent. The goal is a specification any LLM can work from, with human authorship,
+inspection, and experimentation also supported. The bundled generators use Claude;
+the language and compiler are independent of that choice. Broad model authorability
+remains an evaluation question.
+
+## Concrete continuation
+
+The original thought experiment was an LLM producing a binary directly. The
+current development direction is a compiler written in Verbose, maintained and
+used by LLMs under human direction. Self-compilation and a verifying emission
+path already exist; coverage and guarantees continue to evolve. Direct generation
+of machine code by an LLM has no assumed timetable and is not a prerequisite.
+
+Specialized native output retains the safeguards chosen for its behavior.
+Compile-time reasoning can remove unnecessary work; input-dependent checks remain
+at execution. Fast compilation and fast execution are measured separately, with
+the relevant program, constraints, and build flags stated.
+
+## Implementation map
+
+| Component | Present scope | Boundary |
+|---|---|---|
+| Rust-written `verbosec` | Parser, import resolution, verifier, optimizer, three execution/output paths | Experimental implementation; acceptance is not a proof of toolchain correctness |
+| Interpreter | Rule evaluation on JSON and supported effects | Useful reference execution, not universal backend parity |
+| Native x86-64 | Linux ELF rules and declared services; text/bytes, collections, records, recursive structures, supported effects | Support depends on entry ABI and construct combinations; no general library FFI is established by emitting ELF |
+| WebAssembly | Scalar/text rules and supported Result paths | Subset of the language; bytes and aggregate returns are among explicit refusals; native services do not carry over |
+| Self-hosted compiler | `examples/vexprparse.verbose` compiles its full self-source and has a verifying emission path | A growing subset with its own checks and restrictions, not a replacement with full `verbosec` parity |
+| Generation tools | Prose-to-source with compiler-feedback correction through Claude API/SDK | No multi-model success guarantee; acceptance rate does not measure business correctness |
+| Former Rust transpiler | Removed; `--compile` and `--emit-rust` are rejected | Old four-backend descriptions and some CLI descriptive text are stale |
+
+The native backend's `service` path supports declared networking. `resource` and
+`connection` declare file reads and outbound fetches. Older notes saying these are
+future work describe the pre-service implementation. `--http-server` remains a
+legacy rule-plus-shell path; `--demo-http` is a hand-emitted probe without Verbose
+source. Use source-declared services to demonstrate the language's effect model.
+
+## Guarantees and measurements
+
+- Reads/calls consistency, types, layers, source references, and supported resource
+  restrictions have mechanical checks. See [proof classification](spec-proofs.md).
+- `termination.bound` counts expression structure, not total runtime work.
+  Recursion checks are separate.
+- Overflow hints are checked when an interval can be computed. An unknown interval
+  is currently accepted without establishing the hint. Analysis bugs also remain
+  possible; see the recorded signed-modulo counterexample in the proof document.
+- Source-to-binary semantic equivalence is not independently proved by the x86
+  instruction decoder. Compiler and optimizer correctness remain trusted.
+- The bootstrap checks `gen1 == gen2` for the self-source, plus refusal and
+  execution cases. It does not prove correctness for every accepted program.
+- Binary sizes and performance results are measurements for specific programs,
+  flags, and revisions. Use the dated [benchmark report](benchmarks.md) and rerun
+  its commands for a new checkout.
+
+## Immutable artifact, changing inputs
+
+Compiled logic and declared capability structure are fixed in the executable.
+A threshold or allowlist loaded from a declared file is runtime data and can affect
+policy decisions without changing the binary. Service resources with `cache: true`
+load at startup; uncached resources can observe later changes. Explicit service
+state is another source of changing behavior. A source-level change to logic or
+capability declarations requires a new compilation.
+
+## Verification commands
+
+Run the normal suite serially: native tests share temporary executable paths.
+Network tests need permission to bind local sockets.
+
+```sh
+cargo test -- --test-threads=1
+cargo run -- examples/invoices.verbose
+cargo run -- examples/audit_gateway.verbose
+```
+
+The separate bootstrap suite includes ignored tests and needs more time, memory,
+and stack than routine checks. CI runs it in a dedicated job:
+
+```sh
+ulimit -s unlimited
+cargo test --release -- --ignored --test-threads=1 two_generation
+```
+
+These are reproduction commands, not a claim that every suite was run for this
+documentation revision. Test totals change with the checkout; use the actual run
+summary rather than historical counts.
+
+## Reading order and maintenance
+
+1. [README](../README.md): purpose, examples, and design direction.
+2. [Architecture](../ARCHITECTURE.md): implementation map and trust boundaries.
+3. [Proof classification](spec-proofs.md): individual declaration semantics.
+4. [Examples](../examples/README.md): concrete syntax and entry points.
+5. [Self-hosting](self-hosting.md), [known-gap history](known-gaps.md), and
+   [vision journal](vision-journal.md): milestones and reasoning over time.
+
+When implementation scope changes, update this page and the relevant reference.
+Keep dated evidence in the journals; label superseded claims instead of silently
+rewriting a past experiment. Code and its executable tests decide behavior if a
+reference has drifted. A `DESIGN` document alone does not establish implementation.

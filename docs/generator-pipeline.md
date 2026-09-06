@@ -76,6 +76,19 @@ script feeds the diagnostic back to the model and asks it to fix —
 up to `--max-corrections` times. If it still doesn't verify, the
 script exits non-zero and the operator inspects.
 
+## What the evaluation measures
+
+`tools/eval.py` measures whether generated source is accepted, initially or after
+corrections. It does not establish fidelity to the prose, runtime correctness,
+audit effectiveness, or success across different model families. The default
+sample includes the invoices, business, and collections examples that also appear
+in the generator's few-shot prompt, so its aggregate is not a held-out score.
+
+The bundled transports currently use Claude. The language specification and
+compiler interface are available to other LLMs and human authors; broader model
+authorability is part of the project's research goal. Evaluate unseen intentions
+with independent behavioral expectations when testing that goal.
+
 ## Two scripts, two transports
 
 | Script | Transport | Auth | Dependencies |
