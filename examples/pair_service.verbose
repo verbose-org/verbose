@@ -1,0 +1,83 @@
+@verbose 0.1.0
+
+-- Slice agg-svc-1 (2026-09-05): the first HTTP service whose handler
+-- BINDS an aggregate returned by a rule. `stats` returns a three-field
+-- record; the handler calls it with a REQUEST-DEPENDENT constructor
+-- (`a: length(req.path)`), binds the record to `q`, and answers with
+-- `q.sum` / `q.diff` / `q.big`.
+--
+-- What happens natively: `stats` is emitted as a CALLABLE placed ahead of
+-- the service prologue (agg-1's callee, verbatim — prologue, rsi spill,
+-- per-field stores through the destination), `q` is a three-slot GROUP in
+-- the handler frame, and the call site marshals `In` below rsp, hands the
+-- group's address in rsi LAST, and `call`s. No save/restore around the
+-- call: an admitted callee writes rax/rcx/rdx/rsi/rdi only, and the one
+-- register the accept loop keeps live is r12 (the listening socket).
+--
+-- `a: length(req.path)` is chosen for a reason beyond being request-
+-- dependent: loading the text leaves its pointer in rsi, so a destination
+-- parked in rsi BEFORE the marshalling would be gone by the call. That is
+-- agg-1's hazard #1, and this constructor is what makes the negative
+-- control for it non-vacuous on the service path.
+--
+--   GET /abc        -> sum:14 diff:-6 big:10      (length 4)
+--   GET /hello      -> sum:16 diff:-4 big:10      (length 6)
+--   GET /a-longer-1 -> sum:21 diff:1 big:11       (length 11)
+
+concept In
+  @intention: "the two numbers a request-side computation hands to the helper"
+  @source: pair_service.intent:1
+  fields:
+    a : number [0, 4096]
+    b : number [0, 4096]
+
+concept Stats
+  @intention: "sum, difference and larger of the pair, as one record"
+  @source: pair_service.intent:2
+  fields:
+    sum : number [0, 8192]
+    diff : number [-4096, 4096]
+    big : number [0, 4096]
+
+rule stats
+  @intention: "compute all three and return them as one record value"
+  @source: pair_service.intent:3
+  input:
+    i : In
+  output:
+    s : Stats
+  logic:
+    let total = i.a + i.b
+    s = Stats { sum: total, diff: i.a - i.b, big: max(i.a, i.b) }
+  proofs:
+    purity:
+      reads : [i.a, i.b]
+      calls : []
+    termination:
+      bound : 6
+
+rule handle
+  @intention: "feed the helper the path length, bind the returned record, answer with its fields"
+  @source: pair_service.intent:4
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    let q = stats(In { a: length(req.path), b: 10 })
+    resp = HttpResponse { status: 200, body: concat("sum:", q.sum, " diff:", q.diff, " big:", q.big) }
+  proofs:
+    purity:
+      reads : [req.path]
+      calls : [stats]
+    termination:
+      bound : 12
+
+service pair
+  @intention: "HTTP service whose handler binds an aggregate returned by a rule"
+  @source: pair_service.intent:5
+  listen:
+    protocol    : http_1_0
+    port        : 18966
+    max_request : 4096
+  handler: handle
