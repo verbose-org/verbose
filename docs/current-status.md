@@ -48,7 +48,13 @@ source. Use source-declared services to demonstrate the language's effect model.
 ## Guarantees and measurements
 
 - Reads/calls consistency, types, layers, source references, and supported resource
-  restrictions have mechanical checks. See [proof classification](spec-proofs.md).
+  restrictions have mechanical checks. Known rule-call argument types are compared
+  with declared inputs, including calls nested in reductions and matches; unknown
+  local binder types remain outside this check. See [proof classification](spec-proofs.md).
+- HTTP service record callees reject potentially failing `byte_at`, `substring`,
+  and `parse_int` checks until callee-to-handler error propagation exists. A
+  literal byte access with a constant valid index remains supported. Move a
+  runtime check to the handler's constructor argument to use client-only abort.
 - `termination.bound` counts expression structure, not total runtime work.
   Recursion checks are separate.
 - Overflow hints are checked when an interval can be computed. An unknown interval
