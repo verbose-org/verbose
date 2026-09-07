@@ -81,6 +81,18 @@ type of a shadowed outer variable. Arity and callee existence have separate chec
 
 ## Current interpretation and limitations
 
+HTTP service record callees have a service-specific recovery path for emitted
+`byte_at` and `substring` checks. On failure it discards callee stack
+temporaries, restores the handler frame, and jumps to connection close. No partial
+record is consumed and the response, log, and `after` block are skipped. Sequential
+listeners continue accepting; a forked worker takes the existing child exit path.
+This relies on the existing gate excluding nested/recursive calls, callee effects,
+and nonnumeric record fields. It is not a general error-return ABI and does not
+change standalone rule failures or the self-hosted compiler.
+`parse_int` still requires a supported text source, which the numeric-only callee
+gate excludes. Literal operands remain refused by its emitter; a refusal also
+restores the compiler's abort scope, so subsequent compilations are unaffected.
+
 This classification describes the Rust-written verifier. The self-hosted compiler
 has its own coverage; see [current status](current-status.md) and the
 [self-hosting journal](self-hosting.md).
