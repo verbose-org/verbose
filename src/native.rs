@@ -2747,33 +2747,6 @@ struct ServiceAggLet<'a> {
     layout: Vec<(String, i32)>,
 }
 
-fn service_callee_unguarded_failure(expr: &Expr) -> Option<&'static str> {
-    // Callees use their own rbp: a handler close label cannot unwind them.
-    // Admit byte_at only when its literal bounds are established here. The
-    // general runtime-error propagation ABI is deferred to agg-svc-2.
-    match expr {
-        Expr::ByteAt(value, index) => {
-            let len = match value.as_ref() {
-                Expr::Bytes(b) => Some(b.len()),
-                Expr::Text(t) => Some(t.len()),
-                _ => None,
-            };
-            if !matches!((len, index.as_ref()), (Some(n), Expr::Number(i)) if *i >= 0 && (*i as u64) < n as u64) {
-                return Some("byte_at");
-            }
-        }
-        Expr::Substring(_, _, _) => return Some("substring"),
-        Expr::ParseInt(_) => return Some("parse_int"),
-        _ => {}
-    }
-    let mut failure = None;
-    crate::verifier::walk_expr_children(expr, &mut |child| {
-        if failure.is_none() { failure = service_callee_unguarded_failure(child); }
-    });
-    failure
-}
-
-
 /// Slice agg-svc-1 — the shape gate for a record-valued `let` inside an HTTP
 /// service handler: one `Option` per handler binding (`Some` for a `let`
 /// whose RHS is a call to a plain-record-returning rule), or the refusal.
@@ -2990,21 +2963,6 @@ fn check_service_aggregate_lets<'a>(
                     message: format!(
                         "{}: callee '{}' constructs a variant in its body; the arena is the rule path's and the service frame has none — slice agg-svc-2",
                         site(let_name), callee.name
-                    ),
-                });
-            }
-        }
-        for expr in callee.logic.bindings.iter().map(|(_, e)| e)
-            .chain(std::iter::once(&callee.logic.value))
-        {
-            if let Some(primitive) = service_callee_unguarded_failure(expr) {
-                return Err(NativeError {
-                    message: format!(
-                        "{}: callee '{}' contains {} with a potentially failing runtime check; \
-                         a failure inside the callee would stop the listener. Move the check \
-                         into a handler constructor argument, where it closes only the client, \
-                         or wait for callee error propagation in agg-svc-2",
-                        site(let_name), callee.name, primitive,
                     ),
                 });
             }
@@ -6232,6 +6190,39 @@ fn body_is_pure_scalar_arith(expr: &Expr) -> bool {
         // string/byte primitives, …) → NOT eligible. Stay on the slot path.
         _ => false,
     }
+}
+
+/// Service-only recovery for a single-level, effect-free record callable.
+/// The shape gate guarantees a conventional rbp frame and no live callee-owned
+/// resources. An abort abandons partial sret writes and all stack temporaries;
+/// restoring the caller frame lets the existing close path read its client fd.
+/// Returns a rel32 patch to resolve to the service's close label. Use this in
+/// both sizing and final emission so callable offsets include the recovery stub.
+fn emit_service_record_callable<'a>(
+    code: &mut Vec<u8>,
+    rule: &'a Rule,
+    concept: &'a Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    self_call: SelfCallCtx<'_>,
+    service_frame_size: u32,
+) -> Result<Option<usize>, NativeError> {
+    let service_frame_size = i32::try_from(service_frame_size).map_err(|_| NativeError {
+        message: "service frame exceeds the signed displacement used for callee recovery".into(),
+    })?;
+    let scope = ClientAbortScope::begin();
+    emit_callable_into(code, rule, concept, all_rules, all_resources, self_call, None, false)?;
+    let sites = scope.end();
+    if sites.is_empty() { return Ok(None); }
+    let recovery = code.len();
+    patch_client_abort_sites(code, &sites, recovery);
+    code.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D]); // mov rsp, rbp; pop rbp
+    code.extend_from_slice(&[0x48, 0x8D, 0xA5]);       // lea rsp, [rbp - service_frame_size]
+    code.extend_from_slice(&(-service_frame_size).to_le_bytes());
+    code.push(0xE9);                                  // jmp service close
+    let jump = code.len();
+    code.extend_from_slice(&[0; 4]);
+    Ok(Some(jump))
 }
 
 fn emit_callable_into<'a>(
@@ -23171,15 +23162,10 @@ fn emit_http10_dynamic_bytes(
     // emitted — no post-patch of the call sites. A service with no record
     // let emits none of this and is byte-for-byte what it was.
     //
-    // CLIENT-ABORT SCOPE: the callables are emitted OUTSIDE every
-    // `ClientAbortScope` (the first `begin()` is hundreds of lines below),
-    // so a `byte_at` / `substring` / `parse_int` inside a callee keeps its
-    // inline `sys_exit(1)`. That is REQUIRED, not merely tolerated: the
-    // close path does `lea rsp, [rbp - frame_size]` with the HANDLER's rbp,
-    // and inside the callee rbp is the callee's own frame — a site recorded
-    // into the handler's scope would unwind the wrong frame. The aggregate
-    // gate refuses potentially failing checks until an error propagation
-    // ABI exists; known-safe literal byte accesses remain admitted.
+    // Each callee has its own abort scope and a frame-unwinding stub.
+    // Bounds/parse failures restore the handler frame before jumping to
+    // its close label. This requires the gate's single-level, effect-free,
+    // Number-record callables; it is not a general exception ABI.
     //
     // REGISTER AUDIT (what the callee may clobber vs what the service keeps
     // live across the `call`): the ONLY register the accept loop keeps live
@@ -23210,6 +23196,7 @@ fn emit_http10_dynamic_bytes(
     let mut agg_struct_layouts: HashMap<&str, Vec<(String, i32, bool)>> = HashMap::new();
     let mut agg_record_returns: HashMap<&str, Vec<(String, i32)>> = HashMap::new();
     let mut agg_labels: HashMap<&str, i32> = HashMap::new();
+    let mut callee_abort_jumps = Vec::new();
     for a in agg_lets.iter().flatten() {
         // Number-only input (gated above): one 8-byte struct slot per field
         // in DECLARATION order — the layout the callable prologue copies out
@@ -23242,7 +23229,7 @@ fn emit_http10_dynamic_bytes(
         let mut sizes: Vec<usize> = Vec::with_capacity(agg_callees.len());
         for (r, c) in &agg_callees {
             let mut scratch = Vec::new();
-            emit_callable_into(&mut scratch, r, c, program_rules, all_resources, placeholder_ctx, None, false)?;
+            emit_service_record_callable(&mut scratch, r, c, program_rules, all_resources, placeholder_ctx, frame_size)?;
             sizes.push(scratch.len());
         }
         // Leading `jmp rel32` over the callables; the service prologue is
@@ -23265,7 +23252,9 @@ fn emit_http10_dynamic_bytes(
         };
         for (r, c) in &agg_callees {
             let before = code.len();
-            emit_callable_into(&mut code, r, c, program_rules, all_resources, final_ctx, None, false)?;
+            if let Some(jump) = emit_service_record_callable(&mut code, r, c, program_rules, all_resources, final_ctx, frame_size)? {
+                callee_abort_jumps.push(jump);
+            }
             debug_assert_eq!(code.len() - before, sizes[agg_callees.iter().position(|(x, _)| x.name == r.name).unwrap()]);
         }
         let start_actual = code.len() as i32;
@@ -23736,13 +23725,9 @@ fn emit_http10_dynamic_bytes(
             // req.path, i)` or `parse_int(substring(req.path, …))` there is
             // request data evaluated BEFORE the `call`, with the handler's
             // rbp live, so its recorded site unwinds to the close label and
-            // the listener survives (pinned). Inside the CALLEE nothing can
-            // record: the callables were emitted before the scope opened,
-            // so potentially failing callee checks are refused by
-            // check_service_aggregate_lets before emission. Only a literal
-            // byte_at with a constant in-range index is admitted there.
-            // Runtime checks may instead run in the constructor argument,
-            // where this client scope has the correct frame to close.
+            // the listener survives (pinned). Callee-local scopes instead
+            // route through their own recovery stubs, which restore this
+            // handler frame before taking the same close path.
             if let Some(agg) = &agg_lets[idx] {
                 let n = agg.layout.len() as i32;
                 let dest_base = let_cursor - 8 * (n - 1);
@@ -23951,6 +23936,7 @@ fn emit_http10_dynamic_bytes(
     // sequentially the `lea rsp` below frees whatever the aborting
     // primitive had pushed.
     client_abort_sites.extend(after_scope.end());
+    client_abort_sites.extend(callee_abort_jumps);
     patch_client_abort_sites(&mut code, &client_abort_sites, close_label);
     // close(client_fd): rax=3, rdi=[rbp-48]
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
@@ -38864,38 +38850,84 @@ rule probe
     }
 
     #[test]
-    fn service_record_callee_failing_checks_are_refused_before_emission() {
-        let out = std::env::temp_dir().join("verbosec_test_service_callee_guard");
-        for (expr, primitive) in [
-            ("byte_at(b\"abc\", i.a)", "byte_at"),
-            ("byte_at(b\"abc\", 3)", "byte_at"),
-            ("byte_at(b\"abc\", -1)", "byte_at"),
-            ("byte_at(b\"\", 0)", "byte_at"),
-            ("parse_int(\"bad\")", "parse_int"),
-            ("length(substring(\"abc\", 0, i.a))", "substring"),
-        ] {
+    fn service_record_callee_failures_close_only_client() {
+        const BAD: &[u8] = b"GET /ab HTTP/1.0\r\n\r\n";
+        const GOOD: &[u8] = b"GET /a HTTP/1.0\r\n\r\n";
+        for (case, (expr, expected)) in [
+            ("byte_at(b\"abc\", i.a)", 100),
+            ("length(substring(\"abc\", 0, i.a)) + byte_at(b\"abc\", i.a)", 102),
+            ("byte_at(\"abc\", i.a)", 100),
+            ("if i.a > 2 then byte_at(b\"abc\", -1) else i.b", 2),
+            ("if i.a > 2 then byte_at(b\"\", 0) else i.b", 2),
+            ("length(substring(\"ab\", 0, i.a))", 3),
+        ].iter().enumerate() {
             for in_let in [false, true] {
-                let callee = if in_let {
-                    AGG_SVC_SWAP2.replace("    p = Pair { x: i.b, y: i.a }",
-                        &format!("    let checked = {expr}\n    p = Pair {{ x: checked, y: i.a }}"))
-                } else {
-                    AGG_SVC_SWAP2.replace("Pair { x: i.b, y: i.a }",
-                        &format!("Pair {{ x: 1 + {expr}, y: i.a }}"))
-                };
-                let src = agg_svc_src(AGG_SVC_CONCEPTS, &callee,
-                    "    let q = swap2(In { a: length(req.path), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x) }",
-                    "req.path", "swap2", "").replace("__PORT__", "18966");
-                let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("lex");
-                let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
-                let _ = std::fs::remove_file(&out);
-                let err = compile_service(&program, "s", out.to_str().unwrap())
-                    .expect_err("a callee failure must not be able to terminate the listener").message;
-                for needle in ["callee 'swap2'", primitive, "stop the listener", "handler constructor argument", "agg-svc-2"] {
-                    assert!(err.contains(needle), "{expr} / let={in_let}: {err}");
+                for forked in [false, true] {
+                    let logic = if in_let {
+                        format!("    let checked = {expr}\n    p = Pair {{ x: i.b, y: 1 + checked }}")
+                    } else {
+                        // x is already written to the destination when y aborts;
+                        // the caller must never consume that partial record.
+                        format!("    p = Pair {{ x: i.b, y: 1 + ({expr}) }}")
+                    };
+                    let callee = AGG_SVC_SWAP2.replace("    p = Pair { x: i.b, y: i.a }", &logic)
+                        .replace("bound : 3", "bound : 100");
+                    let mut src = agg_svc_src(AGG_SVC_CONCEPTS, &callee,
+                        "    let q = swap2(In { a: length(req.path), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(\"x:\", q.x, \" y:\", q.y) }",
+                        "req.path", "swap2", "");
+                    if forked { src = src.replace("  listen:", "  concurrency : forked\n  listen:"); }
+                    let run = client_abort_drive(&src, "s", &format!("callee_{case}_{in_let}_{forked}"),
+                        &[BAD, GOOD, BAD, GOOD, BAD, GOOD]);
+                    assert_eq!(run.exit, None, "listener must survive: {expr}");
+                    assert!(run.fds_after <= run.fds_baseline, "client fd leak: {expr}");
+                    for (i, reply) in run.replies.iter().enumerate() {
+                        if i % 2 == 0 { assert!(reply.is_empty(), "failed call sent a response: {expr}"); }
+                        else { assert!(String::from_utf8_lossy(reply).ends_with(&format!("x:1 y:{expected}")), "{expr}: {reply:?}"); }
+                    }
                 }
-                assert!(!out.exists(), "refusal must emit no executable");
             }
         }
+    }
+
+    #[test]
+    fn service_record_callee_recovery_handles_multiple_labels_and_skips_after() {
+        let first = AGG_SVC_SWAP2.replace("Pair { x: i.b, y: i.a }",
+            "Pair { x: i.b, y: byte_at(b\"abc\", i.a) }").replace("bound : 3", "bound : 10");
+        let second = first.replace("rule swap2", "rule other")
+            .replace("byte_at(b\"abc\", i.a)", "length(substring(\"ab\", 0, i.a))");
+        let src = agg_svc_src(AGG_SVC_CONCEPTS, &format!("{first}\n{second}"),
+            "    let q = swap2(In { a: 1, b: 1 })\n    let r = other(In { a: length(req.path), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(q.y, \":\", r.y, \" count:\", state.count) }",
+            "req.path, state.count", "swap2, other",
+            "  state:\n    count : number = 0\n  after:\n    set count = state.count + 1\n");
+        let run = client_abort_drive(&src, "s", "callee_multi_state", &[
+            b"GET /ab HTTP/1.0\r\n\r\n", b"GET /a HTTP/1.0\r\n\r\n",
+            b"GET /ab HTTP/1.0\r\n\r\n", b"GET /a HTTP/1.0\r\n\r\n",
+        ]);
+        assert_eq!(run.exit, None);
+        assert!(run.replies[0].is_empty() && run.replies[2].is_empty());
+        assert_eq!(http_body(&run.replies[1]), "98:2 count:0");
+        assert_eq!(http_body(&run.replies[3]), "98:2 count:1");
+        assert!(run.fds_after <= run.fds_baseline);
+    }
+
+    #[test]
+    fn service_record_callee_refusal_restores_abort_scope() {
+        // No text field/let/effect can supply parse_int in this numeric-only
+        // subset. Its unsupported literal operand must still refuse cleanly,
+        // even after a byte_at has registered a callee-local recovery site.
+        let callee = AGG_SVC_SWAP2.replace("Pair { x: i.b, y: i.a }",
+            "Pair { x: byte_at(b\"abc\", i.a), y: parse_int(\"bad\") }");
+        let src = agg_svc_src(AGG_SVC_CONCEPTS, &callee,
+            "    let q = swap2(In { a: length(req.path), b: 1 })\n    resp = HttpResponse { status: 200, body: concat(q.y) }",
+            "req.path", "swap2", "").replace("__PORT__", "18966");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_callee_scope_refusal");
+        let _ = std::fs::remove_file(&out);
+        let err = compile_service(&program, "s", out.to_str().unwrap()).expect_err("unsupported parse_int operand");
+        assert!(err.message.contains("parse_int: inner"), "{}", err.message);
+        assert!(!out.exists());
+        assert!(CLIENT_ABORT_SITES.with(|s| s.borrow().is_none()));
     }
 
     #[test]
@@ -38915,10 +38947,8 @@ rule probe
     /// recorded site takes the close path (svc-client-abort-1's contract):
     /// `/ab` (three bytes, index 3 out of range) is closed with NO response
     /// and the listener survives to answer `/abcd` on the next connection
-    /// (byte 3 is `c` = 99). The callable itself is emitted OUTSIDE the
-    /// scope, and in this slice nothing inside a callee can be reached by
-    /// request bytes at all (Number-only input, no text source in the
-    /// callee) — the residual stated at the emit site.
+    /// (byte 3 is `c` = 99). The callable has a separate scope: its
+    /// failures must first restore the handler frame.
     #[test]
     fn service_record_let_ctor_argument_client_abort_closes_connection_only() {
         let src = agg_svc_src(

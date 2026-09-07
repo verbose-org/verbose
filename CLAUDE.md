@@ -904,6 +904,20 @@ admitted. This closes the client-number/literal-table listener-exit exception
 recorded in agg-svc-1. The fix changes admission, not instruction emission; the
 existing example corpus retains its native output bytes.
 
+**Service callee recovery (2026-09-07):** supersedes the temporary bound-check
+refusal above for `byte_at` and `substring`. Each service record callable now has
+its own `ClientAbortScope` in both sizing and final emission. Its failure sites
+jump to a local stub (`mov rsp, rbp; pop rbp; lea rsp, [rbp - service_frame_size]`)
+before jumping to the handler's close label. This discards callee temporaries,
+return address, and argument storage without consuming a partially written record.
+The response, log, and `after` block are skipped. Sequential listeners resume;
+forked workers use the existing child tail. The gate still excludes nested calls,
+recursion, effects, and nonnumeric record fields; these frame/resource assumptions
+must be revisited before widening it. `parse_int` operands still refuse because
+the admitted callees have no supported text source. Tests cover repeated bad/good
+TCP requests, both concurrency modes, partial records, lets, multiple callees,
+state preservation, fd counts, and scope restoration after emission refusal.
+
 - General reduction: `fold(collection, initial, acc, var => body)`
 - Proofs: purity (reads/calls), termination (bound, structural, decreasing, increasing)
 - Hints: `vectorizable: "reason"`, `parallel: "reason"`, `cache_result: "reason"` (justification required, parser rejects bare form), `overflow: [min, max]` (bounds mechanically verified against interval arithmetic)
