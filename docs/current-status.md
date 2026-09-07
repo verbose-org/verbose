@@ -58,8 +58,9 @@ source. Use source-declared services to demonstrate the language's effect model.
 - `termination.bound` counts expression structure, not total runtime work.
   Recursion checks are separate.
 - Overflow hints are checked when an interval can be computed. An unknown interval
-  is currently accepted without establishing the hint. Analysis bugs also remain
-  possible; see the recorded signed-modulo counterexample in the proof document.
+  is currently accepted without establishing the hint. The signed-modulo interval
+  defect is fixed in the Rust verifier; see the regression and remaining limits
+  in the proof document.
 - Source-to-binary semantic equivalence is not independently proved by the x86
   instruction decoder. Compiler and optimizer correctness remain trusted.
 - The bootstrap checks `gen1 == gen2` for the self-source, plus refusal and

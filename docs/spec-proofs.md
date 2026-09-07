@@ -95,14 +95,20 @@ Overflow analysis can return no interval, including for unsupported expression
 shapes and arithmetic it cannot bound. `check_hints` currently accepts that case;
 an accepted hint is therefore not necessarily an established range. The global
 `all proofs check out` message must be read within this limitation.
+For numeric input fields without a declared range, this pass currently assumes
+`[0, 2147483647]`; it does not establish that arbitrary signed input satisfies
+that assumption. Explicit field ranges remain premises of the interval analysis.
 
 A **signed-modulo counterexample was reproduced on 2026-09-05**: with
 `value : number [-20, 20]`, a rule returning `value % 10` was accepted with
 `overflow: [0, 9]`, but returned `-1` for input `-1` in both the interpreter and
-the native binary. The interval implementation used a nonnegative remainder
-bound even for negative inputs. This records the observed defect, not a guarantee
-that it remains unfixed in a later checkout; check `compute_range` and regression
-tests when revisiting it.
+the native binary. This defect is now fixed in the Rust verifier: signed remainder
+bounds follow the dividend's sign and use the largest absolute divisor endpoint.
+The example computes `[-9, 9]`, rejecting `[0, 9]` and accepting `[-9, 9]`.
+Regression tests exhaust small intervals and cover 64-bit extremes. Divisor ranges
+containing zero or a possible `i64::MIN % -1` return an unknown interval; negation
+that cannot fit in an `i64` does too. The unknown-interval limitation above still
+applies. The self-hosted verifier is unchanged.
 
 `@intention` and hint justification strings carry human-readable meaning. The
 compiler does not prove that those explanations are true. Likewise, a literal

@@ -6439,11 +6439,18 @@ pub fn compute_range(
                     Some((*products.iter().min()?, *products.iter().max()?))
                 }
                 BinOp::Mod => {
-                    if r_min <= 0 && r_max >= 0 {
+                    if (r_min <= 0 && r_max >= 0)
+                        || (l_min == i64::MIN && r_min <= -1 && r_max >= -1)
+                    {
+                        // Zero and MIN % -1 can fail at runtime.
                         None
                     } else {
-                        // x % d is in [0, d-1] for positive d, regardless of x
-                        Some((0, r_max.abs() - 1))
+                        // Signed remainder follows the dividend's sign, not
+                        // the divisor's. Use BOTH divisor endpoints; widen
+                        // before abs so i64::MIN is representable. The largest
+                        // possible magnitude minus one always fits in i64.
+                        let limit = ((r_min as i128).abs().max((r_max as i128).abs()) - 1) as i64;
+                        Some((l_min.min(0).max(-limit), l_max.max(0).min(limit)))
                     }
                 }
                 BinOp::Div => {
@@ -6464,7 +6471,7 @@ pub fn compute_range(
         }
         Expr::Neg(inner) => {
             let (min, max) = compute_range(inner, field_ranges, input_name)?;
-            Some((-max, -min))
+            Some((max.checked_neg()?, min.checked_neg()?))
         }
         Expr::If(_, then_e, else_e) => {
             let (t_min, t_max) = compute_range(then_e, field_ranges, input_name)?;
@@ -6678,6 +6685,68 @@ rule caller
             "    let x = A { a: 3 }\n    let y = f(x)\n    let x = i\n    out = y", "i", "f", "number");
         let errs = verify_str(&src);
         assert!(!errs.iter().any(|e| e.context.contains("call 'f'")), "later rebinding must not change earlier call: {errs:?}");
+    }
+
+    #[test]
+    fn signed_modulo_ranges_cover_all_small_interval_values() {
+        let expr = Expr::Binary(BinOp::Mod,
+            Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "a".into())),
+            Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "b".into())));
+        for lo in -6..=6 {
+            for hi in lo..=6 {
+                for dlo in -6..=6 {
+                    for dhi in dlo..=6 {
+                        let fields = HashMap::from([("a", (lo, hi)), ("b", (dlo, dhi))]);
+                        let range = compute_range(&expr, &fields, "i");
+                        if dlo <= 0 && dhi >= 0 {
+                            assert_eq!(range, None);
+                            continue;
+                        }
+                        let (min, max) = range.expect("nonzero small divisor interval");
+                        for a in lo..=hi {
+                            for b in dlo..=dhi {
+                                let value = a % b;
+                                assert!(min <= value && value <= max,
+                                    "{a} % {b} = {value} outside {range:?}; input {fields:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signed_modulo_ranges_handle_i64_limits_without_overflow() {
+        let expr = Expr::Binary(BinOp::Mod,
+            Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "a".into())),
+            Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "b".into())));
+        for (a, b, expected) in [
+            ((-20, 20), (10, 10), Some((-9, 9))),
+            ((-20, 20), (-10, -2), Some((-9, 9))),
+            ((-20, -1), (10, 10), Some((-9, 0))),
+            ((0, 20), (-10, -2), Some((0, 9))),
+            ((i64::MIN, i64::MAX), (i64::MIN, i64::MIN), Some((-i64::MAX, i64::MAX))),
+            ((i64::MIN, i64::MAX), (-2, -1), None),
+            ((i64::MIN, i64::MAX), (1, 1), Some((0, 0))),
+        ] {
+            let fields = HashMap::from([("a", a), ("b", b)]);
+            assert_eq!(compute_range(&expr, &fields, "i"), expected, "{fields:?}");
+        }
+        let neg_min = Expr::Neg(Box::new(Expr::Number(i64::MIN)));
+        assert_eq!(compute_range(&neg_min, &HashMap::new(), "i"), None);
+    }
+
+    #[test]
+    fn signed_modulo_hint_rejects_nonnegative_claim_and_accepts_signed_twin() {
+        let src = call_type_program("    out = i.b % 10", "i.b", "", "number")
+            .replace("b : number", "b : number [-20, 20]")
+            + "  hints:\n    overflow: [0, 9]\n";
+        let errors = verify_str(&src);
+        assert!(errors.iter().any(|e| e.context.contains("hints.overflow")
+            && e.message.contains("computed range [-9, 9] exceeds declared [0, 9]")), "{errors:?}");
+        let corrected = src.replace("overflow: [0, 9]", "overflow: [-9, 9]");
+        assert!(verify_str(&corrected).is_empty());
     }
 
     #[test]
