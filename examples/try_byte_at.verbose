@@ -1,0 +1,57 @@
+@verbose 0.1.0
+
+concept ByteIndex
+  @intention: "An index into a literal byte table"
+  @source: try_byte_at.intent:1
+  fields:
+    index : number
+
+rule lookup_byte
+  @intention: "Read one byte, or return BoundsError"
+  @source: try_byte_at.intent:1
+  input:
+    i : ByteIndex
+  output:
+    out : Result(number, BoundsError)
+  logic:
+    out = try_byte_at(b"a\x00\xff", i.index)
+  proofs:
+    purity:
+      reads : [i.index]
+      calls : []
+    termination:
+      bound : 16
+
+rule byte_or_zero
+  @intention: "Handle the error with an explicit fallback"
+  @source: try_byte_at.intent:2
+  input:
+    i : ByteIndex
+  output:
+    out : number
+  logic:
+    out = match_result(try_byte_at("é", i.index), value => value, error => 0)
+  proofs:
+    purity:
+      reads : [i.index]
+      calls : []
+    termination:
+      bound : 16
+
+rule forward_byte
+  @intention: "Preserve the obligation through a call and alias"
+  @source: try_byte_at.intent:3
+  input:
+    request : ByteIndex
+  output:
+    out : Result(number, BoundsError)
+  logic:
+    let pending = lookup_byte(request)
+    let alias = pending
+    out = match_result(alias, value => Ok(value), error => Err(error))
+  proofs:
+    purity:
+      reads : [request]
+      calls : [lookup_byte]
+    termination:
+      bound : 32

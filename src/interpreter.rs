@@ -8,6 +8,7 @@ use crate::ast::*;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Number(i64),
+    BoundsError,
     Bool(bool),
     Text(String),
     /// Raw bytes — the runtime counterpart to Expr::Bytes / Type::Bytes.
@@ -33,6 +34,7 @@ pub enum Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::BoundsError => write!(f, "Bounds"),
             Value::Number(n) => write!(f, "{}", n),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Text(s) => write!(f, "{}", s),
@@ -1069,6 +1071,21 @@ fn eval_expr(
         // native abort path): index must be < length(text). Negative
         // indices and out-of-range values produce a RuntimeError (mirrors
         // what native lowers to sys_exit(1)).
+        Expr::TryByteAt(table, index) => {
+            let bytes = match table.as_ref() {
+                Expr::Bytes(b) => b.as_slice(),
+                Expr::Text(t) => t.as_bytes(),
+                _ => return Err(RuntimeError { message: "try_byte_at requires a literal table".into() }),
+            };
+            let index = match eval_expr(index, env, all_rules, concepts, entropies)? {
+                Value::Number(n) => n,
+                _ => return Err(RuntimeError { message: "try_byte_at index must be number".into() }),
+            };
+            Ok(match usize::try_from(index).ok().and_then(|i| bytes.get(i)) {
+                Some(b) => Value::Ok(Box::new(Value::Number(*b as i64))),
+                None => Value::Err(Box::new(Value::BoundsError)),
+            })
+        }
         Expr::ByteAt(text, index) => {
             let t = eval_expr(text, env, all_rules, concepts, entropies)?;
             let i = eval_expr(index, env, all_rules, concepts, entropies)?;

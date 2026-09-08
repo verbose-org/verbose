@@ -139,3 +139,11 @@ Before adding a field to any block, check:
 ## Scope boundary (by design)
 
 The verifier checks the supported source-level obligations. Correct optimization and lowering remain part of the trusted implementation; the verifier does not independently prove that the emitted binary matches the logic expression. It does **not** verify that the `.verbose` is a faithful translation of its prose `.intent` — that bridge is a human / AI concern, by design. Asking the compiler to verify English prose against a formal spec would require solving NLP, and the declarations the compiler verifies could not stay mechanically-checkable under that demand. See the 2026-04-19 entry in `docs/vision-journal.md` for the thesis: the verifier is the floor that doesn't move; the `.intent → .verbose` translation rides the AI capability curve and is audited by humans reading both files side by side.
+
+## Bounded-result obligations
+
+The [checked literal lookup contract](try-byte-at.md) tracks each new bounded
+result through lexical aliases and branches. A result must be returned or matched
+on every analyzed path. Unknown forms and excessive analysis expansion are
+refused. This check is limited to the documented pure acyclic subset; it does
+not strengthen acceptance of legacy `Result(_, text)` declarations.

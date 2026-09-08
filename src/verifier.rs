@@ -19,7 +19,8 @@ impl fmt::Display for VerifyError {
 }
 
 pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError> {
-    let mut errors = Vec::new();
+    let mut errors = crate::bounds::verify(program);
+    let bounded_rules = crate::bounds::active_rules(program);
 
     // Phase 7 slice 3a: if any service declares Protocol::Http10, the compiler
     // owns the names `HttpRequest` and `HttpResponse`. Two consequences:
@@ -353,7 +354,7 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                     .get(r.name.as_str())
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                verify_rule(r, &concepts, &all_rules, &all_resources, &all_connections, &all_entropies, &group_concept_owner, scopes, base_dir, &mut errors);
+                verify_rule(r, bounded_rules.contains(&r.name), &concepts, &all_rules, &all_resources, &all_connections, &all_entropies, &group_concept_owner, scopes, base_dir, &mut errors);
                 // Phase 9 slice 1: every read(name) in the rule's logic
                 // must resolve to a declared resource. This is a separate
                 // pass to keep check_expr_against's signature stable; the
@@ -635,7 +636,7 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         }
         // `byte_at(text, index)` — recurse into both children; either side
         // may carry a `read(...)` (e.g. the source text might be `read(buf)`).
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             collect_read_names(t, out);
             collect_read_names(i, out);
         }
@@ -821,7 +822,7 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names(e, out);
         }
         // `byte_at(text, index)` — recurse into both children.
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             collect_fetch_names(t, out);
             collect_fetch_names(i, out);
         }
@@ -941,7 +942,7 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names_with_dups(e, out);
         }
         // `byte_at(text, index)` — recurse into both children.
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             collect_fetch_names_with_dups(t, out);
             collect_fetch_names_with_dups(i, out);
         }
@@ -2016,6 +2017,7 @@ fn expr_shape_name(e: &Expr) -> &'static str {
         Expr::EndsWith(_, _) => "ends_with(...)",
         Expr::Contains(_, _) => "contains(...)",
         Expr::ByteAt(_, _) => "byte_at(...)",
+        Expr::TryByteAt(_, _) => "try_byte_at(...)",
         Expr::Record(_, _) => "record construction",
         _ => "unsupported expression",
     }
@@ -2165,7 +2167,7 @@ pub(crate) fn walk_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         | Expr::BitXor(a, b)
         | Expr::Shl(a, b)
         | Expr::Shr(a, b)
-        | Expr::ByteAt(a, b)
+        | Expr::ByteAt(a, b) | Expr::TryByteAt(a, b)
         | Expr::Quantifier(_, a, _, b)
         | Expr::Map(a, _, b)
         | Expr::Filter(a, _, b) => {
@@ -2363,7 +2365,7 @@ fn log_content_type(
 
 /// Short label for an Expr variant — used in user-facing log errors so the
 /// message says "if/else" instead of dumping the whole AST.
-fn describe_expr_kind(e: &Expr) -> &'static str {
+pub(crate) fn describe_expr_kind(e: &Expr) -> &'static str {
     match e {
         Expr::Number(_) => "number",
         Expr::Text(_) => "text",
@@ -2402,6 +2404,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::AbortIf(_) => "abort_if",
         Expr::Substring(_, _, _) => "substring",
         Expr::ByteAt(_, _) => "byte_at",
+        Expr::TryByteAt(_, _) => "try_byte_at",
         Expr::FoldBytes(_, _, _, _, _, _) => "fold_bytes",
         Expr::VariantConstruct(_, _, _) => "variant construction",
         Expr::MatchVariant(_, _) => "pattern match",
@@ -2827,7 +2830,7 @@ fn check_group_payload_type(
             }
         }
         // Primitives — nothing to validate here.
-        Type::Number | Type::Bool | Type::Text | Type::Bytes => {}
+        Type::Number | Type::BoundsError | Type::Bool | Type::Text | Type::Bytes => {}
     }
 }
 
@@ -2880,7 +2883,7 @@ fn group_concept_name(ty: &Type) -> Vec<&str> {
                 walk(t, out);
                 walk(e, out);
             }
-            Type::Number | Type::Bool | Type::Text | Type::Bytes => {}
+            Type::Number | Type::BoundsError | Type::Bool | Type::Text | Type::Bytes => {}
         }
     }
     walk(ty, &mut out);
@@ -2889,6 +2892,7 @@ fn group_concept_name(ty: &Type) -> Vec<&str> {
 
 fn verify_rule(
     rule: &Rule,
+    bounded_contract: bool,
     concepts: &HashMap<String, &Concept>,
     all_rules: &[&Rule],
     all_resources: &HashSet<String>,
@@ -3052,6 +3056,8 @@ fn verify_rule(
     // handler serves a `count : number` service and a `count : text`
     // service, both correct). So `state.<f>` is checked against EACH
     // service's declaration, which is the emitter's notion of what it means.
+    // The dedicated pass checks lexical binder types and every obligation path.
+    if bounded_contract { return; }
     let mut baseline: Vec<VerifyError> = Vec::new();
     check_rule_types(rule, all_rules, input_concept, concepts, None, &mut baseline);
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
@@ -4655,6 +4661,7 @@ fn infer_expr_type(
         // enforced by check_expr_against; here we only need the outer type
         // for inference.
         Expr::ByteAt(_, _) => Some(Type::Number),
+        Expr::TryByteAt(_, _) => Some(crate::bounds::result_type()),
         // `fold_bytes(<text>, <init>, acc, byte, idx => <body>)` returns
         // number (the final accumulator). Body shape is enforced by
         // check_expr_against; outer type is what inference cares about.
@@ -4672,6 +4679,7 @@ fn type_display(ty: &Type) -> String {
         Type::Bool => "bool".to_string(),
         Type::Text => "text".to_string(),
         Type::Bytes => "bytes".to_string(),
+        Type::BoundsError => "BoundsError".into(),
         Type::Collection(inner) => format!("collection({})", inner),
         Type::Named(n) => n.clone(),
         Type::Result(t, e) => format!("Result({}, {})", type_display(t), type_display(e)),
@@ -4980,7 +4988,7 @@ fn walk_for_match_result_callees(
             walk_for_match_result_callees(s, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
             walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
             walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, all_entropies, visited, out_reads);
         }
@@ -5064,7 +5072,7 @@ fn collect_call_sites(expr: &Expr, out: &mut Vec<(String, usize)>) {
         | Expr::StartsWith(l, r)
         | Expr::EndsWith(l, r)
         | Expr::Contains(l, r)
-        | Expr::ByteAt(l, r)
+        | Expr::ByteAt(l, r) | Expr::TryByteAt(l, r)
         | Expr::Min(l, r)
         | Expr::Max(l, r)
         | Expr::BitAnd(l, r)
@@ -5397,7 +5405,7 @@ fn collect_expr_facts(
         }
         // `byte_at(text, index)` — pure pass-through: each child contributes
         // its own facts.
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             collect_expr_facts(t, reads, calls);
             collect_expr_facts(i, reads, calls);
         }
@@ -5772,7 +5780,7 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             Expr::Substring(t, s, e) => {
                 walk(t, out); walk(s, out); walk(e, out);
             }
-            Expr::ByteAt(t, i) => {
+            Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
                 walk(t, out); walk(i, out);
             }
             Expr::FoldBytes(t, init, acc, byte, idx, body) => {
@@ -6050,7 +6058,7 @@ fn collect_recursive_call_args(expr: &Expr, rule_name: &str, out: &mut Vec<Strin
         Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b)
         | Expr::Shl(a, b) | Expr::Shr(a, b) => { collect_recursive_call_args(a, rule_name, out); collect_recursive_call_args(b, rule_name, out); }
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { collect_recursive_call_args(h, rule_name, out); collect_recursive_call_args(n, rule_name, out); }
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) | Expr::TryByteAt(h, n) => { collect_recursive_call_args(h, rule_name, out); collect_recursive_call_args(n, rule_name, out); }
         Expr::Substring(t, s, e) => { collect_recursive_call_args(t, rule_name, out); collect_recursive_call_args(s, rule_name, out); collect_recursive_call_args(e, rule_name, out); }
     }
 }
@@ -6303,7 +6311,7 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
         Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b)
         | Expr::Shl(a, b) | Expr::Shr(a, b) => { collect_recursive_call_record_args(a, rule_name, out); collect_recursive_call_record_args(b, rule_name, out); }
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { collect_recursive_call_record_args(h, rule_name, out); collect_recursive_call_record_args(n, rule_name, out); }
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) | Expr::TryByteAt(h, n) => { collect_recursive_call_record_args(h, rule_name, out); collect_recursive_call_record_args(n, rule_name, out); }
         Expr::Substring(t, s, e) => { collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(s, rule_name, out); collect_recursive_call_record_args(e, rule_name, out); }
     }
 }
@@ -6381,7 +6389,7 @@ pub(crate) fn count_operations(expr: &Expr) -> usize {
         Expr::Substring(t, s, e) => 1 + count_operations(t) + count_operations(s) + count_operations(e),
         // `byte_at(text, index)` — one op (bounds check + load) plus the
         // cost of each child.
-        Expr::ByteAt(t, i) => 1 + count_operations(t) + count_operations(i),
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => 1 + count_operations(t) + count_operations(i),
         // `fold_bytes(text, init, acc, byte, idx => body)` — one op for the
         // fold-machinery setup plus the cost of evaluating text, init, and
         // body. Same shape as Fold; the bound names don't contribute their

@@ -1,0 +1,3 @@
+Read a byte from a literal table and return a bounded error on an invalid index.
+Handle a bounded error with an explicit numeric fallback.
+Propagate a bounded error through an alias and a rule call.
