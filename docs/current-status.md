@@ -45,6 +45,14 @@ future work describe the pre-service implementation. `--http-server` remains a
 legacy rule-plus-shell path; `--demo-http` is a hand-emitted probe without Verbose
 source. Use source-declared services to demonstrate the language's effect model.
 
+## Checked literal lookup
+
+`try_byte_at` returns `Result(number, BoundsError)` with explicit handling or
+propagation checked across the supported acyclic numeric-input rules. The
+interpreter and native argv path support it; WASM and the self-hosted compiler
+refuse it. See the [contract and support matrix](try-byte-at.md). This is separate
+from service failure recovery and does not generalize the old Result contract.
+
 ## Guarantees and measurements
 
 - Reads/calls consistency, types, layers, source references, and supported resource

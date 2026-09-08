@@ -47,6 +47,7 @@ pub const PRIMITIVE_CALL_NAMES: &[&str] = &[
     "bor",
     "bxor",
     "byte_at",
+    "try_byte_at",
     "concat",
     "contains",
     "count",
@@ -462,6 +463,7 @@ impl Parser {
             "bool" => Type::Bool,
             "text" => Type::Text,
             "bytes" => Type::Bytes,
+            "BoundsError" => Type::BoundsError,
             "collection" => {
                 self.expect_kind(TokenKind::LParen)?;
                 let inner = self.expect_ident_any()?;
@@ -1354,7 +1356,7 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Substring(Box::new(text_arg), Box::new(start_arg), Box::new(end_arg)))
-            } else if name == "byte_at" && self.check_kind(&TokenKind::LParen) {
+            } else if (name == "byte_at" || name == "try_byte_at") && self.check_kind(&TokenKind::LParen) {
                 // `byte_at(<text>, <index>)` — read the byte at a given
                 // offset of the text, returning a Number in 0..256.
                 // Exactly two arguments; any other arity is a parse-time
@@ -1375,7 +1377,7 @@ impl Parser {
                     return Err(self.error("byte_at requires exactly two arguments (text, index), got more than two"));
                 }
                 self.expect_kind(TokenKind::RParen)?;
-                Ok(Expr::ByteAt(Box::new(text_arg), Box::new(index_arg)))
+                Ok(if name == "try_byte_at" { Expr::TryByteAt(Box::new(text_arg), Box::new(index_arg)) } else { Expr::ByteAt(Box::new(text_arg), Box::new(index_arg)) })
             } else if name == "abs" && self.check_kind(&TokenKind::LParen) {
                 // `abs(<number_expr>)` — absolute value. Exactly one argument;
                 // zero or two-plus is a parse-time error. The verifier checks

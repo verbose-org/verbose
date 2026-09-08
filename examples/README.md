@@ -219,3 +219,9 @@ The resource-aware emitter sweep: every native emitter accepts `read()` with the
 | File | What it shows |
 |------|---------------|
 | `policy.verbose` | First multi-input rule: a context (policy thresholds) read once, requests checked per-record. |
+
+## Checked literal byte lookup
+
+[try_byte_at.verbose](try_byte_at.verbose) demonstrates bounded lookup, an explicit
+fallback and propagation through a rule call and alias. See the
+[contract and backend matrix](../docs/try-byte-at.md).

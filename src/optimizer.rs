@@ -88,7 +88,7 @@ fn count_nodes(expr: &Expr) -> usize {
         // `substring(text, start, end)` — three children, all expressions.
         Expr::Substring(t, s, e) => 1 + count_nodes(t) + count_nodes(s) + count_nodes(e),
         // `byte_at(text, index)` — two children, all expressions.
-        Expr::ByteAt(t, i) => 1 + count_nodes(t) + count_nodes(i),
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => 1 + count_nodes(t) + count_nodes(i),
         // `fold_bytes(text, init, acc, byte, idx => body)` — three Expr
         // children (text, init, body); the three bound names are strings,
         // not nodes.
@@ -112,6 +112,9 @@ fn count_nodes(expr: &Expr) -> usize {
 
 /// Optimize all rules in a program. Non-destructive: returns a new program + stats.
 pub fn optimize_program(program: &Program) -> (Program, OptStats) {
+    // Preserve eager evaluation and obligations in the first bounded-result slice.
+    // Legacy interval-driven rewrites do not yet carry those obligations.
+    let bounded_rules = crate::bounds::active_rules(program);
     // Count nodes before optimization
     let nodes_before: usize = program
         .items
@@ -142,6 +145,7 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
             .iter()
             .map(|item| match item {
                 Item::Concept(c) => Item::Concept(c.clone()),
+                Item::Rule(r) if bounded_rules.contains(&r.name) => Item::Rule(r.clone()),
                 Item::Rule(r) => {
                     let field_ranges = concept_field_ranges(r, &concepts);
                     Item::Rule(optimize_rule(r, &field_ranges))
@@ -475,6 +479,10 @@ pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
             Box::new(substitute_ident(e, name, replacement)),
         ),
         // `byte_at(text, index)` — substitute through both children.
+        Expr::TryByteAt(t, i) => Expr::TryByteAt(
+            Box::new(substitute_ident(t, name, replacement)),
+            Box::new(substitute_ident(i, name, replacement)),
+        ),
         Expr::ByteAt(t, i) => Expr::ByteAt(
             Box::new(substitute_ident(t, name, replacement)),
             Box::new(substitute_ident(i, name, replacement)),
@@ -953,6 +961,8 @@ pub fn optimize_expr(
         // `*idx as usize` cast is what makes a NEGATIVE index safe in both
         // arms: it wraps to a huge value, `.get()` returns None, the wrapper
         // survives and the runtime bounds check fails closed.
+        Expr::TryByteAt(t, i) => Expr::TryByteAt(
+            t.clone(), Box::new(optimize_expr(i, input_name, field_ranges))),
         Expr::ByteAt(t, i) => {
             let t_opt = optimize_expr(t, input_name, field_ranges);
             let i_opt = optimize_expr(i, input_name, field_ranges);

@@ -559,6 +559,8 @@ pub struct Variant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Number,
+    /// Closed, payload-free error. Only Result(number, BoundsError) may expose it.
+    BoundsError,
     Bool,
     Text,
     /// Raw bytes: the arbitrary-content counterpart to Text. Introduced in
@@ -970,6 +972,8 @@ pub enum Expr {
     /// Cheap: no allocation, no scratch — the emit is a bounded
     /// `cmp + jae .abort ; movzx eax, byte [text_ptr + index]`.
     ByteAt(Box<Expr>, Box<Expr>),
+    /// Checked UTF-8/raw byte index into a literal table; returns a bounded Result.
+    TryByteAt(Box<Expr>, Box<Expr>),
     /// `fold_bytes(<text>, <init>, acc, byte, idx => <body>)`
     ///
     /// Iterate over the bytes of `text`, threading an accumulator

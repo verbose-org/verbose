@@ -208,6 +208,9 @@ pub fn compile_wasm(
     rule_name: &str,
     output_path: &str,
 ) -> Result<(), WasmError> {
+    if crate::bounds::active_rules(program).contains(rule_name) {
+        return Err(WasmError { message: "WASM does not support try_byte_at / BoundsError yet".into() });
+    }
     let rules: std::collections::HashMap<&str, &Rule> = program
         .items
         .iter()

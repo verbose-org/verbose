@@ -1,3 +1,4 @@
+mod bounded;
 /// Native x86-64 code generation — produces ELF binaries directly.
 ///
 /// General-purpose expression compiler: supports arithmetic (+, -, *, /),
@@ -126,6 +127,12 @@ fn compile_native_code(
     stream: bool,
     stdin_raw: bool,
 ) -> Result<Vec<u8>, NativeError> {
+    if crate::bounds::active_rules(program).contains(rule_name) {
+        if stdin_raw || stdin || stream {
+            return Err(NativeError { message: "bounded-result entry currently supports argv records only".into() });
+        }
+        return bounded::compile(program, rule_name);
+    }
     // Phase B slice 4a.1: lift the blanket refusal on `concept_group`.
     // From this slice forward, a program containing a `concept_group`
     // declaration can compile natively AS LONG AS the entry rule does
@@ -1356,7 +1363,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         }
         // `byte_at(text, index)` — recurse into both children; either side
         // may carry a `read(...)` reference.
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             collect_read_names_native(t, out);
             collect_read_names_native(i, out);
         }
@@ -1425,7 +1432,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::FoldBytes(t, init, _, _, _, body) => {
             expr_uses_now_unix(t) || expr_uses_now_unix(init) || expr_uses_now_unix(body)
         }
-        Expr::ByteAt(t, i) => expr_uses_now_unix(t) || expr_uses_now_unix(i),
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => expr_uses_now_unix(t) || expr_uses_now_unix(i),
         // Phase A slice 2: any payload field may reference now_unix().
         Expr::VariantConstruct(_, _, fields) => fields.iter().any(|(_, e)| expr_uses_now_unix(e)),
         // Phase A slice 3: pattern match — scrutinee OR any arm's body
@@ -1516,7 +1523,7 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
                 .max(count_match_result_max_depth(s))
                 .max(count_match_result_max_depth(e))
         }
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             count_match_result_max_depth(t).max(count_match_result_max_depth(i))
         }
         Expr::Call(_, args) | Expr::Concat(args) => {
@@ -1635,7 +1642,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
                 || expr_uses_field(s, input_name, field_name)
                 || expr_uses_field(e, input_name, field_name)
         }
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             expr_uses_field(t, input_name, field_name)
                 || expr_uses_field(i, input_name, field_name)
         }
@@ -2376,7 +2383,7 @@ fn expr_uses_ident_outside_field(expr: &Expr, name: &str) -> bool {
             fields.iter().any(|(_, e)| rec(e))
         }
         Expr::Substring(t, a, b) => rec(t) || rec(a) || rec(b),
-        Expr::ByteAt(t, i) => rec(t) || rec(i),
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => rec(t) || rec(i),
         Expr::Fetch(_, request) => rec(request),
         Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Read(_) | Expr::Random(_) | Expr::NowUnix => false,
     }
@@ -2690,7 +2697,7 @@ fn collect_field_reads_of(expr: &Expr, name: &str, f: &mut dyn FnMut(&str)) {
         }
         Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b)
         | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
-        | Expr::EndsWith(a, b) | Expr::Contains(a, b) | Expr::ByteAt(a, b) => {
+        | Expr::EndsWith(a, b) | Expr::Contains(a, b) | Expr::ByteAt(a, b) | Expr::TryByteAt(a, b) => {
             collect_field_reads_of(a, name, f);
             collect_field_reads_of(b, name, f);
         }
@@ -3294,7 +3301,7 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
             collect_native_callees(a, out);
             collect_native_callees(b, out);
         }
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             collect_native_callees(t, out);
             collect_native_callees(i, out);
         }
@@ -3411,7 +3418,7 @@ fn gather_transitive_callee_reads(
             gather_transitive_callee_reads(s, all_rules, visited, out);
             gather_transitive_callee_reads(e, all_rules, visited, out);
         }
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             gather_transitive_callee_reads(t, all_rules, visited, out);
             gather_transitive_callee_reads(i, all_rules, visited, out);
         }
@@ -4066,7 +4073,7 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names_native(e, out);
         }
         // `byte_at(text, index)` — recurse into both children.
-        Expr::ByteAt(t, i) => {
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => {
             collect_fetch_names_native(t, out);
             collect_fetch_names_native(i, out);
         }
@@ -4373,7 +4380,7 @@ fn emit_connection_fetch_sequence(
                 .or_else(|| first_fetch_for(s, name))
                 .or_else(|| first_fetch_for(e, name)),
             // `byte_at(text, index)` — recurse into both children.
-            Expr::ByteAt(t, i) => first_fetch_for(t, name).or_else(|| first_fetch_for(i, name)),
+            Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => first_fetch_for(t, name).or_else(|| first_fetch_for(i, name)),
             // `fold_bytes(text, init, acc, byte, idx => body)` — recurse
             // into text, init, and body.
             Expr::FoldBytes(t, init, _, _, _, body) => first_fetch_for(t, name)
@@ -4619,7 +4626,7 @@ fn find_group_variant_construct_in_expr(
             .find_map(|(_, e)| find_group_variant_construct_in_expr(e, group_concepts)),
         Expr::Fetch(_, req) => find_group_variant_construct_in_expr(req, group_concepts),
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => {
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) | Expr::TryByteAt(h, n) => {
             find_group_variant_construct_in_expr(h, group_concepts)
                 .or_else(|| find_group_variant_construct_in_expr(n, group_concepts))
         }
@@ -4729,7 +4736,7 @@ fn find_group_match_variant_in_expr(
             .find_map(|(_, e)| find_group_match_variant_in_expr(e, group_concepts, rule_input_name, rule_input_ty, all_rules)),
         Expr::Fetch(_, req) => find_group_match_variant_in_expr(req, group_concepts, rule_input_name, rule_input_ty, all_rules),
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => {
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) | Expr::TryByteAt(h, n) => {
             find_group_match_variant_in_expr(h, group_concepts, rule_input_name, rule_input_ty, all_rules)
                 .or_else(|| find_group_match_variant_in_expr(n, group_concepts, rule_input_name, rule_input_ty, all_rules))
         }
@@ -7029,7 +7036,7 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
             Expr::VariantConstruct(_, _, fields) => { for (_, e) in fields { walk(e, m); } }
             Expr::Fetch(_, req) => walk(req, m),
             Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n)
+            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) | Expr::TryByteAt(h, n)
             | Expr::BitAnd(h, n) | Expr::BitOr(h, n) | Expr::BitXor(h, n)
             | Expr::Shl(h, n) | Expr::Shr(h, n) => { walk(h, m); walk(n, m); }
             Expr::Substring(t, s, e) => { walk(t, m); walk(s, m); walk(e, m); }
@@ -7088,7 +7095,7 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
             Expr::VariantConstruct(_, _, fields) => { for (_, e) in fields { walk(e, m, cg); } }
             Expr::Fetch(_, req) => walk(req, m, cg),
             Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n)
+            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) | Expr::TryByteAt(h, n)
             | Expr::BitAnd(h, n) | Expr::BitOr(h, n) | Expr::BitXor(h, n)
             | Expr::Shl(h, n) | Expr::Shr(h, n) => { walk(h, m, cg); walk(n, m, cg); }
             Expr::Substring(t, s, e) => { walk(t, m, cg); walk(s, m, cg); walk(e, m, cg); }
@@ -7238,7 +7245,7 @@ fn max_stacked_match_binder_slots(
             | Expr::EndsWith(h, n)
             | Expr::Min(h, n)
             | Expr::Max(h, n)
-            | Expr::ByteAt(h, n)
+            | Expr::ByteAt(h, n) | Expr::TryByteAt(h, n)
             | Expr::BitAnd(h, n)
             | Expr::BitOr(h, n)
             | Expr::BitXor(h, n)
@@ -7279,7 +7286,7 @@ fn body_contains_variant_construct(expr: &Expr) -> bool {
         }
         Expr::Fetch(_, req) => body_contains_variant_construct(req),
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n)
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) | Expr::TryByteAt(h, n)
         | Expr::BitAnd(h, n) | Expr::BitOr(h, n) | Expr::BitXor(h, n)
         | Expr::Shl(h, n) | Expr::Shr(h, n) => {
             body_contains_variant_construct(h) || body_contains_variant_construct(n)
@@ -15320,7 +15327,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // `byte_at(text, index)` — like Substring, the operation uses fixed
         // registers (bounds check + movzx load). No eval-stack pushes
         // beyond what the children's individual depths already require.
-        Expr::ByteAt(t, i) => max_stack_depth(t).max(max_stack_depth(i)),
+        Expr::ByteAt(t, i) | Expr::TryByteAt(t, i) => max_stack_depth(t).max(max_stack_depth(i)),
         // `fold_bytes(text, init, acc, byte, idx => body)` — like Fold, the
         // loop is driven by fixed registers (byte cursor / accumulator
         // slot); whichever child has the deepest eval-stack dominates.
@@ -18024,6 +18031,7 @@ fn emit_eval_expr(
         //
         // Total ~40 bytes per byte_at call site (excluding the text load
         // and index eval, which size with their sub-expressions).
+        Expr::TryByteAt(_, _) => Err(NativeError { message: "try_byte_at requires the bounded-result emitter".into() }),
         Expr::ByteAt(text, index) => {
             // (1) Load text → (rsi, rcx).
             emit_starts_with_load_text(
@@ -21083,6 +21091,9 @@ pub fn compile_service(
     service_name: &str,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    if let Some(error) = crate::bounds::verify(program).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
     let service = program
         .items
         .iter()
@@ -22243,6 +22254,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Max(_, _) => "Max",
         Expr::Substring(_, _, _) => "Substring",
         Expr::ByteAt(_, _) => "ByteAt",
+        Expr::TryByteAt(_, _) => "TryByteAt",
         Expr::FoldBytes(_, _, _, _, _, _) => "FoldBytes",
         Expr::VariantConstruct(_, _, _) => "VariantConstruct",
         Expr::MatchVariant(_, _) => "MatchVariant",
@@ -55970,6 +55982,15 @@ rule pick
              (gen1={} B, gen2={} B) — the compiler must reproduce its entire self",
             gen1_bytes.len(), gen2_bytes.len());
 
+        // The new contract must remain an explicit refusal after self-compilation.
+        for emitter in [&gen0, &gen1] {
+            let refused = Command::new(emitter).arg("0")
+                .stdin(fs::File::open("examples/try_byte_at.verbose").unwrap())
+                .output().unwrap();
+            assert_eq!(refused.status.code(), Some(1));
+            assert!(refused.stdout.is_empty(), "bounded results emitted an unsupported artifact");
+        }
+
         // R1 — whole real source, NO reorder. Feed the ORIGINAL (non-reordered)
         // examples/vexprparse.verbose to both gen0 and gen1: the self-compiled
         // emitter must emit the entire real 545-proc compiler identically to the
@@ -56466,7 +56487,8 @@ rule pick
         // entry half is unreachable here because the handler gate fires
         // first).
         const EXPECTED_ACCEPTED: usize = 97;
-        const EXPECTED_TOTAL: usize = 161;
+        // try_byte_at adds one deliberately refused bounded-result example.
+        const EXPECTED_TOTAL: usize = 162;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
