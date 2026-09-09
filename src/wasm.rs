@@ -208,6 +208,10 @@ pub fn compile_wasm(
     rule_name: &str,
     output_path: &str,
 ) -> Result<(), WasmError> {
+    if program.items.iter().any(|i| matches!(i, Item::Service(s)
+        if s.name == rule_name && (s.request_timeout.is_some() || s.response_timeout.is_some()))) {
+        return Err(WasmError { message: "WASM does not support bounded HTTP request_timeout / response_timeout".into() });
+    }
     if crate::bounds::active_rules(program).contains(rule_name) {
         return Err(WasmError { message: "WASM does not support try_byte_at / BoundsError yet".into() });
     }

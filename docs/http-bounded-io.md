@@ -1,6 +1,6 @@
 # Bounded HTTP socket I/O
 
-Design agreed for implementation on 2026-09-09. This is the first transport slice
+Implemented in the Rust compiler on 2026-09-09; design committed before emission changes. This is the first transport slice
 of the HTTP → bounded concurrency → TLS roadmap, not a production-server claim.
 
 ## Source contract
@@ -40,7 +40,50 @@ language BoundsError. No partial response is retried on another connection.
 These deadlines cover the receive and response-write phases, not handler CPU,
 resource I/O, logging, fork scheduling, or total process lifetime. Existing logs
 run after the handler and before sending: a logged request need not have a fully
-sent response. A failed response skips `after:`. No rollback is implied.
+sent response. A failed response skips `after:`. A phase succeeds only when its final
+completion check is still before the deadline, even if the last bytes have
+already entered the socket queue. Successful sending means the kernel accepted
+the bytes; it does not establish that the peer application processed them.
+No rollback is implied.
+
+## Example and backend support
+
+See [the complete body-echo example](../examples/http_bounded.verbose):
+
+```verbose
+service bounded_http
+  @intention: "Receive and answer one bounded request before its phase deadlines"
+  @source: http_bounded.intent:3
+  listen:
+    protocol: http_1_0
+    port: 18960
+    max_request: 4096
+  handler: echo_body
+  request_timeout: 2
+  response_timeout: 2
+```
+
+Build and run it:
+
+```sh
+cargo run -- examples/http_bounded.verbose --native /tmp/http-bounded --run bounded_http
+/tmp/http-bounded
+```
+
+| Path | Support |
+|---|---|
+| Rust parser and verifier | Paired deadlines, ranges, duplicate rejection, HTTP-only context |
+| Native Linux x86-64 | Bounded request assembly and complete sends; sequential or existing fork-per-connection mode |
+| Interpreter | Handler rules only; no service transport execution |
+| WASM | Explicit refusal for the bounded HTTP service entry |
+| Self-hosted compiler | Service-scoped refusal before ELF or raw machine-code output |
+
+The receiver reserves `max_request` bytes plus 128 scratch bytes beyond existing
+service slots. A deterministic static header transition table grows the executable
+by 34 KiB. Neither receive nor send loops allocate dynamically. Existing
+handler expressions may still allocate, and existing response text-range checks
+are not a general proof of response size. This slice does not add a connection
+quota or bound the number of forked children. Deadlines use millisecond resolution.
 
 ## Native implementation and register lifetimes
 
@@ -66,14 +109,16 @@ sent response. A failed response skips `after:`. No rollback is implied.
 
 ## Reference and acceptance
 
-Use a Rust reference framing parser and native socket tests with independently
-specified expected wire responses. Cover every split position, binary bodies,
+The [acceptance tests](../src/http_tests.rs) use a separate Rust framing parser
+and native sockets with independently specified expected wire responses. They cover every split position, binary bodies,
 empty bodies, exact capacity, length overflow, ambiguous framing, malformed
 headers, unsupported framing, premature EOF, slow-drip absolute timeout, peer
 reset, response backpressure/short writes, and a healthy client after failures.
-Pin declaration refusals at verification and direct emission, deterministic
-emission, and legacy binary identity. Check effect ordering and skip-after on
-write failure where an observable fixture is supported.
+They also cover declaration refusals at verification and direct emission,
+deterministic emission, instruction decoding, 256 seeded request mutations,
+resource/log ordering, and skip-after on partial send failure. The backpressure
+fixture uses an existing large dynamic concat to exceed socket buffer capacity;
+it is a transport stress case, not a new response-size guarantee.
 
 WASM and the self-hosted compiler explicitly refuse this transport contract
 before artifact output. The interpreter executes handler rules, not services;
@@ -85,3 +130,23 @@ quotas, worker pools/threads, TLS, and load qualification remain later work.
 Framing references: [RFC 9112 sections 2–6](https://www.rfc-editor.org/rfc/rfc9112.html),
 with the narrower rejection policy above; Linux [poll](https://man7.org/linux/man-pages/man2/poll.2.html)
 and [send](https://man7.org/linux/man-pages/man2/send.2.html) define the syscall behavior.
+
+
+## Validation recorded on 2026-09-09
+
+- Normal suite: 636 passed, 26 ignored, run serially.
+- Separate two-generation bootstrap: 25 passed.
+- Ten bounded HTTP acceptance tests include native/reference comparisons,
+  fragmented reads, actual send backpressure, state/effect ordering, backend
+  refusals, and instruction decoding outside the static table.
+- Against compiler revision `3996594`, the 161 pre-existing top-level example
+  entries selected for native compilation produced 158 byte-identical binaries
+  and three refusals on both compilers. The evolving self-host source and the new
+  HTTP example were excluded from this binary-identity comparison.
+- `strace` on the example covered valid empty/binary bodies, length overflow, and
+  receive timeout: no allocation syscalls, no process stdout/stderr, and expected
+  wire responses/connection closure. This is observed coverage, not a universal
+  proof of memory safety or delivery.
+- `cidx validate` passed. Local `cidx run security` and `cidx run ci` passed
+  Trivy/Gitleaks but stopped at cargo-audit because its container lacks `curl`.
+  These local pipelines did not reach a successful overall result.

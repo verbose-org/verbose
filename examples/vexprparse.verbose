@@ -10269,6 +10269,16 @@ rule rule_shape
 -- (backs the byte recognition of the `rule` keyword), and the current scan index.
 -- A group field (toks) + a text field (src) + a number (pos) — the supported
 -- multi-field shape (same as RuleParseState plus a cursor).
+concept HttpIoCheck
+  @intention: "Track service scope while refusing unsupported HTTP transport attributes"
+  @source: vexprparse.intent:42
+  fields:
+    cell : TokenList
+    src : text [..256]
+    depth : number
+    active : number
+
+
 concept ProgramState
   @intention: "The token list cursor cell plus the source text, for parsing a program"
   @source: vexprparse.intent:31
@@ -23423,6 +23433,33 @@ rule all_diags_count
 -- scores 0 here, pinned by self_verify_v2_aggregate_gate.
 -- Bounded-result slice (2026-09-08): refuse reserved identifiers before emission.
 -- Token inspection deliberately ignores comments and string / byte literals.
+-- Service-scoped token refusal: identifiers in rules, comments, and literals
+-- keep their existing meaning. Only a depth-one service attribute followed by
+-- ':' activates this unsupported contract. The gate runs before any output.
+rule http_io_errors
+  @intention: "Refuse bounded HTTP transport before self-hosted artifact emission"
+  @source: vexprparse.intent:42
+  input:
+    h : HttpIoCheck
+  output:
+    out : number
+  logic:
+    let kind = peek_kind(h.cell)
+    let ident = peek_is_ident(h.cell)
+    let start = peek_start(h.cell)
+    let len = peek_len(h.cell)
+    let next = advance(Advance { lst: h.cell, k: 1 })
+    let depth = if kind == 700 then h.depth + 1 else if kind == 800 then h.depth - 1 else h.depth
+    let active = if kind == 800 and depth == 0 then 0 else if h.depth == 0 and ident == 1 and span_is_service(SpanCheck { src: h.src, start: start, len: len }) == 1 then 1 else h.active
+    out = if kind == 0 then 0 else if h.active == 1 and h.depth == 1 and ident == 1 and peek_kind(next) == 410 and ((len == 15 and (byte_at(h.src, start + 0) == 114 and byte_at(h.src, start + 1) == 101 and byte_at(h.src, start + 2) == 113 and byte_at(h.src, start + 3) == 117 and byte_at(h.src, start + 4) == 101 and byte_at(h.src, start + 5) == 115 and byte_at(h.src, start + 6) == 116 and byte_at(h.src, start + 7) == 95 and byte_at(h.src, start + 8) == 116 and byte_at(h.src, start + 9) == 105 and byte_at(h.src, start + 10) == 109 and byte_at(h.src, start + 11) == 101 and byte_at(h.src, start + 12) == 111 and byte_at(h.src, start + 13) == 117 and byte_at(h.src, start + 14) == 116)) or (len == 16 and (byte_at(h.src, start + 0) == 114 and byte_at(h.src, start + 1) == 101 and byte_at(h.src, start + 2) == 115 and byte_at(h.src, start + 3) == 112 and byte_at(h.src, start + 4) == 111 and byte_at(h.src, start + 5) == 110 and byte_at(h.src, start + 6) == 115 and byte_at(h.src, start + 7) == 101 and byte_at(h.src, start + 8) == 95 and byte_at(h.src, start + 9) == 116 and byte_at(h.src, start + 10) == 105 and byte_at(h.src, start + 11) == 109 and byte_at(h.src, start + 12) == 101 and byte_at(h.src, start + 13) == 111 and byte_at(h.src, start + 14) == 117 and byte_at(h.src, start + 15) == 116))) then 1 else http_io_errors(HttpIoCheck { cell: next, src: h.src, depth: depth, active: active })
+  proofs:
+    purity:
+      reads : [h.cell, h.src, h.depth, h.active]
+      calls : [peek_kind, peek_is_ident, peek_start, peek_len, advance, span_is_service, http_io_errors]
+    termination:
+      bound : 256
+
+
 rule bounded_result_errors
   @intention: "Refuse the bounded-result contract until self-hosted support exists"
   @source: vexprparse.intent:42
@@ -23455,11 +23492,11 @@ rule verify_errors
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = bounded_result_errors(ProgramState { cell: toks, src: s.source }) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source })
+    out = http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
-      calls : [bounded_result_errors, begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
+      calls : [http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
     termination:
       bound : 256
 
@@ -31285,11 +31322,11 @@ rule x86_program_src
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
     let svcs = parse_services(ProgramState { cell: toks, src: s.source })
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
-    out = concat(abort_if(bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
+    out = concat(abort_if(http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
+      calls : [http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
     termination:
       bound : 256
 
@@ -35053,7 +35090,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(bounded_result_errors(ProgramState { cell: toks, src: s.source }) + bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -35125,7 +35162,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [bounded_result_errors, begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
+      calls : [http_io_errors, bounded_result_errors, begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
     termination:
       bound : 256
 

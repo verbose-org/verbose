@@ -53,6 +53,14 @@ interpreter and native argv path support it; WASM and the self-hosted compiler
 refuse it. See the [contract and support matrix](try-byte-at.md). This is separate
 from service failure recovery and does not generalize the old Result contract.
 
+HTTP services can opt in to bounded request assembly and complete response writes
+with paired `request_timeout` / `response_timeout` declarations. Native Linux
+x86-64 enforces whole-phase socket deadlines and closes failed clients; WASM and
+the self-hosted compiler refuse this service contract. See the
+[contract and support matrix](http-bounded-io.md). It retains one request per
+connection and existing sequential/forked modes; worker pools, threads, and TLS
+remain outside the implementation.
+
 ## Guarantees and measurements
 
 - Reads/calls consistency, types, layers, source references, and supported resource

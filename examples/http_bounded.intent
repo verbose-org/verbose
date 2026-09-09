@@ -1,0 +1,3 @@
+Bounded HTTP body echo
+Return the complete request body, including NUL bytes, as an HTTP response.
+Accept one request per connection, with a 4096-byte request capacity and two-second receive and send deadlines.

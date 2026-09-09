@@ -370,6 +370,13 @@ Both rules output `Result(number, text)` where each `Err` branch carries the pla
 
 ## Phases 7 / 8 / 9 / 10 / 11 / 12: HTTP services, file I/O, fetch, audit logs
 
+**Bounded HTTP transport (2026-09-09):** paired `request_timeout` and
+`response_timeout` declarations opt in to complete request assembly within
+`max_request`, strict Content-Length framing, and response sends that resume
+partial writes under one deadline. See the [contract and backend matrix](docs/http-bounded-io.md)
+and [body-echo example](examples/http_bounded.verbose). This remains a
+close-after-one-request HTTP transport, with sequential or forked concurrency.
+
 The native backend emits complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and a per-request `log:` block. As of 2026-04-30, the surface includes: HTTP/1.0 services with prefix routing and computed status; cached + per-request file reads with `on_read_error: abort`; outbound `fetch()` to declared connections; multiple `log:` blocks per service (strict + best-effort sinks); fork-per-accept concurrency; `req.body` parsing; and a family of runtime primitives (`read`, `parse_int`, `now_unix`, `length`, `starts_with`, `contains`, `abs`, `field == read(...)`, `json_escape`).
 
 | Example | Binary | What it does |

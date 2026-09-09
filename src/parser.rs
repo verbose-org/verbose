@@ -1813,6 +1813,8 @@ impl Parser {
         // enforces that they come as a pair and only on raw_tcp.
         let mut max_steps: Option<u32> = None;
         let mut read_timeout: Option<u32> = None;
+        let mut request_timeout = None;
+        let mut response_timeout = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -2111,6 +2113,19 @@ impl Parser {
                 }
                 read_timeout = Some(n as u32);
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("request_timeout") || self.check_ident("response_timeout") {
+                let request = self.check_ident("request_timeout");
+                let key = if request { "request_timeout" } else { "response_timeout" };
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=3600).contains(&n) {
+                    return Err(self.error(&format!("{} {} out of range [1, 3600] seconds", key, n)));
+                }
+                let slot = if request { &mut request_timeout } else { &mut response_timeout };
+                if slot.is_some() { return Err(self.error(&format!("duplicate service attribute '{}'", key))); }
+                *slot = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
             } else if self.check_ident("frame") {
                 // Refusal #9 (design §5.5): a DECLARED framing block. It is
                 // recognised so it can be refused by name — an unknown key
@@ -2123,7 +2138,7 @@ impl Parser {
                     name
                 )));
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', or 'read_timeout:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', or 'response_timeout:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -2147,6 +2162,8 @@ impl Parser {
             after_sets,
             max_steps,
             read_timeout,
+            request_timeout,
+            response_timeout,
         })
     }
 
