@@ -375,9 +375,34 @@ pub struct Service {
     /// ceiling is then `max_steps × read_timeout` seconds of READ time.
     /// It covers `read`, not `write` (§5.4's named residual).
     pub read_timeout: Option<u32>,
+    /// Opt-in bounded HTTP framing: absolute receive/send phase deadlines.
+    /// Both are required, in seconds 1..3600. See docs/http-bounded-io.md.
+    pub request_timeout: Option<u32>,
+    pub response_timeout: Option<u32>,
 }
 
 impl Service {
+    /// Shared verifier/emitter backstop; native APIs can bypass verification.
+    pub fn http_io_error(&self) -> Option<&'static str> {
+        if self.request_timeout.is_none() && self.response_timeout.is_none() { return None; }
+        if self.request_timeout.is_none() || self.response_timeout.is_none() {
+            return Some("bounded HTTP requires both request_timeout and response_timeout");
+        }
+        if !matches!(self.protocol, Protocol::Http10) {
+            return Some("request_timeout and response_timeout require protocol http_1_0");
+        }
+        if [self.request_timeout, self.response_timeout].iter().flatten().any(|s| !(1..=3600).contains(s)) {
+            return Some("HTTP request_timeout and response_timeout must be in [1, 3600] seconds");
+        }
+        if !(1..=1_048_576).contains(&self.max_request) {
+            return Some("bounded HTTP max_request must be in [1, 1048576] bytes");
+        }
+        if self.max_steps.is_some() || self.read_timeout.is_some() {
+            return Some("bounded HTTP cannot use raw_tcp max_steps or read_timeout");
+        }
+        None
+    }
+
     /// Is this service multi-step — does it declare a per-connection step
     /// loop? Both knobs are mandatory together (verifier refusal #2), so
     /// after verification `max_steps.is_some()` alone would do; the

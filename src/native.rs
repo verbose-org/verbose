@@ -1,4 +1,5 @@
 mod bounded;
+mod http_io;
 /// Native x86-64 code generation — produces ELF binaries directly.
 ///
 /// General-purpose expression compiler: supports arithmetic (+, -, *, /),
@@ -21105,6 +21106,10 @@ pub fn compile_service(
             message: format!("no service named '{}'", service_name),
         })?;
 
+    if let Some(message) = service.http_io_error() {
+        return Err(NativeError { message: format!("service '{}': {}", service.name, message) });
+    }
+
     if let Protocol::Http10 = service.protocol {
         // Phase 7 Http10 dispatch: detect whether the handler is a constant
         // HttpResponse (slice 3b, precomputed wire response) or a dynamic
@@ -21137,9 +21142,25 @@ pub fn compile_service(
         // and was already Dynamic — but a constant-bodied stateful service is
         // expressible, and "the declaration compiled to nothing" is the false
         // explicitation this project forbids by name.
+        // The opted-in constant handler now uses the dynamic transport, but
+        // must keep the constant emitter's literal admission bounds.
+        if service.request_timeout.is_some()
+            && matches!(analyze_http10_handler_shape(handler), Http10HandlerShape::Constant) {
+            if let Expr::Record(_, fields) = &handler.logic.value {
+                for (name, value) in fields {
+                    match (name.as_str(), value) {
+                        ("status", Expr::Number(n)) if !(100..=599).contains(n) =>
+                            return Err(NativeError { message: format!("status {} outside HTTP valid range [100, 599]", n) }),
+                        ("body", Expr::Text(body)) if body.len() > 4096 =>
+                            return Err(NativeError { message: format!("body length {} exceeds HttpResponse text bound [..4096]", body.len()) }),
+                        _ => {}
+                    }
+                }
+            }
+        }
         return match analyze_http10_handler_shape(handler) {
             Http10HandlerShape::Constant
-                if service.logs.is_empty() && service.after_sets.is_empty() =>
+                if service.logs.is_empty() && service.after_sets.is_empty() && service.request_timeout.is_none() =>
             {
                 compile_http10_constant_service(program, service, output_path)
             }
@@ -23160,6 +23181,8 @@ fn emit_http10_dynamic_bytes(
         .map(|sf| format!("__state_{}", sf.name))
         .collect();
     let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes + entropy_extra_bytes;
+    let http_io = service.request_timeout.map(|_| http_io::Io { base: -(frame_base + http_io::Io::SIZE) });
+    let frame_base = frame_base + if http_io.is_some() { http_io::Io::SIZE } else { 0 };
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
     // shared abort sequence; left empty when policy is Drop.
@@ -23425,12 +23448,18 @@ fn emit_http10_dynamic_bytes(
         emit_fork_dispatch(&mut code, accept_top);
     }
 
+    // Framing precedes every per-request resource read and handler effect.
+    let mut http_io_failures = Vec::new();
+    if let Some(io) = http_io {
+        http_io_failures.extend(http_io::receive(&mut code, io, buf_offset_from_rbp,
+            max_request, service.request_timeout.unwrap()));
+    }
+
     // ═══ TIMESTAMP (Phase 8 slice 8c) ══════════════════════════
     // If the log reads req.timestamp, capture CLOCK_REALTIME seconds once
-    // per request, before the parser runs. The 16-byte timespec is laid out
-    // at the start of the read buffer area (still unused at this point —
-    // the read happens next and overwrites it), then we copy tv_sec into
-    // the dedicated [rbp-56] slot. One syscall, 8 bytes of frame growth.
+    // per request. Legacy transport borrows the still-unused read buffer;
+    // bounded transport has already received the request and uses its separate
+    // scratch timespec. Copy tv_sec into the dedicated [rbp-56] slot.
     if uses_timestamp {
         // mov rax, 228  (sys_clock_gettime)
         code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0xE4, 0x00, 0x00, 0x00]);
@@ -23438,12 +23467,12 @@ fn emit_http10_dynamic_bytes(
         code.extend_from_slice(&[0x48, 0x31, 0xFF]);
         // lea rsi, [rbp + buf_offset_from_rbp]  (timespec scratch)
         code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
-        code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
+        code.extend_from_slice(&http_io.map_or(buf_offset_from_rbp, |io| io.timespec()).to_le_bytes());
         // syscall
         code.extend_from_slice(&[0x0F, 0x05]);
         // mov rax, [rbp + buf_offset_from_rbp]  (tv_sec)
         code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-        code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
+        code.extend_from_slice(&http_io.map_or(buf_offset_from_rbp, |io| io.timespec()).to_le_bytes());
         // mov [rbp-56], rax
         code.extend_from_slice(&[0x48, 0x89, 0x45, 0xC8]);                // -56 = 0xC8 i8
     }
@@ -23482,16 +23511,21 @@ fn emit_http10_dynamic_bytes(
         }
     }
 
-    // ═══ READ ══════════════════════════════════════════════════
-    code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax
-    code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
-    // rsi = rbp + buf_offset_from_rbp  (via lea)
-    code.extend_from_slice(&[0x48, 0x8D, 0xB5]);                         // lea rsi, [rbp + disp32]
-    code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
-    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);                         // mov rdx, max_request
-    code.extend_from_slice(&buf_bytes);
-    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    // rax = bytes_read
+    if let Some(io) = http_io {
+        io.restore_length(&mut code);
+    } else {
+        // ═══ READ ══════════════════════════════════════════════════
+        code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax
+        code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
+        // rsi = rbp + buf_offset_from_rbp  (via lea)
+        code.extend_from_slice(&[0x48, 0x8D, 0xB5]);                         // lea rsi, [rbp + disp32]
+        code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xC7, 0xC2]);                         // mov rdx, max_request
+        code.extend_from_slice(&buf_bytes);
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+        // rax = bytes_read
+
+    }
 
     // ═══ HTTP PARSE (method, path) ═════════════════════════════
     // On malformed input (no space found, no CR/LF found), jumps to
@@ -23922,7 +23956,10 @@ fn emit_http10_dynamic_bytes(
     }
 
     // ═══ HTTP SERIALIZE ════════════════════════════════════════
-    emit_http_serialize(&mut code);
+    if let Some(io) = http_io {
+        http_io_failures.extend(http_io::start_response(&mut code, io, service.response_timeout.unwrap()));
+    }
+    emit_http_serialize(&mut code, http_io, &mut http_io_failures);
 
     // ═══ AFTER BLOCK (mutable state mutations) ═════════════════
     // Runs AFTER the response is written, AFTER log blocks. Each entry
@@ -23952,6 +23989,7 @@ fn emit_http10_dynamic_bytes(
     // ═══ CLOSE + LOOP ══════════════════════════════════════════
     let close_label = code.len();
     // Patch parse_fail jumps to land here.
+    parse_fail_patches.extend(http_io_failures);
     for patch in parse_fail_patches {
         let rel = close_label as i32 - (patch as i32 + 4);
         code[patch..patch + 4].copy_from_slice(&rel.to_le_bytes());
@@ -24482,22 +24520,22 @@ fn emit_handler_to_slots(
 /// body_len / client_fd from their respective rbp slots. Ugly by design —
 /// simple, auditable, no in-memory buffer. writev coalescing is a later
 /// optimisation gated on a concrete bench.
-fn emit_http_serialize(code: &mut Vec<u8>) {
-    // Status itoa buffer lives on the stack; allocate 10 bytes upfront for
-    // both status and body_len, re-used sequentially.
+fn emit_http_serialize(code: &mut Vec<u8>, io: Option<http_io::Io>, failures: &mut Vec<usize>) {
+    // Each numeric segment uses its own 24-byte stack buffer, released after
+    // that segment finishes (or by the enclosing close/reset on I/O failure).
     // Format: HTTP/1.0 <status> OK\r\nContent-Length: <body_len>\r\n\r\n<body>
 
-    emit_write_literal(code, b"HTTP/1.0 ");
-    emit_write_itoa_slot(code, -24);                                     // status at rbp-24
-    emit_write_literal(code, b" OK\r\nContent-Length: ");
-    emit_write_itoa_slot(code, -40);                                     // body_len at rbp-40
-    emit_write_literal(code, b"\r\n\r\n");
-    emit_write_body_ptr_len(code);                                        // body_ptr at rbp-32, len at rbp-40
+    emit_write_literal(code, b"HTTP/1.0 ", io, failures);
+    emit_write_itoa_slot(code, -24, io, failures);                                     // status at rbp-24
+    emit_write_literal(code, b" OK\r\nContent-Length: ", io, failures);
+    emit_write_itoa_slot(code, -40, io, failures);                                     // body_len at rbp-40
+    emit_write_literal(code, b"\r\n\r\n", io, failures);
+    emit_write_body_ptr_len(code, io, failures);                                        // body_ptr at rbp-32, len at rbp-40
 }
 
 /// Emit a write() syscall for a fixed byte literal, inlined with jmp-over
 /// + lea-rip-relative. Uses [rbp - 48] as the client_fd source.
-fn emit_write_literal(code: &mut Vec<u8>, literal: &[u8]) {
+fn emit_write_literal(code: &mut Vec<u8>, literal: &[u8], io: Option<http_io::Io>, failures: &mut Vec<usize>) {
     // jmp rel32 over data
     code.push(0xE9);
     let jlen = literal.len() as i32;
@@ -24515,15 +24553,14 @@ fn emit_write_literal(code: &mut Vec<u8>, literal: &[u8]) {
     code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
     code.extend_from_slice(&(literal.len() as i32).to_le_bytes());
     // mov rax, 1 (write); syscall
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x0F, 0x05]);
+    emit_http_segment(code, io, failures);
 }
 
 /// Emit an itoa + write for a non-negative i64 stored at [rbp + slot_off].
 /// The decimal digits are built on the stack (growing down) then written
-/// via a single write() syscall. Uses rax/rcx/rdx/rsi/rdi/r8; caller
-/// assumes no cross-call invariants in these registers.
-fn emit_write_itoa_slot(code: &mut Vec<u8>, slot_off: i32) {
+/// via legacy write() or the bounded complete-send loop. The latter keeps the
+/// digit buffer live across waits and syscalls; neither path retains registers.
+fn emit_write_itoa_slot(code: &mut Vec<u8>, slot_off: i32, io: Option<http_io::Io>, failures: &mut Vec<usize>) {
     // mov rax, [rbp + slot_off]  (value to print)
     code.extend_from_slice(&[0x48, 0x8B, 0x45]);
     code.push(slot_off as i8 as u8);
@@ -24577,8 +24614,7 @@ fn emit_write_itoa_slot(code: &mut Vec<u8>, slot_off: i32) {
     // rdi = [rbp-48] (client_fd)
     code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);
     // rax = 1 ; syscall
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x0F, 0x05]);
+    emit_http_segment(code, io, failures);
 
     // Release the 24-byte digit buffer
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);                    // add rsp, 24
@@ -24586,7 +24622,7 @@ fn emit_write_itoa_slot(code: &mut Vec<u8>, slot_off: i32) {
 
 /// Emit a write() syscall for the handler-produced body: pointer at
 /// [rbp - 32], length at [rbp - 40], fd at [rbp - 48].
-fn emit_write_body_ptr_len(code: &mut Vec<u8>) {
+fn emit_write_body_ptr_len(code: &mut Vec<u8>, io: Option<http_io::Io>, failures: &mut Vec<usize>) {
     // rsi = [rbp-32]
     code.extend_from_slice(&[0x48, 0x8B, 0x75, 0xE0]);
     // rdx = [rbp-40]
@@ -24594,8 +24630,16 @@ fn emit_write_body_ptr_len(code: &mut Vec<u8>) {
     // rdi = [rbp-48]
     code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);
     // rax = 1 ; syscall
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x0F, 0x05]);
+    emit_http_segment(code, io, failures);
+}
+
+fn emit_http_segment(code: &mut Vec<u8>, io: Option<http_io::Io>, failures: &mut Vec<usize>) {
+    if let Some(io) = io {
+        failures.extend(http_io::send(code, io));
+    } else {
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x0F, 0x05]);
+    }
 }
 
 fn compile_http10_constant_service(
@@ -56488,7 +56532,8 @@ rule pick
         // first).
         const EXPECTED_ACCEPTED: usize = 97;
         // try_byte_at adds one deliberately refused bounded-result example.
-        const EXPECTED_TOTAL: usize = 162;
+        // Bounded HTTP example is explicitly refused by the self-hosted transport.
+        const EXPECTED_TOTAL: usize = 163;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

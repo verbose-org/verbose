@@ -147,3 +147,13 @@ result through lexical aliases and branches. A result must be returned or matche
 on every analyzed path. Unknown forms and excessive analysis expansion are
 refused. This check is limited to the documented pure acyclic subset; it does
 not strengthen acceptance of legacy `Result(_, text)` declarations.
+
+
+### Bounded HTTP transport declarations (2026-09-09)
+
+`service.request_timeout` and `service.response_timeout` are semantic inputs:
+paired integer seconds in 1..3600 select complete bounded HTTP request assembly
+and complete response sends. The verifier rejects other protocols and
+`max_request` outside 1..1048576. Native emission uses absolute monotonic phase
+deadlines; the attributes do not prove handler CPU time, resource/log latency,
+response-size bounds, or total connection count. See [the contract](http-bounded-io.md).

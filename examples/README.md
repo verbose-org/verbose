@@ -10,6 +10,11 @@ This index grew with the implementation slices. Byte sizes and broad feature
 summaries are milestone descriptions, not measurements of every current build.
 See [current status](../docs/current-status.md) for the implementation map.
 
+[`http_bounded.verbose`](http_bounded.verbose) shows explicit request/response
+deadlines, complete request-body assembly, and partial-send recovery. Its
+[transport contract](../docs/http-bounded-io.md) documents supported framing and
+backend refusals.
+
 Every example here either:
 - pins a regression test (the test reads the `.verbose` file and asserts on the emitted binary), or
 - anchors a feature in [`CLAUDE.md`](../CLAUDE.md), or

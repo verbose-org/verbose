@@ -1,0 +1,30 @@
+@verbose 0.1.0
+
+-- One request per connection, with bounded assembly and complete response writes.
+-- Both deadlines are whole phases, in seconds. See docs/http-bounded-io.md.
+rule echo_body
+  @intention: "Return the complete request body, preserving its bytes"
+  @source: http_bounded.intent:2
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: concat("", req.body) }
+  proofs:
+    purity:
+      reads : [req.body]
+      calls : []
+    termination:
+      bound : 4
+
+service bounded_http
+  @intention: "Receive and answer one bounded request before its phase deadlines"
+  @source: http_bounded.intent:3
+  listen:
+    protocol: http_1_0
+    port: 18960
+    max_request: 4096
+  handler: echo_body
+  request_timeout: 2
+  response_timeout: 2
