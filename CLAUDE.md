@@ -1873,3 +1873,16 @@ make demo                                                                       
 ## License
 
 Apache 2.0
+
+
+## Bounded HTTP socket I/O — design, 2026-09-09
+
+The [transport design](docs/http-bounded-io.md) fixes the first HTTP robustness
+slice before emission changes: paired request/response deadlines opt in to bounded
+request assembly and complete sends. A deterministic header DFA plus bounded
+Content-Length arithmetic validates one request before handler effects. Dedicated
+rbp slots preserve cursors and monotonic deadlines across nonblocking syscalls;
+r12 remains the listener. Failure closes the client with existing frame cleanup.
+Legacy services retain their code path. This adds neither a general buffer API
+nor TLS, worker pools, or a typed socket-error ABI. The design lists acceptance
+cases and explicit WASM/self-hosted refusals.
