@@ -111,6 +111,11 @@ summary rather than historical counts.
 
 ## Reading order and maintenance
 
+The [bounded-error and failure-boundary proposal](error-boundaries-design.md)
+is a design for discussion, not an implemented general error contract. It builds
+on `Result` and the scoped service recovery while keeping returned errors,
+boundary termination, and partial effects distinct.
+
 1. [README](../README.md): purpose, examples, and design direction.
 2. [Architecture](../ARCHITECTURE.md): implementation map and trust boundaries.
 3. [Proof classification](spec-proofs.md): individual declaration semantics.
