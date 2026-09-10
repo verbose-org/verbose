@@ -99,6 +99,13 @@ not dedicated benchmark hardware; CPU affinity does not isolate it from Windows
 or other activity. The [complete JSON](measurements/http-worker-baseline-2026-09-10.json)
 retains all 36 runs, including slow ones. Timed runs lasted 3.70–12.36 seconds.
 
+After the run, the operator reported playing a video game on the host during
+the measurements. Concurrent host activity is a possible source of contention;
+its timing and resource use were not captured by the harness. Keep this context
+with the results: neither the throughput differences nor the latency tails can
+be attributed solely to the worker mode or solely to the game. A quiet-host
+repeat is still needed. The original measurement JSON is preserved unchanged.
+
 Rates are medians across three runs, with minimum–maximum in parentheses.
 The last column is the median of the three run p99 values, not a pooled percentile.
 
