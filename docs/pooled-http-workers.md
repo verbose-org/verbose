@@ -102,6 +102,9 @@ The [strace script](../tools/check_http_pool.py) checks reuse, partial fork fail
 wait/accept/setup failures, and the parent-death setup race. Run `cargo build`,
 then `python3 tools/check_http_pool.py`; Linux loopback/ptrace access is required.
 
+The [HTTP worker benchmark](http-worker-benchmarks.md) compares the same echo
+handler in forked and pooled modes and samples memory across repeated batches.
+
 Process semantics follow Linux [parent-death signals](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html),
 [wait](https://man7.org/linux/man-pages/man2/waitpid.2.html), and
 [accept](https://man7.org/linux/man-pages/man2/accept.2.html).
