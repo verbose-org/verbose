@@ -19,6 +19,10 @@ backend refusals.
 HTTP: excess connections close, and exited children release their slots when
 reaped. See the [admission contract](../docs/bounded-service-concurrency.md).
 
+[`http_pooled.verbose`](http_pooled.verbose) reuses two isolated workers and their
+private request storage. It demonstrates the
+[pool and memory-lifetime contract](../docs/pooled-http-workers.md).
+
 Every example here either:
 - pins a regression test (the test reads the `.verbose` file and asserts on the emitted binary), or
 - anchors a feature in [`CLAUDE.md`](../CLAUDE.md), or

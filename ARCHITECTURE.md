@@ -84,6 +84,30 @@ history and [examples](examples/README.md) for concrete declarations.
 
 ## What the checks establish
 
+### Memory as a language design criterion
+
+Recorded on 2026-09-10: evaluate new service capabilities by whether their storage
+has an identifiable owner, a capacity, a lifetime, and a defined outcome when
+that capacity is exhausted. Declarations should let the compiler organize and
+check that storage; unknown bounds must remain explicitly unknown. Apache is a
+useful reference for operational capabilities, not a feature-cloning objective
+or a prerequisite for Verbose to make useful design choices.
+
+This is already concrete for bounded HTTP reception: `max_request` determines a
+fixed frame buffer, receiving does not grow it, and oversize requests close the
+client. It is not yet a whole-service memory bound: response temporaries, callees,
+resources, kernel buffers, and process overhead have separate lifetimes and costs.
+Reclaiming a request region means making its storage reusable, not erasing its
+bytes or releasing every page to the OS. Native emission alone establishes no
+performance or safety advantage over another native server.
+
+Worker reuse must preserve request-local lifetimes and demonstrate stable storage
+across requests and failure paths. Shared mutable memory between threads needs an
+explicit ownership/synchronization contract. See the
+[pooled HTTP design](docs/pooled-http-workers.md) for the next implementation slice.
+
+### Existing checks
+
 `reads` and `calls` are compared against dependencies collected from the AST.
 `@layer` constrains the call graph. `@source` checks that a referenced file and
 line exist, without checking the prose's meaning.

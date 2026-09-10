@@ -381,8 +381,14 @@ close-after-one-request HTTP transport, with sequential or forked concurrency.
 children in forked mode. Excess connections close before request effects; exited
 children release their slots when reaped. Both socket deadlines are required.
 See the [contract and backend matrix](docs/bounded-service-concurrency.md) and
-[capped echo example](examples/http_capped.verbose). Worker pools, threads, and
-TLS remain separate work.
+[capped echo example](examples/http_capped.verbose).
+
+**Reusable workers (2026-09-10):** `concurrency: pooled` with `workers: N` creates
+a fixed pool of isolated processes. Each reclaims its request temporaries and
+reuses its frame across connections; it does not fork for each request. See the
+[pool contract and support matrix](docs/pooled-http-workers.md) and
+[example](examples/http_pooled.verbose). Queueing, failure boundaries, and memory
+scope are explicit. Threads and TLS remain separate work.
 
 The native backend emits complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and a per-request `log:` block. As of 2026-04-30, the surface includes: HTTP/1.0 services with prefix routing and computed status; cached + per-request file reads with `on_read_error: abort`; outbound `fetch()` to declared connections; multiple `log:` blocks per service (strict + best-effort sinks); fork-per-accept concurrency; `req.body` parsing; and a family of runtime primitives (`read`, `parse_int`, `now_unix`, `length`, `starts_with`, `contains`, `abs`, `field == read(...)`, `json_escape`).
 

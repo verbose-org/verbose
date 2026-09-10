@@ -1,6 +1,7 @@
 mod bounded;
 mod http_io;
 mod admission;
+mod pool;
 mod transport_asm;
 /// Native x86-64 code generation — produces ELF binaries directly.
 ///
@@ -21108,6 +21109,9 @@ pub fn compile_service(
             message: format!("no service named '{}'", service_name),
         })?;
 
+    if let Some(message) = service.pool_error() {
+        return Err(NativeError { message: format!("service '{}': {}", service.name, message) });
+    }
     if let Some(message) = service.admission_error() {
         return Err(NativeError { message: format!("service '{}': {}", service.name, message) });
     }
@@ -21982,6 +21986,7 @@ fn emit_raw_tcp_dynamic_bytes(
     emit_mov_rdi_fd(&mut code, WriteFd::RbpSlot(CLIENT_FD_SLOT));
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
     match service.concurrency {
+        ConcurrencyMode::Pooled => return Err(NativeError { message: "pooled workers requires http_1_0".into() }),
         ConcurrencyMode::Sequential => {
             // ITERATION TAIL: restore rsp to the post-prologue invariant
             // (frees any handler-allocated concat buffer in one
@@ -23190,6 +23195,8 @@ fn emit_http10_dynamic_bytes(
     let frame_base = frame_base + if http_io.is_some() { http_io::Io::SIZE } else { 0 };
     let admission = service.max_connections.map(|_| admission::Admission { base: -(frame_base + admission::Admission::SIZE) });
     let frame_base = frame_base + if admission.is_some() { admission::Admission::SIZE } else { 0 };
+    let pool = service.workers.map(|workers| pool::Pool { base: -(frame_base + pool::Pool::size(workers)), workers });
+    let frame_base = frame_base + pool.map(|p| pool::Pool::size(p.workers)).unwrap_or(0);
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
     // shared abort sequence; left empty when policy is Drop.
@@ -23332,7 +23339,7 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // rsi=1 (STREAM)
     code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // rdx=0
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    if admission.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
+    if admission.is_some() || pool.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
     code.extend_from_slice(&[0x49, 0x89, 0xC4]);                         // mov r12, rax
 
     // SETSOCKOPT SO_REUSEADDR
@@ -23358,7 +23365,7 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // rsi=rsp
     code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // rdx=16
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    if admission.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
+    if admission.is_some() || pool.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);                   // add rsp, 16
 
     // ═══ SIGCHLD = SIG_IGN (Phase 10 slice 10) ═════════════════
@@ -23380,6 +23387,8 @@ fn emit_http10_dynamic_bytes(
     // see `emit_sigchld_ignore` (shared with the raw_tcp step-loop emitter).
     if let Some(slots) = admission {
         abort_patches.extend(admission::setup(&mut code, slots));
+    } else if let Some(p) = pool {
+        abort_patches.extend(pool::setup(&mut code, p));
     } else if service.concurrency == ConcurrencyMode::Forked {
         emit_sigchld_ignore(&mut code);
     }
@@ -23389,7 +23398,7 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
     code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // rsi=128
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    if admission.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
+    if admission.is_some() || pool.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
 
     // ═══ CACHED RESOURCES (Phase 9 slice 9.4) ══════════════════
     // Resources marked `cache: true` get their open/read/close sequence
@@ -23431,9 +23440,13 @@ fn emit_http10_dynamic_bytes(
         }
     }
 
+    if let Some(p) = pool { abort_patches.extend(pool::start(&mut code, p)); }
+
     // ═══ ACCEPT LOOP ═══════════════════════════════════════════
     let accept_top = code.len();
-    if let Some(slots) = admission {
+    if pool.is_some() {
+        abort_patches.extend(pool::accept(&mut code));
+    } else if let Some(slots) = admission {
         abort_patches.extend(admission::dispatch(&mut code, slots, service.max_connections.unwrap()));
     } else {
         code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // rax=43 accept
@@ -24042,7 +24055,7 @@ fn emit_http10_dynamic_bytes(
     // exits with status 0 — sys_exit closes any remaining fds and
     // releases the per-request frame; no rsp restore needed.
     match service.concurrency {
-        ConcurrencyMode::Sequential => {
+        ConcurrencyMode::Sequential | ConcurrencyMode::Pooled => {
             // `lea rsp, [rbp + neg_frame_size]`  (REX.W + 0x8D + ModRM 0xA5 + disp32)
             code.extend_from_slice(&[0x48, 0x8D, 0xA5]);
             let neg_frame: i32 = -(frame_size as i32);
@@ -56550,7 +56563,8 @@ rule pick
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.
-        const EXPECTED_TOTAL: usize = 164;
+        // http_pooled adds a service-scoped refusal for reusable workers.
+        const EXPECTED_TOTAL: usize = 165;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

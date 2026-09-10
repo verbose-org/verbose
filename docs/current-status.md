@@ -14,6 +14,11 @@ inspection, and experimentation also supported. The bundled generators use Claud
 the language and compiler are independent of that choice. Broad model authorability
 remains an evaluation question.
 
+For service evolution, the [memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion)
+asks who owns storage, its capacity and lifetime, and what happens at exhaustion.
+The aim is useful, predictable specialization; matching Apache's feature list is
+not the project's identity or a claim of general superiority.
+
 ## Concrete continuation
 
 The original thought experiment was an LLM producing a binary directly. The
@@ -61,8 +66,12 @@ the self-hosted compiler refuse this service contract. See the
 connection and existing sequential/forked modes. Forked HTTP services can also
 declare `max_connections` to cap admitted handler children, close overload before
 request effects, and recover slots after child exits. See the
-[admission contract and support matrix](bounded-service-concurrency.md). Worker
-pools, threads, and TLS remain outside the implementation.
+[admission contract and support matrix](bounded-service-concurrency.md).
+Alternatively, `concurrency: pooled` with `workers: N` reuses N isolated worker
+processes and their request frames. Busy workers leave clients in the kernel
+queue; a worker death terminates the pool. See the
+[pool contract and support matrix](pooled-http-workers.md). Threads, TLS,
+automatic worker replacement, and graceful draining remain outside this contract.
 
 ## Guarantees and measurements
 
