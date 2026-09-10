@@ -165,3 +165,11 @@ clients at capacity. It bounds admitted handler children, with one temporary
 admission socket in the parent. It does not establish handler lifetime, fairness,
 shared-state synchronization, or a bound on the kernel backlog. See the
 [admission contract](bounded-service-concurrency.md).
+
+`service.workers` together with `concurrency: pooled` fixes the number of isolated
+HTTP worker processes (1..64). Both phase deadlines are required. The verifier
+refuses `after:` mutations and the incompatible `max_connections` admission
+policy. Each worker restores its request stack before accepting again; its fixed
+frame persists. This establishes neither a whole-service memory quota nor a
+queue-wait deadline. See the [pool contract](pooled-http-workers.md) and the
+[memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion).

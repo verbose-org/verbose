@@ -1,6 +1,7 @@
 # Reusable HTTP worker processes
 
-Design fixed on 2026-09-10 before emission changes. This slice gives a fixed set
+Designed and implemented on 2026-09-10, with the contract committed before
+emission changes. This slice gives a fixed set
 of isolated processes repeated request lifetimes, following the
 [memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion).
 
@@ -55,7 +56,9 @@ remaining workers and exits 1. A stopped worker remains in the pool but supplies
 no capacity until resumed. Automatic respawn/retry and graceful draining require
 separate policies; repeating effects is not implied by worker reuse.
 
-Startup fork failure kills/reaps already-created children. SIGCHLD is reset to
+Workers can begin accepting while the supervisor creates the remaining workers;
+startup is not an atomic transaction. Startup fork failure kills/reaps
+already-created children. SIGCHLD is reset to
 SIG_DFL before spawning. Workers request Linux parent-death SIGKILL and compare
 getppid with the recorded supervisor PID after installing it, covering the setup
 race. Supervisor death thus cannot intentionally leave orphan listeners. This is
@@ -67,9 +70,23 @@ left; unexpected wait failures terminate, rather than restarting an unknown pool
 
 ## Backends and acceptance
 
-Native Linux x86-64 implements the pool. The interpreter still runs handler rules
-only. WASM and self-hosted service emission must refuse the new contract before
-output; `workers` remains usable outside service attributes.
+| Path | Support |
+|---|---|
+| Rust parser and verifier | Worker count, HTTP/deadline context, mutation and admission-policy refusals |
+| Native Linux x86-64 | Fixed process pool with private reusable request frames |
+| Interpreter | Handler rules only; no service runtime |
+| WASM | Selected pooled service explicitly refused before artifact output |
+| Self-hosted compiler | `workers` or `concurrency: pooled` refused in service scope before ELF/raw output |
+
+`workers` and `pooled` remain usable as ordinary identifiers outside these service
+attributes. Native direct-emission APIs enforce the same context constraints.
+
+Run the [two-worker echo example](../examples/http_pooled.verbose):
+
+```sh
+cargo run -- examples/http_pooled.verbose --native /tmp/http-pooled --run bounded_http
+/tmp/http-pooled
+```
 
 Acceptance covers stable worker PIDs and stack position over repeated requests;
 overlapping clients; long then short/binary requests without stale data; request
@@ -77,3 +94,35 @@ and response timeout recovery; descriptor stability; read-only state and resourc
 lifetimes; worker/supervisor death; partial startup failure; parser/verifier/direct
 emitter refusals; and unsupported backend zero-artifact refusal. Compare existing
 native example bytes and run the serial suite plus affected bootstrap checks.
+
+The [socket tests](../src/http_tests/pool_tests.rs) exercise those lifetimes,
+including reclaiming a 4 MiB response temporary after a write timeout. This is
+an existing dynamic-concat stress shape, not a new general response-size proof.
+The [strace script](../tools/check_http_pool.py) checks reuse, partial fork failure,
+wait/accept/setup failures, and the parent-death setup race. Run `cargo build`,
+then `python3 tools/check_http_pool.py`; Linux loopback/ptrace access is required.
+
+Process semantics follow Linux [parent-death signals](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html),
+[wait](https://man7.org/linux/man-pages/man2/waitpid.2.html), and
+[accept](https://man7.org/linux/man-pages/man2/accept.2.html).
+
+## Validation recorded on 2026-09-10
+
+- Normal suite: 653 passed, 26 ignored, run serially. The nine focused pool tests
+  passed, including stable PIDs/stack/descriptors across 200 requests, binary and
+  changing-length bodies, receive/write timeout recovery, and resource lifetimes.
+- Separate two-generation bootstrap: 25 passed, including the binary fixed point
+  and corpus acceptance (97/165; the new pooled service is explicitly refused).
+  Self-source verification accepted all 376 concepts and 963 rules.
+- Native comparison against `065b284`: 160 byte-identical binaries and three
+  refusals on both compilers across 163 existing example entries; excludes the
+  changing self-source and new pooled example. No mismatches.
+- The strace script passed thirteen reuse/failure/race scenarios. Those traces
+  contain no allocation syscalls or process stdout/stderr, and no listener
+  survives supervisor termination. This is observed coverage of the example,
+  not a whole-program memory-safety proof.
+- `cidx validate` passed. Local security and CI pipelines stop at cargo-audit
+  because its container lacks `curl`; CI does not reach test/build. Gitleaks
+  reported no leaks. Trivy exited successfully with 23 findings in the unchanged
+  Python tools requirements (also present in a local worktree), and none in
+  Cargo.lock. Neither pipeline is an overall pass.

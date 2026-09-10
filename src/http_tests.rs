@@ -1,5 +1,6 @@
 //! Socket-level acceptance tests, independent of the native framing machine.
 mod admission_tests;
+mod pool_tests;
 use crate::{
     ast::*,
     http_framing::{reference, Frame},
@@ -466,6 +467,8 @@ fn bounded_http_self_hosted_refuses_before_output() {
             "  request_timeout: 2\n",
             "  response_timeout: 2\n",
             "  max_connections: 2\n",
+            "  workers: 2\n",
+            "  concurrency: pooled\n",
             "  request_timeout: 2\n  response_timeout: 2\n",
         ] {
             for source in [
@@ -493,13 +496,15 @@ fn bounded_http_self_hosted_refuses_before_output() {
             "{entry} over-reserved identifiers: {output:?}"
         );
         assert!(!output.stdout.is_empty());
-        let ordinary_name = source.replace("request_timeout", "max_connections");
-        let output = run(&ordinary_name);
-        assert!(
-            output.status.success(),
-            "{entry} reserved max_connections outside services"
-        );
-        assert!(!output.stdout.is_empty());
+        for name in ["max_connections", "workers", "pooled"] {
+            let ordinary_name = source.replace("request_timeout", name);
+            let output = run(&ordinary_name);
+            assert!(
+                output.status.success(),
+                "{entry} reserved {name} outside services"
+            );
+            assert!(!output.stdout.is_empty());
+        }
         fs::remove_file(bin).unwrap();
     }
 }

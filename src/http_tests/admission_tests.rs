@@ -3,7 +3,7 @@ extern "C" {
     pub(super) fn kill(pid: i32, signal: i32) -> i32;
     pub(super) fn signal(signal: i32, handler: usize) -> usize;
 }
-fn children(server: &Server) -> Vec<u32> {
+pub(super) fn children(server: &Server) -> Vec<u32> {
     let pid = server.child.id();
     fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
         .unwrap()
@@ -11,7 +11,7 @@ fn children(server: &Server) -> Vec<u32> {
         .map(|s| s.parse().unwrap())
         .collect()
 }
-fn wait_count(server: &Server, expected: usize) -> Vec<u32> {
+pub(super) fn wait_count(server: &Server, expected: usize) -> Vec<u32> {
     let deadline = Instant::now() + Duration::from_secs(4);
     loop {
         let pids = children(server);

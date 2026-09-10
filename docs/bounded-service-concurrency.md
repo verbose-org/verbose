@@ -3,6 +3,8 @@
 Design fixed on 2026-09-09; implemented on 2026-09-10. This slice adds an admission
 limit to the existing fork-per-connection HTTP execution model. It is one step
 toward bounded concurrent services; it does not implement a thread or worker pool.
+The subsequent [reusable process pool](pooled-http-workers.md) has a separate
+queueing policy and preserves this slice's overload-close behavior unchanged.
 
 ## Source contract
 

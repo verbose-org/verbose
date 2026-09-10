@@ -1816,6 +1816,8 @@ impl Parser {
         let mut request_timeout = None;
         let mut response_timeout = None;
         let mut max_connections = None;
+        let mut workers = None;
+        let mut saw_concurrency = false;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -1952,12 +1954,17 @@ impl Parser {
                 self.advance();
                 self.expect_kind(TokenKind::Colon)?;
                 let mode_name = self.expect_ident_any()?;
+                if saw_concurrency && (concurrency == ConcurrencyMode::Pooled || mode_name == "pooled") {
+                    return Err(self.error("duplicate service attribute 'concurrency' with pooled workers"));
+                }
+                saw_concurrency = true;
                 concurrency = match mode_name.as_str() {
                     "sequential" => ConcurrencyMode::Sequential,
                     "forked" => ConcurrencyMode::Forked,
+                    "pooled" => ConcurrencyMode::Pooled,
                     other => {
                         return Err(self.error(&format!(
-                            "unknown concurrency mode '{}' (allowed: sequential, forked)",
+                            "unknown concurrency mode '{}' (allowed: sequential, forked, pooled)",
                             other
                         )));
                     }
@@ -2127,6 +2134,14 @@ impl Parser {
                 if slot.is_some() { return Err(self.error(&format!("duplicate service attribute '{}'", key))); }
                 *slot = Some(n as u32);
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("workers") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=64).contains(&n) { return Err(self.error("workers out of range [1, 64]")); }
+                if workers.is_some() { return Err(self.error("duplicate service attribute 'workers'")); }
+                workers = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
             } else if self.check_ident("max_connections") {
                 self.advance();
                 self.expect_kind(TokenKind::Colon)?;
@@ -2151,7 +2166,7 @@ impl Parser {
                     name
                 )));
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', 'response_timeout:', or 'max_connections:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', 'response_timeout:', 'max_connections:', or 'workers:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -2178,6 +2193,7 @@ impl Parser {
             request_timeout,
             response_timeout,
             max_connections,
+            workers,
         })
     }
 

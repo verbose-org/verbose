@@ -66,8 +66,12 @@ the self-hosted compiler refuse this service contract. See the
 connection and existing sequential/forked modes. Forked HTTP services can also
 declare `max_connections` to cap admitted handler children, close overload before
 request effects, and recover slots after child exits. See the
-[admission contract and support matrix](bounded-service-concurrency.md). Worker
-pools, threads, and TLS remain outside the implementation.
+[admission contract and support matrix](bounded-service-concurrency.md).
+Alternatively, `concurrency: pooled` with `workers: N` reuses N isolated worker
+processes and their request frames. Busy workers leave clients in the kernel
+queue; a worker death terminates the pool. See the
+[pool contract and support matrix](pooled-http-workers.md). Threads, TLS,
+automatic worker replacement, and graceful draining remain outside this contract.
 
 ## Guarantees and measurements
 

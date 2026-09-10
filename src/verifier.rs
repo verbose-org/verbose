@@ -1307,6 +1307,9 @@ fn verify_service(
     // (#1–#4 of §5.5) come FIRST, each attributable to one missing or
     // misplaced key, so a reader is never sent to the emitter for a shape
     // the source already decides.
+    if let Some(message) = s.pool_error() {
+        errors.push(VerifyError { context: format!("service '{}' / workers", s.name), message: message.into() });
+    }
     if let Some(message) = s.admission_error() {
         errors.push(VerifyError { context: format!("service '{}' / admission", s.name), message: message.into() });
     }
