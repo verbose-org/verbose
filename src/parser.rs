@@ -1815,6 +1815,7 @@ impl Parser {
         let mut read_timeout: Option<u32> = None;
         let mut request_timeout = None;
         let mut response_timeout = None;
+        let mut max_connections = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -2126,6 +2127,18 @@ impl Parser {
                 if slot.is_some() { return Err(self.error(&format!("duplicate service attribute '{}'", key))); }
                 *slot = Some(n as u32);
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("max_connections") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=65535).contains(&n) {
+                    return Err(self.error("max_connections out of range [1, 65535]"));
+                }
+                if max_connections.is_some() {
+                    return Err(self.error("duplicate service attribute 'max_connections'"));
+                }
+                max_connections = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
             } else if self.check_ident("frame") {
                 // Refusal #9 (design §5.5): a DECLARED framing block. It is
                 // recognised so it can be refused by name — an unknown key
@@ -2138,7 +2151,7 @@ impl Parser {
                     name
                 )));
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', or 'response_timeout:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', 'response_timeout:', or 'max_connections:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -2164,6 +2177,7 @@ impl Parser {
             read_timeout,
             request_timeout,
             response_timeout,
+            max_connections,
         })
     }
 

@@ -1886,3 +1886,15 @@ r12 remains the listener. Failure closes the client with existing frame cleanup.
 Legacy services retain their code path. This adds neither a general buffer API
 nor TLS, worker pools, or a typed socket-error ABI. The design lists acceptance
 cases and explicit WASM/self-hosted refusals.
+
+## Bounded forked admission — design, 2026-09-09
+
+The [concurrency contract](docs/bounded-service-concurrency.md) fixes the next
+service slice before implementation: `max_connections` limits admitted children
+on forked HTTP services with both socket deadlines. A parent-owned counter and
+checked wait4 reaping bound admission; nonblocking accept plus finite poll keeps
+idle cleanup running. Children close inherited listeners and retain isolated
+state. Excess/fork-failed connections close before handler effects. The design
+specifies failure paths, register/frame ownership, backend refusals, and tests.
+This is a cap on the existing process model, not a worker pool or shared-state
+thread ABI. Legacy services without the declaration retain their emitted bytes.

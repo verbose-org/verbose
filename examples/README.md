@@ -15,6 +15,10 @@ deadlines, complete request-body assembly, and partial-send recovery. Its
 [transport contract](../docs/http-bounded-io.md) documents supported framing and
 backend refusals.
 
+[`http_capped.verbose`](http_capped.verbose) adds `max_connections: 8` to forked
+HTTP: excess connections close, and exited children release their slots when
+reaped. See the [admission contract](../docs/bounded-service-concurrency.md).
+
 Every example here either:
 - pins a regression test (the test reads the `.verbose` file and asserts on the emitted binary), or
 - anchors a feature in [`CLAUDE.md`](../CLAUDE.md), or
