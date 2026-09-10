@@ -377,6 +377,13 @@ partial writes under one deadline. See the [contract and backend matrix](docs/ht
 and [body-echo example](examples/http_bounded.verbose). This remains a
 close-after-one-request HTTP transport, with sequential or forked concurrency.
 
+**Bounded admission (2026-09-10):** `max_connections: N` caps admitted HTTP handler
+children in forked mode. Excess connections close before request effects; exited
+children release their slots when reaped. Both socket deadlines are required.
+See the [contract and backend matrix](docs/bounded-service-concurrency.md) and
+[capped echo example](examples/http_capped.verbose). Worker pools, threads, and
+TLS remain separate work.
+
 The native backend emits complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and a per-request `log:` block. As of 2026-04-30, the surface includes: HTTP/1.0 services with prefix routing and computed status; cached + per-request file reads with `on_read_error: abort`; outbound `fetch()` to declared connections; multiple `log:` blocks per service (strict + best-effort sinks); fork-per-accept concurrency; `req.body` parsing; and a family of runtime primitives (`read`, `parse_int`, `now_unix`, `length`, `starts_with`, `contains`, `abs`, `field == read(...)`, `json_escape`).
 
 | Example | Binary | What it does |

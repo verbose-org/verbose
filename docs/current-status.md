@@ -58,8 +58,11 @@ with paired `request_timeout` / `response_timeout` declarations. Native Linux
 x86-64 enforces whole-phase socket deadlines and closes failed clients; WASM and
 the self-hosted compiler refuse this service contract. See the
 [contract and support matrix](http-bounded-io.md). It retains one request per
-connection and existing sequential/forked modes; worker pools, threads, and TLS
-remain outside the implementation.
+connection and existing sequential/forked modes. Forked HTTP services can also
+declare `max_connections` to cap admitted handler children, close overload before
+request effects, and recover slots after child exits. See the
+[admission contract and support matrix](bounded-service-concurrency.md). Worker
+pools, threads, and TLS remain outside the implementation.
 
 ## Guarantees and measurements
 

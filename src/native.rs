@@ -1,5 +1,7 @@
 mod bounded;
 mod http_io;
+mod admission;
+mod transport_asm;
 /// Native x86-64 code generation — produces ELF binaries directly.
 ///
 /// General-purpose expression compiler: supports arithmetic (+, -, *, /),
@@ -21106,6 +21108,9 @@ pub fn compile_service(
             message: format!("no service named '{}'", service_name),
         })?;
 
+    if let Some(message) = service.admission_error() {
+        return Err(NativeError { message: format!("service '{}': {}", service.name, message) });
+    }
     if let Some(message) = service.http_io_error() {
         return Err(NativeError { message: format!("service '{}': {}", service.name, message) });
     }
@@ -23183,6 +23188,8 @@ fn emit_http10_dynamic_bytes(
     let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes + entropy_extra_bytes;
     let http_io = service.request_timeout.map(|_| http_io::Io { base: -(frame_base + http_io::Io::SIZE) });
     let frame_base = frame_base + if http_io.is_some() { http_io::Io::SIZE } else { 0 };
+    let admission = service.max_connections.map(|_| admission::Admission { base: -(frame_base + admission::Admission::SIZE) });
+    let frame_base = frame_base + if admission.is_some() { admission::Admission::SIZE } else { 0 };
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
     // shared abort sequence; left empty when policy is Drop.
@@ -23325,6 +23332,7 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // rsi=1 (STREAM)
     code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // rdx=0
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    if admission.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
     code.extend_from_slice(&[0x49, 0x89, 0xC4]);                         // mov r12, rax
 
     // SETSOCKOPT SO_REUSEADDR
@@ -23350,6 +23358,7 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // rsi=rsp
     code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // rdx=16
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    if admission.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);                   // add rsp, 16
 
     // ═══ SIGCHLD = SIG_IGN (Phase 10 slice 10) ═════════════════
@@ -23369,7 +23378,9 @@ fn emit_http10_dynamic_bytes(
     // Layout: jmp short over the 32-byte data block, then the syscall
     // itself with `lea rsi, [rip + disp32]` pointing back at the data —
     // see `emit_sigchld_ignore` (shared with the raw_tcp step-loop emitter).
-    if service.concurrency == ConcurrencyMode::Forked {
+    if let Some(slots) = admission {
+        abort_patches.extend(admission::setup(&mut code, slots));
+    } else if service.concurrency == ConcurrencyMode::Forked {
         emit_sigchld_ignore(&mut code);
     }
 
@@ -23378,6 +23389,7 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
     code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // rsi=128
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    if admission.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
 
     // ═══ CACHED RESOURCES (Phase 9 slice 9.4) ══════════════════
     // Resources marked `cache: true` get their open/read/close sequence
@@ -23421,31 +23433,35 @@ fn emit_http10_dynamic_bytes(
 
     // ═══ ACCEPT LOOP ═══════════════════════════════════════════
     let accept_top = code.len();
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // rax=43 accept
-    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
-    code.extend_from_slice(&[0x48, 0x31, 0xF6]);                         // rsi=0
-    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // rdx=0
-    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    // mov [rbp-48], rax  (save client_fd)
-    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xD0]);                   // -48 = 0xD0 i8
+    if let Some(slots) = admission {
+        abort_patches.extend(admission::dispatch(&mut code, slots, service.max_connections.unwrap()));
+    } else {
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // rax=43 accept
+        code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+        code.extend_from_slice(&[0x48, 0x31, 0xF6]);                         // rsi=0
+        code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // rdx=0
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+        // mov [rbp-48], rax  (save client_fd)
+        code.extend_from_slice(&[0x48, 0x89, 0x45, 0xD0]);                   // -48 = 0xD0 i8
 
-    // ═══ FORK DISPATCH (Phase 10 slice 10) ═════════════════════
-    // Forked mode only. After saving client_fd, fork(). Three branches:
-    //   rax > 0  (parent): close(client_fd), jmp accept_top
-    //   rax == 0 (child):  fall through to the existing iteration body
-    //   rax < 0  (failed): write "fork failed\n" to stderr, then take
-    //                      the same close + loop path as the parent
-    //                      (drop the connection, keep serving).
-    //
-    // Layout (so the child path is the natural fall-through):
-    //   mov rax, 57; syscall; test rax, rax
-    //   jz child            (forward, into the rest of the function)
-    //   js fork_error       (forward, into the inline error handler)
-    //   <parent close + loop>
-    //   <fork_error>: write to stderr, then jmp parent_close
-    //   <child label>: end of dispatch — falls through naturally
-    if service.concurrency == ConcurrencyMode::Forked {
-        emit_fork_dispatch(&mut code, accept_top);
+        // ═══ FORK DISPATCH (Phase 10 slice 10) ═════════════════════
+        // Forked mode only. After saving client_fd, fork(). Three branches:
+        //   rax > 0  (parent): close(client_fd), jmp accept_top
+        //   rax == 0 (child):  fall through to the existing iteration body
+        //   rax < 0  (failed): write "fork failed\n" to stderr, then take
+        //                      the same close + loop path as the parent
+        //                      (drop the connection, keep serving).
+        //
+        // Layout (so the child path is the natural fall-through):
+        //   mov rax, 57; syscall; test rax, rax
+        //   jz child            (forward, into the rest of the function)
+        //   js fork_error       (forward, into the inline error handler)
+        //   <parent close + loop>
+        //   <fork_error>: write to stderr, then jmp parent_close
+        //   <child label>: end of dispatch — falls through naturally
+        if service.concurrency == ConcurrencyMode::Forked {
+            emit_fork_dispatch(&mut code, accept_top);
+        }
     }
 
     // Framing precedes every per-request resource read and handler effect.
@@ -56533,7 +56549,8 @@ rule pick
         const EXPECTED_ACCEPTED: usize = 97;
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
-        const EXPECTED_TOTAL: usize = 163;
+        // http_capped adds an explicitly refused admission contract.
+        const EXPECTED_TOTAL: usize = 164;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

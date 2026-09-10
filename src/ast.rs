@@ -379,9 +379,29 @@ pub struct Service {
     /// Both are required, in seconds 1..3600. See docs/http-bounded-io.md.
     pub request_timeout: Option<u32>,
     pub response_timeout: Option<u32>,
+    /// Maximum admitted HTTP handler children; overload closes before effects.
+    pub max_connections: Option<u32>,
 }
 
 impl Service {
+    /// Admission is implemented only for bounded HTTP with isolated forked state.
+    pub fn admission_error(&self) -> Option<&'static str> {
+        let Some(limit) = self.max_connections else { return None; };
+        if !(1..=65535).contains(&limit) {
+            return Some("max_connections must be in [1, 65535]");
+        }
+        if !matches!(self.protocol, Protocol::Http10) || self.concurrency != ConcurrencyMode::Forked {
+            return Some("max_connections requires http_1_0 and concurrency: forked");
+        }
+        if self.request_timeout.is_none() || self.response_timeout.is_none() {
+            return Some("max_connections requires both request_timeout and response_timeout");
+        }
+        if !self.after_sets.is_empty() {
+            return Some("max_connections does not support after mutations in forked HTTP state");
+        }
+        self.http_io_error()
+    }
+
     /// Shared verifier/emitter backstop; native APIs can bypass verification.
     pub fn http_io_error(&self) -> Option<&'static str> {
         if self.request_timeout.is_none() && self.response_timeout.is_none() { return None; }

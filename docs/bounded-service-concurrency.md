@@ -1,6 +1,6 @@
 # Bounded forked service concurrency
 
-Design fixed on 2026-09-09, before implementation. This slice adds an admission
+Design fixed on 2026-09-09; implemented on 2026-09-10. This slice adds an admission
 limit to the existing fork-per-connection HTTP execution model. It is one step
 toward bounded concurrent services; it does not implement a thread or worker pool.
 
@@ -14,6 +14,14 @@ declare `max_connections: N`, where N is an integer in 1..65535. For example:
   max_connections: 64
   request_timeout: 2
   response_timeout: 2
+```
+
+The [complete echo example](../examples/http_capped.verbose) admits eight handler
+children and closes excess connections. Run it with:
+
+```sh
+cargo run -- examples/http_capped.verbose --native /tmp/http-capped --run bounded_http
+/tmp/http-capped
 ```
 
 The compiler verifies the range, uniqueness, protocol, concurrency mode, and
@@ -84,13 +92,19 @@ cancellation follows from a process count.
 
 ## Backend refusals and acceptance
 
-Native Linux x86-64 supports this contract. The interpreter still runs handler
-rules, not a service runtime. WASM rejects the selected capped service; the
-self-hosted compiler rejects the service attribute before either ELF or raw
-machine-code output. `max_connections` remains usable as an ordinary identifier
-outside service attributes. Existing backend gates remain in force.
+| Path | Support |
+|---|---|
+| Rust parser and verifier | Range, uniqueness, HTTP/forked/deadline context, no `after:` mutations |
+| Native Linux x86-64 | Admission cap, immediate overload close, child reaping and slot recovery |
+| Interpreter | Handler rules only; no service runtime |
+| WASM | Explicit refusal for the selected capped service |
+| Self-hosted compiler | Service-scoped refusal before ELF or raw machine-code output |
 
-Tests must cover:
+`max_connections` remains usable as an ordinary identifier outside service
+attributes. Existing backend gates remain in force.
+
+The [socket acceptance tests](../src/http_tests/admission_tests.rs), shared
+[backend refusal tests](../src/http_tests.rs), and native admission checks cover:
 
 - N simultaneous incomplete requests and immediate N+1 rejection without effects;
   N=1, N>1, bursts, and later admission after capacity is freed.
@@ -99,8 +113,8 @@ Tests must cover:
 - Parent/client descriptor closure, child listener closure, inherited SIGCHLD
   ignore, and normal startup refusal when the declared port is already bound.
 - Fork failure without counter increment and failed accept without fork, through
-  targeted syscall fault injection when available, plus emitted control-flow
-  tests. Confirm no dynamic allocation in admission/overload paths.
+  [targeted syscall fault injection](../tools/check_http_admission.py), plus
+  emitted control-flow tests and allocation-syscall checks on admission/overload.
 - Range/duplicate/context refusals at parser/verifier/direct emitter; self-hosted
   and WASM zero-artifact refusals, with accepted identifier controls.
 - Deterministic emission and binary identity for existing examples without the
@@ -110,3 +124,28 @@ Tests must cover:
 The emitted syscall behavior follows Linux [wait](https://man7.org/linux/man-pages/man2/waitpid.2.html),
 [accept](https://man7.org/linux/man-pages/man2/accept.2.html), and
 [poll](https://man7.org/linux/man-pages/man2/poll.2.html).
+
+The fault-injection checks require Linux, `strace`, loopback sockets, and ptrace
+permission. Run `cargo build`, then `python3 tools/check_http_admission.py`.
+The script retains its traces in the temporary directory printed with the report.
+
+## Validation recorded on 2026-09-10
+
+- Normal suite: 644 passed, 26 ignored, run serially. The focused `bounded_` run
+  passed 21 tests, including inherited signal disposition and backend refusals.
+- Separate two-generation bootstrap: 25 passed, including the binary fixed point
+  and corpus acceptance (97/164; the added capped service is explicitly refused).
+- Self-source verification: 376 concepts and 963 rules, with all proofs accepted.
+- Against compiler revision `e35a880`, 162 pre-existing top-level example entries
+  produced 159 byte-identical binaries and three refusals on both compilers.
+  The evolving self-source and new capped example were excluded.
+- The optional strace check passed twelve syscall-failure cases and one overload
+  burst/recovery case. It observed no allocation syscalls or stdout/stderr output;
+  a full quota never reached fork. This is observed coverage, not a general
+  guarantee about allocations or side effects inside arbitrary handlers.
+- `cidx validate` passed. `cidx run security` and `cidx run ci` stopped in
+  cargo-audit because the configured container lacks `curl`; CI did not reach
+  test/build. Gitleaks found no secrets. Trivy exited successfully but reported
+  23 vulnerabilities in the unchanged `tools/requirements.txt` (also found in
+  an existing local worktree); the Cargo lockfile had no findings. Neither
+  pipeline is recorded as an overall pass.

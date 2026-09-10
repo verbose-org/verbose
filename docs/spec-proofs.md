@@ -157,3 +157,11 @@ and complete response sends. The verifier rejects other protocols and
 `max_request` outside 1..1048576. Native emission uses absolute monotonic phase
 deadlines; the attributes do not prove handler CPU time, resource/log latency,
 response-size bounds, or total connection count. See [the contract](http-bounded-io.md).
+
+`service.max_connections` is an optional admission bound for forked HTTP with
+both socket deadlines. Verification checks its range and supported context;
+native admission counts children until their exits are reaped and closes new
+clients at capacity. It bounds admitted handler children, with one temporary
+admission socket in the parent. It does not establish handler lifetime, fairness,
+shared-state synchronization, or a bound on the kernel backlog. See the
+[admission contract](bounded-service-concurrency.md).
