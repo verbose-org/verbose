@@ -14,6 +14,11 @@ inspection, and experimentation also supported. The bundled generators use Claud
 the language and compiler are independent of that choice. Broad model authorability
 remains an evaluation question.
 
+For service evolution, the [memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion)
+asks who owns storage, its capacity and lifetime, and what happens at exhaustion.
+The aim is useful, predictable specialization; matching Apache's feature list is
+not the project's identity or a claim of general superiority.
+
 ## Concrete continuation
 
 The original thought experiment was an LLM producing a binary directly. The
