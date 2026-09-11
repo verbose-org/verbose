@@ -173,3 +173,10 @@ policy. Each worker restores its request stack before accepting again; its fixed
 frame persists. This establishes neither a whole-service memory quota nor a
 queue-wait deadline. See the [pool contract](pooled-http-workers.md) and the
 [memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion).
+
+`service.shutdown_timeout` is an optional SIGTERM grace period (1..3600 seconds)
+for bounded HTTP pools. Verification checks the declaration's context and range;
+native code disables the listener, waits for accepted work, then requests forced
+termination at an absolute monotonic deadline. It is an enforced runtime policy,
+not a proof of handler completion, effect rollback, client receipt, or OS scheduling
+latency. See the [shutdown contract](http-pool-shutdown.md).

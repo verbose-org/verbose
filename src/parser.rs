@@ -1817,6 +1817,7 @@ impl Parser {
         let mut response_timeout = None;
         let mut max_connections = None;
         let mut workers = None;
+        let mut shutdown_timeout = None;
         let mut saw_concurrency = false;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
@@ -2134,6 +2135,14 @@ impl Parser {
                 if slot.is_some() { return Err(self.error(&format!("duplicate service attribute '{}'", key))); }
                 *slot = Some(n as u32);
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("shutdown_timeout") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=3600).contains(&n) { return Err(self.error("shutdown_timeout out of range [1, 3600] seconds")); }
+                if shutdown_timeout.is_some() { return Err(self.error("duplicate service attribute 'shutdown_timeout'")); }
+                shutdown_timeout = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
             } else if self.check_ident("workers") {
                 self.advance();
                 self.expect_kind(TokenKind::Colon)?;
@@ -2166,7 +2175,7 @@ impl Parser {
                     name
                 )));
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', 'response_timeout:', 'max_connections:', or 'workers:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', 'response_timeout:', 'max_connections:', 'workers:', or 'shutdown_timeout:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -2194,6 +2203,7 @@ impl Parser {
             response_timeout,
             max_connections,
             workers,
+            shutdown_timeout,
         })
     }
 

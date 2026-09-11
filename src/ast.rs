@@ -383,10 +383,20 @@ pub struct Service {
     pub max_connections: Option<u32>,
     /// Fixed process pool size; each worker reuses its private request frame.
     pub workers: Option<u32>,
+    /// Grace period after supervisor SIGTERM; only for bounded HTTP pools.
+    pub shutdown_timeout: Option<u32>,
 }
 
 impl Service {
     pub fn pool_error(&self) -> Option<&'static str> {
+        if let Some(seconds) = self.shutdown_timeout {
+            if self.concurrency != ConcurrencyMode::Pooled || self.protocol != Protocol::Http10 {
+                return Some("shutdown_timeout requires http_1_0 and concurrency: pooled");
+            }
+            if !(1..=3600).contains(&seconds) {
+                return Some("shutdown_timeout must be in [1, 3600] seconds");
+            }
+        }
         if self.concurrency != ConcurrencyMode::Pooled && self.workers.is_none() { return None; }
         if self.concurrency != ConcurrencyMode::Pooled || self.protocol != Protocol::Http10 {
             return Some("workers requires http_1_0 and concurrency: pooled");

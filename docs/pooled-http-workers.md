@@ -54,7 +54,9 @@ keeps the worker available. An unexpected worker exit (including an operator
 failure or terminating signal) terminates the pool: the supervisor kills/reaps
 remaining workers and exits 1. A stopped worker remains in the pool but supplies
 no capacity until resumed. Automatic respawn/retry and graceful draining require
-separate policies; repeating effects is not implied by worker reuse.
+separate policies; repeating effects is not implied by worker reuse. The optional
+[`shutdown_timeout` contract](http-pool-shutdown.md) now supplies SIGTERM draining
+with a declared grace period; this page describes the default without that key.
 
 Workers can begin accepting while the supervisor creates the remaining workers;
 startup is not an atomic transaction. Startup fork failure kills/reaps

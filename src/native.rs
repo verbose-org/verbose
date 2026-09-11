@@ -23195,8 +23195,11 @@ fn emit_http10_dynamic_bytes(
     let frame_base = frame_base + if http_io.is_some() { http_io::Io::SIZE } else { 0 };
     let admission = service.max_connections.map(|_| admission::Admission { base: -(frame_base + admission::Admission::SIZE) });
     let frame_base = frame_base + if admission.is_some() { admission::Admission::SIZE } else { 0 };
-    let pool = service.workers.map(|workers| pool::Pool { base: -(frame_base + pool::Pool::size(workers)), workers });
-    let frame_base = frame_base + pool.map(|p| pool::Pool::size(p.workers)).unwrap_or(0);
+    let pool = service.workers.map(|workers| pool::Pool {
+        base: -(frame_base + pool::Pool::size(workers, service.shutdown_timeout)),
+        workers, shutdown_timeout: service.shutdown_timeout,
+    });
+    let frame_base = frame_base + pool.map(|p| pool::Pool::size(p.workers, p.shutdown_timeout)).unwrap_or(0);
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
     // shared abort sequence; left empty when policy is Drop.
@@ -23444,8 +23447,8 @@ fn emit_http10_dynamic_bytes(
 
     // ═══ ACCEPT LOOP ═══════════════════════════════════════════
     let accept_top = code.len();
-    if pool.is_some() {
-        abort_patches.extend(pool::accept(&mut code));
+    if let Some(p) = pool {
+        abort_patches.extend(pool::accept(&mut code, p));
     } else if let Some(slots) = admission {
         abort_patches.extend(admission::dispatch(&mut code, slots, service.max_connections.unwrap()));
     } else {
@@ -56564,7 +56567,8 @@ rule pick
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.
         // http_pooled adds a service-scoped refusal for reusable workers.
-        const EXPECTED_TOTAL: usize = 165;
+        // http_shutdown adds an explicitly refused SIGTERM lifecycle contract.
+        const EXPECTED_TOTAL: usize = 166;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
