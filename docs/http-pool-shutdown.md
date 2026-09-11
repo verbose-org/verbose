@@ -53,10 +53,11 @@ userspace handler or a shared mutable userspace flag. Nonblocking wait4 reaps
 children; every reaped PID is removed before another process could reuse it.
 The original parent-death protection remains in each worker.
 
-Control storage is fixed per service frame, alongside the existing PID table.
+Control storage adds 72 bytes per service frame, alongside the existing PID table
+(608 bytes total at 64 workers, excluding the HTTP/request storage).
 No request data survives through this control state, and shutdown introduces no
-userspace heap allocation. Worker request-frame reuse is unchanged. Frame bytes
-and syscall coverage will be recorded with validation.
+userspace heap allocation. Worker request-frame reuse is unchanged. The supervisor
+retains one extra descriptor compared with the pool without this declaration.
 
 Linux references: [signal waiting](https://man7.org/linux/man-pages/man2/sigwaitinfo.2.html),
 [socket shutdown](https://man7.org/linux/man-pages/man2/shutdown.2.html), and
@@ -77,3 +78,49 @@ workers, partial startup failure, syscall interruptions/failures, inherited
 ignored signals, stable request storage, and unsupported-backend refusals.
 Normal tests run serially; self-hosted refusal changes require bootstrap checks.
 Compare existing native examples against the pool reference before delivery.
+
+Run the [example](../examples/http_shutdown.verbose), then send SIGTERM to its PID
+from another terminal:
+
+```sh
+cargo run -- examples/http_shutdown.verbose --native /tmp/http-shutdown --run bounded_http
+/tmp/http-shutdown
+```
+
+`shutdown_timeout: 5` gives accepted requests up to five seconds after the
+supervisor begins shutdown. Existing receive/send deadlines can close clients
+sooner. Read the exit status: 0 means all workers finished normally; 1 means
+forced termination or operational failure. The example does not implement reload
+or guarantee an uninterrupted listener during a subsequent restart.
+
+The [socket tests](../src/http_tests/shutdown_tests.rs) cover the lifecycle and
+refusals. Run `cargo build`, then `python3 tools/check_http_shutdown.py` for the
+18 strace scenarios covering shutdown, startup, interrupts, syscall failures,
+and parent death. Traces and their JSON summary stay in a printed temporary
+directory; loopback and ptrace access are required.
+
+## Validation recorded on 2026-09-11
+
+- Normal suite: 662 passed, 26 ignored, run serially. This includes eight socket
+  and declaration tests plus the emitter decoding/storage test for this slice.
+  Shutdown handles idle/group SIGTERM, inherited ignored signals, in-flight
+  binary requests, queued clients, completed and forced 4 MiB responses,
+  request timeouts, request-effect failure, stopped/dead workers, and repeated
+  SIGTERM. Worker PIDs, descriptors, and stack positions remain stable during
+  repeated long/empty requests before shutdown.
+- The strace harness passes 18 success/failure/race cases, with no allocation
+  syscalls or process output on these paths. Worker setup failure never executes
+  supervisor cleanup; no listener survives termination. The persistent EINTR
+  test verifies the fixed deadline continues to advance while waits retry.
+- Native comparison against `b26ddc2`: 161 byte-identical binaries, three
+  refusals on both compilers, no mismatches across 164 existing example entries.
+  The changed self-source and new shutdown example are excluded from this check.
+- Self-source verification accepts all 376 concepts and 963 rules. Both
+  self-hosted raw-code and ELF paths refuse a service-scoped `shutdown_timeout`
+  before writing output; the same identifier remains valid outside services.
+- Separate two-generation bootstrap: 25 passed, including the binary fixed point
+  and corpus acceptance (97/166; the new shutdown service is explicitly refused).
+- `cidx validate` passes. `cidx run ci` stops before tests/build because its
+  cargo-audit container lacks `curl`. Gitleaks reports no leaks. Trivy exits
+  successfully with 23 existing Python dependency findings (also seen in a local
+  worktree), and none in Cargo.lock. This is not an overall CI pass.

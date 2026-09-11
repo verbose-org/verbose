@@ -70,8 +70,10 @@ request effects, and recover slots after child exits. See the
 Alternatively, `concurrency: pooled` with `workers: N` reuses N isolated worker
 processes and their request frames. Busy workers leave clients in the kernel
 queue; a worker death terminates the pool. See the
-[pool contract and support matrix](pooled-http-workers.md). Threads, TLS,
-automatic worker replacement, and graceful draining remain outside this contract.
+[pool contract and support matrix](pooled-http-workers.md). A pool may also declare
+`shutdown_timeout` to finish accepted requests after supervisor SIGTERM, then
+force termination at its deadline; see [shutdown and failure boundaries](http-pool-shutdown.md).
+Threads, TLS, automatic worker replacement, and listener handoff remain separate.
 
 ## Guarantees and measurements
 

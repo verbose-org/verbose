@@ -209,6 +209,10 @@ pub fn compile_wasm(
     output_path: &str,
 ) -> Result<(), WasmError> {
     if program.items.iter().any(|i| matches!(i, Item::Service(s)
+        if s.name == rule_name && s.shutdown_timeout.is_some())) {
+        return Err(WasmError { message: "WASM does not support service shutdown_timeout".into() });
+    }
+    if program.items.iter().any(|i| matches!(i, Item::Service(s)
         if s.name == rule_name && (s.workers.is_some() || s.concurrency == ConcurrencyMode::Pooled))) {
         return Err(WasmError { message: "WASM does not support pooled service workers".into() });
     }

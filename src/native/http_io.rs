@@ -66,19 +66,7 @@ impl Io {
 
 impl<'a> Asm<'a> {
     fn now(&mut self, io: Io) {
-        self.imm(DI, 1);
-        self.lea(SI, io.time());
-        self.syscall(228);
-        self.cmp(AX, 0);
-        self.jump(Some(0x88), 0); // clock failure
-        self.load(R8, io.time());
-        self.imm(CX, 1000);
-        self.bytes(&[0x4c, 0x0f, 0xaf, 0xc1]); // imul r8,rcx
-        self.load(AX, io.time() + 8);
-        self.imm(DX, 0);
-        self.imm(CX, 1_000_000);
-        self.bytes(&[0x48, 0xf7, 0xf1]); // div rcx
-        self.rr(0x01, AX, R8);
+        self.now_ms(io.time());
     }
     fn start(&mut self, io: Io, seconds: u32) {
         self.now(io);
