@@ -14,6 +14,16 @@ The thing to refuse is a declaration that is **neither**: the compiler cannot ve
 
 ## Classification
 
+### Text output capacity
+
+`output: out : text [..N]` is a checked semantic claim about the maximum byte
+length of a returned value. In the supported pure acyclic subset, the verifier
+adds concat capacities, joins branches and checks callee contracts with lexical
+binding types. Both an excessive bound and an unknown analysis cause refusal.
+The claim depends on enforced input bounds and trusted compiler correctness;
+it does not establish allocation ownership, temporary memory or total RSS.
+See [the contract and support matrix](bounded-text-output.md).
+
 ### Purity block
 
 | Field | Category | What the compiler does | Source |

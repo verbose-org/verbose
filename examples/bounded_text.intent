@@ -1,0 +1,3 @@
+A label input has a title of at most eight UTF-8 bytes and a signed 64-bit numeric identifier.
+The label encloses the title in square brackets and appends the identifier, within thirty bytes.
+The decorated label composes that checked result with angle brackets, within thirty-two bytes.

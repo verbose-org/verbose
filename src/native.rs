@@ -131,6 +131,11 @@ fn compile_native_code(
     stream: bool,
     stdin_raw: bool,
 ) -> Result<Vec<u8>, NativeError> {
+    let text_lowered;
+    let program = if !crate::text_bounds::active_rules(program).is_empty() {
+        text_lowered = crate::text_bounds::lower_native(program).map_err(|message| NativeError { message })?;
+        &text_lowered
+    } else { program };
     if crate::bounds::active_rules(program).contains(rule_name) {
         if stdin_raw || stdin || stream {
             return Err(NativeError { message: "bounded-result entry currently supports argv records only".into() });
@@ -8702,6 +8707,18 @@ fn classify_concat_arg(
             Some(ConcatArgKind::BoundText)
         }
         Expr::Call(_, _) => Some(ConcatArgKind::CallText),
+        Expr::If(_, yes, no) => {
+            let branch_kind = |e: &Expr| if matches!(e, Expr::Concat(_)) {
+                Some(ConcatArgKind::CallText)
+            } else { classify_concat_arg(e, concept, input_name, text_bindings, offsets) };
+            let a = branch_kind(yes)?;
+            let b = branch_kind(no)?;
+            if a == ConcatArgKind::Number && b == ConcatArgKind::Number {
+                Some(ConcatArgKind::Number)
+            } else if a != ConcatArgKind::Number && b != ConcatArgKind::Number {
+                Some(ConcatArgKind::CallText)
+            } else { None }
+        }
         // Substring shares CallText's pre-eval/stash/fill machinery
         // 1-for-1: classify reserves a 16-byte slot, the pre-eval loop
         // calls emit_text_produce_ptrlen on the whole Substring expr
@@ -9438,6 +9455,25 @@ fn emit_text_produce_ptrlen(
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match text_expr {
+        Expr::If(cond, yes, no) => {
+            emit_eval_expr(code, cond, input_name, offsets, all_rules,
+                field_ranges, text_bindings, None, None)?;
+            code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x84]);
+            let no_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            emit_text_produce_ptrlen(code, yes, input_name, concept, all_rules,
+                offsets, field_ranges, text_bindings)?;
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            let no_offset = (code.len() as i32 - no_patch as i32 - 4).to_le_bytes();
+            code[no_patch..no_patch + 4].copy_from_slice(&no_offset);
+            emit_text_produce_ptrlen(code, no, input_name, concept, all_rules,
+                offsets, field_ranges, text_bindings)?;
+            let end_offset = (code.len() as i32 - end_patch as i32 - 4).to_le_bytes();
+            code[end_patch..end_patch + 4].copy_from_slice(&end_offset);
+            Ok(())
+        }
         Expr::Call(callee_name, args) => {
             // Validate the same Phase 2G restrictions.
             let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
@@ -21095,6 +21131,11 @@ pub fn compile_service(
     service_name: &str,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    let text_lowered;
+    let program = if !crate::text_bounds::active_rules(program).is_empty() {
+        text_lowered = crate::text_bounds::lower_native(program).map_err(|message| NativeError { message })?;
+        &text_lowered
+    } else { program };
     if let Some(error) = crate::bounds::verify(program).first() {
         return Err(NativeError { message: error.to_string() });
     }
@@ -56568,7 +56609,8 @@ rule pick
         // http_capped adds an explicitly refused admission contract.
         // http_pooled adds a service-scoped refusal for reusable workers.
         // http_shutdown adds an explicitly refused SIGTERM lifecycle contract.
-        const EXPECTED_TOTAL: usize = 166;
+        // bounded_text and http_bounded_text add refused text output contracts.
+        const EXPECTED_TOTAL: usize = 168;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

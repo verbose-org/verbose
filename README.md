@@ -175,6 +175,13 @@ compiler executes or emits           interpreter, native x86-64, or WASM
 
 ## What the compiler verifies (and what it does not)
 
+**Language-level text capacities (2026-09-12):** a rule can declare
+`out : text [..N]`. The verifier checks the result's byte capacity through pure
+acyclic calls, aliases and branches; excessive and unknown capacities are refused.
+See the [contract](docs/bounded-text-output.md), [standalone example](examples/bounded_text.verbose)
+and [HTTP formatter](examples/http_bounded_text.verbose). This bounds a value,
+not the memory used by all temporaries or a process.
+
 "Verified" is intentionally not used as a synonym for "bug-free". The current
 trust boundary is:
 
@@ -464,6 +471,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 |---|---|
 | Typed concepts | `number`, `bool`, `text`, `collection(Type)` |
 | Field value ranges | `temperature : number [0, 50]` |
+| Checked text result capacity | `output: out : text [..64]` — see [scope](docs/bounded-text-output.md) |
 | Arithmetic | `amount + amount * tax_rate / 100` |
 | Comparisons & equality | `>`, `<`, `>=`, `<=`, `==`, `!=` |
 | Boolean logic | `and`, `or`, `not` |

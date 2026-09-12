@@ -50,7 +50,13 @@ future work describe the pre-service implementation. `--http-server` remains a
 legacy rule-plus-shell path; `--demo-http` is a hand-emitted probe without Verbose
 source. Use source-declared services to demonstrate the language's effect model.
 
-## Checked literal lookup
+## Bounded values
+
+Rules can declare `out : text [..N]` to require a statically proved result
+capacity in bytes. The analysis follows aliases, branches and acyclic rule
+composition; unknown capacities are refused. This is a result-size contract,
+not a total memory or ownership guarantee. Interpreter/native support and the
+WASM/self-hosted refusals are documented in [bounded text results](bounded-text-output.md).
 
 `try_byte_at` returns `Result(number, BoundsError)` with explicit handling or
 propagation checked across the supported acyclic numeric-input rules. The

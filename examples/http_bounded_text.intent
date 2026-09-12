@@ -1,0 +1,3 @@
+A pure formatter returns the request path prefixed with path-colon-space, within 262 bytes.
+The handler uses that formatter's result as its HTTP response body.
+The service runs the handler through the existing bounded HTTP transport.

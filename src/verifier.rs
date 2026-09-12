@@ -20,6 +20,7 @@ impl fmt::Display for VerifyError {
 
 pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError> {
     let mut errors = crate::bounds::verify(program);
+    errors.extend(crate::text_bounds::verify(program));
     let bounded_rules = crate::bounds::active_rules(program);
 
     // Phase 7 slice 3a: if any service declares Protocol::Http10, the compiler
@@ -1064,7 +1065,7 @@ fn verify_connection_stub(c: &Connection, base_dir: &StdPath, errors: &mut Vec<V
 /// ≤ this value; the divergence is only ever in the safe direction, and for
 /// a single-service program (every example in the repo, and the only shape
 /// `--run <service>` compiles) the two are identical.
-fn builtin_http_request(body_max: i64) -> Concept {
+pub(crate) fn builtin_http_request(body_max: i64) -> Concept {
     Concept {
         name: "HttpRequest".to_string(),
         intention:
@@ -1097,7 +1098,7 @@ fn builtin_http_request(body_max: i64) -> Concept {
 ///   status : number [100, 599] — valid HTTP status code range
 ///   body   : text [..4096]     — response body (text only in slice 3;
 ///                                binary bodies await bytes primitives)
-fn builtin_http_response() -> Concept {
+pub(crate) fn builtin_http_response() -> Concept {
     Concept {
         name: "HttpResponse".to_string(),
         intention:

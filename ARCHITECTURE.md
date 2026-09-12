@@ -101,6 +101,12 @@ Reclaiming a request region means making its storage reusable, not erasing its
 bytes or releasing every page to the OS. Native emission alone establishes no
 performance or safety advantage over another native server.
 
+At rule boundaries, a text output annotated `[..N]` now requires a static proof
+of its byte capacity, including pure acyclic composition. See
+[bounded text results](docs/bounded-text-output.md). This makes value capacity
+explicit independently of services; temporary storage and ownership remain
+separate questions.
+
 Worker reuse must preserve request-local lifetimes and demonstrate stable storage
 across requests and failure paths. Shared mutable memory between threads needs an
 explicit ownership/synchronization contract. See the
