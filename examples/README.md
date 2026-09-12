@@ -1,5 +1,10 @@
 # Verbose examples
 
+[`bounded_text.verbose`](bounded_text.verbose) declares and composes checked text
+result capacities across pure rules. [`http_bounded_text.verbose`](http_bounded_text.verbose)
+uses the same contract in an HTTP formatter. See the
+[contract and support matrix](../docs/bounded-text-output.md).
+
 Examples show concrete language constructs, compiler entry points, and regression
 cases. Some require imports, resources, a particular backend/ABI, or test setup;
 files under `negative/` are intentionally rejected. Read each example's header
