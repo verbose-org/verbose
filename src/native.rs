@@ -1,4 +1,5 @@
 mod bounded;
+mod bounded_text;
 mod http_io;
 mod admission;
 mod pool;
@@ -131,16 +132,23 @@ fn compile_native_code(
     stream: bool,
     stdin_raw: bool,
 ) -> Result<Vec<u8>, NativeError> {
-    let text_lowered;
-    let program = if !crate::text_bounds::active_rules(program).is_empty() {
-        text_lowered = crate::text_bounds::lower_native(program).map_err(|message| NativeError { message })?;
-        &text_lowered
-    } else { program };
+    if let Some(error) = crate::text_bounds::verify_mode(program, true).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
     if crate::bounds::active_rules(program).contains(rule_name) {
         if stdin_raw || stdin || stream {
             return Err(NativeError { message: "bounded-result entry currently supports argv records only".into() });
         }
         return bounded::compile(program, rule_name);
+    }
+    if crate::text_bounds::active_rules(program).contains(rule_name) {
+        let rule = program.items.iter().find_map(|i| match i {
+            Item::Rule(r) if r.name == rule_name => Some(r), _ => None,
+        }).ok_or_else(|| NativeError { message: "bounded text entry missing".into() })?;
+        let concept = iter_all_concepts(&program.items).find(|c| rule.input_ty == Type::Named(c.name.clone()))
+            .ok_or_else(|| NativeError { message: "bounded text input concept missing".into() })?;
+        let code = bounded_text::compile(program, rule, concept)?;
+        return wrap_record_input_mode(code, rule, concept, false, false, stdin, stream, stdin_raw);
     }
     // Phase B slice 4a.1: lift the blanket refusal on `concept_group`.
     // From this slice forward, a program containing a `concept_group`
@@ -804,7 +812,7 @@ fn compile_native_code(
         }
     }
 
-    let mut code = if needs_callable_path {
+    let code = if needs_callable_path {
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
@@ -847,6 +855,14 @@ fn compile_native_code(
         emit_full_program(rule, concept, context_concept, &rules, &resources, &connections, &entropies, concept_group)?
     };
 
+    wrap_record_input_mode(code, rule, concept, is_vectorizable, is_parallel, stdin, stream, stdin_raw)
+}
+
+fn wrap_record_input_mode(
+    mut code: Vec<u8>, rule: &Rule, concept: &Concept,
+    is_vectorizable: bool, is_parallel: bool,
+    stdin: bool, stream: bool, stdin_raw: bool,
+) -> Result<Vec<u8>, NativeError> {
     if stream {
         // Streaming mode: wrap rule code in a line-by-line read loop.
         // Requires the rule code to use the standard push rbp / mov rbp, rsp
@@ -21131,11 +21147,9 @@ pub fn compile_service(
     service_name: &str,
     output_path: &str,
 ) -> Result<(), NativeError> {
-    let text_lowered;
-    let program = if !crate::text_bounds::active_rules(program).is_empty() {
-        text_lowered = crate::text_bounds::lower_native(program).map_err(|message| NativeError { message })?;
-        &text_lowered
-    } else { program };
+    if let Some(error) = crate::text_bounds::verify_mode(program, true).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
     if let Some(error) = crate::bounds::verify(program).first() {
         return Err(NativeError { message: error.to_string() });
     }
@@ -21179,6 +21193,9 @@ pub fn compile_service(
                     service.name, service.handler
                 ),
             })?;
+        if crate::text_bounds::active_rules(program).contains(&handler.name) {
+            return compile_http10_dynamic_service(program, service, output_path);
+        }
         // Phase 8 slice 8a: presence of a log forces the dynamic path,
         // because the log content can reference request fields (method /
         // path) which only exist once the HTTP parser has run — and the
@@ -22445,6 +22462,27 @@ fn compile_http10_dynamic_service(
             ),
         })?;
 
+    let storage = if crate::text_bounds::active_rules(program).contains(&handler.name) {
+        Some(bounded_text::prepare(program, &handler.name, &http_request_builtin_concept_native(service.max_request))?)
+    } else { None };
+    let transport_handler;
+    let handler = if let Some(storage) = &storage {
+        transport_handler = {
+            let mut r = handler.clone();
+            r.logic.bindings.clear();
+            // Preserve the parser's demand for a counted body even when only
+            // a callee reads it. Actual rule evaluation uses `storage` below.
+            r.logic.value = Expr::Record("HttpResponse".into(), vec![
+                ("status".into(), Expr::Number(200)),
+                ("body".into(), if storage.uses_field("body") {
+                    Expr::Field(Box::new(Expr::Ident(r.input_name.clone())), "body".into())
+                } else { Expr::Text(String::new()) }),
+            ]);
+            r
+        };
+        &transport_handler
+    } else { handler };
+
     // HttpRequest fields at fixed rbp slots — mirrors Phase 2E's text-input-
     // field layout so emit_eval_expr can compare req.method / req.path
     // against literals without modification.
@@ -22500,7 +22538,7 @@ fn compile_http10_dynamic_service(
     let code = emit_http10_dynamic_bytes(
         service, handler, &offsets, &no_rules, &no_ranges,
         &all_resources, &all_connections, &all_entropies,
-        &program_rules, &program_concepts,
+        &program_rules, &program_concepts, storage.as_ref(),
     )?;
     write_server_elf(&code, output_path, "service", service.port)
 }
@@ -23067,6 +23105,7 @@ fn emit_http10_dynamic_bytes(
     // pre-existing service byte-identical).
     program_rules: &HashMap<&str, &Rule>,
     program_concepts: &[&Concept],
+    bounded_storage: Option<&bounded_text::Fragment>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
@@ -23936,16 +23975,20 @@ fn emit_http10_dynamic_bytes(
 
     // ═══ HANDLER BODY ══════════════════════════════════════════
     // Populates [rbp-24]=status, [rbp-32]=body_ptr, [rbp-40]=body_len.
-    emit_handler_to_slots(
-        &mut code,
-        &handler.logic.value,
-        &handler.input_name,
-        &handler_offsets,
-        all_rules,
-        field_ranges,
-        &http_text_bindings,
-        max_request,
-    )?;
+    if let Some(storage) = bounded_storage {
+        storage.http(&mut code, &handler_offsets, &http_text_bindings)?;
+    } else {
+        emit_handler_to_slots(
+            &mut code,
+            &handler.logic.value,
+            &handler.input_name,
+            &handler_offsets,
+            all_rules,
+            field_ranges,
+            &http_text_bindings,
+            max_request,
+        )?;
+    }
     // Lets + body done: these sites take the bare close path. The log
     // blocks below get their OWN scope (their fd is live in r15 while the
     // content evaluates), and the `after:` block rejoins this set.
@@ -56609,8 +56652,8 @@ rule pick
         // http_capped adds an explicitly refused admission contract.
         // http_pooled adds a service-scoped refusal for reusable workers.
         // http_shutdown adds an explicitly refused SIGTERM lifecycle contract.
-        // bounded_text and http_bounded_text add refused text output contracts.
-        const EXPECTED_TOTAL: usize = 168;
+        // Bounded text capacity/storage examples remain explicit gen0 refusals.
+        const EXPECTED_TOTAL: usize = 169;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

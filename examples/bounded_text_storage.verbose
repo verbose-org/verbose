@@ -1,0 +1,60 @@
+@verbose 0.1.0
+
+concept StorageInput
+  @intention: "Bound the text input used by a reusable formatter"
+  @source: bounded_text_storage.intent:1
+  fields:
+    title : text [..8]
+    code : number
+
+rule piece
+  @intention: "Build a bounded text value once per call"
+  @source: bounded_text_storage.intent:2
+  input:
+    item : StorageInput
+  output:
+    out : text [..30]
+  logic:
+    out = concat("[", item.title, "]", item.code)
+  proofs:
+    purity:
+      reads : [item.title, item.code]
+      calls : []
+    termination:
+      bound : 16
+
+rule reuse_text
+  @intention: "Reuse the same computed value after its original name is shadowed"
+  @source: bounded_text_storage.intent:3
+  input:
+    request : StorageInput
+  output:
+    out : text [..63]
+  logic:
+    let message = piece(request)
+    let saved = message
+    let message = "shadow"
+    out = concat(saved, " | ", saved)
+  proofs:
+    purity:
+      reads : [request]
+      calls : [piece]
+    termination:
+      bound : 32
+
+rule choose_text
+  @intention: "Keep nested conditional text alive until the result is consumed"
+  @source: bounded_text_storage.intent:4
+  input:
+    input : StorageInput
+  output:
+    out : text [..65]
+  logic:
+    let result = reuse_text(input)
+    out = concat("", if input.code >= 0 then concat("<", result, ">") else concat("{", result, "}"))
+  proofs:
+    purity:
+      reads : [input, input.code]
+      calls : [reuse_text]
+    termination:
+      bound : 32

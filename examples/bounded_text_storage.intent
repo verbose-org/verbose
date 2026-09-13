@@ -1,0 +1,4 @@
+The formatter input contains at most eight UTF-8 bytes and one signed numeric identifier.
+A formatter call encloses the title and appends the identifier within thirty bytes.
+An alias preserves the computed value when its original name is shadowed; two uses share that computation.
+Conditional delimiters surround the reused text, whose storage lasts through consumption of the final result.

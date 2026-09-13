@@ -62,14 +62,29 @@ fn differential(p: &Program, name: &str) {
     assert!(verify(p).is_empty(), "{:?}", verify(p));
     let bin = format!("/tmp/verbose-text-bounds-{}", std::process::id());
     crate::native::compile_native(p, name, &bin, false, false).unwrap();
-    for title in ["", "hello", "abcdefgh", "éééé"] {
+    let first = fs::read(&bin).unwrap();
+    crate::native::compile_native(p, name, &bin, false, false).unwrap();
+    assert_eq!(
+        first,
+        fs::read(&bin).unwrap(),
+        "non-deterministic storage emission"
+    );
+    for title in ["", "hello", "world", "abcdefgh", "éééé"] {
         for code in [i64::MIN, -1, 0, 1, i64::MAX] {
             let reference = eval(p, name, title, code).unwrap();
             let output = Command::new(&bin)
                 .args([title, &code.to_string()])
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{title} {code}: {output:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(if matches!(reference, interpreter::Value::Bool(false)) {
+                    1
+                } else {
+                    0
+                }),
+                "{title} {code}: {output:?}"
+            );
             assert!(output.stderr.is_empty());
             assert_eq!(
                 output.stdout,
@@ -165,13 +180,17 @@ fn text_bounds_call_dag_expansion_limit() {
         p.items.push(Item::Rule(r));
     }
     assert!(verify(&p).is_empty());
-    assert!(lower_native(&p)
-        .unwrap_err()
-        .contains("call expansion limit"));
+    let err =
+        crate::native::compile_native(&p, &prior, "/tmp/verbose-storage-rejected", false, false)
+            .unwrap_err();
+    assert!(
+        err.message.contains("invocation frame") || err.message.contains("call expansion limit"),
+        "{err}"
+    );
 }
 
 #[test]
-fn text_bounds_literal_expansion_budget() {
+fn text_bounds_literal_aliases_do_not_expand() {
     let mut p = fixture();
     let r = rule(&mut p, "label");
     r.output_text_max = Some(1_048_576);
@@ -186,9 +205,17 @@ fn text_bounds_literal_expansion_budget() {
     r.output_text_max = None;
     r.logic.value = Expr::Ident("alias".into());
     assert!(verify(&p).is_empty());
-    assert!(lower_native(&p)
-        .unwrap_err()
-        .contains("literal expansion exceeds 16 MiB"));
+    let bin = format!("/tmp/verbose-storage-literal-{}", std::process::id());
+    crate::native::compile_native(&p, "label", &bin, false, false).unwrap();
+    let output = Command::new(&bin).args(["", "0"]).output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", "x".repeat(1_048_576)).as_bytes()
+    );
+    assert!(fs::metadata(&bin).unwrap().len() < 1_060_000);
+    fs::remove_file(bin).unwrap();
 }
 
 #[test]
@@ -335,12 +362,12 @@ fn text_bounds_analysis_and_expansion_limits() {
     }
     r.logic.value = Expr::Ident("x".into());
     rejects(&p, "capacity arithmetic overflow");
-    // Zero-length doubling remains within the result capacity, but native
-    // expansion still has to refuse exponential compiler work.
+    // Empty doubling remains within capacity and must now compile linearly:
+    // each let reads the previous value rather than expanding its expression.
     let r = rule(&mut p, "label");
     r.logic.bindings[0].1 = Expr::Text(String::new());
     assert!(verify(&p).is_empty());
-    assert!(lower_native(&p).unwrap_err().contains("expansion limit"));
+    differential(&p, "decorated_label");
 }
 
 #[test]
@@ -438,4 +465,189 @@ fn text_bounds_self_hosted_refuses_before_artifact() {
         assert!(!output.stdout.is_empty());
         fs::remove_file(bin).unwrap();
     }
+}
+
+#[test]
+fn text_storage_nested_branches_and_short_circuit() {
+    let mut p = fixture();
+    let r = rule(&mut p, "label");
+    r.output_text_max = Some(64);
+    r.logic.bindings = vec![
+        ("a".into(), expression("if item.code > 0 then concat(\"yes:\", item.title) else concat(\"no:\", item.title)")),
+        ("b".into(), expression("concat(\"[\", if length(a) > 5 then concat(a, \"!\") else concat(\"?\", a), \"]\")")),
+        ("a".into(), expression("concat(b, if item.title == \"\" then \"empty\" else item.title)")),
+    ];
+    r.logic.value = expression("concat(a, if (item.code > 0 and item.title != \"\") or not (length(b) > 4) then b else concat(\"<\", b, \">\"))");
+    rule(&mut p, "decorated_label").output_text_max = Some(66);
+    differential(&p, "decorated_label");
+    // Scalars consume already materialized text, including a call on an
+    // untaken RHS. Boolean entry status must still accumulate per record.
+    let r = rule(&mut p, "decorated_label");
+    r.output_text_max = None;
+    r.output_ty = Type::Bool;
+    r.logic.value =
+        expression("(request.code > 0 and length(label(request)) > 5) or (alias == message)");
+    differential(&p, "decorated_label");
+    rule(&mut p, "decorated_label").logic.value =
+        expression("request.code > 0 and (alias != message or request.title == \"hello\")");
+    differential(&p, "decorated_label");
+    let r = rule(&mut p, "decorated_label");
+    r.output_ty = Type::Number;
+    r.logic.value = expression("if alias == message then length(label(request)) else request.code");
+    differential(&p, "decorated_label");
+}
+
+#[test]
+fn text_storage_record_fields_preserve_lexical_values() {
+    let mut p = fixture();
+    let r = rule(&mut p, "decorated_label");
+    r.output_text_max = None;
+    r.output_ty = Type::Named("LabelInput".into());
+    r.logic.bindings.extend([
+        (
+            "record".into(),
+            expression("LabelInput { title: alias, code: length(message) }"),
+        ),
+        ("message".into(), Expr::Text("shadow".into())),
+    ]);
+    r.logic.value = expression("LabelInput { code: record.code, title: record.title }");
+    assert!(verify(&p).is_empty());
+    let bin = format!("/tmp/verbose-storage-record-{}", std::process::id());
+    crate::native::compile_native(&p, "decorated_label", &bin, false, false).unwrap();
+    let result = Command::new(&bin).args(["é", "42"]).output().unwrap();
+    assert!(result.status.success());
+    assert!(result.stderr.is_empty());
+    assert_eq!(
+        result.stdout,
+        "{\"title\":\"[é]42\",\"code\":6}\n".as_bytes()
+    );
+    let interpreter::Value::Record(fields) = eval(&p, "decorated_label", "é", 42).unwrap() else {
+        panic!("expected record");
+    };
+    assert_eq!(fields["title"].to_string(), "[é]42");
+    assert_eq!(fields["code"].to_string(), "6");
+    rule(&mut p, "decorated_label").logic.value = Expr::Ident("request".into());
+    crate::native::compile_native(&p, "decorated_label", &bin, false, false).unwrap();
+    let result = Command::new(&bin).args(["hello", "-42"]).output().unwrap();
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"{\"title\":\"hello\",\"code\":-42}\n");
+    fs::remove_file(bin).unwrap();
+}
+
+#[test]
+fn text_storage_limits_include_unused_work_and_preserve_artifacts() {
+    let mut p = fixture();
+    let r = rule(&mut p, "label");
+    r.logic.value = Expr::Text("ok".into());
+    r.logic.bindings = (0..12)
+        .map(|i| {
+            (
+                format!("unused_{i}"),
+                Expr::Concat(vec![
+                    Expr::Text("x".repeat(200_000)),
+                    expression("item.title"),
+                ]),
+            )
+        })
+        .collect();
+    assert!(verify(&p).is_empty());
+    let bin = format!("/tmp/verbose-storage-limit-{}", std::process::id());
+    assert!(!Path::new(&bin).exists());
+    let err = crate::native::compile_native(&p, "label", &bin, false, false).unwrap_err();
+    assert!(
+        err.message
+            .contains("invocation frame exceeds 2097152 bytes"),
+        "{err}"
+    );
+    assert!(!Path::new(&bin).exists());
+    fs::write(&bin, b"existing artifact").unwrap();
+    assert!(crate::native::compile_native(&p, "label", &bin, false, false).is_err());
+    assert_eq!(fs::read(&bin).unwrap(), b"existing artifact");
+    fs::remove_file(&bin).unwrap();
+    // Unused literals don't need writable buffers, but their code/data copies
+    // still have a separate compiler budget. Aliases don't spend that budget.
+    rule(&mut p, "label").logic.bindings = (0..17)
+        .map(|i| (format!("literal_{i}"), Expr::Text("x".repeat(1_048_576))))
+        .collect();
+    assert!(verify(&p).is_empty());
+    let err = crate::native::compile_native(&p, "label", &bin, false, false).unwrap_err();
+    assert!(
+        err.message.contains("literal expansion exceeds 16 MiB"),
+        "{err}"
+    );
+    assert!(!Path::new(&bin).exists());
+}
+
+#[test]
+fn text_storage_reclaims_each_argv_record_and_stream_line() {
+    use std::process::Stdio;
+    let mut p = fixture();
+    let r = rule(&mut p, "label");
+    r.logic.bindings = vec![(
+        "eager".into(),
+        Expr::Concat(vec![
+            Expr::Text("x".repeat(16_384)),
+            expression("item.title"),
+        ]),
+    )];
+    r.logic.value = expression("concat(item.title, item.code)");
+    let bin = format!("/tmp/verbose-storage-reuse-{}", std::process::id());
+    let input_file = format!("{bin}.input");
+    let count = 600;
+    let expected = "<é42>\n".repeat(count);
+    for stream in [false, true] {
+        crate::native::compile_native(&p, "decorated_label", &bin, false, stream).unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "ulimit -s 256; exec \"$@\"", "storage-test", &bin]);
+        if stream {
+            fs::write(&input_file, "é 42\n".repeat(count)).unwrap();
+            command.stdin(Stdio::from(fs::File::open(&input_file).unwrap()));
+        } else {
+            for _ in 0..count {
+                command.args(["é", "42"]);
+            }
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "stream={stream}: {output:?}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout, expected.as_bytes(), "stream={stream}");
+    }
+    fs::remove_file(bin).unwrap();
+    fs::remove_file(input_file).unwrap();
+}
+
+#[test]
+fn text_storage_example_matches_interpreter() {
+    let p = parse(include_str!("../../examples/bounded_text_storage.verbose"));
+    let errors = crate::verifier::verify_program(&p, Path::new("examples"));
+    assert!(errors.is_empty(), "{errors:?}");
+    differential(&p, "reuse_text");
+    differential(&p, "choose_text");
+}
+
+#[test]
+fn text_storage_compares_counted_values_past_nul() {
+    let mut p = fixture();
+    let r = rule(&mut p, "label");
+    r.logic.bindings = vec![(
+        "x".into(),
+        Expr::If(
+            Box::new(expression("item.code > 0")),
+            Box::new(Expr::Text("a\0x".into())),
+            Box::new(Expr::Text("a\0y".into())),
+        ),
+    )];
+    r.logic.value = Expr::If(
+        Box::new(Expr::Binary(
+            BinOp::Eq,
+            Box::new(Expr::Ident("x".into())),
+            Box::new(Expr::Text("a\0x".into())),
+        )),
+        Box::new(Expr::Text("same".into())),
+        Box::new(Expr::Text("different".into())),
+    );
+    differential(&p, "decorated_label");
+    let r = rule(&mut p, "label");
+    r.logic.value = expression("if \"\" == \"\" then \"empty match\" else \"wrong\"");
+    differential(&p, "decorated_label");
 }

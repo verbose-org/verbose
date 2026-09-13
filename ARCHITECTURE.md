@@ -104,8 +104,10 @@ performance or safety advantage over another native server.
 At rule boundaries, a text output annotated `[..N]` now requires a static proof
 of its byte capacity, including pure acyclic composition. See
 [bounded text results](docs/bounded-text-output.md). This makes value capacity
-explicit independently of services; temporary storage and ownership remain
-separate questions.
+explicit independently of services. Its checked native subset now reserves
+[invocation-owned text storage](docs/bounded-text-storage.md), with evaluated
+lets, shared aliases and a separate ceiling on slots and temporary buffers.
+Ownership across state, resources or threads remains a separate contract.
 
 Worker reuse must preserve request-local lifetimes and demonstrate stable storage
 across requests and failure paths. Shared mutable memory between threads needs an

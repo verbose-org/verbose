@@ -37,33 +37,27 @@ The analysis does not infer correlations between conditions: both branches must
 fit. It stops with a diagnostic after 100,000 visited expression nodes, 256
 expression levels or 128 nested calls. Capacity addition uses checked arithmetic.
 
-This bounds the returned value. It does **not** reserve a caller-owned buffer,
-bound the sum of temporaries, establish a new ownership model, or bound process
-RSS. Existing native input guards enforce the text capacities assumed by the
-analysis. The interpreter checks those inputs before evaluating a participating
-rule, including an unannotated caller whose bounded callee sits in an untaken
-branch. It checks annotated results as a runtime backstop. Native storage and
-reclamation retain their existing contracts. Input violations fail evaluation;
-they do not produce a recoverable `Result`.
+The annotation bounds the returned value. Native compilation now also assigns
+invocation-owned storage to the checked subset: lets evaluate once, aliases
+share values, and text returns have caller-owned destinations. The separate
+2 MiB native storage ceiling counts slots, buffers and fixed scratch, including
+both branches and unused lets. See [native text storage](bounded-text-storage.md)
+for ownership, reclamation, limits and exclusions. This is not a process memory
+quota or a general ownership type system.
 
-Native lowering expands acyclic calls and lexical lets, renames inputs and
-flattens concatenations before using the existing text emitter. Callees can have
-lets and different input names. Expansion may duplicate pure computation; effects
-and potentially failing primitives are excluded so substitution cannot duplicate
-effects or suppress their errors. This is not an evaluate-once or temporary-memory
-contract. Expansion itself is limited to 100,000 nodes and 256 levels, including
-the expanded call graph. Each expansion pass also limits copied literal data to
-16 MiB, so a short alias chain cannot duplicate a large literal without limit.
-Native emission additionally requires each text expression to have a known
-capacity at most 1 MiB and refuses declared input text bounds above 1 MiB. Some
-emitter combinations, such as nested conditional text materialization, still
-receive an explicit refusal.
+Existing native input guards enforce the capacities assumed by the analysis.
+The interpreter checks those inputs before evaluating a participating rule,
+including an unannotated caller whose bounded callee sits in an untaken branch.
+It checks annotated results as a runtime backstop. Input violations fail
+evaluation; they do not produce a recoverable `Result`. Native emission requires
+each text expression to have a known capacity at most 1 MiB and refuses declared
+input text bounds above 1 MiB.
 
 | Path | Support |
 |---|---|
 | Rust verifier | Static capacities, lexical binding types and call graph checks |
 | Interpreter | Value semantics, annotated input checks and result backstop |
-| Native Linux x86-64 | Checked subset through existing text lowering |
+| Native Linux x86-64 | Checked subset with fixed invocation storage |
 | HTTP service | Pure handler without state, logs or after mutations; request bounds derive from service declarations |
 | WASM | Explicit refusal of participating rules and services before artifact emission |
 | Self-hosted compiler | Output-section token refusal in both ELF and raw machine-code entry points |

@@ -471,7 +471,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 |---|---|
 | Typed concepts | `number`, `bool`, `text`, `collection(Type)` |
 | Field value ranges | `temperature : number [0, 50]` |
-| Checked text result capacity | `output: out : text [..64]` — see [scope](docs/bounded-text-output.md) |
+| Checked text result capacity | `output: out : text [..64]` — [capacity](docs/bounded-text-output.md), [native ownership and storage limit](docs/bounded-text-storage.md) |
 | Arithmetic | `amount + amount * tax_rate / 100` |
 | Comparisons & equality | `>`, `<`, `>=`, `<=`, `==`, `!=` |
 | Boolean logic | `and`, `or`, `not` |
