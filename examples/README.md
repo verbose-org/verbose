@@ -2,7 +2,9 @@
 
 [`bounded_text.verbose`](bounded_text.verbose) declares and composes checked text
 result capacities across pure rules. [`http_bounded_text.verbose`](http_bounded_text.verbose)
-uses the same contract in an HTTP formatter. See the
+uses the same contract in an HTTP formatter.
+[`bounded_text_storage.verbose`](bounded_text_storage.verbose) demonstrates shared
+aliases, shadowing and nested conditional buffers. See the
 [contract and support matrix](../docs/bounded-text-output.md).
 
 Examples show concrete language constructs, compiler entry points, and regression

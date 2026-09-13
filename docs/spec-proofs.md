@@ -20,8 +20,10 @@ The thing to refuse is a declaration that is **neither**: the compiler cannot ve
 length of a returned value. In the supported pure acyclic subset, the verifier
 adds concat capacities, joins branches and checks callee contracts with lexical
 binding types. Both an excessive bound and an unknown analysis cause refusal.
-The claim depends on enforced input bounds and trusted compiler correctness;
-it does not establish allocation ownership, temporary memory or total RSS.
+The claim depends on enforced input bounds and trusted compiler correctness.
+The annotation itself does not establish total RSS or general ownership. The
+native checked subset also enforces a separate invocation storage ceiling and
+reclaims its buffers after consumption; see [native text storage](bounded-text-storage.md).
 See [the contract and support matrix](bounded-text-output.md).
 
 ### Purity block

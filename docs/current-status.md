@@ -54,9 +54,12 @@ source. Use source-declared services to demonstrate the language's effect model.
 
 Rules can declare `out : text [..N]` to require a statically proved result
 capacity in bytes. The analysis follows aliases, branches and acyclic rule
-composition; unknown capacities are refused. This is a result-size contract,
-not a total memory or ownership guarantee. Interpreter/native support and the
-WASM/self-hosted refusals are documented in [bounded text results](bounded-text-output.md).
+composition; unknown capacities are refused. Native evaluation uses a fixed
+invocation region with a separate 2 MiB ceiling: lets evaluate once, aliases
+share values, and storage is reclaimed after output or HTTP response consumption.
+This does not bound process memory or establish ownership across effects/state.
+See [bounded text results](bounded-text-output.md) and
+[native storage](bounded-text-storage.md) for the limits and backend matrix.
 
 `try_byte_at` returns `Result(number, BoundsError)` with explicit handling or
 propagation checked across the supported acyclic numeric-input rules. The
