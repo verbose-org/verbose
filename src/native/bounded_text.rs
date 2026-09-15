@@ -3,7 +3,8 @@
 //! All offsets are assigned before execution. A let binds a value descriptor,
 //! never a substituted expression. Calls expand once per call site. Text result
 //! destinations pass through tail calls and conditionals to the final producer.
-//! Other temporaries remain distinct and live for the entire invocation.
+//! Buffer placement follows proved last uses, including aliased branch results.
+mod storage;
 use super::*;
 
 const FRAME_LIMIT: usize = 2 * 1024 * 1024;
@@ -104,6 +105,7 @@ struct Emit<'a> {
     nodes: usize,
     literal_bytes: usize,
     constants: HashMap<i32, i64>,
+    storage: storage::Storage,
 }
 impl Emit<'_> {
     fn allocate(&mut self, bytes: usize) -> Result<i32, NativeError> {
@@ -130,11 +132,37 @@ impl Emit<'_> {
         })
     }
     fn text(&mut self, cap: usize) -> Result<Value, NativeError> {
+        let ptr = self.allocate(8)?;
+        self.storage.pointer(ptr);
         Ok(Value::Text {
-            ptr: self.allocate(8)?,
+            ptr,
             len: self.allocate(8)?,
             cap,
         })
+    }
+    fn destination(
+        &mut self,
+        cap: Option<usize>,
+        context: String,
+    ) -> Result<TextDestination, NativeError> {
+        let Value::Text { ptr, len, .. } = self.text(0)? else {
+            unreachable!()
+        };
+        self.storage.reserve(ptr, cap, context, &mut self.code)?;
+        store(&mut self.code, 0, ptr);
+        Ok(TextDestination { ptr, len })
+    }
+    fn use_value(&mut self, value: &Value) -> Result<(), NativeError> {
+        match value {
+            Value::Text { ptr, .. } => self.storage.touch(*ptr)?,
+            Value::Record(_, fields) => {
+                for (_, value) in fields {
+                    self.use_value(value)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
     fn save_pair(&mut self, value: &Value) {
         if let Value::Text { ptr, len, .. } = value {
@@ -169,6 +197,7 @@ impl Emit<'_> {
         Ok(value)
     }
     fn copy_text(&mut self, value: Value, dest: TextDestination) -> Result<Value, NativeError> {
+        self.use_value(&value)?;
         let Value::Text { ptr, len, cap } = value else {
             return Err(error("expected text result"));
         };
@@ -192,19 +221,10 @@ impl Emit<'_> {
         if depth > 256 {
             return Err(error("native call expansion limit exceeded (256 levels)"));
         }
-        // Inferred capacities become known while emitting the body. Reserve
-        // the pair now and patch the buffer's displacement after that analysis;
-        // all frame allocation still happens before runtime evaluation begins.
-        let mut buffer_site = None;
-        let destination = if rule.output_ty == Type::Text && destination.is_none() {
-            let dest = TextDestination {
-                ptr: self.allocate(8)?,
-                len: self.allocate(8)?,
-            };
-            address(&mut self.code, 0, 0);
-            buffer_site = Some(self.code.len() - 4);
-            store(&mut self.code, 0, dest.ptr);
-            Some(dest)
+        // Capacities and last uses are known before final buffer placement.
+        let owns_destination = rule.output_ty == Type::Text && destination.is_none();
+        let destination = if owns_destination {
+            Some(self.destination(None, format!("rule '{}' / output", rule.name))?)
         } else {
             destination
         };
@@ -235,15 +255,11 @@ impl Emit<'_> {
         };
         if let Value::Text { cap, .. } = value {
             let cap = rule.output_text_max.map_or(cap, |n| n as usize);
-            if let Some(site) = buffer_site {
-                let buffer = self
-                    .allocate(cap)
-                    .map_err(|e| error(format!("rule '{}' / output: {}", rule.name, e.message)))?;
-                self.code[site..site + 4].copy_from_slice(&buffer.to_le_bytes());
+            let dest = destination.ok_or_else(|| error("missing text destination"))?;
+            if owns_destination {
+                self.storage.capacity(dest.ptr, cap)?;
             }
-            Ok(destination
-                .ok_or_else(|| error("missing text destination"))?
-                .value(cap))
+            Ok(dest.value(cap))
         } else {
             Ok(value)
         }
@@ -344,17 +360,13 @@ impl Emit<'_> {
                 let dest = if let Some(dest) = destination {
                     dest
                 } else {
-                    let dest = TextDestination {
-                        ptr: self.allocate(8)?,
-                        len: self.allocate(8)?,
-                    };
-                    let buffer = self.allocate(cap)?;
-                    address(&mut self.code, 0, buffer);
-                    store(&mut self.code, 0, dest.ptr);
-                    dest
+                    self.destination(Some(cap), "concat".into())?
                 };
                 load(&mut self.code, 3, dest.ptr); // rbx: write cursor
                 for arg in values {
+                    // Earlier operands remain live across all later operand
+                    // evaluations and the destination's first write.
+                    self.use_value(&arg)?;
                     match arg {
                         Value::Number(s) => {
                             load(&mut self.code, 0, s);
@@ -394,6 +406,8 @@ impl Emit<'_> {
             Expr::Binary(op, a, b) => {
                 let a = self.expr(a, env, depth + 1)?;
                 let b = self.expr(b, env, depth + 1)?;
+                self.use_value(&a)?;
+                self.use_value(&b)?;
                 if let (
                     Value::Text {
                         ptr: ap, len: al, ..
@@ -453,11 +467,13 @@ impl Emit<'_> {
             ),
             _ => return Err(error("expression outside the checked subset")),
         };
-        if let Some(dest) = destination {
-            self.copy_text(value, dest)
+        let value = if let Some(dest) = destination {
+            self.copy_text(value, dest)?
         } else {
-            Ok(value)
-        }
+            value
+        };
+        self.use_value(&value)?;
+        Ok(value)
     }
     fn conditional(
         &mut self,
@@ -497,6 +513,10 @@ impl Emit<'_> {
     }
     fn move_value(&mut self, from: &Value, to: &Value) -> Result<(), NativeError> {
         if let Value::Text { ptr, len, .. } = from {
+            let Value::Text { ptr: dest, .. } = to else {
+                return Err(error("text join requires text"));
+            };
+            self.storage.alias(*dest, *ptr)?;
             load(&mut self.code, 0, *ptr);
             load(&mut self.code, 2, *len);
             self.save_pair(to);
@@ -530,8 +550,13 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
         nodes: 0,
         literal_bytes: 0,
         constants: HashMap::new(),
+        storage: storage::Storage::default(),
     };
     let result = emit.rule(rule, 0, None)?;
+    // CLI/HTTP consumers run after the entire fragment. Retain every buffer
+    // reachable from the returned text or record through that boundary.
+    emit.use_value(&result)?;
+    emit.frame_bytes = emit.storage.layout(&mut emit.code, emit.frame_bytes)?;
     Ok(Fragment {
         code: emit.code,
         fields: emit.fields,

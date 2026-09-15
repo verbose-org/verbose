@@ -4,7 +4,8 @@
 result capacities across pure rules. [`http_bounded_text.verbose`](http_bounded_text.verbose)
 uses the same contract in an HTTP formatter.
 [`bounded_text_storage.verbose`](bounded_text_storage.verbose) demonstrates shared
-aliases, shadowing, nested conditional buffers and direct result destinations. See the
+aliases, shadowing, nested conditional buffers, direct result destinations and
+buffer reuse after the last use. See the
 [contract and support matrix](../docs/bounded-text-output.md).
 
 Examples show concrete language constructs, compiler entry points, and regression
