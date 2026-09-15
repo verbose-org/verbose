@@ -2,8 +2,11 @@
 
 Run cargo build, then python3 tools/check_bounded_text_storage.py. Requires ptrace
 permission. Uses only Python's standard library; artifacts remain in the printed
-work directory. This is an instruction trace, not a timing benchmark.
+work directory. Optional --reference-compiler compares reserved frame bytes and
+actual bytes copied with a compiler from before destination forwarding. This is
+an instruction trace, not a timing benchmark.
 """
+import argparse
 import collections
 import ctypes
 import json
@@ -15,6 +18,10 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--compiler', type=Path, default=ROOT / 'target/debug/verbosec')
+parser.add_argument('--reference-compiler', type=Path)
+options = parser.parse_args()
 WORK = Path(tempfile.mkdtemp(prefix='verbose-text-storage-trace-'))
 print(f'Traces: {WORK}', flush=True)
 MARKERS = dict(eager=420000000001, once=420000000002,
@@ -77,8 +84,38 @@ rule trace
       calls : [once, probe]
     termination:
       bound : 64
+rule relay
+  @intention: "Forward an inferred-capacity result"
+  @source: trace.intent:5
+  input:
+    other : Input
+  output:
+    out : text
+  logic:
+    out = trace(other)
+  proofs:
+    purity:
+      reads : [other]
+      calls : [trace]
+    termination:
+      bound : 8
+rule forward
+  @intention: "Forward through a wider public result contract"
+  @source: trace.intent:6
+  input:
+    input : Input
+  output:
+    out : text [..96]
+  logic:
+    out = relay(input)
+  proofs:
+    purity:
+      reads : [input]
+      calls : [relay]
+    termination:
+      bound : 8
 '''
-(WORK / 'trace.intent').write_text('Input.\nAliased call.\nShort circuit.\nEager lets and branches.\n')
+(WORK / 'trace.intent').write_text('Input.\nAliased call.\nShort circuit.\nEager lets and branches.\nInferred relay.\nWider result.\n')
 
 # Linux x86-64 user_regs_struct, as declared by sys/user.h.
 class Registers(ctypes.Structure):
@@ -131,7 +168,9 @@ def trace(binary, records, operator, case):
             os._exit(127)
     reaped = False
     counts, syscalls = collections.Counter(), collections.Counter()
+    evaluations = []
     frames, moves, steps = [], 0, 0
+    pending_copy, copied_bytes, copy_operations = None, 0, 0
     try:
         while True:
             _, status = os.waitpid(child, 0)
@@ -146,8 +185,17 @@ def trace(binary, records, operator, case):
             registers = Registers()
             ptrace(12, child, ctypes.byref(registers))  # GETREGS
             pc = registers.rip
+            continuing_copy = pending_copy is not None and pending_copy[0] == pc
+            if pending_copy is not None:
+                _, count, source, dest = pending_copy
+                copied = count - registers.rcx
+                assert 0 <= copied <= count, 'unexpected REP count change'
+                assert registers.rsi == source + copied and registers.rdi == dest + copied
+                copied_bytes += copied
+                pending_copy = None
             if pc in sites:
                 counts[sites[pc]] += 1
+                evaluations.append(sites[pc])
             if pc == allocation_pc:
                 frames.append(registers.rbp)
             if frames:
@@ -160,6 +208,12 @@ def trace(binary, records, operator, case):
                 assert frames, 'copy before region reservation'
                 assert not (registers.eflags & 0x400), 'copy direction flag set'
                 assert frames[-1] - frame_bytes <= registers.rdi <= registers.rdi + registers.rcx <= frames[-1], 'copy escapes invocation region'
+                if registers.rcx:
+                    assert (registers.rsi + registers.rcx <= registers.rdi or
+                            registers.rdi + registers.rcx <= registers.rsi), 'source overlaps writable destination'
+                if not continuing_copy:
+                    copy_operations += 1
+                pending_copy = (pc, registers.rcx, registers.rsi, registers.rdi)
                 moves += 1
             steps += 1
             assert steps < 100_000, 'instruction budget exceeded'
@@ -174,6 +228,13 @@ def trace(binary, records, operator, case):
                            probe=positive if operator == 'and' else len(records)-positive)
     if {n: counts[n] for n in MARKERS} != expected_counts:
         raise EvaluationCountMismatch((counts, expected_counts))
+    expected_order = []
+    for _, code in records:
+        expected_order.extend(['eager', 'once'])
+        if (code > 0) == (operator == 'and'):
+            expected_order.append('probe')
+        expected_order.append('yes' if code > 0 else 'no')
+    assert evaluations == expected_order, ('evaluation order', evaluations, expected_order)
     assert len(frames) == len(records) and len(set(frames)) == 1, 'invocation region was not reclaimed'
     assert moves > 0, 'copy-range check was not exercised'
     assert set(syscalls) == {1, 60}, f'unexpected syscall / allocation: {syscalls}'
@@ -183,21 +244,36 @@ def trace(binary, records, operator, case):
         expected += (piece * (2 if code > 0 else 1) + str(MARKERS['yes' if code > 0 else 'no']) + '\n').encode()
     assert out_path.read_bytes() == expected
     assert err_path.read_bytes() == b''
-    return dict(case=case, evaluation_counts=expected_counts, frame_bytes=frame_bytes,
-                region_reused=True, checked_copy_steps=moves, syscalls=dict(syscalls), steps=steps)
+    return dict(case=case, evaluation_counts=expected_counts, evaluation_order=evaluations, frame_bytes=frame_bytes,
+                region_reused=True, checked_copy_steps=moves, copied_bytes=copied_bytes,
+                copy_operations=copy_operations, syscalls=dict(syscalls), steps=steps)
 
 
 reports = []
+comparisons = []
 for operator in ['and', 'or']:
     source = WORK / f'{operator}.verbose'
     source.write_text(SOURCE.replace('and probe(req)', f'{operator} probe(req)'))
     binary = WORK / operator
-    subprocess.run([str(ROOT / 'target/debug/verbosec'), str(source), '--run', 'trace',
+    subprocess.run([str(options.compiler.resolve()), str(source), '--run', 'forward',
                     '--native', str(binary)], check=True, capture_output=True)
+    reference = WORK / f'{operator}-reference'
+    if options.reference_compiler:
+        subprocess.run([str(options.reference_compiler.resolve()), str(source), '--run', 'forward',
+                        '--native', str(reference)], check=True, capture_output=True)
     for case, records in [('yes', [('é', 1)]), ('no', [('', -1)]),
                           ('repeat', [('é', 1), ('hello', -1), ('x', 2)])]:
-        reports.append(trace(binary, records, operator, f'{operator}-{case}'))
+        report = trace(binary, records, operator, f'{operator}-{case}')
+        reports.append(report)
+        if options.reference_compiler:
+            before = trace(reference, records, operator, f'{operator}-{case}-reference')
+            for metric in ['frame_bytes', 'copied_bytes', 'copy_operations']:
+                assert report[metric] < before[metric], (metric, before, report)
+            comparisons.append(dict(case=report['case'], before=before, after=report))
 (WORK / 'report.json').write_text(json.dumps(reports, indent=2) + '\n')
+if comparisons:
+    (WORK / 'comparison.json').write_text(json.dumps(comparisons, indent=2) + '\n')
+    print(json.dumps(comparisons, indent=2))
 print(json.dumps(reports, indent=2))
 # Negative control: invert only the AND short-circuit jump. This deliberately
 # runs probe on the negative input and skips it on the positive input; since

@@ -58,3 +58,19 @@ rule choose_text
       calls : [reuse_text]
     termination:
       bound : 32
+
+rule forward_text
+  @intention: "Build the selected rule result directly in the final destination"
+  @source: bounded_text_storage.intent:5
+  input:
+    choice : StorageInput
+  output:
+    out : text [..63]
+  logic:
+    out = if choice.code >= 0 then reuse_text(choice) else piece(choice)
+  proofs:
+    purity:
+      reads : [choice, choice.code]
+      calls : [reuse_text, piece]
+    termination:
+      bound : 16
