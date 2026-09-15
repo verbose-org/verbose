@@ -111,7 +111,10 @@ Output-position calls and branches forward a fresh result destination to the
 producer; other live values retain distinct storage. Text buffers can share
 space after their proved last use, including through aliases and branch joins.
 Placement happens at compilation; scalar/pointer/length slots are not reused.
-Ownership across state, resources or threads remains a separate contract.
+A sequential HTTP service can also [copy a bounded rule result into its own text
+state](docs/bounded-text-state.md). The compiler checks the destination capacity
+and releases temporary storage after copying. General ownership across resources
+or threads remains a separate contract.
 
 Worker reuse must preserve request-local lifetimes and demonstrate stable storage
 across requests and failure paths. Shared mutable memory between threads needs an

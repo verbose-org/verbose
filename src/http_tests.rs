@@ -3,6 +3,7 @@ mod admission_tests;
 mod pool_tests;
 mod shutdown_tests;
 mod text_bounds_tests;
+mod bounded_state_tests;
 use crate::{
     ast::*,
     http_framing::{reference, Frame},

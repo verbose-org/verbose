@@ -4,6 +4,8 @@
 # Edit to match your needs. Run 'cidx preset list' for all available tools.
 # Run 'cidx validate' to check, 'cidx run ci' to execute.
 
+required_version = "3.4.2"
+
 [security]
 containers = ["trivy", "gitleaks", "cargo-audit"]
 
@@ -29,32 +31,13 @@ phases = ["security", "test", "build"]
 [pipelines.pr]
 phases = ["security", "test"]
 
-# The default cidx Rust presets pin dhi.io/rust:1.83-alpine3.21, which
-# isn't on a public registry. Override to the official Docker Hub image
-# so anyone running this CI locally / in GitHub Actions can pull it.
-[containers.cargo-audit]
-image = "rust:alpine"
-
-[containers.clippy]
-image = "rust:alpine"
-# rust:alpine pre-installs the toolchain at /usr/local/rustup. The preset
-# default RUSTUP_HOME=/tmp/rustup makes rustup look in an empty dir and fail
-# with "could not choose a version of rustup". Point at the image's default.
-env = { RUSTUP_HOME = "/usr/local/rustup", CARGO_HOME = "/usr/local/cargo" }
-
-[containers.rustfmt]
-image = "rust:alpine"
-env = { RUSTUP_HOME = "/usr/local/rustup", CARGO_HOME = "/usr/local/cargo" }
-
+# Use the upstream public, digest-pinned Rust presets. cargo-audit uses
+# buildpack-deps:trixie-curl; forcing rust:alpine removes its curl dependency.
 [containers.cargo-test]
-image = "rust:alpine"
 # RUST_TEST_THREADS=1: many native tests compile a binary to a shared temp path
 # then exec it; in parallel they race (Text-file-busy, or a stack-overflow
-# abort that takes the whole process down). Serial is deterministic (390/390).
+# abort that takes the whole process down). Keep the test harness serial.
 # Stack sizing: RUST_MIN_STACK=64 MiB comes from .cargo/config.toml [env]
 # (cargo forwards it), covering every test thread; some older tests also set
 # their own Builder::stack_size(64 MiB).
 env = { RUST_TEST_THREADS = "1" }
-
-[containers.cargo-build]
-image = "rust:alpine"
