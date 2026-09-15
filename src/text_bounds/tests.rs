@@ -623,6 +623,113 @@ fn text_storage_example_matches_interpreter() {
     assert!(errors.is_empty(), "{errors:?}");
     differential(&p, "reuse_text");
     differential(&p, "choose_text");
+    differential(&p, "forward_text");
+}
+
+#[test]
+fn text_destinations_forward_calls_branches_and_borrowed_values() {
+    let mut p = fixture();
+    // Different input names, inferred relay capacity, and a wider caller
+    // contract. An unused eager call must not acquire the output destination.
+    let mut relay = rule(&mut p, "label").clone();
+    relay.name = "relay".into();
+    relay.input_name = "other".into();
+    relay.output_text_max = None;
+    relay.logic.bindings = vec![(
+        "unused".into(),
+        Expr::Call("label".into(), vec![Expr::Ident("other".into())]),
+    )];
+    relay.logic.value = expression(
+        "if other.code > 0 then label(other) else if other.code == 0 then other.title else \"\"",
+    );
+    p.items.push(Item::Rule(relay));
+    let r = rule(&mut p, "decorated_label");
+    r.logic.bindings.clear();
+    r.output_text_max = Some(64);
+    r.logic.value = Expr::Call("relay".into(), vec![Expr::Ident("request".into())]);
+    differential(&p, "decorated_label");
+    // Both zero-capacity and counted literal results pass through the same
+    // destination. The negative branch has a different byte length.
+    for value in [Expr::Text(String::new()), Expr::Text("a\0é".into())] {
+        let r = rule(&mut p, "label");
+        r.output_text_max = Some(if matches!(&value, Expr::Text(s) if s.is_empty()) {
+            0
+        } else {
+            4
+        });
+        r.logic.value = value;
+        differential(&p, "decorated_label");
+    }
+}
+
+#[test]
+fn text_destinations_keep_live_aliases_and_concat_arguments_distinct() {
+    let mut p = fixture();
+    let r = rule(&mut p, "decorated_label");
+    r.output_text_max = Some(128);
+    r.logic.bindings.extend([
+        ("second".into(), expression("label(request)")),
+        (
+            "message".into(),
+            expression("concat(\"new:\", request.title)"),
+        ),
+    ]);
+    r.logic.value = expression("if request.code > 0 then concat(alias, second, message, alias) else concat(label(request), alias, label(request))");
+    differential(&p, "decorated_label");
+    // A field lookup may evaluate a record-producing rule with several text
+    // results; its live fields must not share the final scalar destination.
+    let mut record = rule(&mut p, "label").clone();
+    record.name = "record".into();
+    record.output_ty = Type::Named("LabelInput".into());
+    record.output_text_max = None;
+    record.logic.value = expression("LabelInput { title: label(item), code: length(label(item)) }");
+    p.items.push(Item::Rule(record));
+    let r = rule(&mut p, "decorated_label");
+    r.logic
+        .bindings
+        .push(("held".into(), expression("record(request)")));
+    r.logic.value = expression("held.title");
+    differential(&p, "decorated_label");
+}
+
+#[test]
+fn text_destinations_allow_a_large_result_without_duplicate_buffers() {
+    let mut p = fixture();
+    let r = rule(&mut p, "label");
+    r.output_text_max = Some(1_048_576);
+    r.logic.value = Expr::Concat(vec![
+        Expr::Text("x".repeat(1_048_568)),
+        expression("item.title"),
+    ]);
+    let mut relay = r.clone();
+    relay.name = "relay".into();
+    relay.input_name = "other".into();
+    relay.output_text_max = None;
+    relay.logic.value = expression("label(other)");
+    p.items.push(Item::Rule(relay));
+    let r = rule(&mut p, "decorated_label");
+    r.output_text_max = Some(1_048_576);
+    r.logic.bindings.clear();
+    r.logic.value = expression(
+        "if request.code > 0 then relay(request) else concat(\"short:\", request.title)",
+    );
+    // Previously, even label's own concat + result used 2 MiB before slots.
+    differential(&p, "decorated_label");
+    // Two independently evaluated large results still cannot share storage,
+    // even if the final result is tiny. Reject before touching an artifact.
+    let r = rule(&mut p, "decorated_label");
+    r.logic.bindings = vec![
+        ("first".into(), expression("label(request)")),
+        ("second".into(), expression("label(request)")),
+    ];
+    r.logic.value = Expr::Text("ok".into());
+    r.output_text_max = Some(2);
+    let bin = format!("/tmp/verbose-text-destination-limit-{}", std::process::id());
+    fs::write(&bin, b"existing artifact").unwrap();
+    let err = crate::native::compile_native(&p, "decorated_label", &bin, false, false).unwrap_err();
+    assert!(err.message.contains("invocation frame"), "{err}");
+    assert_eq!(fs::read(&bin).unwrap(), b"existing artifact");
+    fs::remove_file(bin).unwrap();
 }
 
 #[test]

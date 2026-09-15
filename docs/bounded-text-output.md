@@ -39,9 +39,11 @@ expression levels or 128 nested calls. Capacity addition uses checked arithmetic
 
 The annotation bounds the returned value. Native compilation now also assigns
 invocation-owned storage to the checked subset: lets evaluate once, aliases
-share values, and text returns have caller-owned destinations. The separate
+share values, and text returns have caller-owned destinations, forwarded through
+output-position calls and branches to avoid intermediate result copies. The separate
 2 MiB native storage ceiling counts slots, buffers and fixed scratch, including
-both branches and unused lets. See [native text storage](bounded-text-storage.md)
+temporaries from both branches and unused lets; output branches share their
+result destination. See [native text storage](bounded-text-storage.md)
 for ownership, reclamation, limits and exclusions. This is not a process memory
 quota or a general ownership type system.
 

@@ -1,9 +1,9 @@
 //! Invocation-owned storage for the checked, acyclic text subset.
 //!
 //! All offsets are assigned before execution. A let binds a value descriptor,
-//! never a substituted expression. Calls expand once per call site and copy
-//! their text result into a destination owned by the enclosing invocation.
-//! Branches execute selectively; their storage is conservatively summed.
+//! never a substituted expression. Calls expand once per call site. Text result
+//! destinations pass through tail calls and conditionals to the final producer.
+//! Other temporaries remain distinct and live for the entire invocation.
 use super::*;
 
 const FRAME_LIMIT: usize = 2 * 1024 * 1024;
@@ -17,6 +17,24 @@ enum Value {
     Text { ptr: i32, len: i32, cap: usize },
     Input,
     Record(String, Vec<(String, Value)>),
+}
+// A fresh result destination is never put in a lexical environment while it is
+// being filled. Only output-position calls/branches may receive it; lets and
+// concat operands keep their own immutable storage. Its pointer slot is set
+// before evaluating the rule and never overwritten by a producer.
+#[derive(Clone, Copy)]
+struct TextDestination {
+    ptr: i32,
+    len: i32,
+}
+impl TextDestination {
+    fn value(self, cap: usize) -> Value {
+        Value::Text {
+            ptr: self.ptr,
+            len: self.len,
+            cap,
+        }
+    }
 }
 impl Value {
     fn scalar(&self) -> Result<i32, NativeError> {
@@ -150,25 +168,46 @@ impl Emit<'_> {
         self.fields.push((name.into(), value.clone()));
         Ok(value)
     }
-    fn copy_text(&mut self, value: Value, cap: usize) -> Result<Value, NativeError> {
-        let Value::Text { ptr, len, .. } = value else {
+    fn copy_text(&mut self, value: Value, dest: TextDestination) -> Result<Value, NativeError> {
+        let Value::Text { ptr, len, cap } = value else {
             return Err(error("expected text result"));
         };
-        let dest = self.text(cap)?;
-        let buffer = self.allocate(cap)?;
-        address(&mut self.code, 7, buffer);
+        if ptr == dest.ptr && len == dest.len {
+            return Ok(value);
+        }
+        load(&mut self.code, 7, dest.ptr);
         load(&mut self.code, 6, ptr);
         load(&mut self.code, 1, len);
         self.code.extend_from_slice(&[0xfc, 0xf3, 0xa4]); // cld; rep movsb
-        address(&mut self.code, 0, buffer);
         load(&mut self.code, 2, len);
-        self.save_pair(&dest);
-        Ok(dest)
+        store(&mut self.code, 2, dest.len);
+        Ok(dest.value(cap))
     }
-    fn rule(&mut self, rule: &Rule, depth: usize) -> Result<Value, NativeError> {
+    fn rule(
+        &mut self,
+        rule: &Rule,
+        depth: usize,
+        destination: Option<TextDestination>,
+    ) -> Result<Value, NativeError> {
         if depth > 256 {
             return Err(error("native call expansion limit exceeded (256 levels)"));
         }
+        // Inferred capacities become known while emitting the body. Reserve
+        // the pair now and patch the buffer's displacement after that analysis;
+        // all frame allocation still happens before runtime evaluation begins.
+        let mut buffer_site = None;
+        let destination = if rule.output_ty == Type::Text && destination.is_none() {
+            let dest = TextDestination {
+                ptr: self.allocate(8)?,
+                len: self.allocate(8)?,
+            };
+            address(&mut self.code, 0, 0);
+            buffer_site = Some(self.code.len() - 4);
+            store(&mut self.code, 0, dest.ptr);
+            Some(dest)
+        } else {
+            destination
+        };
         let mut env = HashMap::from([(rule.input_name.clone(), Value::Input)]);
         for (name, rhs) in &rule.logic.bindings {
             let v = self.expr(rhs, &env, depth + 1).map_err(|e| {
@@ -180,7 +219,7 @@ impl Emit<'_> {
             env.insert(name.clone(), v);
         }
         let value = self
-            .expr(&rule.logic.value, &env, depth + 1)
+            .expr_into(&rule.logic.value, &env, depth + 1, destination)
             .map_err(|e| error(format!("rule '{}' / output: {}", rule.name, e.message)))?;
         let value = if matches!(value, Value::Input) {
             let fields: Vec<_> = self.concept.fields.iter().map(|f| f.name.clone()).collect();
@@ -195,9 +234,16 @@ impl Emit<'_> {
             value
         };
         if let Value::Text { cap, .. } = value {
-            // This destination belongs to the caller's invocation frame. No
-            // pointer into a shorter-lived callee frame can escape.
-            self.copy_text(value, rule.output_text_max.map_or(cap, |n| n as usize))
+            let cap = rule.output_text_max.map_or(cap, |n| n as usize);
+            if let Some(site) = buffer_site {
+                let buffer = self
+                    .allocate(cap)
+                    .map_err(|e| error(format!("rule '{}' / output: {}", rule.name, e.message)))?;
+                self.code[site..site + 4].copy_from_slice(&buffer.to_le_bytes());
+            }
+            Ok(destination
+                .ok_or_else(|| error("missing text destination"))?
+                .value(cap))
         } else {
             Ok(value)
         }
@@ -208,13 +254,22 @@ impl Emit<'_> {
         env: &HashMap<String, Value>,
         depth: usize,
     ) -> Result<Value, NativeError> {
+        self.expr_into(e, env, depth, None)
+    }
+    fn expr_into(
+        &mut self,
+        e: &Expr,
+        env: &HashMap<String, Value>,
+        depth: usize,
+        destination: Option<TextDestination>,
+    ) -> Result<Value, NativeError> {
         self.nodes += 1;
         if self.nodes > 100_000 || depth > 256 {
             return Err(error(
                 "native call expansion limit exceeded (100000 nodes / 256 levels)",
             ));
         }
-        Ok(match e {
+        let value = match e {
             Expr::Ident(n) => env
                 .get(n)
                 .cloned()
@@ -273,7 +328,7 @@ impl Emit<'_> {
                     .rules
                     .get(name.as_str())
                     .ok_or_else(|| error("unknown callee"))?;
-                self.rule(rule, depth + 1)?
+                self.rule(rule, depth + 1, destination)?
             }
             Expr::Concat(args) => {
                 // Evaluate every argument exactly once, in source order, before
@@ -286,9 +341,19 @@ impl Emit<'_> {
                     n.checked_add(v.capacity()?)
                         .ok_or_else(|| error("capacity overflow"))
                 })?;
-                let value = self.text(cap)?;
-                let buffer = self.allocate(cap)?;
-                address(&mut self.code, 3, buffer); // rbx: write cursor
+                let dest = if let Some(dest) = destination {
+                    dest
+                } else {
+                    let dest = TextDestination {
+                        ptr: self.allocate(8)?,
+                        len: self.allocate(8)?,
+                    };
+                    let buffer = self.allocate(cap)?;
+                    address(&mut self.code, 0, buffer);
+                    store(&mut self.code, 0, dest.ptr);
+                    dest
+                };
+                load(&mut self.code, 3, dest.ptr); // rbx: write cursor
                 for arg in values {
                     match arg {
                         Value::Number(s) => {
@@ -305,13 +370,13 @@ impl Emit<'_> {
                         _ => return Err(error("unsupported concat argument")),
                     }
                 }
-                address(&mut self.code, 0, buffer);
+                load(&mut self.code, 0, dest.ptr);
                 self.code
                     .extend_from_slice(&[0x48, 0x89, 0xda, 0x48, 0x29, 0xc2]); // len = rbx - rax
-                self.save_pair(&value);
-                value
+                store(&mut self.code, 2, dest.len);
+                dest.value(cap)
             }
-            Expr::If(c, a, b) => self.conditional(c, a, b, env, depth)?,
+            Expr::If(c, a, b) => self.conditional(c, a, b, env, depth, destination)?,
             Expr::Binary(op @ (BinOp::And | BinOp::Or), a, b) => {
                 let a = self.expr(a, env, depth + 1)?;
                 load(&mut self.code, 0, a.scalar()?);
@@ -387,7 +452,12 @@ impl Emit<'_> {
                     .collect::<Result<_, NativeError>>()?,
             ),
             _ => return Err(error("expression outside the checked subset")),
-        })
+        };
+        if let Some(dest) = destination {
+            self.copy_text(value, dest)
+        } else {
+            Ok(value)
+        }
     }
     fn conditional(
         &mut self,
@@ -396,23 +466,29 @@ impl Emit<'_> {
         b: &Expr,
         env: &HashMap<String, Value>,
         depth: usize,
+        destination: Option<TextDestination>,
     ) -> Result<Value, NativeError> {
         let c = self.expr(c, env, depth + 1)?;
         load(&mut self.code, 0, c.scalar()?);
         self.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
         let otherwise = jump(&mut self.code, &[0x0f, 0x84]);
-        let a = self.expr(a, env, depth + 1)?;
-        let mut dest = match a {
-            Value::Text { cap, .. } => self.text(cap)?,
-            Value::Bool(_) => Value::Bool(self.allocate(8)?),
-            Value::Number(_) => Value::Number(self.allocate(8)?),
+        let a = self.expr_into(a, env, depth + 1, destination)?;
+        let mut dest = match (&a, destination) {
+            (Value::Text { cap, .. }, Some(dest)) => dest.value(*cap),
+            (Value::Text { cap, .. }, None) => self.text(*cap)?,
+            (Value::Bool(_), None) => Value::Bool(self.allocate(8)?),
+            (Value::Number(_), None) => Value::Number(self.allocate(8)?),
             _ => return Err(error("conditional record storage is unsupported")),
         };
-        self.move_value(&a, &dest)?;
+        if destination.is_none() {
+            self.move_value(&a, &dest)?;
+        }
         let done = jump(&mut self.code, &[0xe9]);
         self.finish_jump(otherwise);
-        let b = self.expr(b, env, depth + 1)?;
-        self.move_value(&b, &dest)?;
+        let b = self.expr_into(b, env, depth + 1, destination)?;
+        if destination.is_none() {
+            self.move_value(&b, &dest)?;
+        }
         if let (Value::Text { cap, .. }, Value::Text { cap: other, .. }) = (&mut dest, b) {
             *cap = (*cap).max(other);
         }
@@ -455,7 +531,7 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
         literal_bytes: 0,
         constants: HashMap::new(),
     };
-    let result = emit.rule(rule, 0)?;
+    let result = emit.rule(rule, 0, None)?;
     Ok(Fragment {
         code: emit.code,
         fields: emit.fields,

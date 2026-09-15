@@ -107,6 +107,9 @@ of its byte capacity, including pure acyclic composition. See
 explicit independently of services. Its checked native subset now reserves
 [invocation-owned text storage](docs/bounded-text-storage.md), with evaluated
 lets, shared aliases and a separate ceiling on slots and temporary buffers.
+Output-position calls and branches forward a fresh result destination to the
+producer; other live values retain distinct storage. This removes intermediate
+result copies without a new calling ABI or general slot reuse after last use.
 Ownership across state, resources or threads remains a separate contract.
 
 Worker reuse must preserve request-local lifetimes and demonstrate stable storage

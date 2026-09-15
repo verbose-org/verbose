@@ -5,11 +5,11 @@ Implemented 2026-09-13. This implements the native storage of the
 changes no unannotated call component.
 
 A participating native entry owns one fixed stack region for its evaluation.
-Each concat receives a statically sized buffer. A text-returning rule writes its
-result into a destination reserved in that region, sized from its declared
-capacity (or its inferred capacity for an unannotated dependency). Calls are
-still expanded at compilation; this is an invocation storage convention, not a
-new general callable ABI.
+An independently materialized text result receives a destination sized from its
+declared capacity (or its inferred capacity for an unannotated dependency).
+Calls and concats in output position write directly into that destination.
+Calls are still expanded at compilation; this is an invocation storage
+convention, not a new general callable ABI.
 
 ```verbose
 let message = piece(request)
@@ -32,10 +32,29 @@ conditionals can be materialized without the former emitter nesting restriction.
 | Exhaustion | Excessive or unknown requirements cause a compile diagnostic before the output artifact is opened. There is no truncation, runtime heap fallback or recoverable memory error in this contract. |
 
 The 2 MiB ceiling is a backend limit, not a new source annotation. It sums all
-reserved temporaries, including unused lets and both sides of a conditional;
-there is no slot reuse based on last use yet. A small output can therefore exceed
-the storage limit. Text results currently copy into their caller's destination;
-forwarding that destination into a callee's concat is a later optimization.
+reserved temporaries, including unused lets and temporaries on both sides of a
+conditional. Since 2026-09-15, output-position calls and conditional branches
+forward the same result destination to their final producer. A concat in that
+position fills the destination directly, without an intermediate concat buffer
+or return copy. This applies through annotated and inferred-capacity callees,
+with different input names; each rule still exposes its checked public capacity.
+The selected output branch alone writes the shared destination.
+
+This does not reuse slots based on last use. Lets and concat operands evaluate
+in source order into independent values. A returned alias, input field or literal
+still copies into the result destination; nested concat arguments still have
+their own storage. The destination is fresh and is never exposed through a let
+while it is being filled, so no live alias can observe partial writes or be
+overwritten by a later call. A small output with large temporaries can still
+exceed the storage limit.
+
+In the [example](../examples/bounded_text_storage.verbose), `forward_text` passes
+its destination through the selected `reuse_text` or `piece` call. `reuse_text`
+keeps `saved` in its own buffer and reads it twice while filling the destination.
+Two independent calls still reserve distinct results. A single 1 MiB concat
+returned through a call chain now fits the 2 MiB region ceiling; two independent
+1 MiB results plus their slots still exceed it and are refused before artifact
+emission.
 
 This region excludes the existing input/transport frames, argv data, literal
 bytes embedded in the binary and the surrounding process. Numeric formatting
@@ -72,10 +91,14 @@ Run the [storage example](../examples/bounded_text_storage.verbose):
 cargo run -- examples/bounded_text_storage.verbose --run choose_text --input examples/bounded_text_storage.json
 cargo run -- examples/bounded_text_storage.verbose --run choose_text --native /tmp/text-storage
 /tmp/text-storage café 42 café -42
+
+cargo run -- examples/bounded_text_storage.verbose --run forward_text --native /tmp/text-forward
+/tmp/text-forward café 42 café -42
 ```
 
-The output is `<[café]42 | [café]42>` followed by
-`{[café]-42 | [café]-42}`. Differential tests cover nested branches, numeric
+`choose_text` outputs `<[café]42 | [café]42>` followed by
+`{[café]-42 | [café]-42}`. `forward_text` outputs `[café]42 | [café]42`
+followed by `[café]-42`. Differential tests cover nested branches, numeric
 extremes, empty/NUL/multibyte text, lexical records and aliases. Reuse tests process
 600 argv records and 600 stream lines with a 256 KiB stack, and inspect idle worker
 stack pointers and descriptor counts after repeated binary HTTP responses and
@@ -90,7 +113,28 @@ python3 tools/check_bounded_text_storage.py
 ```
 
 This Linux x86-64 check needs ptrace permission. It counts actual evaluations of
-unused lets, aliased calls and conditional operands; checks copy destinations
-against the reserved region; and checks that the traced argv binaries use only
-`write` and `exit` syscalls. Its negative control changes short-circuit execution
+unused lets, aliased calls and conditional operands, including their order;
+checks copy destinations against the reserved region and non-overlapping
+sources; and checks that the traced argv binaries use only `write` and `exit`
+syscalls. Its negative control changes short-circuit execution
 while preserving stdout, and must be caught by the evaluation counts.
+
+To compare destination forwarding with a compiler from before this optimization:
+
+```sh
+python3 tools/check_bounded_text_storage.py --reference-compiler /path/to/reference-verbosec
+```
+
+The comparison uses the same source and records in both compilers. It measures
+the reserved frame, executed copy operations and actual copied bytes (including
+REP instructions stepped across multiple traps), and requires a reduction in
+each metric for all six cases. It also checks output, exit status, evaluation
+counts and frame reclamation on both binaries. These are instruction/storage
+measurements, not throughput or latency claims.
+
+Measured on 2026-09-15 against `f1656fc` (before destination forwarding), all
+six cases reserve 280 frame bytes instead of 696, excluding the unchanged
+48-byte saved-register/scratch allowance. For the three-record cases, actual
+copied bytes fall from 516 to 151 and executed copy operations from 26 to 14.
+Both compilers pass the value, evaluation and reclamation checks; the negative
+control is caught. These figures describe this fixture only.
