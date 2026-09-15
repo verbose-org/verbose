@@ -627,6 +627,46 @@ impl Fragment {
     fn end(code: &mut Vec<u8>) {
         code.extend_from_slice(&[0x48, 0x89, 0xec, 0x5b, 0x5d]);
     }
+    // Copy while invocation storage is live. State keeps its own pointer;
+    // restoring the temporary frame must happen on both success and backstop.
+    pub(super) fn persist(
+        &self,
+        code: &mut Vec<u8>,
+        offsets: &HashMap<&str, i32>,
+        text: &TextBindings<'_>,
+        buffer: i32,
+        length: i32,
+        capacity: i32,
+        abort_patches: &mut Vec<usize>,
+    ) -> Result<(), NativeError> {
+        let Value::Text { ptr, len, cap } = self.result else {
+            return Err(error("state transfer requires a text result"));
+        };
+        if capacity < 0 || cap > capacity as usize {
+            return Err(error("text result exceeds persistent destination capacity"));
+        }
+        self.begin(code, offsets, text)?;
+        load(code, 2, len);
+        code.extend_from_slice(&[0x48, 0x81, 0xfa]);
+        code.extend_from_slice(&capacity.to_le_bytes());
+        let excessive = jump(code, &[0x0f, 0x87]);
+        // r10 is the enclosing service frame, saved by begin().
+        code.extend_from_slice(&[0x4c, 0x8b, 0x55, 0x08]);
+        load(code, 6, ptr);
+        code.extend_from_slice(&[0x49, 0x8d, 0xba]); // lea rdi, [r10 + buffer]
+        code.extend_from_slice(&buffer.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0xd1, 0xfc, 0xf3, 0xa4]);
+        outer_store(code, 2, length);
+        Self::end(code);
+        let done = jump(code, &[0xe9]);
+        let fail = code.len();
+        patch(code, excessive, fail);
+        Self::end(code);
+        abort_patches.push(jump(code, &[0xe9]));
+        let end = code.len();
+        patch(code, done, end);
+        Ok(())
+    }
     pub(super) fn http(
         &self,
         code: &mut Vec<u8>,

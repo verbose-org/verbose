@@ -360,6 +360,69 @@ pub fn verify(p: &Program) -> Vec<VerifyError> {
     verify_mode(p, false)
 }
 
+/// The only new escape from invocation storage: a complete, explicitly bounded
+/// text call copied into a sequential HTTP service's existing owned state.
+/// Used by the service capacity gate and native preparation too. Callee bodies
+/// remain subject to the ordinary bounded-text analysis above.
+pub(crate) fn state_call<'a>(
+    service: &Service,
+    handler: &Rule,
+    set: &StateSet,
+    rules: &HashMap<&str, &'a Rule>,
+) -> Result<Option<&'a Rule>, String> {
+    let Expr::Call(name, args) = &set.value else {
+        return Ok(None);
+    };
+    let Some(callee) = rules.get(name.as_str()).copied() else {
+        return Ok(None);
+    };
+    let Some(cap) = callee.output_text_max else {
+        return Ok(None);
+    };
+    if service.protocol != Protocol::Http10 || service.concurrency != ConcurrencyMode::Sequential {
+        return Err("bounded text state transfer requires a sequential HTTP service".into());
+    }
+    if args.len() != 1
+        || !matches!(&args[0], Expr::Ident(n) if *n == handler.input_name)
+        || handler.input_ty != Type::Named("HttpRequest".into())
+        || callee.input_ty != handler.input_ty
+    {
+        return Err("bounded text state transfer requires callee(input) with the original HTTP input binding".into());
+    }
+    let field = service
+        .state_fields
+        .iter()
+        .find(|f| f.name == set.field_name)
+        .ok_or("bounded text state transfer requires a declared state field")?;
+    if field.ty != Type::Text || callee.output_ty != Type::Text {
+        return Err(
+            "bounded text state transfer requires a text result and a text state field".into(),
+        );
+    }
+    let max = field
+        .max_bytes
+        .filter(|n| (1..=65536).contains(n))
+        .ok_or("bounded text state transfer requires a state capacity in 1..=65536")?;
+    if i64::from(cap) > max {
+        return Err(format!(
+            "bounded text result [..{cap}] exceeds state field '{}' capacity [..{max}]",
+            field.name
+        ));
+    }
+    Ok(Some(callee))
+}
+
+pub(crate) fn service_uses_contract(s: &Service, active: &BTreeSet<String>) -> bool {
+    if active.contains(&s.handler) {
+        return true;
+    }
+    let mut names = BTreeSet::new();
+    for set in &s.after_sets {
+        calls(&set.value, &mut names);
+    }
+    !active.is_disjoint(&names)
+}
+
 pub(crate) fn verify_mode(p: &Program, native: bool) -> Vec<VerifyError> {
     let active = active_rules(p);
     if active.is_empty() {
@@ -432,13 +495,34 @@ pub(crate) fn verify_mode(p: &Program, native: bool) -> Vec<VerifyError> {
                     inspect_effect(&log.effect);
                 }
                 for set in &s.after_sets {
-                    calls(&set.value, &mut effect_calls);
+                    let mut names = BTreeSet::new();
+                    calls(&set.value, &mut names);
+                    if !active.is_disjoint(&names) {
+                        let result = check.rules.get(s.handler.as_str())
+                            .ok_or_else(|| "missing service handler".to_string())
+                            .and_then(|handler| state_call(s, handler, set, &check.rules))
+                            .and_then(|callee| callee.ok_or_else(|| "bounded text after mutation requires a complete call to a rule with an explicit text [..N] result".into()));
+                        if let Err(message) = result {
+                            errors.push(VerifyError {
+                                context: format!(
+                                    "service '{}' / after / set {}",
+                                    s.name, set.field_name
+                                ),
+                                message,
+                            });
+                        }
+                    }
                 }
             }
             _ => {}
         }
         if !active.is_disjoint(&effect_calls) {
-            errors.push(VerifyError { context: "bounded text output / effect".into(), message: "participating rules cannot be called from reactions, logs or after mutations in this slice".into() });
+            errors.push(VerifyError {
+                context: "bounded text output / effect".into(),
+                message:
+                    "participating rules cannot be called from reactions or logs in this slice"
+                        .into(),
+            });
         }
         if let Item::Service(s) = item {
             if active.contains(&s.handler)

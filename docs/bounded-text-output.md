@@ -60,7 +60,7 @@ input text bounds above 1 MiB.
 | Rust verifier | Static capacities, lexical binding types and call graph checks |
 | Interpreter | Value semantics, annotated input checks and result backstop |
 | Native Linux x86-64 | Checked subset with fixed invocation storage |
-| HTTP service | Pure handler without state, logs or after mutations; request bounds derive from service declarations |
+| HTTP service | Pure handler without state, logs or after mutations; also a complete annotated text call in a sequential service's `after` block, copied into bounded text state |
 | WASM | Explicit refusal of participating rules and services before artifact emission |
 | Self-hosted compiler | Output-section token refusal in both ELF and raw machine-code entry points |
 
@@ -68,6 +68,10 @@ The result capacity excludes the CLI's trailing newline and HTTP headers. HTTP
 input `body` uses the maximum `max_request` across the program's HTTP services;
 `path` uses the enforced 256-byte limit. This may be conservative for a smaller
 service, but never assumes a bound only one of its callers enforces.
+
+The [persistent copy contract](bounded-text-state.md) checks the callee's public
+result capacity against the destination state field. It defines the owner and
+lifetime at that boundary without making participating rules stateful.
 
 See [the standalone composition](../examples/bounded_text.verbose) and
 [HTTP formatter](../examples/http_bounded_text.verbose). The standalone example

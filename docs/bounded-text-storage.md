@@ -99,14 +99,17 @@ back to the transport; its region stays live through response writes. Request
 bodies use the parser's counted pointer/length pair, so embedded NUL bytes do not
 shorten a copy or comparison. The CLI retains its existing input-channel rules,
 including NUL-terminated text inputs. Scalar and flat-record wrappers can consume
-a bounded text call; persistent state, effects, recursive rules and cross-concept
-call inputs remain outside this subset.
+a bounded text call. Sequential HTTP services can also
+[copy a complete bounded call into text state](bounded-text-state.md), releasing
+its invocation region after the copy. Effects inside participating rules,
+recursive rules and cross-concept call inputs remain outside this subset.
 
 | Path | Support |
 |---|---|
 | Interpreter | Existing eager lexical value semantics and capacity checks; its Rust allocations are not covered by the native storage ceiling |
 | Native argv / stdin / raw stdin / stream | Fixed invocation storage; output policy and input guards retained |
 | Native HTTP, sequential / forked / pooled | Same storage emitter, pure handler without state, logs or after mutations |
+| Native sequential HTTP `after` | Complete explicitly bounded text call copied into existing owned state before releasing its temporary region |
 | WASM / self-hosted compiler | Explicit refusal of the output contract before artifact emission |
 
 Run the [storage example](../examples/bounded_text_storage.verbose):
