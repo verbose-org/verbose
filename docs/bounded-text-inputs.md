@@ -4,6 +4,8 @@ Implemented 2026-09-15. Rules participating in the
 [bounded text contract](bounded-text-output.md) can now receive an explicitly
 constructed flat concept, a record returned by another rule, or a lexical alias
 of either. They can still receive the original input, including through an alias.
+[Conditional records](bounded-text-branches.md) can also select the input while
+retaining the field bounds of both alternatives.
 
 ```verbose
 let packed = FormatInput {
@@ -88,8 +90,8 @@ formatter independent of HTTP. The parser supplies counted bytes, so native
 copies preserve NUL and non-UTF-8 bodies. [Persistent state](bounded-text-state.md)
 still receives its own copy after the outer formatter returns.
 
-Context inputs, effects, recursion, collections, Results, nested or conditional
-records, and state access inside participating rules remain outside this slice.
+Context inputs, effects, recursion, collections, Results, nested record fields,
+and state access inside participating rules remain outside this slice.
 Existing syntax is reused; unannotated call components retain their behavior.
 
 ## Example and verification

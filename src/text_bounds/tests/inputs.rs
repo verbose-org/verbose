@@ -164,7 +164,7 @@ fn text_inputs_refuse_unproved_or_unsupported_transfers_before_emission() {
         ("render_text(FormatInput { title: \"x\", title: \"y\" })", "duplicate record field"),
         ("render_text(FormatInput { title: 0, code: 0 })", "expected Text"),
         ("render_text(FormatInput { title: request.title, code: now_unix() })", "effect"),
-        ("render_text(if request.code > 0 then FormatInput { title: \"x\", code: 0 } else FormatInput { title: \"y\", code: 0 })", "conditional record"),
+        ("render_text(if request.code > 0 then FormatInput { title: \"x\", code: 0 } else FormatInput { title: \"too long for the field\", code: 0 })", "input field 'title'"),
         ("if request.code > 0 then render_text(FormatInput { title: \"too long for the field\", code: 0 }) else \"ok\"", "input field 'title'"),
     ] {
         let mut p = input_fixture();
