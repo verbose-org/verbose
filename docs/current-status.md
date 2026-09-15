@@ -66,6 +66,9 @@ Pure rules can also pass explicitly constructed or returned flat records between
 different input concepts. [Input transfer checks](bounded-text-inputs.md) prove
 field capacities and numeric intervals; fields evaluate once and their owners
 remain live through callee and caller uses.
+[Conditional records](bounded-text-branches.md) can select complete values of
+the same concept; field bounds cover both alternatives and only the selected
+branch executes. Their text fields retain their owners without a join-time copy.
 Sequential HTTP services can now copy a complete annotated text call into an
 existing bounded state field. The service keeps its own buffer; the invocation
 region is released after copying. See [persistent text copies](bounded-text-state.md).

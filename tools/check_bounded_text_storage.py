@@ -9,6 +9,8 @@ the compiler before buffer reuse: addresses must be reused and copy counts must
 stay unchanged.
 With --check-inputs, trace a constructed record passed to a different concept:
 even an unused argument field must execute once before the callee.
+With --check-branches, trace the condition and the selected record's unused
+field; joining that record must not evaluate the other branch or copy its text.
 """
 import argparse
 import collections
@@ -29,9 +31,13 @@ parser.add_argument('--check-reuse', action='store_true',
                     help='trace successive dead buffers; compare with the pre-reuse compiler')
 parser.add_argument('--check-inputs', action='store_true',
                     help='trace constructed inputs, record aliases and unused argument evaluation')
+parser.add_argument('--check-branches', action='store_true',
+                    help='trace conditional records and selected-branch evaluation')
 options = parser.parse_args()
-if options.check_inputs and options.reference_compiler:
-    parser.error('--check-inputs checks evaluation semantics without a reference compiler')
+if options.check_inputs and options.check_branches:
+    parser.error('choose --check-inputs or --check-branches')
+if (options.check_inputs or options.check_branches) and options.reference_compiler:
+    parser.error('input/branch checks run without a reference compiler')
 WORK = Path(tempfile.mkdtemp(prefix='verbose-text-storage-trace-'))
 print(f'Traces: {WORK}', flush=True)
 MARKERS = dict(eager=420000000001, once=420000000002,
@@ -126,8 +132,7 @@ rule forward
     termination:
       bound : 8
 '''
-if options.check_inputs:
-    MARKERS['argument'] = 420000000006
+if options.check_inputs or options.check_branches:
     SOURCE = SOURCE.replace('rule once\n', '''concept PieceInput
   @intention: "Bound the explicitly constructed call input"
   @source: trace.intent:2
@@ -137,9 +142,35 @@ if options.check_inputs:
 rule once
 ''', 1)
     SOURCE = SOURCE.replace('    i : Input', '    i : PieceInput', 1)
-    SOURCE = SOURCE.replace('    let result = once(req)', '''    let argument = PieceInput { title: concat("", req.title), code: if req.code == req.code then 420000000006 else 0 }
+    argument = 'PieceInput { title: concat("", req.title), code: if req.code == req.code then 420000000006 else 0 }'
+    if options.check_branches:
+        MARKERS.update(argument_yes=420000000006, argument_no=420000000007,
+                       decision=420000000008)
+        argument = 'if choose(req) then PieceInput { title: concat("", req.title), code: 420000000006 } else PieceInput { code: 420000000007, title: concat("", req.title) }'
+        SOURCE = SOURCE.replace('rule once\n', '''rule choose
+  @intention: "Evaluate the record choice once"
+  @source: trace.intent:3
+  input:
+    input : Input
+  output:
+    out : bool
+  logic:
+    let unused = 420000000008
+    out = input.code > 0
+  proofs:
+    purity:
+      reads : [input.code]
+      calls : []
+    termination:
+      bound : 16
+rule once
+''', 1)
+        SOURCE = SOURCE.replace('calls : [once, probe]', 'calls : [once, probe, choose]')
+    else:
+        MARKERS['argument'] = 420000000006
+    SOURCE = SOURCE.replace('    let result = once(req)', f'''    let argument = {argument}
     let saved_argument = argument
-    let argument = PieceInput { title: "ignored", code: 0 }
+    let argument = PieceInput {{ title: "ignored", code: 0 }}
     let result = once(saved_argument)''')
     SOURCE = SOURCE.replace('reads : [req, req.code]', 'reads : [req, req.code, req.title]')
     SOURCE = SOURCE.replace('bound : 64', 'bound : 128')
@@ -261,11 +292,17 @@ def trace(binary, records, operator, case, reuse_expected=None):
                            probe=positive if operator == 'and' else len(records)-positive)
     if options.check_inputs:
         expected_counts['argument'] = len(records)
+    if options.check_branches:
+        expected_counts.update(argument_yes=positive, argument_no=len(records)-positive,
+                               decision=len(records))
     if {n: counts[n] for n in MARKERS} != expected_counts:
         raise EvaluationCountMismatch((counts, expected_counts))
     expected_order = []
     for _, code in records:
-        expected_order.extend(['eager', 'argument', 'once'] if options.check_inputs else ['eager', 'once'])
+        if options.check_branches:
+            expected_order.extend(['eager', 'decision', 'argument_yes' if code > 0 else 'argument_no', 'once'])
+        else:
+            expected_order.extend(['eager', 'argument', 'once'] if options.check_inputs else ['eager', 'once'])
         if (code > 0) == (operator == 'and'):
             expected_order.append('probe')
         expected_order.append('yes' if code > 0 else 'no')
@@ -305,6 +342,15 @@ for operator in ['and', 'or']:
     binary = WORK / operator
     subprocess.run([str(options.compiler.resolve()), str(source), '--run', 'forward',
                     '--native', str(binary)], check=True, capture_output=True)
+    if options.check_branches:
+        # Same selected data and markers using the already supported scalar
+        # conditional. A record join must add no payload copy to this control.
+        control_source = WORK / f'{operator}-scalar-control.verbose'
+        control_source.write_text(source_text.replace(argument,
+            'PieceInput { title: concat("", req.title), code: if choose(req) then 420000000006 else 420000000007 }'))
+        control_binary = WORK / f'{operator}-scalar-control'
+        subprocess.run([str(options.compiler.resolve()), str(control_source), '--run', 'forward',
+                        '--native', str(control_binary)], check=True, capture_output=True)
     reference = WORK / f'{operator}-reference'
     if options.reference_compiler:
         subprocess.run([str(options.reference_compiler.resolve()), str(source), '--run', 'forward',
@@ -312,6 +358,13 @@ for operator in ['and', 'or']:
     for case, records in [('yes', [('é', 1)]), ('no', [('', -1)]),
                           ('repeat', [('é', 1), ('hello', -1), ('x', 2)])]:
         report = trace(binary, records, operator, f'{operator}-{case}', True if options.check_reuse else None)
+        if options.check_branches:
+            control = trace(control_binary, records, operator, f'{operator}-{case}-scalar-control',
+                            True if options.check_reuse else None)
+            for metric in ['copied_bytes', 'copy_operations']:
+                assert report[metric] == control[metric], (metric, control, report)
+            report['scalar_control_copied_bytes'] = control['copied_bytes']
+            report['scalar_control_copy_operations'] = control['copy_operations']
         reports.append(report)
         if options.reference_compiler:
             before = trace(reference, records, operator, f'{operator}-{case}-reference', False if options.check_reuse else None)
@@ -329,7 +382,8 @@ if comparisons:
 print(json.dumps(reports, indent=2))
 # Negative control: invert the first conditional jump. Normally this changes
 # AND short-circuit evaluation. With --check-inputs it skips the always-selected
-# unused argument computation instead. stdout remains correct in BOTH cases.
+# unused argument computation instead. With --check-branches it selects the
+# wrong record with the same title. stdout remains correct in all cases.
 # The instruction counter must detect the semantic error that output misses.
 mutant = bytearray((WORK / 'and').read_bytes())
 frame = mutant.index(b'\x55\x53\x49\x89\xea\x48\x89\xe5\x48\x81\xec')
@@ -345,7 +399,8 @@ for code in [1, -1]:
 try:
     trace(bad, [('é', -1)], 'and', 'negative-control')
 except EvaluationCountMismatch:
-    fault = 'skipped unused argument' if options.check_inputs else 'wrong short-circuit evaluation'
+    fault = ('wrong record branch' if options.check_branches else
+             'skipped unused argument' if options.check_inputs else 'wrong short-circuit evaluation')
     print(f'Negative control caught: {fault} despite identical output.')
 else:
     raise AssertionError('instruction counter missed the negative control')

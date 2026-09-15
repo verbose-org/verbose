@@ -115,6 +115,9 @@ Rules can [construct checked record inputs](docs/bounded-text-inputs.md) for
 callees with different concepts. The compiler proves field capacities and numeric
 intervals at that boundary, evaluates fields once, and retains their storage
 through callee and caller uses.
+[Conditional records](docs/bounded-text-branches.md) join capacities and numeric
+intervals field by field. Native selection moves text descriptors while keeping
+their possible owners alive through subsequent uses.
 A sequential HTTP service can also [copy a bounded rule result into its own text
 state](docs/bounded-text-state.md). The compiler checks the destination capacity
 and releases temporary storage after copying. General ownership across resources

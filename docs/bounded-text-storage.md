@@ -46,6 +46,9 @@ does not end its lifetime. A conditional pointer keeps both possible owners
 alive through all later uses of the joined value, including nested joins and
 record fields. Concat operands stay alive through subsequent operand evaluations
 and the copy into the destination. The same holds for text comparisons.
+[Conditional records](bounded-text-branches.md) apply these joins field by field:
+only the selected branch evaluates, and choosing its text fields moves their
+pointer/length pairs without an additional payload copy.
 
 Lets, including unused lets, still evaluate in source order. Their dead buffers
 can share an address with later values. A returned alias, input field or literal

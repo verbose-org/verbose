@@ -98,6 +98,79 @@ struct Check<'a> {
     native: bool,
 }
 impl Check<'_> {
+    fn input_field(&self, concept: &str, name: &str) -> Result<Value, String> {
+        let f = self.concepts[concept]
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| format!("unknown field '{concept}.{name}'"))?;
+        Self::declared_field(f)
+    }
+
+    fn declared_field(f: &Field) -> Result<Value, String> {
+        match f.ty {
+            Type::Number => {
+                let (min, max) = f.range.unwrap_or((i64::MIN, i64::MAX));
+                Ok(Value::Number(min, max))
+            }
+            Type::Text => Ok(Value::Text(
+                f.range.and_then(|(_, n)| u64::try_from(n).ok()),
+            )),
+            _ => Err("unsupported input field type".into()),
+        }
+    }
+
+    fn materialize_input(&self, value: Value) -> Result<Value, String> {
+        let Value::Input(name) = value else {
+            return Ok(value);
+        };
+        let fields = self.concepts[name.as_str()]
+            .fields
+            .iter()
+            .map(|f| Ok((f.name.clone(), Self::declared_field(f)?)))
+            .collect::<Result<_, String>>()?;
+        Ok(Value::Record(name, fields))
+    }
+
+    fn join(&mut self, a: Value, b: Value) -> Result<Value, String> {
+        a.require(&b.ty())?;
+        match (self.materialize_input(a)?, self.materialize_input(b)?) {
+            (Value::Text(a), Value::Text(b)) => Ok(Value::Text(a.zip(b).map(|(a, b)| a.max(b)))),
+            (Value::Number(a, b), Value::Number(c, d)) => Ok(Value::Number(a.min(c), b.max(d))),
+            (Value::Bool, Value::Bool) => Ok(Value::Bool),
+            (Value::Record(name, mut a), Value::Record(_, mut b)) => {
+                // Whole-input aliases may hide large records behind a tiny
+                // expression. Account for synthesized field joins too.
+                self.steps = self.steps.saturating_add(a.len());
+                if self.steps > 100_000 {
+                    return Err(
+                        "bounded text analysis limit exceeded (100000 expression/field visits)"
+                            .into(),
+                    );
+                }
+                // Use declaration order for deterministic diagnostics. Source
+                // field order affects evaluation, never field correspondence.
+                let names: Vec<_> = self.concepts[name.as_str()]
+                    .fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect();
+                let fields = names
+                    .into_iter()
+                    .map(|field| {
+                        let a = a.remove(&field).ok_or("missing conditional record field")?;
+                        let b = b.remove(&field).ok_or("missing conditional record field")?;
+                        self.join(a, b)
+                            .map(|v| (field.clone(), v))
+                            .map_err(|e| format!("conditional field '{}.{}': {e}", name, field))
+                    })
+                    .collect::<Result<_, String>>()?;
+                Ok(Value::Record(name, fields))
+            }
+            _ => Err("incompatible conditional values".into()),
+        }
+    }
+
     // Rule bodies are checked against their declared input, not specialized to
     // one call site's narrower values. Prove the transfer before using that
     // public contract; a nominal record type alone does not prove its ranges.
@@ -261,21 +334,7 @@ impl Check<'_> {
                 .cloned()
                 .ok_or_else(|| format!("unknown binding '{n}'"))?,
             Expr::Field(base, name) => match sub(base)? {
-                Value::Input(c) => {
-                    let f = self.concepts[c.as_str()]
-                        .fields
-                        .iter()
-                        .find(|f| f.name == *name)
-                        .ok_or_else(|| format!("unknown field '{c}.{name}'"))?;
-                    match f.ty {
-                        Type::Number => {
-                            let (min, max) = f.range.unwrap_or((i64::MIN, i64::MAX));
-                            Value::Number(min, max)
-                        }
-                        Type::Text => Value::Text(f.range.and_then(|(_, n)| u64::try_from(n).ok())),
-                        _ => return Err("unsupported field type".into()),
-                    }
-                }
+                Value::Input(c) => self.input_field(&c, name)?,
                 Value::Record(_, fields) => {
                     fields.get(name).cloned().ok_or("unknown record field")?
                 }
@@ -299,21 +358,7 @@ impl Check<'_> {
                 sub(cond)?.require(&Type::Bool)?;
                 let a = sub(yes)?;
                 let b = sub(no)?;
-                a.require(&b.ty())?;
-                match (a, b) {
-                    (Value::Text(a), Value::Text(b)) => {
-                        Value::Text(a.zip(b).map(|(a, b)| a.max(b)))
-                    }
-                    (Value::Number(a, b), Value::Number(c, d)) => Value::Number(a.min(c), b.max(d)),
-                    (Value::Bool, Value::Bool) => Value::Bool,
-                    // Fieldwise joins need their own analysis; never keep one arm's capacity.
-                    _ => {
-                        return Err(
-                            "conditional record values are unsupported in bounded text analysis"
-                                .into(),
-                        )
-                    }
-                }
+                self.join(a, b)?
             }
             Expr::Call(name, args) => {
                 if args.len() != 1 {
