@@ -58,7 +58,7 @@ pub fn active_rules(p: &Program) -> BTreeSet<String> {
 
 #[derive(Clone, Debug)]
 enum Value {
-    Number,
+    Number(i64, i64),
     Bool,
     Text(Option<u64>),
     Input(String),
@@ -67,7 +67,7 @@ enum Value {
 impl Value {
     fn ty(&self) -> Type {
         match self {
-            Self::Number => Type::Number,
+            Self::Number(..) => Type::Number,
             Self::Bool => Type::Bool,
             Self::Text(_) => Type::Text,
             Self::Input(n) | Self::Record(n, _) => Type::Named(n.clone()),
@@ -83,7 +83,7 @@ impl Value {
     fn capacity(&self) -> Result<Option<u64>, String> {
         match self {
             Self::Text(n) => Ok(*n),
-            Self::Number => Ok(Some(20)),
+            Self::Number(..) => Ok(Some(20)),
             _ => Err("concat requires text or number arguments".into()),
         }
     }
@@ -98,6 +98,57 @@ struct Check<'a> {
     native: bool,
 }
 impl Check<'_> {
+    // Rule bodies are checked against their declared input, not specialized to
+    // one call site's narrower values. Prove the transfer before using that
+    // public contract; a nominal record type alone does not prove its ranges.
+    fn call_input(&self, name: &str, value: &Value) -> Result<(), String> {
+        let callee = self.rules.get(name).ok_or("unknown callee")?;
+        value.require(&callee.input_ty)?;
+        if matches!(value, Value::Input(_)) {
+            // Forwarding the original input (also through an alias) preserves
+            // the same concept and the entry's existing input guards.
+            return Ok(());
+        }
+        let Value::Record(concept, values) = value else {
+            return Err(format!("call '{name}' requires one flat record input"));
+        };
+        let concept = self
+            .concepts
+            .get(concept.as_str())
+            .ok_or("unknown input concept")?;
+        for field in &concept.fields {
+            let value = values.get(&field.name).ok_or("missing input field")?;
+            value.require(&field.ty)?;
+            let context = format!("call '{name}' input field '{}'", field.name);
+            match value {
+                Value::Text(actual) => {
+                    let max = field
+                        .range
+                        .and_then(|(_, n)| u64::try_from(n).ok())
+                        .ok_or_else(|| format!("{context}: declared byte capacity is unknown"))?;
+                    let actual = actual
+                        .ok_or_else(|| format!("{context}: argument byte capacity is unknown"))?;
+                    if actual > max {
+                        return Err(format!("{context}: argument needs up to {actual} bytes, exceeds declared [..{max}]"));
+                    }
+                }
+                Value::Number(lo, hi) => {
+                    if let Some((min, max)) = field.range {
+                        if *lo < min || *hi > max {
+                            return Err(format!("{context}: cannot prove argument range [{lo}, {hi}] fits [{min}, {max}]"));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "{context}: input must be a flat concept of numbers and text"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn rule(&mut self, name: &str) -> Result<Value, String> {
         if let Some(v) = self.cache.get(name) {
             return Ok(v.clone());
@@ -198,8 +249,13 @@ impl Check<'_> {
         let mut sub = |e| self.expr(e, r, env, depth + 1);
         let value = match e {
             Expr::Text(s) => Value::Text(Some(s.len() as u64)),
-            Expr::Number(_) => Value::Number,
-            Expr::Neg(n) if matches!(n.as_ref(), Expr::Number(0..)) => Value::Number,
+            Expr::Number(n) => Value::Number(*n, *n),
+            Expr::Neg(n) if matches!(n.as_ref(), Expr::Number(0..)) => {
+                let Expr::Number(n) = n.as_ref() else {
+                    unreachable!()
+                };
+                Value::Number(-*n, -*n)
+            }
             Expr::Ident(n) => env
                 .get(n)
                 .cloned()
@@ -212,7 +268,10 @@ impl Check<'_> {
                         .find(|f| f.name == *name)
                         .ok_or_else(|| format!("unknown field '{c}.{name}'"))?;
                     match f.ty {
-                        Type::Number => Value::Number,
+                        Type::Number => {
+                            let (min, max) = f.range.unwrap_or((i64::MIN, i64::MAX));
+                            Value::Number(min, max)
+                        }
                         Type::Text => Value::Text(f.range.and_then(|(_, n)| u64::try_from(n).ok())),
                         _ => return Err("unsupported field type".into()),
                     }
@@ -245,7 +304,7 @@ impl Check<'_> {
                     (Value::Text(a), Value::Text(b)) => {
                         Value::Text(a.zip(b).map(|(a, b)| a.max(b)))
                     }
-                    (Value::Number, Value::Number) => Value::Number,
+                    (Value::Number(a, b), Value::Number(c, d)) => Value::Number(a.min(c), b.max(d)),
                     (Value::Bool, Value::Bool) => Value::Bool,
                     // Fieldwise joins need their own analysis; never keep one arm's capacity.
                     _ => {
@@ -257,18 +316,11 @@ impl Check<'_> {
                 }
             }
             Expr::Call(name, args) => {
-                if args.len() != 1
-                    || !matches!(&args[0], Expr::Ident(n) if *n == r.input_name)
-                    || !matches!(env.get(&r.input_name), Some(Value::Input(_)))
-                {
-                    return Err(format!(
-                        "call '{name}' requires callee(input) with the original input binding"
-                    ));
+                if args.len() != 1 {
+                    return Err(format!("call '{name}' requires exactly one record input"));
                 }
-                let callee = self.rules.get(name.as_str()).ok_or("unknown callee")?;
-                if callee.input_ty != r.input_ty {
-                    return Err(format!("call '{name}' requires the same input concept"));
-                }
+                let input = sub(&args[0])?;
+                self.call_input(name, &input)?;
                 self.rule(name)?
             }
             Expr::Binary(op, left, right) => {
@@ -277,7 +329,7 @@ impl Check<'_> {
                 match op {
                     BinOp::Eq | BinOp::NotEq => {
                         a.require(&b.ty())?;
-                        if !matches!(a, Value::Number | Value::Bool | Value::Text(_)) {
+                        if !matches!(a, Value::Number(..) | Value::Bool | Value::Text(_)) {
                             return Err("comparison requires scalar values".into());
                         }
                         Value::Bool
@@ -296,8 +348,15 @@ impl Check<'_> {
                 Value::Bool
             }
             Expr::Length(e) => {
-                sub(e)?.require(&Type::Text)?;
-                Value::Number
+                let value = sub(e)?;
+                value.require(&Type::Text)?;
+                let Value::Text(cap) = value else {
+                    unreachable!()
+                };
+                Value::Number(
+                    0,
+                    cap.and_then(|n| i64::try_from(n).ok()).unwrap_or(i64::MAX),
+                )
             }
             Expr::Record(name, fields) => {
                 let c = *self
@@ -316,7 +375,7 @@ impl Check<'_> {
                         .ok_or("unknown record field")?;
                     let v = self.expr(e, r, env, depth + 1)?;
                     v.require(&f.ty)?;
-                    if !matches!(v, Value::Text(_) | Value::Number | Value::Bool) {
+                    if !matches!(v, Value::Text(_) | Value::Number(..) | Value::Bool) {
                         return Err(
                             "nested records are unsupported in bounded text analysis".into()
                         );

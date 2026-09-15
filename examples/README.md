@@ -9,6 +9,8 @@ buffer reuse after the last use. [`bounded_text_state.verbose`](bounded_text_sta
 copies a bounded formatter result into persistent service state; its
 [copy contract](../docs/bounded-text-state.md) specifies ownership and reclamation. See the
 [contract and support matrix](../docs/bounded-text-output.md).
+[`bounded_text_inputs.verbose`](bounded_text_inputs.verbose) constructs checked
+inputs for another concept, preserving field values across calls and aliases.
 
 Examples show concrete language constructs, compiler entry points, and regression
 cases. Some require imports, resources, a particular backend/ABI, or test setup;

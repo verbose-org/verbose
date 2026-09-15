@@ -7,6 +7,8 @@ actual bytes copied with a compiler from before destination forwarding. This is
 an instruction trace, not a timing benchmark. With --check-reuse, compare with
 the compiler before buffer reuse: addresses must be reused and copy counts must
 stay unchanged.
+With --check-inputs, trace a constructed record passed to a different concept:
+even an unused argument field must execute once before the callee.
 """
 import argparse
 import collections
@@ -25,7 +27,11 @@ parser.add_argument('--compiler', type=Path, default=ROOT / 'target/debug/verbos
 parser.add_argument('--reference-compiler', type=Path)
 parser.add_argument('--check-reuse', action='store_true',
                     help='trace successive dead buffers; compare with the pre-reuse compiler')
+parser.add_argument('--check-inputs', action='store_true',
+                    help='trace constructed inputs, record aliases and unused argument evaluation')
 options = parser.parse_args()
+if options.check_inputs and options.reference_compiler:
+    parser.error('--check-inputs checks evaluation semantics without a reference compiler')
 WORK = Path(tempfile.mkdtemp(prefix='verbose-text-storage-trace-'))
 print(f'Traces: {WORK}', flush=True)
 MARKERS = dict(eager=420000000001, once=420000000002,
@@ -120,6 +126,23 @@ rule forward
     termination:
       bound : 8
 '''
+if options.check_inputs:
+    MARKERS['argument'] = 420000000006
+    SOURCE = SOURCE.replace('rule once\n', '''concept PieceInput
+  @intention: "Bound the explicitly constructed call input"
+  @source: trace.intent:2
+  fields:
+    title : text [..8]
+    code : number
+rule once
+''', 1)
+    SOURCE = SOURCE.replace('    i : Input', '    i : PieceInput', 1)
+    SOURCE = SOURCE.replace('    let result = once(req)', '''    let argument = PieceInput { title: concat("", req.title), code: if req.code == req.code then 420000000006 else 0 }
+    let saved_argument = argument
+    let argument = PieceInput { title: "ignored", code: 0 }
+    let result = once(saved_argument)''')
+    SOURCE = SOURCE.replace('reads : [req, req.code]', 'reads : [req, req.code, req.title]')
+    SOURCE = SOURCE.replace('bound : 64', 'bound : 128')
 (WORK / 'trace.intent').write_text('Input.\nAliased call.\nShort circuit.\nEager lets and branches.\nInferred relay.\nWider result.\n')
 
 # Linux x86-64 user_regs_struct, as declared by sys/user.h.
@@ -236,11 +259,13 @@ def trace(binary, records, operator, case, reuse_expected=None):
     expected_counts = dict(eager=len(records), once=len(records), yes=positive,
                            no=len(records)-positive,
                            probe=positive if operator == 'and' else len(records)-positive)
+    if options.check_inputs:
+        expected_counts['argument'] = len(records)
     if {n: counts[n] for n in MARKERS} != expected_counts:
         raise EvaluationCountMismatch((counts, expected_counts))
     expected_order = []
     for _, code in records:
-        expected_order.extend(['eager', 'once'])
+        expected_order.extend(['eager', 'argument', 'once'] if options.check_inputs else ['eager', 'once'])
         if (code > 0) == (operator == 'and'):
             expected_order.append('probe')
         expected_order.append('yes' if code > 0 else 'no')
@@ -302,9 +327,9 @@ if comparisons:
     (WORK / 'comparison.json').write_text(json.dumps(comparisons, indent=2) + '\n')
     print(json.dumps(comparisons, indent=2))
 print(json.dumps(reports, indent=2))
-# Negative control: invert only the AND short-circuit jump. This deliberately
-# runs probe on the negative input and skips it on the positive input; since
-# probe repeats the same predicate, stdout remains correct in BOTH cases.
+# Negative control: invert the first conditional jump. Normally this changes
+# AND short-circuit evaluation. With --check-inputs it skips the always-selected
+# unused argument computation instead. stdout remains correct in BOTH cases.
 # The instruction counter must detect the semantic error that output misses.
 mutant = bytearray((WORK / 'and').read_bytes())
 frame = mutant.index(b'\x55\x53\x49\x89\xea\x48\x89\xe5\x48\x81\xec')
@@ -320,7 +345,8 @@ for code in [1, -1]:
 try:
     trace(bad, [('é', -1)], 'and', 'negative-control')
 except EvaluationCountMismatch:
-    print('Negative control caught: wrong short-circuit evaluation despite identical output.')
+    fault = 'skipped unused argument' if options.check_inputs else 'wrong short-circuit evaluation'
+    print(f'Negative control caught: {fault} despite identical output.')
 else:
     raise AssertionError('instruction counter missed the negative control')
 print('All 6 instruction-trace cases passed.')

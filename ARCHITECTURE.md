@@ -111,6 +111,10 @@ Output-position calls and branches forward a fresh result destination to the
 producer; other live values retain distinct storage. Text buffers can share
 space after their proved last use, including through aliases and branch joins.
 Placement happens at compilation; scalar/pointer/length slots are not reused.
+Rules can [construct checked record inputs](docs/bounded-text-inputs.md) for
+callees with different concepts. The compiler proves field capacities and numeric
+intervals at that boundary, evaluates fields once, and retains their storage
+through callee and caller uses.
 A sequential HTTP service can also [copy a bounded rule result into its own text
 state](docs/bounded-text-state.md). The compiler checks the destination capacity
 and releases temporary storage after copying. General ownership across resources

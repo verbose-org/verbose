@@ -62,6 +62,10 @@ removing intermediate result buffers and copies. Writable text buffers can also
 share storage after their proved last use, including through aliases and branch
 joins. Simultaneously live values remain distinct; scalar/pointer/length slots
 are not reused.
+Pure rules can also pass explicitly constructed or returned flat records between
+different input concepts. [Input transfer checks](bounded-text-inputs.md) prove
+field capacities and numeric intervals; fields evaluate once and their owners
+remain live through callee and caller uses.
 Sequential HTTP services can now copy a complete annotated text call into an
 existing bounded state field. The service keeps its own buffer; the invocation
 region is released after copying. See [persistent text copies](bounded-text-state.md).
