@@ -58,8 +58,10 @@ composition; unknown capacities are refused. Native evaluation uses a fixed
 invocation region with a separate 2 MiB ceiling: lets evaluate once, aliases
 share values, and storage is reclaimed after output or HTTP response consumption.
 Output-position calls and branches pass their destination to the final producer,
-removing intermediate result buffers and copies. Other live temporaries remain
-distinct; slots are not yet reused after their last use.
+removing intermediate result buffers and copies. Writable text buffers can also
+share storage after their proved last use, including through aliases and branch
+joins. Simultaneously live values remain distinct; scalar/pointer/length slots
+are not reused.
 This does not bound process memory or establish ownership across effects/state.
 See [bounded text results](bounded-text-output.md) and
 [native storage](bounded-text-storage.md) for the limits and backend matrix.

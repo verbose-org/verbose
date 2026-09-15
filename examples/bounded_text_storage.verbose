@@ -74,3 +74,25 @@ rule forward_text
       calls : [reuse_text, piece]
     termination:
       bound : 16
+
+rule measure_text
+  @intention: "Reuse dead formatter buffers while preserving their measured lengths"
+  @source: bounded_text_storage.intent:6
+  input:
+    item : StorageInput
+  output:
+    out : text [..41]
+  logic:
+    let first = piece(item)
+    let saved = first
+    let first = "shadow"
+    let first_length = length(saved)
+    let second = piece(item)
+    let second_length = length(second)
+    out = concat(first_length, ":", second_length)
+  proofs:
+    purity:
+      reads : [item]
+      calls : [piece]
+    termination:
+      bound : 32

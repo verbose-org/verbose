@@ -4,7 +4,9 @@ Run cargo build, then python3 tools/check_bounded_text_storage.py. Requires ptra
 permission. Uses only Python's standard library; artifacts remain in the printed
 work directory. Optional --reference-compiler compares reserved frame bytes and
 actual bytes copied with a compiler from before destination forwarding. This is
-an instruction trace, not a timing benchmark.
+an instruction trace, not a timing benchmark. With --check-reuse, compare with
+the compiler before buffer reuse: addresses must be reused and copy counts must
+stay unchanged.
 """
 import argparse
 import collections
@@ -21,11 +23,14 @@ ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--compiler', type=Path, default=ROOT / 'target/debug/verbosec')
 parser.add_argument('--reference-compiler', type=Path)
+parser.add_argument('--check-reuse', action='store_true',
+                    help='trace successive dead buffers; compare with the pre-reuse compiler')
 options = parser.parse_args()
 WORK = Path(tempfile.mkdtemp(prefix='verbose-text-storage-trace-'))
 print(f'Traces: {WORK}', flush=True)
 MARKERS = dict(eager=420000000001, once=420000000002,
                yes=420000000003, no=420000000004, probe=420000000005)
+REUSE_PREFIXES = {name: f'reuse-{name}:'.ljust(128, name) for name in ['a', 'b', 'c']}
 SOURCE = '''@verbose 0.1.0
 concept Input
   @intention: "Trace input"
@@ -138,7 +143,7 @@ class EvaluationCountMismatch(AssertionError):
     pass
 
 
-def trace(binary, records, operator, case):
+def trace(binary, records, operator, case, reuse_expected=None):
     blob = binary.read_bytes()
     phoff = struct.unpack_from('<Q', blob, 32)[0]
     segment = struct.unpack_from('<IIQQQQQQ', blob, phoff)
@@ -169,6 +174,7 @@ def trace(binary, records, operator, case):
     reaped = False
     counts, syscalls = collections.Counter(), collections.Counter()
     evaluations = []
+    temporary_offsets = collections.defaultdict(list)
     frames, moves, steps = [], 0, 0
     pending_copy, copied_bytes, copy_operations = None, 0, 0
     try:
@@ -213,6 +219,10 @@ def trace(binary, records, operator, case):
                             registers.rdi + registers.rcx <= registers.rsi), 'source overlaps writable destination'
                 if not continuing_copy:
                     copy_operations += 1
+                    source_offset = registers.rsi - base
+                    for name, prefix in REUSE_PREFIXES.items():
+                        if source_offset >= 0 and blob[source_offset:source_offset + len(prefix)] == prefix.encode():
+                            temporary_offsets[name].append(registers.rdi - frames[-1])
                 pending_copy = (pc, registers.rcx, registers.rsi, registers.rdi)
                 moves += 1
             steps += 1
@@ -235,6 +245,12 @@ def trace(binary, records, operator, case):
             expected_order.append('probe')
         expected_order.append('yes' if code > 0 else 'no')
     assert evaluations == expected_order, ('evaluation order', evaluations, expected_order)
+    if reuse_expected is not None:
+        assert set(temporary_offsets) == set(REUSE_PREFIXES), 'a dead concat was dropped'
+        assert all(len(v) == len(records) for v in temporary_offsets.values()), 'a dead concat was repeated'
+        for i in range(len(records)):
+            addresses = {temporary_offsets[n][i] for n in REUSE_PREFIXES}
+            assert len(addresses) == (1 if reuse_expected else 3), ('temporary reuse', temporary_offsets)
     assert len(frames) == len(records) and len(set(frames)) == 1, 'invocation region was not reclaimed'
     assert moves > 0, 'copy-range check was not exercised'
     assert set(syscalls) == {1, 60}, f'unexpected syscall / allocation: {syscalls}'
@@ -246,14 +262,21 @@ def trace(binary, records, operator, case):
     assert err_path.read_bytes() == b''
     return dict(case=case, evaluation_counts=expected_counts, evaluation_order=evaluations, frame_bytes=frame_bytes,
                 region_reused=True, checked_copy_steps=moves, copied_bytes=copied_bytes,
-                copy_operations=copy_operations, syscalls=dict(syscalls), steps=steps)
+                copy_operations=copy_operations, temporary_offsets=dict(temporary_offsets),
+                syscalls=dict(syscalls), steps=steps)
 
 
 reports = []
 comparisons = []
 for operator in ['and', 'or']:
     source = WORK / f'{operator}.verbose'
-    source.write_text(SOURCE.replace('and probe(req)', f'{operator} probe(req)'))
+    source_text = SOURCE.replace('and probe(req)', f'{operator} probe(req)')
+    if options.check_reuse:
+        work = '\n'.join(f'    let discarded = concat("{prefix}", req.title)' for prefix in REUSE_PREFIXES.values())
+        source_text = source_text.replace('    let unused = 420000000001', f'    let unused = 420000000001\n{work}')
+        source_text = source_text.replace('reads : [req, req.code]', 'reads : [req, req.code, req.title]')
+        source_text = source_text.replace('bound : 64', 'bound : 128')
+    source.write_text(source_text)
     binary = WORK / operator
     subprocess.run([str(options.compiler.resolve()), str(source), '--run', 'forward',
                     '--native', str(binary)], check=True, capture_output=True)
@@ -263,12 +286,16 @@ for operator in ['and', 'or']:
                         '--native', str(reference)], check=True, capture_output=True)
     for case, records in [('yes', [('é', 1)]), ('no', [('', -1)]),
                           ('repeat', [('é', 1), ('hello', -1), ('x', 2)])]:
-        report = trace(binary, records, operator, f'{operator}-{case}')
+        report = trace(binary, records, operator, f'{operator}-{case}', True if options.check_reuse else None)
         reports.append(report)
         if options.reference_compiler:
-            before = trace(reference, records, operator, f'{operator}-{case}-reference')
-            for metric in ['frame_bytes', 'copied_bytes', 'copy_operations']:
-                assert report[metric] < before[metric], (metric, before, report)
+            before = trace(reference, records, operator, f'{operator}-{case}-reference', False if options.check_reuse else None)
+            assert report['frame_bytes'] < before['frame_bytes'], (before, report)
+            for metric in ['copied_bytes', 'copy_operations']:
+                if options.check_reuse:
+                    assert report[metric] == before[metric], (metric, before, report)
+                else:
+                    assert report[metric] < before[metric], (metric, before, report)
             comparisons.append(dict(case=report['case'], before=before, after=report))
 (WORK / 'report.json').write_text(json.dumps(reports, indent=2) + '\n')
 if comparisons:

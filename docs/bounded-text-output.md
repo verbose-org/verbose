@@ -41,9 +41,9 @@ The annotation bounds the returned value. Native compilation now also assigns
 invocation-owned storage to the checked subset: lets evaluate once, aliases
 share values, and text returns have caller-owned destinations, forwarded through
 output-position calls and branches to avoid intermediate result copies. The separate
-2 MiB native storage ceiling counts slots, buffers and fixed scratch, including
-temporaries from both branches and unused lets; output branches share their
-result destination. See [native text storage](bounded-text-storage.md)
+2 MiB native storage ceiling counts fixed slots, the placement of live buffers
+and fixed scratch. Buffers can be reused after their last alias use; unused lets
+still execute, and output branches share their result destination. See [native text storage](bounded-text-storage.md)
 for ownership, reclamation, limits and exclusions. This is not a process memory
 quota or a general ownership type system.
 
