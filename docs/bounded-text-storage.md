@@ -101,8 +101,10 @@ shorten a copy or comparison. The CLI retains its existing input-channel rules,
 including NUL-terminated text inputs. Scalar and flat-record wrappers can consume
 a bounded text call. Sequential HTTP services can also
 [copy a complete bounded call into text state](bounded-text-state.md), releasing
-its invocation region after the copy. Effects inside participating rules,
-recursive rules and cross-concept call inputs remain outside this subset.
+its invocation region after the copy. [Checked record inputs](bounded-text-inputs.md)
+also allow composition across different concepts: constructor fields evaluate
+once and retain their owners through callee and caller uses. Effects inside
+participating rules and recursive rules remain outside this subset.
 
 | Path | Support |
 |---|---|

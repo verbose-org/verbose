@@ -215,6 +215,7 @@ impl Emit<'_> {
     fn rule(
         &mut self,
         rule: &Rule,
+        input: Value,
         depth: usize,
         destination: Option<TextDestination>,
     ) -> Result<Value, NativeError> {
@@ -228,7 +229,7 @@ impl Emit<'_> {
         } else {
             destination
         };
-        let mut env = HashMap::from([(rule.input_name.clone(), Value::Input)]);
+        let mut env = HashMap::from([(rule.input_name.clone(), input)]);
         for (name, rhs) in &rule.logic.bindings {
             let v = self.expr(rhs, &env, depth + 1).map_err(|e| {
                 error(format!(
@@ -339,12 +340,19 @@ impl Emit<'_> {
                 }
                 _ => return Err(error("field access requires a record")),
             },
-            Expr::Call(name, _) => {
+            Expr::Call(name, args) => {
+                let [arg] = args.as_slice() else {
+                    return Err(error("call requires exactly one record input"));
+                };
+                // Evaluate all constructed fields before entering the callee.
+                // Descriptors retain the original storage owners, including
+                // across callee lets, returned records and later alias uses.
+                let input = self.expr(arg, env, depth + 1)?;
                 let rule = *self
                     .rules
                     .get(name.as_str())
                     .ok_or_else(|| error("unknown callee"))?;
-                self.rule(rule, depth + 1, destination)?
+                self.rule(rule, input, depth + 1, destination)?
             }
             Expr::Concat(args) => {
                 // Evaluate every argument exactly once, in source order, before
@@ -552,7 +560,7 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
         constants: HashMap::new(),
         storage: storage::Storage::default(),
     };
-    let result = emit.rule(rule, 0, None)?;
+    let result = emit.rule(rule, Value::Input, 0, None)?;
     // CLI/HTTP consumers run after the entire fragment. Retain every buffer
     // reachable from the returned text or record through that boundary.
     emit.use_value(&result)?;

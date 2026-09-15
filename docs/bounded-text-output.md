@@ -19,8 +19,10 @@ byte lengths; input fields use their declared bounds; numeric formatting needs
 at most 20 bytes. Concatenation adds capacities and a conditional takes the
 maximum of both branches. Lets are processed in lexical order, including aliases
 and shadowing. A checked callee exposes its declared capacity to its callers;
-an unannotated dependency exposes its inferred capacity. Calls pass the original
-input, `callee(input)`, with the same concept. Constructed call inputs, recursion,
+an unannotated dependency exposes its inferred capacity. Calls can pass the
+original input, or a constructed/returned flat record and its lexical aliases.
+The [input transfer check](bounded-text-inputs.md) proves each supplied field fits
+the callee's declared type, text capacity and numeric interval. Recursion,
 collections, Results, effects and context inputs receive explicit diagnostics.
 Unknown bounds are never accepted as evidence of the annotation.
 
