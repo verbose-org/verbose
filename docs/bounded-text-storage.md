@@ -46,6 +46,9 @@ does not end its lifetime. A conditional pointer keeps both possible owners
 alive through all later uses of the joined value, including nested joins and
 record fields. Concat operands stay alive through subsequent operand evaluations
 and the copy into the destination. The same holds for text comparisons.
+[Conditional records](bounded-text-branches.md) apply these joins field by field:
+only the selected branch evaluates, and choosing its text fields moves their
+pointer/length pairs without an additional payload copy.
 
 Lets, including unused lets, still evaluate in source order. Their dead buffers
 can share an address with later values. A returned alias, input field or literal
@@ -60,11 +63,29 @@ propagates last uses backwards through pointer joins, and assigns aligned buffer
 using deterministic best fit with coalescing of adjacent free space. There are
 no runtime allocator calls, reference counts or garbage collection. Pointer,
 length, number and boolean slots remain distinct for the entire invocation.
-Branch lifetimes are conservative, and a result destination is reserved from
-entry into its producer; this is not an optimal packing or full control-flow
-liveness analysis. Fragmentation can make the reserved region larger than the
-sum of simultaneously live byte capacities. Unknown provenance/capacity or an
-excessive placement produces a compile diagnostic before artifact emission.
+Since 2026-09-16, writable buffers created in opposite arms of the same `if`
+can also overlap. The compiler lays out each arm independently, including nested
+choices, then reserves one region sized to the larger arm. That entire region
+stays live through the last use of either arm's owners, including aliases used
+after the join. Buffers created before the condition, the output destination,
+and later live values remain protected. Separate calls have separate choices;
+the compiler does not assume that repeating a condition selects the same arm.
+
+This grouping can retain dead arm-local temporaries longer than necessary. The
+compiler therefore compares its frame with the original last-use placement and
+uses it only if smaller; ties retain the original layout. The optimization never
+increases a previously accepted invocation's reserved frame. Both placements
+use checked arithmetic and the same 2 MiB limit. A result destination remains
+reserved from entry into its producer; this is not optimal packing or full
+control-flow liveness analysis. Fragmentation and conservative region lifetimes
+can still waste space. Unknown provenance/capacity or an excessive placement
+produces a compile diagnostic before artifact emission.
+
+Only frame sizes and buffer address offsets change in the emitted code. No
+runtime ownership metadata, allocation, extra branch, or payload copy is added.
+The extra work is in compilation: a tree of structured choices and a second
+placement, without enumerating execution paths or building pairwise buffer
+conflicts. Scalar/pointer/length slots still have invocation-wide storage.
 
 In the [example](../examples/bounded_text_storage.verbose), `forward_text` passes
 its destination through the selected `reuse_text` or `piece` call. `reuse_text`
@@ -101,8 +122,10 @@ shorten a copy or comparison. The CLI retains its existing input-channel rules,
 including NUL-terminated text inputs. Scalar and flat-record wrappers can consume
 a bounded text call. Sequential HTTP services can also
 [copy a complete bounded call into text state](bounded-text-state.md), releasing
-its invocation region after the copy. Effects inside participating rules,
-recursive rules and cross-concept call inputs remain outside this subset.
+its invocation region after the copy. [Checked record inputs](bounded-text-inputs.md)
+also allow composition across different concepts: constructor fields evaluate
+once and retain their owners through callee and caller uses. Effects inside
+participating rules and recursive rules remain outside this subset.
 
 | Path | Support |
 |---|---|
@@ -189,3 +212,31 @@ three discarded concats writes to the same address after its predecessor's
 last use. In the three-record cases, both compilers execute 32 copy operations
 and copy 1327 bytes. The improvement here is storage, not fewer evaluations or
 copies, and it makes no throughput claim.
+
+For exclusive branch storage, compare with a compiler built from `555e402`
+(before this placement optimization):
+
+```sh
+python3 tools/check_bounded_text_storage.py --check-overlay --reference-compiler /path/to/reference-verbosec
+```
+
+The fixture gives each arm a 4096-byte result capacity while passing short
+runtime payloads. It checks that alternating arms use the same buffer address,
+retains all evaluation/copy-range/reclamation checks, and requires identical
+executed instruction counts, copy counts and bytes, syscalls, output and status.
+The wrong-branch negative control must still fail even with identical stdout.
+
+Measured on 2026-09-16, all six cases reserve **16,792 bytes instead of 20,888**,
+a reduction of 4096 bytes (19.6%), excluding the unchanged 48-byte allowance.
+The three-record cases still execute 20 copy operations and copy 159 bytes.
+The `and` case executes 1376 traced instructions before and after; the `or` case
+executes 1364 before and after. The branch buffer's offset is the same for all
+three records, where the reference uses two addresses.
+
+These are reserved-frame and instruction measurements for this fixture, not RSS,
+cache-hit, latency or throughput measurements. Reducing reserved space and
+reusing addresses support a small working-set objective, but reserved capacity
+is not the number of bytes actually touched. Cache residency also depends on
+access patterns, processor characteristics and other work. Future performance
+reports should distinguish those quantities rather than infer cache behavior
+from a smaller stack frame.

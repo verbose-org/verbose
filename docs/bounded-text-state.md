@@ -23,8 +23,11 @@ The complete `set` source must be `callee(input)`. That entry must explicitly
 declare a bounded text result; dependencies inside it may use inferred bounds.
 The argument is the handler's original `HttpRequest` binding. Handler and callee
 may name their inputs differently. Handler lets, including names such as `body`,
-`path` or `req`, do not replace the parser's input to this call. Constructed
-arguments and expressions wrapping the call are outside this slice.
+`path` or `req`, do not replace the parser's input to this call. At this service
+boundary, constructed arguments and expressions wrapping the call remain
+outside the slice. Inside the formatter,
+[checked record construction](bounded-text-inputs.md) can project the request
+into other bounded concepts before calling pure dependencies.
 
 ## Ownership and lifetime
 

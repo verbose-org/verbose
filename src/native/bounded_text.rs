@@ -94,7 +94,7 @@ pub(super) struct Fragment {
     fields: Vec<(String, Value)>,
     result: Value,
     frame_bytes: usize,
-    constants: HashMap<i32, i64>,
+    literal_ranges: HashMap<i32, (i64, i64)>,
 }
 struct Emit<'a> {
     code: Vec<u8>,
@@ -104,7 +104,9 @@ struct Emit<'a> {
     frame_bytes: usize,
     nodes: usize,
     literal_bytes: usize,
-    constants: HashMap<i32, i64>,
+    // Envelopes of known literal alternatives, solely for HTTP diagnostics.
+    // Unknown alternatives are not represented: this is not an interval proof.
+    literal_ranges: HashMap<i32, (i64, i64)>,
     storage: storage::Storage,
 }
 impl Emit<'_> {
@@ -215,6 +217,7 @@ impl Emit<'_> {
     fn rule(
         &mut self,
         rule: &Rule,
+        input: Value,
         depth: usize,
         destination: Option<TextDestination>,
     ) -> Result<Value, NativeError> {
@@ -228,7 +231,7 @@ impl Emit<'_> {
         } else {
             destination
         };
-        let mut env = HashMap::from([(rule.input_name.clone(), Value::Input)]);
+        let mut env = HashMap::from([(rule.input_name.clone(), input)]);
         for (name, rhs) in &rule.logic.bindings {
             let v = self.expr(rhs, &env, depth + 1).map_err(|e| {
                 error(format!(
@@ -241,18 +244,7 @@ impl Emit<'_> {
         let value = self
             .expr_into(&rule.logic.value, &env, depth + 1, destination)
             .map_err(|e| error(format!("rule '{}' / output: {}", rule.name, e.message)))?;
-        let value = if matches!(value, Value::Input) {
-            let fields: Vec<_> = self.concept.fields.iter().map(|f| f.name.clone()).collect();
-            Value::Record(
-                self.concept.name.clone(),
-                fields
-                    .into_iter()
-                    .map(|n| Ok((n.clone(), self.field(&n)?)))
-                    .collect::<Result<_, NativeError>>()?,
-            )
-        } else {
-            value
-        };
+        let value = self.materialize_input(value)?;
         if let Value::Text { cap, .. } = value {
             let cap = rule.output_text_max.map_or(cap, |n| n as usize);
             let dest = destination.ok_or_else(|| error("missing text destination"))?;
@@ -263,6 +255,20 @@ impl Emit<'_> {
         } else {
             Ok(value)
         }
+    }
+    fn materialize_input(&mut self, value: Value) -> Result<Value, NativeError> {
+        Ok(if matches!(value, Value::Input) {
+            let fields: Vec<_> = self.concept.fields.iter().map(|f| f.name.clone()).collect();
+            Value::Record(
+                self.concept.name.clone(),
+                fields
+                    .into_iter()
+                    .map(|n| Ok((n.clone(), self.field(&n)?)))
+                    .collect::<Result<_, NativeError>>()?,
+            )
+        } else {
+            value
+        })
     }
     fn expr(
         &mut self,
@@ -293,7 +299,7 @@ impl Emit<'_> {
             Expr::Number(n) => {
                 emit_mov_rax_imm(&mut self.code, *n);
                 let value = self.scalar(false)?;
-                self.constants.insert(value.scalar()?, *n);
+                self.literal_ranges.insert(value.scalar()?, (*n, *n));
                 value
             }
             Expr::Neg(n) => {
@@ -301,12 +307,12 @@ impl Emit<'_> {
                 load(&mut self.code, 0, v.scalar()?);
                 self.code.extend_from_slice(&[0x48, 0xf7, 0xd8]);
                 let value = self.scalar(false)?;
-                if let Some(n) = self
-                    .constants
+                if let Some(range) = self
+                    .literal_ranges
                     .get(&v.scalar()?)
-                    .and_then(|n| n.checked_neg())
+                    .and_then(|(lo, hi)| Some((hi.checked_neg()?, lo.checked_neg()?)))
                 {
-                    self.constants.insert(value.scalar()?, n);
+                    self.literal_ranges.insert(value.scalar()?, range);
                 }
                 value
             }
@@ -339,12 +345,19 @@ impl Emit<'_> {
                 }
                 _ => return Err(error("field access requires a record")),
             },
-            Expr::Call(name, _) => {
+            Expr::Call(name, args) => {
+                let [arg] = args.as_slice() else {
+                    return Err(error("call requires exactly one record input"));
+                };
+                // Evaluate all constructed fields before entering the callee.
+                // Descriptors retain the original storage owners, including
+                // across callee lets, returned records and later alias uses.
+                let input = self.expr(arg, env, depth + 1)?;
                 let rule = *self
                     .rules
                     .get(name.as_str())
                     .ok_or_else(|| error("unknown callee"))?;
-                self.rule(rule, depth + 1, destination)?
+                self.rule(rule, input, depth + 1, destination)?
             }
             Expr::Concat(args) => {
                 // Evaluate every argument exactly once, in source order, before
@@ -488,31 +501,95 @@ impl Emit<'_> {
         load(&mut self.code, 0, c.scalar()?);
         self.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
         let otherwise = jump(&mut self.code, &[0x0f, 0x84]);
+        let branch = self.storage.branch();
         let a = self.expr_into(a, env, depth + 1, destination)?;
+        let a = self.materialize_input(a)?;
         let mut dest = match (&a, destination) {
             (Value::Text { cap, .. }, Some(dest)) => dest.value(*cap),
-            (Value::Text { cap, .. }, None) => self.text(*cap)?,
-            (Value::Bool(_), None) => Value::Bool(self.allocate(8)?),
-            (Value::Number(_), None) => Value::Number(self.allocate(8)?),
-            _ => return Err(error("conditional record storage is unsupported")),
+            (_, None) => self.join_slots(&a)?,
+            _ => return Err(error("text destination requires a text branch")),
         };
         if destination.is_none() {
             self.move_value(&a, &dest)?;
         }
         let done = jump(&mut self.code, &[0xe9]);
         self.finish_jump(otherwise);
+        self.storage.otherwise(branch)?;
         let b = self.expr_into(b, env, depth + 1, destination)?;
+        let b = self.materialize_input(b)?;
         if destination.is_none() {
             self.move_value(&b, &dest)?;
         }
-        if let (Value::Text { cap, .. }, Value::Text { cap: other, .. }) = (&mut dest, b) {
-            *cap = (*cap).max(other);
-        }
+        self.join_capacities(&mut dest, &b)?;
         self.finish_jump(done);
+        self.storage.end_branch(branch)?;
         Ok(dest)
     }
+    fn join_slots(&mut self, value: &Value) -> Result<Value, NativeError> {
+        Ok(match value {
+            Value::Text { cap, .. } => self.text(*cap)?,
+            Value::Bool(_) => Value::Bool(self.allocate(8)?),
+            Value::Number(source) => {
+                let slot = self.allocate(8)?;
+                self.join_literals(*source, slot);
+                Value::Number(slot)
+            }
+            Value::Record(name, fields) => Value::Record(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|(n, v)| Ok((n.clone(), self.join_slots(v)?)))
+                    .collect::<Result<_, NativeError>>()?,
+            ),
+            Value::Input => return Err(error("conditional input was not materialized")),
+        })
+    }
+    fn join_literals(&mut self, source: i32, dest: i32) {
+        if let Some((lo, hi)) = self.literal_ranges.get(&source).copied() {
+            self.literal_ranges
+                .entry(dest)
+                .and_modify(|(a, b)| {
+                    *a = (*a).min(lo);
+                    *b = (*b).max(hi);
+                })
+                .or_insert((lo, hi));
+        }
+    }
+    fn join_capacities(&mut self, dest: &mut Value, other: &Value) -> Result<(), NativeError> {
+        match (dest, other) {
+            (Value::Text { cap, .. }, Value::Text { cap: other, .. }) => *cap = (*cap).max(*other),
+            (Value::Record(name, fields), Value::Record(other_name, other))
+                if name == other_name =>
+            {
+                let other: HashMap<_, _> = other.iter().map(|(n, v)| (n.as_str(), v)).collect();
+                for (name, value) in fields {
+                    let other = other
+                        .get(name.as_str())
+                        .ok_or_else(|| error("missing conditional record field"))?;
+                    self.join_capacities(value, other)?;
+                }
+            }
+            (Value::Number(dest), Value::Number(source)) => self.join_literals(*source, *dest),
+            (Value::Bool(_), Value::Bool(_)) => {}
+            _ => return Err(error("incompatible conditional storage")),
+        }
+        Ok(())
+    }
     fn move_value(&mut self, from: &Value, to: &Value) -> Result<(), NativeError> {
-        if let Value::Text { ptr, len, .. } = from {
+        if let (Value::Record(name, source), Value::Record(other, fields)) = (from, to) {
+            if name != other {
+                return Err(error("incompatible conditional record concepts"));
+            }
+            let source: HashMap<_, _> = source.iter().map(|(n, v)| (n.as_str(), v)).collect();
+            for (name, dest) in fields {
+                let value = source
+                    .get(name.as_str())
+                    .ok_or_else(|| error("missing conditional record field"))?;
+                // Joining a text field moves its pointer and length only. The
+                // existing provenance graph keeps both possible owners alive.
+                self.move_value(value, dest)?;
+            }
+        } else if let Value::Text { ptr, len, .. } = from {
             let Value::Text { ptr: dest, .. } = to else {
                 return Err(error("text join requires text"));
             };
@@ -549,10 +626,10 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
         frame_bytes: 0,
         nodes: 0,
         literal_bytes: 0,
-        constants: HashMap::new(),
+        literal_ranges: HashMap::new(),
         storage: storage::Storage::default(),
     };
-    let result = emit.rule(rule, 0, None)?;
+    let result = emit.rule(rule, Value::Input, 0, None)?;
     // CLI/HTTP consumers run after the entire fragment. Retain every buffer
     // reachable from the returned text or record through that boundary.
     emit.use_value(&result)?;
@@ -562,7 +639,7 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
         fields: emit.fields,
         result,
         frame_bytes: emit.frame_bytes,
-        constants: emit.constants,
+        literal_ranges: emit.literal_ranges,
     })
 }
 
@@ -685,8 +762,9 @@ impl Fragment {
             .ok_or_else(|| error("missing response status"))?
             .1
             .scalar()?;
-        if let Some(n) = self.constants.get(&status) {
-            if !(100..=599).contains(n) {
+        if let Some((lo, hi)) = self.literal_ranges.get(&status) {
+            if *lo < 100 || *hi > 599 {
+                let n = if *lo < 100 { lo } else { hi };
                 return Err(error(format!(
                     "status {n} outside HTTP valid range [100, 599]"
                 )));
