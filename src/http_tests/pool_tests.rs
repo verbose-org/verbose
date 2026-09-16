@@ -4,6 +4,7 @@ use super::*;
 fn source(n: u32) -> String {
     format!("{SOURCE}  concurrency: pooled\n  workers: {n}\n")
 }
+#[track_caller]
 fn until(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(4);
     while !condition() {
@@ -67,9 +68,13 @@ fn pooled_workers_reuse_pids_stack_and_descriptors() {
 fn pooled_workers_overlap_and_queue_without_spawning() {
     let server = Server::start(&source(2));
     let pids = wait_count(&server, 2);
-    for p in &pids {
-        idle_stack(*p);
-    }
+    let idle_fds: Vec<_> = pids
+        .iter()
+        .map(|p| {
+            idle_stack(*p);
+            fds(*p)
+        })
+        .collect();
     let mut held: Vec<_> = (0..2)
         .map(|_| {
             let mut s = server.connect();
@@ -78,7 +83,14 @@ fn pooled_workers_overlap_and_queue_without_spawning() {
             s
         })
         .collect();
-    until(|| pids.iter().all(|p| fds(*p) == 5)); // stdin/out/err, listener, client
+    // The test runner may pass through additional inheritable descriptors.
+    // Observe one client above EACH worker's idle baseline, not an absolute
+    // count that could mistake an idle worker for a busy one after a timeout.
+    until(|| {
+        pids.iter()
+            .zip(&idle_fds)
+            .all(|(p, idle)| fds(*p) == idle + 1)
+    });
     let mut queued = server.connect();
     queued.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
     queued
@@ -252,7 +264,9 @@ fn pooled_workers_supervisor_death_closes_worker_listeners() {
 #[test]
 fn pooled_workers_contexts_and_backend_refusals() {
     for n in [1, 64] {
-        assert!(crate::verifier::verify_program(&parse(&source(n)), Path::new("examples")).is_empty());
+        assert!(
+            crate::verifier::verify_program(&parse(&source(n)), Path::new("examples")).is_empty()
+        );
     }
     for n in [0, 65] {
         assert!(Parser::new(Lexer::new(&source(n)).tokenize().unwrap())
