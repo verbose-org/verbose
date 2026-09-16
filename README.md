@@ -175,6 +175,13 @@ compiler executes or emits           interpreter, native x86-64, or WASM
 
 ## What the compiler verifies (and what it does not)
 
+**Language-level text capacities (2026-09-12):** a rule can declare
+`out : text [..N]`. The verifier checks the result's byte capacity through pure
+acyclic calls, aliases and branches; excessive and unknown capacities are refused.
+See the [contract](docs/bounded-text-output.md), [standalone example](examples/bounded_text.verbose)
+and [HTTP formatter](examples/http_bounded_text.verbose). This bounds a value,
+not the memory used by all temporaries or a process.
+
 "Verified" is intentionally not used as a synonym for "bug-free". The current
 trust boundary is:
 
@@ -390,6 +397,12 @@ reuses its frame across connections; it does not fork for each request. See the
 [example](examples/http_pooled.verbose). Queueing, failure boundaries, and memory
 scope are explicit. Threads and TLS remain separate work.
 
+**Graceful pool shutdown (2026-09-11):** optional `shutdown_timeout: S` stops new
+accepts on supervisor SIGTERM, lets accepted requests finish, and forces remaining
+workers to terminate when the grace period expires. See the
+[contract and example](docs/http-pool-shutdown.md), including exit statuses,
+partial effects, and the limits of the deadline.
+
 The native backend emits complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and a per-request `log:` block. As of 2026-04-30, the surface includes: HTTP/1.0 services with prefix routing and computed status; cached + per-request file reads with `on_read_error: abort`; outbound `fetch()` to declared connections; multiple `log:` blocks per service (strict + best-effort sinks); fork-per-accept concurrency; `req.body` parsing; and a family of runtime primitives (`read`, `parse_int`, `now_unix`, `length`, `starts_with`, `contains`, `abs`, `field == read(...)`, `json_escape`).
 
 | Example | Binary | What it does |
@@ -458,6 +471,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 |---|---|
 | Typed concepts | `number`, `bool`, `text`, `collection(Type)` |
 | Field value ranges | `temperature : number [0, 50]` |
+| Checked text result capacity | `output: out : text [..64]` — [capacity](docs/bounded-text-output.md), [native ownership and storage limit](docs/bounded-text-storage.md) |
 | Arithmetic | `amount + amount * tax_rate / 100` |
 | Comparisons & equality | `>`, `<`, `>=`, `<=`, `==`, `!=` |
 | Boolean logic | `and`, `or`, `not` |

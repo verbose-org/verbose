@@ -1,0 +1,67 @@
+@verbose 0.1.0
+
+rule recall_text
+  @intention: "Answer with the previously stored formatter result"
+  @source: bounded_text_state.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: concat("prev:", state.last) }
+  proofs:
+    purity:
+      reads : [state.last]
+      calls : []
+    termination:
+      bound : 8
+
+rule wrap_body
+  @intention: "Format a counted request body within a checked byte capacity"
+  @source: bounded_text_state.intent:2
+  input:
+    item : HttpRequest
+  output:
+    out : text [..4098]
+  logic:
+    out = concat("[", item.body, "]")
+  proofs:
+    purity:
+      reads : [item.body]
+      calls : []
+    termination:
+      bound : 8
+
+rule remember_text
+  @intention: "Produce a bounded value to copy into persistent state"
+  @source: bounded_text_state.intent:3
+  input:
+    input : HttpRequest
+  output:
+    out : text [..4098]
+  logic:
+    let message = wrap_body(input)
+    let saved = message
+    let message = "shadow"
+    out = if input.method == "POST" then saved else concat("<", input.path, ">")
+  proofs:
+    purity:
+      reads : [input, input.method, input.path]
+      calls : [wrap_body]
+    termination:
+      bound : 32
+
+service remember_http
+  @intention: "Persist a copied bounded result after each successful response"
+  @source: bounded_text_state.intent:4
+  listen:
+    protocol: http_1_0
+    port: 18965
+    max_request: 4096
+  handler: recall_text
+  request_timeout: 2
+  response_timeout: 2
+  state:
+    last : text [..4098] = "none"
+  after:
+    set last = remember_text(req)

@@ -209,6 +209,10 @@ pub fn compile_wasm(
     output_path: &str,
 ) -> Result<(), WasmError> {
     if program.items.iter().any(|i| matches!(i, Item::Service(s)
+        if s.name == rule_name && s.shutdown_timeout.is_some())) {
+        return Err(WasmError { message: "WASM does not support service shutdown_timeout".into() });
+    }
+    if program.items.iter().any(|i| matches!(i, Item::Service(s)
         if s.name == rule_name && (s.workers.is_some() || s.concurrency == ConcurrencyMode::Pooled))) {
         return Err(WasmError { message: "WASM does not support pooled service workers".into() });
     }
@@ -219,6 +223,11 @@ pub fn compile_wasm(
     if program.items.iter().any(|i| matches!(i, Item::Service(s)
         if s.name == rule_name && (s.request_timeout.is_some() || s.response_timeout.is_some()))) {
         return Err(WasmError { message: "WASM does not support bounded HTTP request_timeout / response_timeout".into() });
+    }
+    let text_active = crate::text_bounds::active_rules(program);
+    if text_active.contains(rule_name) || program.items.iter().any(|i| matches!(i,
+        Item::Service(s) if s.name == rule_name && crate::text_bounds::service_uses_contract(s, &text_active))) {
+        return Err(WasmError { message: "WASM does not support bounded text output contracts".into() });
     }
     if crate::bounds::active_rules(program).contains(rule_name) {
         return Err(WasmError { message: "WASM does not support try_byte_at / BoundsError yet".into() });

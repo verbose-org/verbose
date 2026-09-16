@@ -1,5 +1,6 @@
 //! Fixed isolated workers. The parent owns PIDs; each worker owns its request frame.
 use super::transport_asm::Asm;
+mod shutdown;
 const AX: u8 = 0;
 const CX: u8 = 1;
 const DX: u8 = 2;
@@ -13,10 +14,11 @@ const LISTENER: u8 = 12;
 pub(super) struct Pool {
     pub base: i32,
     pub workers: u32,
+    pub shutdown_timeout: Option<u32>,
 }
 impl Pool {
-    pub fn size(workers: u32) -> i32 {
-        24 + 8 * workers as i32
+    pub fn size(workers: u32, timeout: Option<u32>) -> i32 {
+        24 + 8 * workers as i32 + if timeout.is_some() { shutdown::SIZE } else { 0 }
     }
     fn parent(self) -> i32 {
         self.base
@@ -54,7 +56,9 @@ pub(super) fn setup(code: &mut Vec<u8>, p: Pool) -> Vec<usize> {
     a.syscall(13); // SIGCHLD = SIG_DFL, including inherited SA_NOCLDWAIT reset
     a.cmp(AX, 0);
     a.jump(Some(0x88), 0);
-    a.finish()
+    let mut failures = a.finish();
+    if p.shutdown_timeout.is_some() { failures.extend(shutdown::setup(code, p)); }
+    failures
 }
 
 fn wait(a: &mut Asm<'_>, status: Option<i32>) {
@@ -72,6 +76,7 @@ fn wait(a: &mut Asm<'_>, status: Option<i32>) {
 /// The parent never falls through. Every failure after the first fork drains
 /// its owned children; only a worker with parent-death protection reaches accept.
 pub(super) fn start(code: &mut Vec<u8>, p: Pool) -> Vec<usize> {
+    if let Some(seconds) = p.shutdown_timeout { return shutdown::start(code, p, seconds); }
     let mut a = Asm::new(code);
     let child = a.label();
     let cleanup = a.label();
@@ -129,6 +134,11 @@ pub(super) fn start(code: &mut Vec<u8>, p: Pool) -> Vec<usize> {
     a.jump(Some(0x8f), drain);
     a.jump(None, 0); // exit(1), including unexpected drain errors
     a.mark(child);
+    child_setup(&mut a, p);
+    a.finish()
+}
+
+fn child_setup(a: &mut Asm<'_>, p: Pool) {
     a.imm(DI, 1); // PR_SET_PDEATHSIG
     a.imm(SI, 9);
     a.imm(DX, 0);
@@ -141,10 +151,9 @@ pub(super) fn start(code: &mut Vec<u8>, p: Pool) -> Vec<usize> {
     a.load(CX, p.parent());
     a.rr(0x39, CX, AX);
     a.jump(Some(0x85), 0);
-    a.finish()
 }
 
-pub(super) fn accept(code: &mut Vec<u8>) -> Vec<usize> {
+pub(super) fn accept(code: &mut Vec<u8>, p: Pool) -> Vec<usize> {
     let mut a = Asm::new(code);
     let again = a.label();
     a.mark(again);
@@ -156,6 +165,7 @@ pub(super) fn accept(code: &mut Vec<u8>) -> Vec<usize> {
         a.cmp(AX, -errno);
         a.jump(Some(0x84), again);
     }
+    if p.shutdown_timeout.is_some() { shutdown::accept_shutdown(&mut a, p); }
     a.cmp(AX, 0);
     a.jump(Some(0x88), 0); // permanent accept failure kills this worker/pool
     a.store(-48, AX);
@@ -167,20 +177,21 @@ mod tests {
     use super::*;
     #[test]
     fn pooled_worker_emission_has_fixed_storage_and_valid_instructions() {
-        assert_eq!(Pool::size(64), 536);
+        assert_eq!(Pool::size(64, None), 536);
         for workers in [1, 3, 64] {
             let mut code = vec![];
             assert!(!start(
                 &mut code,
                 Pool {
                     base: -1024,
-                    workers
+                    workers,
+                    shutdown_timeout: None,
                 }
             )
             .is_empty());
             crate::validate_x86::validate_code(&code).unwrap();
             let mut accept_code = vec![];
-            assert_eq!(accept(&mut accept_code).len(), 1);
+            assert_eq!(accept(&mut accept_code, Pool { base: -1024, workers, shutdown_timeout: None }).len(), 1);
             crate::validate_x86::validate_code(&accept_code).unwrap();
         }
     }

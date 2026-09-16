@@ -1,4 +1,5 @@
 mod bounded;
+mod bounded_text;
 mod http_io;
 mod admission;
 mod pool;
@@ -131,11 +132,23 @@ fn compile_native_code(
     stream: bool,
     stdin_raw: bool,
 ) -> Result<Vec<u8>, NativeError> {
+    if let Some(error) = crate::text_bounds::verify_mode(program, true).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
     if crate::bounds::active_rules(program).contains(rule_name) {
         if stdin_raw || stdin || stream {
             return Err(NativeError { message: "bounded-result entry currently supports argv records only".into() });
         }
         return bounded::compile(program, rule_name);
+    }
+    if crate::text_bounds::active_rules(program).contains(rule_name) {
+        let rule = program.items.iter().find_map(|i| match i {
+            Item::Rule(r) if r.name == rule_name => Some(r), _ => None,
+        }).ok_or_else(|| NativeError { message: "bounded text entry missing".into() })?;
+        let concept = iter_all_concepts(&program.items).find(|c| rule.input_ty == Type::Named(c.name.clone()))
+            .ok_or_else(|| NativeError { message: "bounded text input concept missing".into() })?;
+        let code = bounded_text::compile(program, rule, concept)?;
+        return wrap_record_input_mode(code, rule, concept, false, false, stdin, stream, stdin_raw);
     }
     // Phase B slice 4a.1: lift the blanket refusal on `concept_group`.
     // From this slice forward, a program containing a `concept_group`
@@ -799,7 +812,7 @@ fn compile_native_code(
         }
     }
 
-    let mut code = if needs_callable_path {
+    let code = if needs_callable_path {
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
@@ -842,6 +855,14 @@ fn compile_native_code(
         emit_full_program(rule, concept, context_concept, &rules, &resources, &connections, &entropies, concept_group)?
     };
 
+    wrap_record_input_mode(code, rule, concept, is_vectorizable, is_parallel, stdin, stream, stdin_raw)
+}
+
+fn wrap_record_input_mode(
+    mut code: Vec<u8>, rule: &Rule, concept: &Concept,
+    is_vectorizable: bool, is_parallel: bool,
+    stdin: bool, stream: bool, stdin_raw: bool,
+) -> Result<Vec<u8>, NativeError> {
     if stream {
         // Streaming mode: wrap rule code in a line-by-line read loop.
         // Requires the rule code to use the standard push rbp / mov rbp, rsp
@@ -8702,6 +8723,18 @@ fn classify_concat_arg(
             Some(ConcatArgKind::BoundText)
         }
         Expr::Call(_, _) => Some(ConcatArgKind::CallText),
+        Expr::If(_, yes, no) => {
+            let branch_kind = |e: &Expr| if matches!(e, Expr::Concat(_)) {
+                Some(ConcatArgKind::CallText)
+            } else { classify_concat_arg(e, concept, input_name, text_bindings, offsets) };
+            let a = branch_kind(yes)?;
+            let b = branch_kind(no)?;
+            if a == ConcatArgKind::Number && b == ConcatArgKind::Number {
+                Some(ConcatArgKind::Number)
+            } else if a != ConcatArgKind::Number && b != ConcatArgKind::Number {
+                Some(ConcatArgKind::CallText)
+            } else { None }
+        }
         // Substring shares CallText's pre-eval/stash/fill machinery
         // 1-for-1: classify reserves a 16-byte slot, the pre-eval loop
         // calls emit_text_produce_ptrlen on the whole Substring expr
@@ -9438,6 +9471,25 @@ fn emit_text_produce_ptrlen(
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match text_expr {
+        Expr::If(cond, yes, no) => {
+            emit_eval_expr(code, cond, input_name, offsets, all_rules,
+                field_ranges, text_bindings, None, None)?;
+            code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x84]);
+            let no_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            emit_text_produce_ptrlen(code, yes, input_name, concept, all_rules,
+                offsets, field_ranges, text_bindings)?;
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            let no_offset = (code.len() as i32 - no_patch as i32 - 4).to_le_bytes();
+            code[no_patch..no_patch + 4].copy_from_slice(&no_offset);
+            emit_text_produce_ptrlen(code, no, input_name, concept, all_rules,
+                offsets, field_ranges, text_bindings)?;
+            let end_offset = (code.len() as i32 - end_patch as i32 - 4).to_le_bytes();
+            code[end_patch..end_patch + 4].copy_from_slice(&end_offset);
+            Ok(())
+        }
         Expr::Call(callee_name, args) => {
             // Validate the same Phase 2G restrictions.
             let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
@@ -21095,6 +21147,9 @@ pub fn compile_service(
     service_name: &str,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    if let Some(error) = crate::text_bounds::verify_mode(program, true).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
     if let Some(error) = crate::bounds::verify(program).first() {
         return Err(NativeError { message: error.to_string() });
     }
@@ -21138,6 +21193,9 @@ pub fn compile_service(
                     service.name, service.handler
                 ),
             })?;
+        if crate::text_bounds::active_rules(program).contains(&handler.name) {
+            return compile_http10_dynamic_service(program, service, output_path);
+        }
         // Phase 8 slice 8a: presence of a log forces the dynamic path,
         // because the log content can reference request fields (method /
         // path) which only exist once the HTTP parser has run — and the
@@ -21953,6 +22011,7 @@ fn emit_raw_tcp_dynamic_bytes(
             &text_bindings,
             &state_layout,
             &mut abort_patches,
+            None,
         )?;
         // STEP TAIL: restore rsp to the post-prologue invariant (frees any
         // handler-allocated concat buffer) and loop to the next frame. Every
@@ -22404,6 +22463,27 @@ fn compile_http10_dynamic_service(
             ),
         })?;
 
+    let storage = if crate::text_bounds::active_rules(program).contains(&handler.name) {
+        Some(bounded_text::prepare(program, &handler.name, &http_request_builtin_concept_native(service.max_request))?)
+    } else { None };
+    let transport_handler;
+    let handler = if let Some(storage) = &storage {
+        transport_handler = {
+            let mut r = handler.clone();
+            r.logic.bindings.clear();
+            // Preserve the parser's demand for a counted body even when only
+            // a callee reads it. Actual rule evaluation uses `storage` below.
+            r.logic.value = Expr::Record("HttpResponse".into(), vec![
+                ("status".into(), Expr::Number(200)),
+                ("body".into(), if storage.uses_field("body") {
+                    Expr::Field(Box::new(Expr::Ident(r.input_name.clone())), "body".into())
+                } else { Expr::Text(String::new()) }),
+            ]);
+            r
+        };
+        &transport_handler
+    } else { handler };
+
     // HttpRequest fields at fixed rbp slots — mirrors Phase 2E's text-input-
     // field layout so emit_eval_expr can compare req.method / req.path
     // against literals without modification.
@@ -22456,10 +22536,20 @@ fn compile_http10_dynamic_service(
     }).collect();
     let program_concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
 
+    let mut bounded_after = HashMap::new();
+    for (index, set) in service.after_sets.iter().enumerate() {
+        if let Some(callee) = crate::text_bounds::state_call(service, handler, set, &program_rules)
+            .map_err(|message| NativeError { message })? {
+            let fragment = bounded_text::prepare(program, &callee.name,
+                &http_request_builtin_concept_native(service.max_request))?;
+            bounded_after.insert(index, fragment);
+        }
+    }
+
     let code = emit_http10_dynamic_bytes(
         service, handler, &offsets, &no_rules, &no_ranges,
         &all_resources, &all_connections, &all_entropies,
-        &program_rules, &program_concepts,
+        &program_rules, &program_concepts, storage.as_ref(), &bounded_after,
     )?;
     write_server_elf(&code, output_path, "service", service.port)
 }
@@ -22807,8 +22897,9 @@ fn emit_after_block(
     text_bindings: &TextBindings,
     layout: &StateLayout,
     abort_patches: &mut Vec<usize>,
+    bounded: Option<(&HashMap<usize, bounded_text::Fragment>, &HashMap<&str, i32>, &TextBindings)>,
 ) -> Result<(), NativeError> {
-    for aset in &service.after_sets {
+    for (index, aset) in service.after_sets.iter().enumerate() {
         let sf = service.state_fields.iter()
             .find(|sf| sf.name == aset.field_name)
             .ok_or_else(|| NativeError {
@@ -22825,6 +22916,12 @@ fn emit_after_block(
                     .find(|(n, ..)| *n == aset.field_name.as_str())
                     .expect("text state field has a slot triple");
                 let n = state_text_bound(sf)?;
+                if let Some((fragments, input_offsets, input_text)) = bounded {
+                    if let Some(fragment) = fragments.get(&index) {
+                        fragment.persist(code, input_offsets, input_text, buf_off, len_slot, n, abort_patches)?;
+                        continue;
+                    }
+                }
                 emit_text_produce_ptrlen(
                     code,
                     &aset.value,
@@ -23026,6 +23123,8 @@ fn emit_http10_dynamic_bytes(
     // pre-existing service byte-identical).
     program_rules: &HashMap<&str, &Rule>,
     program_concepts: &[&Concept],
+    bounded_storage: Option<&bounded_text::Fragment>,
+    bounded_after: &HashMap<usize, bounded_text::Fragment>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
@@ -23050,7 +23149,8 @@ fn emit_http10_dynamic_bytes(
     // content references `req.body`. Body parsing in the HTTP parser
     // is conditional on this — the cost (one inline scan for \r\n\r\n
     // and two slot stores) is paid only when body is consumed.
-    let uses_body = expr_uses_field(&handler.logic.value, &handler.input_name, "body")
+    let uses_body = bounded_after.values().any(|fragment| fragment.uses_field("body"))
+        || expr_uses_field(&handler.logic.value, &handler.input_name, "body")
         || handler.logic.bindings.iter().any(|(_, e)| expr_uses_field(e, &handler.input_name, "body"))
         || service.logs.iter().any(|lb| match &lb.effect {
             Effect::AppendFile { content, .. } => expr_uses_field(content, "req", "body"),
@@ -23195,8 +23295,11 @@ fn emit_http10_dynamic_bytes(
     let frame_base = frame_base + if http_io.is_some() { http_io::Io::SIZE } else { 0 };
     let admission = service.max_connections.map(|_| admission::Admission { base: -(frame_base + admission::Admission::SIZE) });
     let frame_base = frame_base + if admission.is_some() { admission::Admission::SIZE } else { 0 };
-    let pool = service.workers.map(|workers| pool::Pool { base: -(frame_base + pool::Pool::size(workers)), workers });
-    let frame_base = frame_base + pool.map(|p| pool::Pool::size(p.workers)).unwrap_or(0);
+    let pool = service.workers.map(|workers| pool::Pool {
+        base: -(frame_base + pool::Pool::size(workers, service.shutdown_timeout)),
+        workers, shutdown_timeout: service.shutdown_timeout,
+    });
+    let frame_base = frame_base + pool.map(|p| pool::Pool::size(p.workers, p.shutdown_timeout)).unwrap_or(0);
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
     // shared abort sequence; left empty when policy is Drop.
@@ -23444,8 +23547,8 @@ fn emit_http10_dynamic_bytes(
 
     // ═══ ACCEPT LOOP ═══════════════════════════════════════════
     let accept_top = code.len();
-    if pool.is_some() {
-        abort_patches.extend(pool::accept(&mut code));
+    if let Some(p) = pool {
+        abort_patches.extend(pool::accept(&mut code, p));
     } else if let Some(slots) = admission {
         abort_patches.extend(admission::dispatch(&mut code, slots, service.max_connections.unwrap()));
     } else {
@@ -23892,16 +23995,20 @@ fn emit_http10_dynamic_bytes(
 
     // ═══ HANDLER BODY ══════════════════════════════════════════
     // Populates [rbp-24]=status, [rbp-32]=body_ptr, [rbp-40]=body_len.
-    emit_handler_to_slots(
-        &mut code,
-        &handler.logic.value,
-        &handler.input_name,
-        &handler_offsets,
-        all_rules,
-        field_ranges,
-        &http_text_bindings,
-        max_request,
-    )?;
+    if let Some(storage) = bounded_storage {
+        storage.http(&mut code, &handler_offsets, &http_text_bindings)?;
+    } else {
+        emit_handler_to_slots(
+            &mut code,
+            &handler.logic.value,
+            &handler.input_name,
+            &handler_offsets,
+            all_rules,
+            field_ranges,
+            &http_text_bindings,
+            max_request,
+        )?;
+    }
     // Lets + body done: these sites take the bare close path. The log
     // blocks below get their OWN scope (their fd is live in r15 while the
     // content evaluates), and the `after:` block rejoins this set.
@@ -24000,6 +24107,12 @@ fn emit_http10_dynamic_bytes(
     // rejoin the bare close set — the response is already on the wire, the
     // state simply stays unchanged for that request.
     let after_scope = ClientAbortScope::begin();
+    // These are parser-owned inputs, independent of handler let names. A let
+    // called "body" or "path" must not redirect a bounded after call.
+    let mut bounded_input_text = HashMap::new();
+    if uses_body {
+        bounded_input_text.insert("body", (body_ptr_slot, body_len_slot));
+    }
     // Shared with the raw_tcp step-loop emitter since slice `multistep-1`;
     // the copy discipline and the backstop are documented on the helper.
     emit_after_block(
@@ -24013,6 +24126,7 @@ fn emit_http10_dynamic_bytes(
         &http_text_bindings,
         &state_layout,
         &mut abort_patches,
+        Some((bounded_after, offsets, &bounded_input_text)),
     )?;
 
     // ═══ CLOSE + LOOP ══════════════════════════════════════════
@@ -56564,7 +56678,9 @@ rule pick
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.
         // http_pooled adds a service-scoped refusal for reusable workers.
-        const EXPECTED_TOTAL: usize = 165;
+        // http_shutdown adds an explicitly refused SIGTERM lifecycle contract.
+        // Bounded text capacity/storage examples remain explicit gen0 refusals.
+        const EXPECTED_TOTAL: usize = 172;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
