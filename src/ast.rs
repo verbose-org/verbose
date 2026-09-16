@@ -375,9 +375,86 @@ pub struct Service {
     /// ceiling is then `max_steps × read_timeout` seconds of READ time.
     /// It covers `read`, not `write` (§5.4's named residual).
     pub read_timeout: Option<u32>,
+    /// Opt-in bounded HTTP framing: absolute receive/send phase deadlines.
+    /// Both are required, in seconds 1..3600. See docs/http-bounded-io.md.
+    pub request_timeout: Option<u32>,
+    pub response_timeout: Option<u32>,
+    /// Maximum admitted HTTP handler children; overload closes before effects.
+    pub max_connections: Option<u32>,
+    /// Fixed process pool size; each worker reuses its private request frame.
+    pub workers: Option<u32>,
+    /// Grace period after supervisor SIGTERM; only for bounded HTTP pools.
+    pub shutdown_timeout: Option<u32>,
 }
 
 impl Service {
+    pub fn pool_error(&self) -> Option<&'static str> {
+        if let Some(seconds) = self.shutdown_timeout {
+            if self.concurrency != ConcurrencyMode::Pooled || self.protocol != Protocol::Http10 {
+                return Some("shutdown_timeout requires http_1_0 and concurrency: pooled");
+            }
+            if !(1..=3600).contains(&seconds) {
+                return Some("shutdown_timeout must be in [1, 3600] seconds");
+            }
+        }
+        if self.concurrency != ConcurrencyMode::Pooled && self.workers.is_none() { return None; }
+        if self.concurrency != ConcurrencyMode::Pooled || self.protocol != Protocol::Http10 {
+            return Some("workers requires http_1_0 and concurrency: pooled");
+        }
+        if !self.workers.is_some_and(|n| (1..=64).contains(&n)) {
+            return Some("concurrency: pooled requires workers in [1, 64]");
+        }
+        if self.max_connections.is_some() {
+            return Some("pooled workers cannot use max_connections: busy workers leave clients in the kernel queue");
+        }
+        if self.request_timeout.is_none() || self.response_timeout.is_none() {
+            return Some("pooled workers requires both request_timeout and response_timeout");
+        }
+        if !self.after_sets.is_empty() {
+            return Some("pooled workers does not support after mutations across request lifetimes");
+        }
+        self.http_io_error()
+    }
+
+    /// Admission is implemented only for bounded HTTP with isolated forked state.
+    pub fn admission_error(&self) -> Option<&'static str> {
+        let Some(limit) = self.max_connections else { return None; };
+        if !(1..=65535).contains(&limit) {
+            return Some("max_connections must be in [1, 65535]");
+        }
+        if !matches!(self.protocol, Protocol::Http10) || self.concurrency != ConcurrencyMode::Forked {
+            return Some("max_connections requires http_1_0 and concurrency: forked");
+        }
+        if self.request_timeout.is_none() || self.response_timeout.is_none() {
+            return Some("max_connections requires both request_timeout and response_timeout");
+        }
+        if !self.after_sets.is_empty() {
+            return Some("max_connections does not support after mutations in forked HTTP state");
+        }
+        self.http_io_error()
+    }
+
+    /// Shared verifier/emitter backstop; native APIs can bypass verification.
+    pub fn http_io_error(&self) -> Option<&'static str> {
+        if self.request_timeout.is_none() && self.response_timeout.is_none() { return None; }
+        if self.request_timeout.is_none() || self.response_timeout.is_none() {
+            return Some("bounded HTTP requires both request_timeout and response_timeout");
+        }
+        if !matches!(self.protocol, Protocol::Http10) {
+            return Some("request_timeout and response_timeout require protocol http_1_0");
+        }
+        if [self.request_timeout, self.response_timeout].iter().flatten().any(|s| !(1..=3600).contains(s)) {
+            return Some("HTTP request_timeout and response_timeout must be in [1, 3600] seconds");
+        }
+        if !(1..=1_048_576).contains(&self.max_request) {
+            return Some("bounded HTTP max_request must be in [1, 1048576] bytes");
+        }
+        if self.max_steps.is_some() || self.read_timeout.is_some() {
+            return Some("bounded HTTP cannot use raw_tcp max_steps or read_timeout");
+        }
+        None
+    }
+
     /// Is this service multi-step — does it declare a per-connection step
     /// loop? Both knobs are mandatory together (verifier refusal #2), so
     /// after verification `max_steps.is_some()` alone would do; the
@@ -444,6 +521,8 @@ pub enum ConcurrencyMode {
     /// `sys_exit(0)`. `SIGCHLD` is set to `SIG_IGN` once at startup so
     /// no `wait`/`waitpid` is needed and no zombies accumulate.
     Forked,
+    /// Fixed isolated worker processes reuse their frame across connections.
+    Pooled,
 }
 
 /// Phase 8 slice 8d: how a service should react when its log effect
@@ -594,6 +673,9 @@ pub struct Rule {
     pub input_ty: Type,
     pub output_name: String,
     pub output_ty: Type,
+    /// Optional, statically checked UTF-8 byte capacity of a text result.
+    /// This bounds the value, not temporary storage or the process RSS.
+    pub output_text_max: Option<u32>,
     pub logic: LogicStmt,
     pub proofs: Proofs,
     pub hints: Option<Hints>,

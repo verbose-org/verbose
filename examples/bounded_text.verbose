@@ -1,0 +1,42 @@
+@verbose 0.1.0
+
+concept LabelInput
+  @intention: "A short UTF-8 title and a numeric identifier"
+  @source: bounded_text.intent:1
+  fields:
+    title : text [..8]
+    code : number
+
+rule label
+  @intention: "Produce a label of at most 30 bytes"
+  @source: bounded_text.intent:2
+  input:
+    item : LabelInput
+  output:
+    out : text [..30]
+  logic:
+    out = concat("[", item.title, "]", item.code)
+  proofs:
+    purity:
+      reads : [item.title, item.code]
+      calls : []
+    termination:
+      bound : 16
+
+rule decorated_label
+  @intention: "Compose the checked label capacity with two delimiter bytes"
+  @source: bounded_text.intent:3
+  input:
+    request : LabelInput
+  output:
+    out : text [..32]
+  logic:
+    let message = label(request)
+    let alias = message
+    out = concat("<", alias, ">")
+  proofs:
+    purity:
+      reads : [request]
+      calls : [label]
+    termination:
+      bound : 16

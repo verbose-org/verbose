@@ -1,0 +1,3 @@
+Reusable bounded HTTP workers
+Echo each complete request body without leaking bytes from earlier requests.
+Use two isolated reusable workers; a worker death terminates the pool.

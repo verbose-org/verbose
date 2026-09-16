@@ -175,6 +175,13 @@ compiler executes or emits           interpreter, native x86-64, or WASM
 
 ## What the compiler verifies (and what it does not)
 
+**Language-level text capacities (2026-09-12):** a rule can declare
+`out : text [..N]`. The verifier checks the result's byte capacity through pure
+acyclic calls, aliases and branches; excessive and unknown capacities are refused.
+See the [contract](docs/bounded-text-output.md), [standalone example](examples/bounded_text.verbose)
+and [HTTP formatter](examples/http_bounded_text.verbose). This bounds a value,
+not the memory used by all temporaries or a process.
+
 "Verified" is intentionally not used as a synonym for "bug-free". The current
 trust boundary is:
 
@@ -370,6 +377,32 @@ Both rules output `Result(number, text)` where each `Err` branch carries the pla
 
 ## Phases 7 / 8 / 9 / 10 / 11 / 12: HTTP services, file I/O, fetch, audit logs
 
+**Bounded HTTP transport (2026-09-09):** paired `request_timeout` and
+`response_timeout` declarations opt in to complete request assembly within
+`max_request`, strict Content-Length framing, and response sends that resume
+partial writes under one deadline. See the [contract and backend matrix](docs/http-bounded-io.md)
+and [body-echo example](examples/http_bounded.verbose). This remains a
+close-after-one-request HTTP transport, with sequential or forked concurrency.
+
+**Bounded admission (2026-09-10):** `max_connections: N` caps admitted HTTP handler
+children in forked mode. Excess connections close before request effects; exited
+children release their slots when reaped. Both socket deadlines are required.
+See the [contract and backend matrix](docs/bounded-service-concurrency.md) and
+[capped echo example](examples/http_capped.verbose).
+
+**Reusable workers (2026-09-10):** `concurrency: pooled` with `workers: N` creates
+a fixed pool of isolated processes. Each reclaims its request temporaries and
+reuses its frame across connections; it does not fork for each request. See the
+[pool contract and support matrix](docs/pooled-http-workers.md) and
+[example](examples/http_pooled.verbose). Queueing, failure boundaries, and memory
+scope are explicit. Threads and TLS remain separate work.
+
+**Graceful pool shutdown (2026-09-11):** optional `shutdown_timeout: S` stops new
+accepts on supervisor SIGTERM, lets accepted requests finish, and forces remaining
+workers to terminate when the grace period expires. See the
+[contract and example](docs/http-pool-shutdown.md), including exit statuses,
+partial effects, and the limits of the deadline.
+
 The native backend emits complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and a per-request `log:` block. As of 2026-04-30, the surface includes: HTTP/1.0 services with prefix routing and computed status; cached + per-request file reads with `on_read_error: abort`; outbound `fetch()` to declared connections; multiple `log:` blocks per service (strict + best-effort sinks); fork-per-accept concurrency; `req.body` parsing; and a family of runtime primitives (`read`, `parse_int`, `now_unix`, `length`, `starts_with`, `contains`, `abs`, `field == read(...)`, `json_escape`).
 
 | Example | Binary | What it does |
@@ -403,6 +436,8 @@ The [benchmark report](docs/benchmarks.md) compares startup, binary size, memory
 and computation separately, including cases where the native backend loses.
 Its commands and dated measurements provide the context needed to assess the
 results. A small executable alone establishes neither correctness nor throughput.
+The [HTTP worker baseline](docs/http-worker-benchmarks.md) compares the same echo
+service in forked and pooled modes, with response checks and memory snapshots.
 
 ## Three Axioms
 
@@ -438,6 +473,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 |---|---|
 | Typed concepts | `number`, `bool`, `text`, `collection(Type)` |
 | Field value ranges | `temperature : number [0, 50]` |
+| Checked text result capacity | `output: out : text [..64]` — [capacity](docs/bounded-text-output.md), [native ownership and storage limit](docs/bounded-text-storage.md) |
 | Arithmetic | `amount + amount * tax_rate / 100` |
 | Comparisons & equality | `>`, `<`, `>=`, `<=`, `==`, `!=` |
 | Boolean logic | `and`, `or`, `not` |

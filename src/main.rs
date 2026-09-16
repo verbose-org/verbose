@@ -5,6 +5,10 @@ use std::process;
 
 mod ast;
 mod bounds;
+mod text_bounds;
+mod http_framing;
+#[cfg(test)]
+mod http_tests;
 mod interpreter;
 mod lexer;
 mod native;

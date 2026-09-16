@@ -14,6 +14,18 @@ The thing to refuse is a declaration that is **neither**: the compiler cannot ve
 
 ## Classification
 
+### Text output capacity
+
+`output: out : text [..N]` is a checked semantic claim about the maximum byte
+length of a returned value. In the supported pure acyclic subset, the verifier
+adds concat capacities, joins branches and checks callee contracts with lexical
+binding types. Both an excessive bound and an unknown analysis cause refusal.
+The claim depends on enforced input bounds and trusted compiler correctness.
+The annotation itself does not establish total RSS or general ownership. The
+native checked subset also enforces a separate invocation storage ceiling and
+reclaims its buffers after consumption; see [native text storage](bounded-text-storage.md).
+See [the contract and support matrix](bounded-text-output.md).
+
 ### Purity block
 
 | Field | Category | What the compiler does | Source |
@@ -147,3 +159,36 @@ result through lexical aliases and branches. A result must be returned or matche
 on every analyzed path. Unknown forms and excessive analysis expansion are
 refused. This check is limited to the documented pure acyclic subset; it does
 not strengthen acceptance of legacy `Result(_, text)` declarations.
+
+
+### Bounded HTTP transport declarations (2026-09-09)
+
+`service.request_timeout` and `service.response_timeout` are semantic inputs:
+paired integer seconds in 1..3600 select complete bounded HTTP request assembly
+and complete response sends. The verifier rejects other protocols and
+`max_request` outside 1..1048576. Native emission uses absolute monotonic phase
+deadlines; the attributes do not prove handler CPU time, resource/log latency,
+response-size bounds, or total connection count. See [the contract](http-bounded-io.md).
+
+`service.max_connections` is an optional admission bound for forked HTTP with
+both socket deadlines. Verification checks its range and supported context;
+native admission counts children until their exits are reaped and closes new
+clients at capacity. It bounds admitted handler children, with one temporary
+admission socket in the parent. It does not establish handler lifetime, fairness,
+shared-state synchronization, or a bound on the kernel backlog. See the
+[admission contract](bounded-service-concurrency.md).
+
+`service.workers` together with `concurrency: pooled` fixes the number of isolated
+HTTP worker processes (1..64). Both phase deadlines are required. The verifier
+refuses `after:` mutations and the incompatible `max_connections` admission
+policy. Each worker restores its request stack before accepting again; its fixed
+frame persists. This establishes neither a whole-service memory quota nor a
+queue-wait deadline. See the [pool contract](pooled-http-workers.md) and the
+[memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion).
+
+`service.shutdown_timeout` is an optional SIGTERM grace period (1..3600 seconds)
+for bounded HTTP pools. Verification checks the declaration's context and range;
+native code disables the listener, waits for accepted work, then requests forced
+termination at an absolute monotonic deadline. It is an enforced runtime policy,
+not a proof of handler completion, effect rollback, client receipt, or OS scheduling
+latency. See the [shutdown contract](http-pool-shutdown.md).

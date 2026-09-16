@@ -1,0 +1,32 @@
+@verbose 0.1.0
+
+-- A fixed process pool reuses private request storage between connections.
+-- Busy workers leave clients in the kernel queue. See docs/pooled-http-workers.md.
+rule echo_body
+  @intention: "Return the complete request body, preserving its bytes"
+  @source: http_pooled.intent:2
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: concat("", req.body) }
+  proofs:
+    purity:
+      reads : [req.body]
+      calls : []
+    termination:
+      bound : 4
+
+service bounded_http
+  @intention: "Receive and answer one bounded request before its phase deadlines"
+  @source: http_pooled.intent:3
+  listen:
+    protocol: http_1_0
+    port: 18962
+    max_request: 4096
+  handler: echo_body
+  request_timeout: 2
+  response_timeout: 2
+  concurrency: pooled
+  workers: 2
