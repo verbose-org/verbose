@@ -4,6 +4,11 @@ use std::path::Path;
 use std::process;
 
 mod ast;
+mod bounds;
+mod text_bounds;
+mod http_framing;
+#[cfg(test)]
+mod http_tests;
 mod interpreter;
 mod lexer;
 mod native;
@@ -683,6 +688,7 @@ fn value_to_json(val: &interpreter::Value) -> String {
             format!("{{{}}}", parts.join(","))
         }
         interpreter::Value::Ok(inner) => format!("{{\"ok\":{}}}", value_to_json(inner)),
+        interpreter::Value::BoundsError => "\"Bounds\"".into(),
         interpreter::Value::Err(inner) => format!("{{\"err\":{}}}", value_to_json(inner)),
         // Phase A slice 2: tagged-union JSON shape — `{"variant":"<name>","fields":{...}}`.
         // The concept name is included so multi-concept programs disambiguate.

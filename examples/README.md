@@ -1,5 +1,19 @@
 # Verbose examples
 
+[`bounded_text.verbose`](bounded_text.verbose) declares and composes checked text
+result capacities across pure rules. [`http_bounded_text.verbose`](http_bounded_text.verbose)
+uses the same contract in an HTTP formatter.
+[`bounded_text_storage.verbose`](bounded_text_storage.verbose) demonstrates shared
+aliases, shadowing, nested conditional buffers, direct result destinations and
+buffer reuse after the last use. [`bounded_text_state.verbose`](bounded_text_state.verbose)
+copies a bounded formatter result into persistent service state; its
+[copy contract](../docs/bounded-text-state.md) specifies ownership and reclamation. See the
+[contract and support matrix](../docs/bounded-text-output.md).
+[`bounded_text_inputs.verbose`](bounded_text_inputs.verbose) constructs checked
+inputs for another concept, preserving field values across calls and aliases.
+[`bounded_text_branches.verbose`](bounded_text_branches.verbose) selects a complete
+record, preserving field bounds and buffer lifetimes across branches and later calls.
+
 Examples show concrete language constructs, compiler entry points, and regression
 cases. Some require imports, resources, a particular backend/ABI, or test setup;
 files under `negative/` are intentionally rejected. Read each example's header
@@ -9,6 +23,19 @@ human-readable specification; a human or an LLM can author the `.verbose`.
 This index grew with the implementation slices. Byte sizes and broad feature
 summaries are milestone descriptions, not measurements of every current build.
 See [current status](../docs/current-status.md) for the implementation map.
+
+[`http_bounded.verbose`](http_bounded.verbose) shows explicit request/response
+deadlines, complete request-body assembly, and partial-send recovery. Its
+[transport contract](../docs/http-bounded-io.md) documents supported framing and
+backend refusals.
+
+[`http_capped.verbose`](http_capped.verbose) adds `max_connections: 8` to forked
+HTTP: excess connections close, and exited children release their slots when
+reaped. See the [admission contract](../docs/bounded-service-concurrency.md).
+
+[`http_pooled.verbose`](http_pooled.verbose) reuses two isolated workers and their
+private request storage. It demonstrates the
+[pool and memory-lifetime contract](../docs/pooled-http-workers.md).
 
 Every example here either:
 - pins a regression test (the test reads the `.verbose` file and asserts on the emitted binary), or
@@ -219,3 +246,9 @@ The resource-aware emitter sweep: every native emitter accepts `read()` with the
 | File | What it shows |
 |------|---------------|
 | `policy.verbose` | First multi-input rule: a context (policy thresholds) read once, requests checked per-record. |
+
+## Checked literal byte lookup
+
+[try_byte_at.verbose](try_byte_at.verbose) demonstrates bounded lookup, an explicit
+fallback and propagation through a rule call and alias. See the
+[contract and backend matrix](../docs/try-byte-at.md).

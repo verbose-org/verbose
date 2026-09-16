@@ -1,0 +1,45 @@
+@verbose 0.1.0
+
+rule response_text
+  @intention: "Format a request path within a checked 262-byte result capacity"
+  @source: http_bounded_text.intent:1
+  input:
+    request : HttpRequest
+  output:
+    out : text [..262]
+  logic:
+    let prefix = "path: "
+    out = concat(prefix, request.path)
+  proofs:
+    purity:
+      reads : [request.path]
+      calls : []
+    termination:
+      bound : 8
+
+rule handle
+  @intention: "Use the bounded text rule as an HTTP response body"
+  @source: http_bounded_text.intent:2
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: concat("", response_text(req)) }
+  proofs:
+    purity:
+      reads : [req]
+      calls : [response_text]
+    termination:
+      bound : 8
+
+service bounded_text_http
+  @intention: "Serve a bounded response formatter through the existing HTTP transport"
+  @source: http_bounded_text.intent:3
+  listen:
+    protocol: http_1_0
+    port: 18964
+    max_request: 4096
+  handler: handle
+  request_timeout: 2
+  response_timeout: 2

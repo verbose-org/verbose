@@ -8,6 +8,7 @@ use crate::ast::*;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Number(i64),
+    BoundsError,
     Bool(bool),
     Text(String),
     /// Raw bytes — the runtime counterpart to Expr::Bytes / Type::Bytes.
@@ -33,6 +34,7 @@ pub enum Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::BoundsError => write!(f, "Bounds"),
             Value::Number(n) => write!(f, "{}", n),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Text(s) => write!(f, "{}", s),
@@ -296,13 +298,38 @@ pub fn eval_rule_with_value(
     entropies: &[&Entropy],
     input_value: Value,
 ) -> Result<Value, RuntimeError> {
+    // Callers participate even when the bounded callee sits in an untaken
+    // branch. Enforce the same input assumptions as the native entry guards.
+    if rule.output_text_max.is_some() || crate::text_bounds::participating(all_rules).contains(&rule.name) {
+        let concept = concepts.iter().find(|c| rule.input_ty == Type::Named(c.name.clone()))
+            .ok_or_else(|| RuntimeError { message: "bounded text output: unknown input concept".into() })?;
+        let Value::Record(fields) = &input_value else {
+            return Err(RuntimeError { message: "bounded text output requires a record input".into() });
+        };
+        for field in &concept.fields {
+            let valid = match (&field.ty, fields.get(&field.name)) {
+                (Type::Text, Some(Value::Text(s))) => field.range.map_or(true, |(_, max)| s.len() as i64 <= max),
+                (Type::Number, Some(Value::Number(n))) => field.range.map_or(true, |(min, max)| min <= *n && *n <= max),
+                _ => false,
+            };
+            if !valid {
+                return Err(RuntimeError { message: format!("bounded text output: input field '{}' violates its declared type or bound", field.name) });
+            }
+        }
+    }
     let mut env: HashMap<String, Value> = HashMap::new();
     env.insert(rule.input_name.clone(), input_value);
     for (name, expr) in &rule.logic.bindings {
         let val = eval_expr(expr, &env, all_rules, concepts, entropies)?;
         env.insert(name.clone(), val);
     }
-    eval_expr(&rule.logic.value, &env, all_rules, concepts, entropies)
+    let result = eval_expr(&rule.logic.value, &env, all_rules, concepts, entropies)?;
+    if let Some(max) = rule.output_text_max {
+        if !matches!(&result, Value::Text(s) if s.len() <= max as usize) {
+            return Err(RuntimeError { message: format!("bounded text output: rule '{}' violated [..{}]", rule.name, max) });
+        }
+    }
+    Ok(result)
 }
 
 fn eval_expr(
@@ -1069,6 +1096,21 @@ fn eval_expr(
         // native abort path): index must be < length(text). Negative
         // indices and out-of-range values produce a RuntimeError (mirrors
         // what native lowers to sys_exit(1)).
+        Expr::TryByteAt(table, index) => {
+            let bytes = match table.as_ref() {
+                Expr::Bytes(b) => b.as_slice(),
+                Expr::Text(t) => t.as_bytes(),
+                _ => return Err(RuntimeError { message: "try_byte_at requires a literal table".into() }),
+            };
+            let index = match eval_expr(index, env, all_rules, concepts, entropies)? {
+                Value::Number(n) => n,
+                _ => return Err(RuntimeError { message: "try_byte_at index must be number".into() }),
+            };
+            Ok(match usize::try_from(index).ok().and_then(|i| bytes.get(i)) {
+                Some(b) => Value::Ok(Box::new(Value::Number(*b as i64))),
+                None => Value::Err(Box::new(Value::BoundsError)),
+            })
+        }
         Expr::ByteAt(text, index) => {
             let t = eval_expr(text, env, all_rules, concepts, entropies)?;
             let i = eval_expr(index, env, all_rules, concepts, entropies)?;
@@ -1215,6 +1257,7 @@ mod tests {
             input_ty: Type::Named("Invoice".into()),
             output_name: "important".into(),
             output_ty: Type::Bool,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "important".into(),
@@ -1327,6 +1370,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Number,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1364,6 +1408,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Number,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1401,6 +1446,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Number,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1445,6 +1491,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Bool,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1485,6 +1532,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Number,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1527,6 +1575,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Bool,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1567,6 +1616,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Number,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1604,6 +1654,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Collection("number".into()),
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1652,6 +1703,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Collection("number".into()),
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1705,6 +1757,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Result(Box::new(Type::Number), Box::new(Type::Text)),
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1761,6 +1814,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Result(Box::new(Type::Number), Box::new(Type::Text)),
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1834,6 +1888,7 @@ mod tests {
             input_ty: Type::Named("T".into()),
             output_name: "r".into(),
             output_ty: Type::Text,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "r".into(),
@@ -1942,6 +1997,7 @@ mod tests {
             input_ty: Type::Named("Input".into()),
             output_name: "n".into(),
             output_ty: Type::Number,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "n".into(),
@@ -2006,6 +2062,7 @@ mod tests {
             input_ty: Type::Named("Input".into()),
             output_name: "t".into(),
             output_ty: Type::Named("Token".into()),
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "t".into(),
@@ -2053,6 +2110,7 @@ mod tests {
             input_ty: Type::Named("Input".into()),
             output_name: "t".into(),
             output_ty: Type::Named("Token".into()),
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "t".into(),
@@ -2147,6 +2205,7 @@ mod tests {
             input_ty: Type::Named("Input".into()),
             output_name: "out".into(),
             output_ty: Type::Number,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![("t".into(), construct)],
                 target: "out".into(),
@@ -2291,6 +2350,7 @@ mod tests {
             input_ty: Type::Named("Expr".into()),
             output_name: "n".into(),
             output_ty: Type::Number,
+            output_text_max: None,
             logic: LogicStmt {
                 bindings: vec![],
                 target: "n".into(),

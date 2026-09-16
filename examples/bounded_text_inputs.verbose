@@ -1,0 +1,67 @@
+@verbose 0.1.0
+
+concept TextInput
+  @intention: "Receive a short title and an unrestricted numeric choice"
+  @source: bounded_text_inputs.intent:1
+  fields:
+    title : text [..8]
+    code : number
+
+concept FormatInput
+  @intention: "Require a bounded title and a normalized numeric choice"
+  @source: bounded_text_inputs.intent:2
+  fields:
+    title : text [..10]
+    code : number [-1, 1]
+
+rule pack_text
+  @intention: "Construct an input whose fields fit the formatter contract"
+  @source: bounded_text_inputs.intent:3
+  input:
+    req : TextInput
+  output:
+    out : FormatInput
+  logic:
+    out = FormatInput { title: concat("[", req.title, "]"), code: if req.code > 0 then 1 else -1 }
+  proofs:
+    purity:
+      reads : [req.title, req.code]
+      calls : []
+    termination:
+      bound : 32
+
+rule render_text
+  @intention: "Format a checked record without repeating its field computations"
+  @source: bounded_text_inputs.intent:4
+  input:
+    entry : FormatInput
+  output:
+    out : text [..31]
+  logic:
+    let unused = concat("unused", entry.title)
+    out = concat(entry.title, ":", entry.code)
+  proofs:
+    purity:
+      reads : [entry.title, entry.code]
+      calls : []
+    termination:
+      bound : 32
+
+rule compose_text
+  @intention: "Keep constructed input aliases alive across successive formatter calls"
+  @source: bounded_text_inputs.intent:5
+  input:
+    request : TextInput
+  output:
+    out : text [..78]
+  logic:
+    let packed = pack_text(request)
+    let saved = packed
+    let packed = FormatInput { title: "shadow", code: 0 }
+    out = concat(render_text(saved), " | ", render_text(FormatInput { title: "fixed", code: 0 }), " | ", saved.title)
+  proofs:
+    purity:
+      reads : [request]
+      calls : [pack_text, render_text]
+    termination:
+      bound : 64

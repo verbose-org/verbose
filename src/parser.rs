@@ -47,6 +47,7 @@ pub const PRIMITIVE_CALL_NAMES: &[&str] = &[
     "bor",
     "bxor",
     "byte_at",
+    "try_byte_at",
     "concat",
     "contains",
     "count",
@@ -462,6 +463,7 @@ impl Parser {
             "bool" => Type::Bool,
             "text" => Type::Text,
             "bytes" => Type::Bytes,
+            "BoundsError" => Type::BoundsError,
             "collection" => {
                 self.expect_kind(TokenKind::LParen)?;
                 let inner = self.expect_ident_any()?;
@@ -510,6 +512,7 @@ impl Parser {
         let mut input: Option<(String, Type)> = None;
         let mut context: Option<(String, Type)> = None;
         let mut output: Option<(String, Type)> = None;
+        let mut output_text_max = None;
         let mut logic = None;
         let mut proofs = None;
         let mut hints = None;
@@ -563,7 +566,33 @@ impl Parser {
             } else if self.check_ident("input") {
                 input = Some(self.parse_binding_block("input")?);
             } else if self.check_ident("output") {
-                output = Some(self.parse_binding_block("output")?);
+                if output.is_some() {
+                    return Err(self.error("duplicate output block"));
+                }
+                self.expect_ident("output")?;
+                self.expect_kind(TokenKind::Colon)?;
+                self.expect_kind(TokenKind::Newline)?;
+                self.expect_kind(TokenKind::Indent)?;
+                let name = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::Colon)?;
+                let ty = self.parse_type()?;
+                if self.check_kind(&TokenKind::LBracket) {
+                    if ty != Type::Text {
+                        return Err(self.error("bounded output requires text [..N]"));
+                    }
+                    self.advance();
+                    self.expect_kind(TokenKind::Dot)?;
+                    self.expect_kind(TokenKind::Dot)?;
+                    let max = self.parse_signed_number()?;
+                    self.expect_kind(TokenKind::RBracket)?;
+                    if !(0..=1_048_576).contains(&max) {
+                        return Err(self.error("text output bound must be between 0 and 1048576 bytes"));
+                    }
+                    output_text_max = Some(max as u32);
+                }
+                self.expect_kind(TokenKind::Newline)?;
+                self.expect_kind(TokenKind::Dedent)?;
+                output = Some((name, ty));
             } else if self.check_ident("logic") {
                 logic = Some(self.parse_logic_block()?);
             } else if self.check_ident("proofs") {
@@ -604,6 +633,7 @@ impl Parser {
             input_ty,
             output_name,
             output_ty,
+            output_text_max,
             logic,
             proofs,
             hints,
@@ -1354,7 +1384,7 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Substring(Box::new(text_arg), Box::new(start_arg), Box::new(end_arg)))
-            } else if name == "byte_at" && self.check_kind(&TokenKind::LParen) {
+            } else if (name == "byte_at" || name == "try_byte_at") && self.check_kind(&TokenKind::LParen) {
                 // `byte_at(<text>, <index>)` — read the byte at a given
                 // offset of the text, returning a Number in 0..256.
                 // Exactly two arguments; any other arity is a parse-time
@@ -1375,7 +1405,7 @@ impl Parser {
                     return Err(self.error("byte_at requires exactly two arguments (text, index), got more than two"));
                 }
                 self.expect_kind(TokenKind::RParen)?;
-                Ok(Expr::ByteAt(Box::new(text_arg), Box::new(index_arg)))
+                Ok(if name == "try_byte_at" { Expr::TryByteAt(Box::new(text_arg), Box::new(index_arg)) } else { Expr::ByteAt(Box::new(text_arg), Box::new(index_arg)) })
             } else if name == "abs" && self.check_kind(&TokenKind::LParen) {
                 // `abs(<number_expr>)` — absolute value. Exactly one argument;
                 // zero or two-plus is a parse-time error. The verifier checks
@@ -1811,6 +1841,12 @@ impl Parser {
         // enforces that they come as a pair and only on raw_tcp.
         let mut max_steps: Option<u32> = None;
         let mut read_timeout: Option<u32> = None;
+        let mut request_timeout = None;
+        let mut response_timeout = None;
+        let mut max_connections = None;
+        let mut workers = None;
+        let mut shutdown_timeout = None;
+        let mut saw_concurrency = false;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -1947,12 +1983,17 @@ impl Parser {
                 self.advance();
                 self.expect_kind(TokenKind::Colon)?;
                 let mode_name = self.expect_ident_any()?;
+                if saw_concurrency && (concurrency == ConcurrencyMode::Pooled || mode_name == "pooled") {
+                    return Err(self.error("duplicate service attribute 'concurrency' with pooled workers"));
+                }
+                saw_concurrency = true;
                 concurrency = match mode_name.as_str() {
                     "sequential" => ConcurrencyMode::Sequential,
                     "forked" => ConcurrencyMode::Forked,
+                    "pooled" => ConcurrencyMode::Pooled,
                     other => {
                         return Err(self.error(&format!(
-                            "unknown concurrency mode '{}' (allowed: sequential, forked)",
+                            "unknown concurrency mode '{}' (allowed: sequential, forked, pooled)",
                             other
                         )));
                     }
@@ -2109,6 +2150,47 @@ impl Parser {
                 }
                 read_timeout = Some(n as u32);
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("request_timeout") || self.check_ident("response_timeout") {
+                let request = self.check_ident("request_timeout");
+                let key = if request { "request_timeout" } else { "response_timeout" };
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=3600).contains(&n) {
+                    return Err(self.error(&format!("{} {} out of range [1, 3600] seconds", key, n)));
+                }
+                let slot = if request { &mut request_timeout } else { &mut response_timeout };
+                if slot.is_some() { return Err(self.error(&format!("duplicate service attribute '{}'", key))); }
+                *slot = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("shutdown_timeout") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=3600).contains(&n) { return Err(self.error("shutdown_timeout out of range [1, 3600] seconds")); }
+                if shutdown_timeout.is_some() { return Err(self.error("duplicate service attribute 'shutdown_timeout'")); }
+                shutdown_timeout = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("workers") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=64).contains(&n) { return Err(self.error("workers out of range [1, 64]")); }
+                if workers.is_some() { return Err(self.error("duplicate service attribute 'workers'")); }
+                workers = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("max_connections") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=65535).contains(&n) {
+                    return Err(self.error("max_connections out of range [1, 65535]"));
+                }
+                if max_connections.is_some() {
+                    return Err(self.error("duplicate service attribute 'max_connections'"));
+                }
+                max_connections = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
             } else if self.check_ident("frame") {
                 // Refusal #9 (design §5.5): a DECLARED framing block. It is
                 // recognised so it can be refused by name — an unknown key
@@ -2121,7 +2203,7 @@ impl Parser {
                     name
                 )));
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', or 'read_timeout:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', 'response_timeout:', 'max_connections:', 'workers:', or 'shutdown_timeout:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -2145,6 +2227,11 @@ impl Parser {
             after_sets,
             max_steps,
             read_timeout,
+            request_timeout,
+            response_timeout,
+            max_connections,
+            workers,
+            shutdown_timeout,
         })
     }
 

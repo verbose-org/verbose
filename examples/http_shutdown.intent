@@ -1,0 +1,3 @@
+Bounded graceful HTTP pool shutdown
+Echo each complete request body without leaking bytes from earlier requests.
+Finish accepted requests on SIGTERM; request forced termination when the declared grace period expires.
