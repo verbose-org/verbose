@@ -436,6 +436,8 @@ The [benchmark report](docs/benchmarks.md) compares startup, binary size, memory
 and computation separately, including cases where the native backend loses.
 Its commands and dated measurements provide the context needed to assess the
 results. A small executable alone establishes neither correctness nor throughput.
+The [HTTP worker baseline](docs/http-worker-benchmarks.md) compares the same echo
+service in forked and pooled modes, with response checks and memory snapshots.
 
 ## Three Axioms
 

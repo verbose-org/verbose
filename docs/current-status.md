@@ -126,7 +126,8 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   execution cases. It does not prove correctness for every accepted program.
 - Binary sizes and performance results are measurements for specific programs,
   flags, and revisions. Use the dated [benchmark report](benchmarks.md) and rerun
-  its commands for a new checkout.
+  its commands for a new checkout. The [HTTP worker baseline](http-worker-benchmarks.md)
+  separately measures forked/pool goodput and pool memory reuse.
 
 ## Immutable artifact, changing inputs
 
