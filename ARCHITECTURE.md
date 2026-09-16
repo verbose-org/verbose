@@ -93,6 +93,14 @@ check that storage; unknown bounds must remain explicitly unknown. Apache is a
 useful reference for operational capabilities, not a feature-cloning objective
 or a prerequisite for Verbose to make useful design choices.
 
+Memory efficiency is also an objective: minimize live storage, unnecessary
+copies and the working set to support processor-cache locality. Capacity bounds
+are ceilings, not targets to fill. The compiler should exploit verified
+lifetimes and exclusive execution to reuse storage without runtime management.
+This does not guarantee cache residency: reserved bytes, touched bytes, RSS and
+hardware cache misses must be distinguished in measurements. No particular
+cache size becomes a language contract.
+
 This is already concrete for bounded HTTP reception: `max_request` determines a
 fixed frame buffer, receiving does not grow it, and oversize requests close the
 client. It is not yet a whole-service memory bound: response temporaries, callees,
@@ -104,8 +112,27 @@ performance or safety advantage over another native server.
 At rule boundaries, a text output annotated `[..N]` now requires a static proof
 of its byte capacity, including pure acyclic composition. See
 [bounded text results](docs/bounded-text-output.md). This makes value capacity
-explicit independently of services; temporary storage and ownership remain
-separate questions.
+explicit independently of services. Its checked native subset now reserves
+[invocation-owned text storage](docs/bounded-text-storage.md), with evaluated
+lets, shared aliases and a separate ceiling on slots and temporary buffers.
+Output-position calls and branches forward a fresh result destination to the
+producer; other live values retain distinct storage. Text buffers can share
+space after their proved last use, including through aliases and branch joins.
+Buffers created in opposite `if` arms can overlap while their region remains
+protected through all subsequent alias uses. The compiler keeps that placement
+only when it reduces the reserved frame compared with ordinary last-use reuse.
+Placement happens at compilation; scalar/pointer/length slots are not reused.
+Rules can [construct checked record inputs](docs/bounded-text-inputs.md) for
+callees with different concepts. The compiler proves field capacities and numeric
+intervals at that boundary, evaluates fields once, and retains their storage
+through callee and caller uses.
+[Conditional records](docs/bounded-text-branches.md) join capacities and numeric
+intervals field by field. Native selection moves text descriptors while keeping
+their possible owners alive through subsequent uses.
+A sequential HTTP service can also [copy a bounded rule result into its own text
+state](docs/bounded-text-state.md). The compiler checks the destination capacity
+and releases temporary storage after copying. General ownership across resources
+or threads remains a separate contract.
 
 Worker reuse must preserve request-local lifetimes and demonstrate stable storage
 across requests and failure paths. Shared mutable memory between threads needs an

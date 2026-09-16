@@ -58,7 +58,7 @@ pub fn active_rules(p: &Program) -> BTreeSet<String> {
 
 #[derive(Clone, Debug)]
 enum Value {
-    Number,
+    Number(i64, i64),
     Bool,
     Text(Option<u64>),
     Input(String),
@@ -67,7 +67,7 @@ enum Value {
 impl Value {
     fn ty(&self) -> Type {
         match self {
-            Self::Number => Type::Number,
+            Self::Number(..) => Type::Number,
             Self::Bool => Type::Bool,
             Self::Text(_) => Type::Text,
             Self::Input(n) | Self::Record(n, _) => Type::Named(n.clone()),
@@ -83,7 +83,7 @@ impl Value {
     fn capacity(&self) -> Result<Option<u64>, String> {
         match self {
             Self::Text(n) => Ok(*n),
-            Self::Number => Ok(Some(20)),
+            Self::Number(..) => Ok(Some(20)),
             _ => Err("concat requires text or number arguments".into()),
         }
     }
@@ -98,6 +98,130 @@ struct Check<'a> {
     native: bool,
 }
 impl Check<'_> {
+    fn input_field(&self, concept: &str, name: &str) -> Result<Value, String> {
+        let f = self.concepts[concept]
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| format!("unknown field '{concept}.{name}'"))?;
+        Self::declared_field(f)
+    }
+
+    fn declared_field(f: &Field) -> Result<Value, String> {
+        match f.ty {
+            Type::Number => {
+                let (min, max) = f.range.unwrap_or((i64::MIN, i64::MAX));
+                Ok(Value::Number(min, max))
+            }
+            Type::Text => Ok(Value::Text(
+                f.range.and_then(|(_, n)| u64::try_from(n).ok()),
+            )),
+            _ => Err("unsupported input field type".into()),
+        }
+    }
+
+    fn materialize_input(&self, value: Value) -> Result<Value, String> {
+        let Value::Input(name) = value else {
+            return Ok(value);
+        };
+        let fields = self.concepts[name.as_str()]
+            .fields
+            .iter()
+            .map(|f| Ok((f.name.clone(), Self::declared_field(f)?)))
+            .collect::<Result<_, String>>()?;
+        Ok(Value::Record(name, fields))
+    }
+
+    fn join(&mut self, a: Value, b: Value) -> Result<Value, String> {
+        a.require(&b.ty())?;
+        match (self.materialize_input(a)?, self.materialize_input(b)?) {
+            (Value::Text(a), Value::Text(b)) => Ok(Value::Text(a.zip(b).map(|(a, b)| a.max(b)))),
+            (Value::Number(a, b), Value::Number(c, d)) => Ok(Value::Number(a.min(c), b.max(d))),
+            (Value::Bool, Value::Bool) => Ok(Value::Bool),
+            (Value::Record(name, mut a), Value::Record(_, mut b)) => {
+                // Whole-input aliases may hide large records behind a tiny
+                // expression. Account for synthesized field joins too.
+                self.steps = self.steps.saturating_add(a.len());
+                if self.steps > 100_000 {
+                    return Err(
+                        "bounded text analysis limit exceeded (100000 expression/field visits)"
+                            .into(),
+                    );
+                }
+                // Use declaration order for deterministic diagnostics. Source
+                // field order affects evaluation, never field correspondence.
+                let names: Vec<_> = self.concepts[name.as_str()]
+                    .fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect();
+                let fields = names
+                    .into_iter()
+                    .map(|field| {
+                        let a = a.remove(&field).ok_or("missing conditional record field")?;
+                        let b = b.remove(&field).ok_or("missing conditional record field")?;
+                        self.join(a, b)
+                            .map(|v| (field.clone(), v))
+                            .map_err(|e| format!("conditional field '{}.{}': {e}", name, field))
+                    })
+                    .collect::<Result<_, String>>()?;
+                Ok(Value::Record(name, fields))
+            }
+            _ => Err("incompatible conditional values".into()),
+        }
+    }
+
+    // Rule bodies are checked against their declared input, not specialized to
+    // one call site's narrower values. Prove the transfer before using that
+    // public contract; a nominal record type alone does not prove its ranges.
+    fn call_input(&self, name: &str, value: &Value) -> Result<(), String> {
+        let callee = self.rules.get(name).ok_or("unknown callee")?;
+        value.require(&callee.input_ty)?;
+        if matches!(value, Value::Input(_)) {
+            // Forwarding the original input (also through an alias) preserves
+            // the same concept and the entry's existing input guards.
+            return Ok(());
+        }
+        let Value::Record(concept, values) = value else {
+            return Err(format!("call '{name}' requires one flat record input"));
+        };
+        let concept = self
+            .concepts
+            .get(concept.as_str())
+            .ok_or("unknown input concept")?;
+        for field in &concept.fields {
+            let value = values.get(&field.name).ok_or("missing input field")?;
+            value.require(&field.ty)?;
+            let context = format!("call '{name}' input field '{}'", field.name);
+            match value {
+                Value::Text(actual) => {
+                    let max = field
+                        .range
+                        .and_then(|(_, n)| u64::try_from(n).ok())
+                        .ok_or_else(|| format!("{context}: declared byte capacity is unknown"))?;
+                    let actual = actual
+                        .ok_or_else(|| format!("{context}: argument byte capacity is unknown"))?;
+                    if actual > max {
+                        return Err(format!("{context}: argument needs up to {actual} bytes, exceeds declared [..{max}]"));
+                    }
+                }
+                Value::Number(lo, hi) => {
+                    if let Some((min, max)) = field.range {
+                        if *lo < min || *hi > max {
+                            return Err(format!("{context}: cannot prove argument range [{lo}, {hi}] fits [{min}, {max}]"));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "{context}: input must be a flat concept of numbers and text"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn rule(&mut self, name: &str) -> Result<Value, String> {
         if let Some(v) = self.cache.get(name) {
             return Ok(v.clone());
@@ -198,25 +322,19 @@ impl Check<'_> {
         let mut sub = |e| self.expr(e, r, env, depth + 1);
         let value = match e {
             Expr::Text(s) => Value::Text(Some(s.len() as u64)),
-            Expr::Number(_) => Value::Number,
-            Expr::Neg(n) if matches!(n.as_ref(), Expr::Number(0..)) => Value::Number,
+            Expr::Number(n) => Value::Number(*n, *n),
+            Expr::Neg(n) if matches!(n.as_ref(), Expr::Number(0..)) => {
+                let Expr::Number(n) = n.as_ref() else {
+                    unreachable!()
+                };
+                Value::Number(-*n, -*n)
+            }
             Expr::Ident(n) => env
                 .get(n)
                 .cloned()
                 .ok_or_else(|| format!("unknown binding '{n}'"))?,
             Expr::Field(base, name) => match sub(base)? {
-                Value::Input(c) => {
-                    let f = self.concepts[c.as_str()]
-                        .fields
-                        .iter()
-                        .find(|f| f.name == *name)
-                        .ok_or_else(|| format!("unknown field '{c}.{name}'"))?;
-                    match f.ty {
-                        Type::Number => Value::Number,
-                        Type::Text => Value::Text(f.range.and_then(|(_, n)| u64::try_from(n).ok())),
-                        _ => return Err("unsupported field type".into()),
-                    }
-                }
+                Value::Input(c) => self.input_field(&c, name)?,
                 Value::Record(_, fields) => {
                     fields.get(name).cloned().ok_or("unknown record field")?
                 }
@@ -240,35 +358,14 @@ impl Check<'_> {
                 sub(cond)?.require(&Type::Bool)?;
                 let a = sub(yes)?;
                 let b = sub(no)?;
-                a.require(&b.ty())?;
-                match (a, b) {
-                    (Value::Text(a), Value::Text(b)) => {
-                        Value::Text(a.zip(b).map(|(a, b)| a.max(b)))
-                    }
-                    (Value::Number, Value::Number) => Value::Number,
-                    (Value::Bool, Value::Bool) => Value::Bool,
-                    // Fieldwise joins need their own analysis; never keep one arm's capacity.
-                    _ => {
-                        return Err(
-                            "conditional record values are unsupported in bounded text analysis"
-                                .into(),
-                        )
-                    }
-                }
+                self.join(a, b)?
             }
             Expr::Call(name, args) => {
-                if args.len() != 1
-                    || !matches!(&args[0], Expr::Ident(n) if *n == r.input_name)
-                    || !matches!(env.get(&r.input_name), Some(Value::Input(_)))
-                {
-                    return Err(format!(
-                        "call '{name}' requires callee(input) with the original input binding"
-                    ));
+                if args.len() != 1 {
+                    return Err(format!("call '{name}' requires exactly one record input"));
                 }
-                let callee = self.rules.get(name.as_str()).ok_or("unknown callee")?;
-                if callee.input_ty != r.input_ty {
-                    return Err(format!("call '{name}' requires the same input concept"));
-                }
+                let input = sub(&args[0])?;
+                self.call_input(name, &input)?;
                 self.rule(name)?
             }
             Expr::Binary(op, left, right) => {
@@ -277,7 +374,7 @@ impl Check<'_> {
                 match op {
                     BinOp::Eq | BinOp::NotEq => {
                         a.require(&b.ty())?;
-                        if !matches!(a, Value::Number | Value::Bool | Value::Text(_)) {
+                        if !matches!(a, Value::Number(..) | Value::Bool | Value::Text(_)) {
                             return Err("comparison requires scalar values".into());
                         }
                         Value::Bool
@@ -296,8 +393,15 @@ impl Check<'_> {
                 Value::Bool
             }
             Expr::Length(e) => {
-                sub(e)?.require(&Type::Text)?;
-                Value::Number
+                let value = sub(e)?;
+                value.require(&Type::Text)?;
+                let Value::Text(cap) = value else {
+                    unreachable!()
+                };
+                Value::Number(
+                    0,
+                    cap.and_then(|n| i64::try_from(n).ok()).unwrap_or(i64::MAX),
+                )
             }
             Expr::Record(name, fields) => {
                 let c = *self
@@ -316,7 +420,7 @@ impl Check<'_> {
                         .ok_or("unknown record field")?;
                     let v = self.expr(e, r, env, depth + 1)?;
                     v.require(&f.ty)?;
-                    if !matches!(v, Value::Text(_) | Value::Number | Value::Bool) {
+                    if !matches!(v, Value::Text(_) | Value::Number(..) | Value::Bool) {
                         return Err(
                             "nested records are unsupported in bounded text analysis".into()
                         );
@@ -360,7 +464,70 @@ pub fn verify(p: &Program) -> Vec<VerifyError> {
     verify_mode(p, false)
 }
 
-fn verify_mode(p: &Program, native: bool) -> Vec<VerifyError> {
+/// The only new escape from invocation storage: a complete, explicitly bounded
+/// text call copied into a sequential HTTP service's existing owned state.
+/// Used by the service capacity gate and native preparation too. Callee bodies
+/// remain subject to the ordinary bounded-text analysis above.
+pub(crate) fn state_call<'a>(
+    service: &Service,
+    handler: &Rule,
+    set: &StateSet,
+    rules: &HashMap<&str, &'a Rule>,
+) -> Result<Option<&'a Rule>, String> {
+    let Expr::Call(name, args) = &set.value else {
+        return Ok(None);
+    };
+    let Some(callee) = rules.get(name.as_str()).copied() else {
+        return Ok(None);
+    };
+    let Some(cap) = callee.output_text_max else {
+        return Ok(None);
+    };
+    if service.protocol != Protocol::Http10 || service.concurrency != ConcurrencyMode::Sequential {
+        return Err("bounded text state transfer requires a sequential HTTP service".into());
+    }
+    if args.len() != 1
+        || !matches!(&args[0], Expr::Ident(n) if *n == handler.input_name)
+        || handler.input_ty != Type::Named("HttpRequest".into())
+        || callee.input_ty != handler.input_ty
+    {
+        return Err("bounded text state transfer requires callee(input) with the original HTTP input binding".into());
+    }
+    let field = service
+        .state_fields
+        .iter()
+        .find(|f| f.name == set.field_name)
+        .ok_or("bounded text state transfer requires a declared state field")?;
+    if field.ty != Type::Text || callee.output_ty != Type::Text {
+        return Err(
+            "bounded text state transfer requires a text result and a text state field".into(),
+        );
+    }
+    let max = field
+        .max_bytes
+        .filter(|n| (1..=65536).contains(n))
+        .ok_or("bounded text state transfer requires a state capacity in 1..=65536")?;
+    if i64::from(cap) > max {
+        return Err(format!(
+            "bounded text result [..{cap}] exceeds state field '{}' capacity [..{max}]",
+            field.name
+        ));
+    }
+    Ok(Some(callee))
+}
+
+pub(crate) fn service_uses_contract(s: &Service, active: &BTreeSet<String>) -> bool {
+    if active.contains(&s.handler) {
+        return true;
+    }
+    let mut names = BTreeSet::new();
+    for set in &s.after_sets {
+        calls(&set.value, &mut names);
+    }
+    !active.is_disjoint(&names)
+}
+
+pub(crate) fn verify_mode(p: &Program, native: bool) -> Vec<VerifyError> {
     let active = active_rules(p);
     if active.is_empty() {
         return Vec::new();
@@ -432,13 +599,34 @@ fn verify_mode(p: &Program, native: bool) -> Vec<VerifyError> {
                     inspect_effect(&log.effect);
                 }
                 for set in &s.after_sets {
-                    calls(&set.value, &mut effect_calls);
+                    let mut names = BTreeSet::new();
+                    calls(&set.value, &mut names);
+                    if !active.is_disjoint(&names) {
+                        let result = check.rules.get(s.handler.as_str())
+                            .ok_or_else(|| "missing service handler".to_string())
+                            .and_then(|handler| state_call(s, handler, set, &check.rules))
+                            .and_then(|callee| callee.ok_or_else(|| "bounded text after mutation requires a complete call to a rule with an explicit text [..N] result".into()));
+                        if let Err(message) = result {
+                            errors.push(VerifyError {
+                                context: format!(
+                                    "service '{}' / after / set {}",
+                                    s.name, set.field_name
+                                ),
+                                message,
+                            });
+                        }
+                    }
                 }
             }
             _ => {}
         }
         if !active.is_disjoint(&effect_calls) {
-            errors.push(VerifyError { context: "bounded text output / effect".into(), message: "participating rules cannot be called from reactions, logs or after mutations in this slice".into() });
+            errors.push(VerifyError {
+                context: "bounded text output / effect".into(),
+                message:
+                    "participating rules cannot be called from reactions or logs in this slice"
+                        .into(),
+            });
         }
         if let Item::Service(s) = item {
             if active.contains(&s.handler)
@@ -457,168 +645,6 @@ fn verify_mode(p: &Program, native: bool) -> Vec<VerifyError> {
         }
     }
     errors
-}
-
-/// Lower the checked, pure, total subset to the legacy text emitter's grammar.
-/// Substitution can duplicate computation but cannot duplicate effects or hide
-/// checked-operation failure: neither is accepted by this slice. Count expanded
-/// nodes so an alias DAG cannot turn into an unbounded compiler allocation.
-pub fn lower_native(p: &Program) -> Result<Program, String> {
-    if let Some(e) = verify_mode(p, true).first() {
-        return Err(e.to_string());
-    }
-    let active = active_rules(p);
-    let mut out = p.clone();
-    let mut budget = ExpansionBudget::new();
-    for item in &mut out.items {
-        if let Item::Rule(r) = item {
-            if !active.contains(&r.name) {
-                continue;
-            }
-            let mut env = HashMap::from([(
-                r.input_name.clone(),
-                Expr::Ident("__bounded_text_input".into()),
-            )]);
-            for (name, expr) in &r.logic.bindings {
-                let value = expand(expr, &env, &HashMap::new(), &mut budget, 0)?;
-                env.insert(name.clone(), value);
-            }
-            r.logic.value = expand(&r.logic.value, &env, &HashMap::new(), &mut budget, 0)?;
-            r.logic.bindings.clear();
-            r.input_name = "__bounded_text_input".into();
-        }
-    }
-    // The legacy backend expands acyclic calls too. Bound that expansion,
-    // including a branching call DAG whose rule summaries were memoized above.
-    fn cost(name: &str, rules: &HashMap<&str, &Rule>, cache: &mut HashMap<String, usize>) -> usize {
-        if let Some(n) = cache.get(name) {
-            return *n;
-        }
-        fn node(
-            e: &Expr,
-            rules: &HashMap<&str, &Rule>,
-            cache: &mut HashMap<String, usize>,
-        ) -> usize {
-            let mut n: usize = 1;
-            if let Expr::Call(name, _) = e {
-                n = n.saturating_add(cost(name, rules, cache));
-            }
-            walk_expr_children(e, &mut |e| n = n.saturating_add(node(e, rules, cache)));
-            n
-        }
-        let n = node(&rules[name].logic.value, rules, cache);
-        cache.insert(name.into(), n);
-        n
-    }
-    let rules: HashMap<_, _> = out
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Rule(r) => Some((r.name.as_str(), r)),
-            _ => None,
-        })
-        .collect();
-    let mut cache = HashMap::new();
-    for name in &active {
-        if cost(name, &rules, &mut cache) > 100_000 {
-            return Err(format!(
-                "bounded text native call expansion limit exceeded in rule '{name}'"
-            ));
-        }
-    }
-    let bodies: Vec<_> = out
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Rule(r) => Some(r.clone()),
-            _ => None,
-        })
-        .collect();
-    let inline_rules = bodies.iter().map(|r| (r.name.as_str(), r)).collect();
-    let mut budget = ExpansionBudget::new();
-    for item in &mut out.items {
-        if let Item::Rule(r) = item {
-            if active.contains(&r.name) {
-                r.logic.value = expand(
-                    &r.logic.value,
-                    &HashMap::new(),
-                    &inline_rules,
-                    &mut budget,
-                    0,
-                )?;
-            }
-        }
-    }
-    Ok(out)
-}
-
-struct ExpansionBudget {
-    nodes: usize,
-    literal_bytes: usize,
-}
-impl ExpansionBudget {
-    fn new() -> Self {
-        Self {
-            nodes: 100_000,
-            literal_bytes: 16 * 1024 * 1024,
-        }
-    }
-}
-
-fn expand(
-    e: &Expr,
-    env: &HashMap<String, Expr>,
-    rules: &HashMap<&str, &Rule>,
-    budget: &mut ExpansionBudget,
-    depth: usize,
-) -> Result<Expr, String> {
-    if budget.nodes == 0 || depth > 256 {
-        return Err("bounded text native expansion limit exceeded".into());
-    }
-    budget.nodes -= 1;
-    if let Expr::Text(s) = e {
-        budget.literal_bytes = budget
-            .literal_bytes
-            .checked_sub(s.len())
-            .ok_or("bounded text native literal expansion exceeds 16 MiB")?;
-    }
-    let mut sub = |e| expand(e, env, rules, budget, depth + 1);
-    Ok(match e {
-        Expr::Ident(n) if env.contains_key(n) => {
-            // An already expanded binding must never see a later lexical binding.
-            expand(&env[n], &HashMap::new(), rules, budget, depth + 1)?
-        }
-        Expr::Text(_) | Expr::Number(_) | Expr::Ident(_) => e.clone(),
-        Expr::Field(a, n) => Expr::Field(Box::new(sub(a)?), n.clone()),
-        Expr::Concat(args) => {
-            let mut flat = Vec::new();
-            for arg in args {
-                match sub(arg)? {
-                    Expr::Concat(inner) => flat.extend(inner),
-                    other => flat.push(other),
-                }
-            }
-            Expr::Concat(flat)
-        }
-        Expr::Call(n, _) if rules.contains_key(n.as_str()) => sub(&rules[n.as_str()].logic.value)?,
-        Expr::Call(n, args) => Expr::Call(
-            n.clone(),
-            args.iter().map(&mut sub).collect::<Result<_, _>>()?,
-        ),
-        Expr::If(c, a, b) => Expr::If(Box::new(sub(c)?), Box::new(sub(a)?), Box::new(sub(b)?)),
-        Expr::Binary(op, a, b) => Expr::Binary(*op, Box::new(sub(a)?), Box::new(sub(b)?)),
-        Expr::Not(a) => Expr::Not(Box::new(sub(a)?)),
-        Expr::Neg(a) => Expr::Neg(Box::new(sub(a)?)),
-        Expr::Length(a) => Expr::Length(Box::new(sub(a)?)),
-        Expr::Record(n, fields) => Expr::Record(
-            n.clone(),
-            fields
-                .iter()
-                .map(|(n, e)| Ok((n.clone(), sub(e)?)))
-                .collect::<Result<_, String>>()?,
-        ),
-        _ => return Err("unsupported expression in bounded text native expansion".into()),
-    })
 }
 
 #[cfg(test)]
