@@ -1,0 +1,4 @@
+Each response shows the formatter value stored after the previous successful response.
+A pure formatter surrounds the counted request body with delimiters within 4098 bytes.
+The bounded result uses lexical aliases and selects a body or path representation.
+A sequential HTTP service copies the result into its own bounded state buffer before reclaiming temporary storage.

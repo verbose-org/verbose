@@ -1,7 +1,9 @@
 # Text/bytes-typed `state:` fields on a service — design note (native slice `text-state-1`)
 
-> **Status: DESIGN ONLY. Nothing in this note is implemented.** Written against `main = 7bf998b`,
-> clean tree. Every `file:line` below was opened and read at that commit.
+> **Historical design note**, written against `main = 7bf998b`. Text state fields
+> and counted copies have since been implemented; the proposals and `file:line`
+> references below describe that earlier snapshot. For the current bounded rule
+> result transfer, see [copying bounded text into persistent state](bounded-text-state.md).
 
 ---
 

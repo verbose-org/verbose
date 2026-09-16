@@ -2,6 +2,9 @@ use super::*;
 use crate::{interpreter, lexer::Lexer, parser::Parser};
 use std::{fs, path::Path, process::Command};
 
+mod branches;
+mod inputs;
+
 const SOURCE: &str = include_str!("../../examples/bounded_text.verbose");
 fn parse(s: &str) -> Program {
     Parser::new(Lexer::new(s).tokenize().unwrap())
@@ -326,7 +329,7 @@ fn text_bounds_refusals_are_explicit() {
         ("label(item)", "recursion"),
         (
             "label(LabelInput { title: \"too long for input\", code: 1 })",
-            "original input",
+            "input field 'title'",
         ),
         ("try_byte_at(b\"x\", item.code)", "Result"),
     ];
@@ -346,7 +349,7 @@ fn text_bounds_refusals_are_explicit() {
             expression("LabelInput { title: \"longlonglong\", code: 1 }"),
         ),
     );
-    rejects(&p, "original input");
+    rejects(&p, "input field 'title'");
 }
 
 #[test]
@@ -417,6 +420,9 @@ fn text_bounds_self_hosted_refuses_before_artifact() {
             SOURCE.to_string(),
             SOURCE.replace("[..30]", "[..0]"),
             include_str!("../../examples/http_bounded_text.verbose").to_string(),
+            include_str!("../../examples/bounded_text_state.verbose").to_string(),
+            include_str!("../../examples/bounded_text_inputs.verbose").to_string(),
+            include_str!("../../examples/bounded_text_branches.verbose").to_string(),
         ] {
             let mut child = Command::new(&bin)
                 .arg("0")
