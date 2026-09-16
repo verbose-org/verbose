@@ -1,0 +1,5 @@
+Accept a title of at most eight bytes and a numeric choice.
+The formatter input permits ten title bytes and a choice from minus one to one.
+Wrap the title and normalize the numeric choice to meet the formatter input contract.
+Format the already evaluated input fields within a checked output capacity.
+Reuse a constructed record after shadowing it and calling the formatter again.

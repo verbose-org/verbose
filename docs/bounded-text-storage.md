@@ -5,11 +5,11 @@ Implemented 2026-09-13. This implements the native storage of the
 changes no unannotated call component.
 
 A participating native entry owns one fixed stack region for its evaluation.
-Each concat receives a statically sized buffer. A text-returning rule writes its
-result into a destination reserved in that region, sized from its declared
-capacity (or its inferred capacity for an unannotated dependency). Calls are
-still expanded at compilation; this is an invocation storage convention, not a
-new general callable ABI.
+An independently materialized text result receives a destination sized from its
+declared capacity (or its inferred capacity for an unannotated dependency).
+Calls and concats in output position write directly into that destination.
+Calls are still expanded at compilation; this is an invocation storage
+convention, not a new general callable ABI.
 
 ```verbose
 let message = piece(request)
@@ -28,14 +28,76 @@ conditionals can be materialized without the former emitter nesting restriction.
 |---|---|
 | Owner | The enclosing entry evaluation or HTTP request owns all writable text buffers. Aliases share immutable values. Literals and input fields can be borrowed within that lifetime. |
 | Capacity | Each text expression has a proved byte bound of at most 1 MiB. The native storage region plus saved registers and fixed formatting scratch must fit in 2 MiB. Slots and buffers use checked size arithmetic and eight-byte alignment. |
-| Lifetime | Buffers stay valid until the entry output is written, or until the HTTP response finishes or its client is closed. Repeated argv records, stream lines and pooled requests release the region before the next evaluation. |
+| Lifetime | Each buffer stays valid through its last use, including uses through aliases. Returned values stay valid until the entry output is written, or until the HTTP response finishes or its client is closed. Repeated argv records, stream lines and pooled requests release the region before the next evaluation. |
 | Exhaustion | Excessive or unknown requirements cause a compile diagnostic before the output artifact is opened. There is no truncation, runtime heap fallback or recoverable memory error in this contract. |
 
-The 2 MiB ceiling is a backend limit, not a new source annotation. It sums all
-reserved temporaries, including unused lets and both sides of a conditional;
-there is no slot reuse based on last use yet. A small output can therefore exceed
-the storage limit. Text results currently copy into their caller's destination;
-forwarding that destination into a callee's concat is a later optimization.
+The 2 MiB ceiling is a backend limit, not a new source annotation. It covers
+the chosen placement of live buffers, fixed scalar/pointer/length slots and
+formatting scratch. Since 2026-09-15, output-position calls and conditional branches
+forward the same result destination to their final producer. A concat in that
+position fills the destination directly, without an intermediate concat buffer
+or return copy. This applies through annotated and inferred-capacity callees,
+with different input names; each rule still exposes its checked public capacity.
+The selected output branch alone writes the shared destination.
+
+Native compilation now also reuses writable text buffers after their proved
+last use. Aliases carry the same storage identity; renaming or shadowing alone
+does not end its lifetime. A conditional pointer keeps both possible owners
+alive through all later uses of the joined value, including nested joins and
+record fields. Concat operands stay alive through subsequent operand evaluations
+and the copy into the destination. The same holds for text comparisons.
+[Conditional records](bounded-text-branches.md) apply these joins field by field:
+only the selected branch evaluates, and choosing its text fields moves their
+pointer/length pairs without an additional payload copy.
+
+Lets, including unused lets, still evaluate in source order. Their dead buffers
+can share an address with later values. A returned alias, input field or literal
+still copies into the result destination; nested concat arguments still need
+independent storage while they are live. The destination is never exposed through
+a let while it is being filled, so no live alias can observe partial writes or
+be overwritten by a later call. Small outputs with large simultaneously live
+temporaries can still exceed the storage limit.
+
+Placement happens entirely in the compiler. It follows the emitted order,
+propagates last uses backwards through pointer joins, and assigns aligned buffers
+using deterministic best fit with coalescing of adjacent free space. There are
+no runtime allocator calls, reference counts or garbage collection. Pointer,
+length, number and boolean slots remain distinct for the entire invocation.
+Since 2026-09-16, writable buffers created in opposite arms of the same `if`
+can also overlap. The compiler lays out each arm independently, including nested
+choices, then reserves one region sized to the larger arm. That entire region
+stays live through the last use of either arm's owners, including aliases used
+after the join. Buffers created before the condition, the output destination,
+and later live values remain protected. Separate calls have separate choices;
+the compiler does not assume that repeating a condition selects the same arm.
+
+This grouping can retain dead arm-local temporaries longer than necessary. The
+compiler therefore compares its frame with the original last-use placement and
+uses it only if smaller; ties retain the original layout. The optimization never
+increases a previously accepted invocation's reserved frame. Both placements
+use checked arithmetic and the same 2 MiB limit. A result destination remains
+reserved from entry into its producer; this is not optimal packing or full
+control-flow liveness analysis. Fragmentation and conservative region lifetimes
+can still waste space. Unknown provenance/capacity or an excessive placement
+produces a compile diagnostic before artifact emission.
+
+Only frame sizes and buffer address offsets change in the emitted code. No
+runtime ownership metadata, allocation, extra branch, or payload copy is added.
+The extra work is in compilation: a tree of structured choices and a second
+placement, without enumerating execution paths or building pairwise buffer
+conflicts. Scalar/pointer/length slots still have invocation-wide storage.
+
+In the [example](../examples/bounded_text_storage.verbose), `forward_text` passes
+its destination through the selected `reuse_text` or `piece` call. `reuse_text`
+keeps `saved` in its own buffer and reads it twice while filling the destination.
+Two independent calls retain distinct results while both are live. A single
+1 MiB concat returned through a call chain fits the 2 MiB region ceiling. Two
+1 MiB results used together still exceed it once slots are counted; sequential
+results whose last uses do not overlap can share their buffer.
+
+The example's `measure_text` measures a formatter result through an alias, then
+calls the formatter again. The first buffer can be reused by the second call;
+the two measured numeric lengths remain available for the final output.
 
 This region excludes the existing input/transport frames, argv data, literal
 bytes embedded in the binary and the surrounding process. Numeric formatting
@@ -50,20 +112,27 @@ entry. Alias descriptors do not copy literal data. The earlier whole-expression
 substitution pass has been removed. Independent calls still expand separately,
 so a branching call graph can still receive an expansion or storage diagnostic.
 The existing verifier limits and subset restrictions remain in force.
+Provenance propagation processes each pointer/join edge once; it does not expand
+the set of possible owners on every alias use.
 
 The same emitter evaluates pure HTTP handlers. Only its result slots are passed
 back to the transport; its region stays live through response writes. Request
 bodies use the parser's counted pointer/length pair, so embedded NUL bytes do not
 shorten a copy or comparison. The CLI retains its existing input-channel rules,
 including NUL-terminated text inputs. Scalar and flat-record wrappers can consume
-a bounded text call; persistent state, effects, recursive rules and cross-concept
-call inputs remain outside this subset.
+a bounded text call. Sequential HTTP services can also
+[copy a complete bounded call into text state](bounded-text-state.md), releasing
+its invocation region after the copy. [Checked record inputs](bounded-text-inputs.md)
+also allow composition across different concepts: constructor fields evaluate
+once and retain their owners through callee and caller uses. Effects inside
+participating rules and recursive rules remain outside this subset.
 
 | Path | Support |
 |---|---|
 | Interpreter | Existing eager lexical value semantics and capacity checks; its Rust allocations are not covered by the native storage ceiling |
 | Native argv / stdin / raw stdin / stream | Fixed invocation storage; output policy and input guards retained |
 | Native HTTP, sequential / forked / pooled | Same storage emitter, pure handler without state, logs or after mutations |
+| Native sequential HTTP `after` | Complete explicitly bounded text call copied into existing owned state before releasing its temporary region |
 | WASM / self-hosted compiler | Explicit refusal of the output contract before artifact emission |
 
 Run the [storage example](../examples/bounded_text_storage.verbose):
@@ -72,10 +141,18 @@ Run the [storage example](../examples/bounded_text_storage.verbose):
 cargo run -- examples/bounded_text_storage.verbose --run choose_text --input examples/bounded_text_storage.json
 cargo run -- examples/bounded_text_storage.verbose --run choose_text --native /tmp/text-storage
 /tmp/text-storage café 42 café -42
+
+cargo run -- examples/bounded_text_storage.verbose --run forward_text --native /tmp/text-forward
+/tmp/text-forward café 42 café -42
+
+cargo run -- examples/bounded_text_storage.verbose --run measure_text --native /tmp/text-measure
+/tmp/text-measure café 42 café -42
 ```
 
-The output is `<[café]42 | [café]42>` followed by
-`{[café]-42 | [café]-42}`. Differential tests cover nested branches, numeric
+`choose_text` outputs `<[café]42 | [café]42>` followed by
+`{[café]-42 | [café]-42}`. `forward_text` outputs `[café]42 | [café]42`
+followed by `[café]-42`. `measure_text` outputs `9:9` followed by `10:10`
+(UTF-8 byte lengths). Differential tests cover nested branches, numeric
 extremes, empty/NUL/multibyte text, lexical records and aliases. Reuse tests process
 600 argv records and 600 stream lines with a 256 KiB stack, and inspect idle worker
 stack pointers and descriptor counts after repeated binary HTTP responses and
@@ -90,7 +167,76 @@ python3 tools/check_bounded_text_storage.py
 ```
 
 This Linux x86-64 check needs ptrace permission. It counts actual evaluations of
-unused lets, aliased calls and conditional operands; checks copy destinations
-against the reserved region; and checks that the traced argv binaries use only
-`write` and `exit` syscalls. Its negative control changes short-circuit execution
+unused lets, aliased calls and conditional operands, including their order;
+checks copy destinations against the reserved region and non-overlapping
+sources; and checks that the traced argv binaries use only `write` and `exit`
+syscalls. Its negative control changes short-circuit execution
 while preserving stdout, and must be caught by the evaluation counts.
+
+To compare destination forwarding with a compiler from before this optimization:
+
+```sh
+python3 tools/check_bounded_text_storage.py --reference-compiler /path/to/reference-verbosec
+```
+
+The comparison uses the same source and records in both compilers. It measures
+the reserved frame, executed copy operations and actual copied bytes (including
+REP instructions stepped across multiple traps), and requires a reduction in
+each metric for all six cases. It also checks output, exit status, evaluation
+counts and frame reclamation on both binaries. These are instruction/storage
+measurements, not throughput or latency claims.
+
+Measured on 2026-09-15 against `f1656fc` (before destination forwarding), all
+six cases reserve 280 frame bytes instead of 696, excluding the unchanged
+48-byte saved-register/scratch allowance. For the three-record cases, actual
+copied bytes fall from 516 to 151 and executed copy operations from 26 to 14.
+Both compilers pass the value, evaluation and reclamation checks; the negative
+control is caught. These figures describe this fixture only.
+
+For last-use buffer reuse, compare with a compiler from before that optimization:
+
+```sh
+python3 tools/check_bounded_text_storage.py --check-reuse --reference-compiler /path/to/reference-verbosec
+```
+
+This variant adds three successive, discarded concats. The trace must observe
+all three computations at the same destination address in the new binary and at
+three distinct addresses in the reference. The reserved frame must shrink, while
+copy operations and bytes copied stay equal: reuse changes placement, not which
+eager calculations execute. It retains the value, alias, copy-range, syscall,
+evaluation-order and short-circuit negative-control checks.
+
+Measured on 2026-09-15 against `4b6ff2d`, all six reuse cases reserve 480 frame
+bytes instead of 784 (excluding the unchanged 48-byte allowance). Each of the
+three discarded concats writes to the same address after its predecessor's
+last use. In the three-record cases, both compilers execute 32 copy operations
+and copy 1327 bytes. The improvement here is storage, not fewer evaluations or
+copies, and it makes no throughput claim.
+
+For exclusive branch storage, compare with a compiler built from `555e402`
+(before this placement optimization):
+
+```sh
+python3 tools/check_bounded_text_storage.py --check-overlay --reference-compiler /path/to/reference-verbosec
+```
+
+The fixture gives each arm a 4096-byte result capacity while passing short
+runtime payloads. It checks that alternating arms use the same buffer address,
+retains all evaluation/copy-range/reclamation checks, and requires identical
+executed instruction counts, copy counts and bytes, syscalls, output and status.
+The wrong-branch negative control must still fail even with identical stdout.
+
+Measured on 2026-09-16, all six cases reserve **16,792 bytes instead of 20,888**,
+a reduction of 4096 bytes (19.6%), excluding the unchanged 48-byte allowance.
+The three-record cases still execute 20 copy operations and copy 159 bytes.
+The `and` case executes 1376 traced instructions before and after; the `or` case
+executes 1364 before and after. The branch buffer's offset is the same for all
+three records, where the reference uses two addresses.
+
+These are reserved-frame and instruction measurements for this fixture, not RSS,
+cache-hit, latency or throughput measurements. Reducing reserved space and
+reusing addresses support a small working-set objective, but reserved capacity
+is not the number of bytes actually touched. Cache residency also depends on
+access patterns, processor characteristics and other work. Future performance
+reports should distinguish those quantities rather than infer cache behavior
+from a smaller stack frame.

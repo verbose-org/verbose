@@ -49,7 +49,7 @@ fn bounded_text_http_uses_every_service_input_bound() {
         .any(|e| e.message.contains("exceeds declared")));
 }
 
-fn storage_accept_stack(pid: u32) -> String {
+pub(super) fn storage_accept_stack(pid: u32) -> String {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let s = fs::read_to_string(format!("/proc/{pid}/syscall")).unwrap();
@@ -143,4 +143,57 @@ fn text_storage_http_preserves_literal_status_guard() {
         "{error}"
     );
     assert!(!Path::new(&out).exists());
+}
+
+#[test]
+fn text_destinations_http_forwards_tail_calls_in_every_worker_mode() {
+    let source = include_str!("../../examples/http_bounded_text.verbose")
+        .replace("port: 18964", "port: 18960")
+        .replace("service bounded_text_http", "service bounded_http")
+        .replace("[..262]", "[..4098]")
+        .replace("[request.path]", "[request.path, request.body, request.method]")
+        .replace("bound : 8", "bound : 64")
+        .replace("out = concat(prefix, request.path)", "out = if request.method == \"POST\" then concat(\"[\", request.body, \"]\") else concat(\"<\", request.path, \">\")")
+        .replace("body: concat(\"\", response_text(req))", "body: relay(req)")
+        .replace("calls : [response_text]", "calls : [relay]");
+    // An inferred-capacity relay must forward the HTTP counted body just as
+    // an annotated rule does. Only the selected output branch may fill it.
+    let relay = r#"
+rule relay
+  @intention: "Forward the counted response body"
+  @source: http_bounded_text.intent:2
+  input:
+    other : HttpRequest
+  output:
+    out : text
+  logic:
+    out = response_text(other)
+  proofs:
+    purity:
+      reads : [other]
+      calls : [response_text]
+    termination:
+      bound : 8
+"#;
+    for mode in [
+        "",
+        "  concurrency: forked\n  max_connections: 2\n",
+        "  concurrency: pooled\n  workers: 2\n",
+    ] {
+        let server = Server::start(&format!("{source}{mode}{relay}"));
+        for body in [vec![], b"\0\xc3\xa9\xff\0z".to_vec(), vec![b'x'; 3900]] {
+            let mut request =
+                format!("POST / HTTP/1.0\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+            request.extend_from_slice(&body);
+            let mut expected = b"[".to_vec();
+            expected.extend_from_slice(&body);
+            expected.push(b']');
+            assert_eq!(server.request(&request), wire(&expected));
+            assert!(server.request(b"invalid\r\n\r\n").is_empty());
+            assert_eq!(
+                server.request(b"GET /after HTTP/1.0\r\n\r\n"),
+                wire(b"</after>")
+            );
+        }
+    }
 }
