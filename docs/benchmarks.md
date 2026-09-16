@@ -2,6 +2,9 @@
 
 For native HTTP services, see the separate
 [forked/pool throughput and memory baseline](http-worker-benchmarks.md).
+The separate [bounded text HTTP comparison](bounded-text-http-benchmark.md)
+measures branch-buffer reuse, distinguishing reserved frame size, sampled
+residency and observed latency/throughput.
 
 This is an honest, reproducible measurement of what a `verbosec`-compiled
 native binary actually buys you, per axis, **including where it loses**.

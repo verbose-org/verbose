@@ -97,6 +97,39 @@ class LoadOracle(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, b'')
 
+    def test_alternating_paths_keep_the_binary_response_oracle(self):
+        # Capture paths independently of the client, including the zero-body
+        # case where the body itself cannot encode which branch was requested.
+        paths = []
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                self.connection.settimeout(2)
+                paths.append(self.rfile.readline().split()[1])
+                while True:
+                    line = self.rfile.readline()
+                    if not line:
+                        return
+                    if line == b'\r\n':
+                        break
+                self.wfile.write(b'HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n')
+        with socketserver.TCPServer(('127.0.0.1', 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01})
+            thread.start()
+            try:
+                report = load(self.client, server.server_address[1], 1, 6, 0, None,
+                              alternate_paths=True)
+                check_load(report)
+                self.assertEqual(paths, [b'/a', b'/b'] * 3)
+            finally:
+                server.shutdown()
+                thread.join()
+        with peer('wrong') as port:
+            report = load(self.client, port, 2, 6, 1024, None, alternate_paths=True)
+            self.assertEqual(report['errors']['response'], 6)
+        bad = subprocess.run([str(self.client), '1', '1', '1', '0', '50', '--unknown'],
+                             capture_output=True)
+        self.assertEqual(bad.returncode, 2)
+
     def test_overall_deadline_kills_a_stuck_client(self):
         with peer('silent') as port:
             with self.assertRaises(subprocess.TimeoutExpired):
