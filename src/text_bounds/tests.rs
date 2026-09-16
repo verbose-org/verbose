@@ -423,6 +423,7 @@ fn text_bounds_self_hosted_refuses_before_artifact() {
             include_str!("../../examples/bounded_text_state.verbose").to_string(),
             include_str!("../../examples/bounded_text_inputs.verbose").to_string(),
             include_str!("../../examples/bounded_text_branches.verbose").to_string(),
+            include_str!("../../examples/http_bounded_log.verbose").to_string(),
         ] {
             let mut child = Command::new(&bin)
                 .arg("0")
