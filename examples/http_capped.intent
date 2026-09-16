@@ -1,0 +1,3 @@
+Bounded concurrent HTTP echo
+Echo one complete bounded request body per admitted connection.
+Serve at most eight handler children; close overload connections before request effects.

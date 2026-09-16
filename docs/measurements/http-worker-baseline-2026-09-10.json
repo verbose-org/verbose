@@ -1,0 +1,2744 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "started_utc": "2026-09-10T15:26:51.448065+00:00",
+  "revision": "b26ddc292958941f5ea47b3aaca5ea4d5fbb6500",
+  "working_tree_status": "M docs/benchmarks.md\n M docs/current-status.md\n M docs/pooled-http-workers.md\n?? docs/http-worker-benchmarks.md\n?? tools/benchmark_http.py\n?? tools/http_load.rs\n?? tools/test_http_load.py",
+  "compiler_sha256": "31fe0723e4effe67ac201e800a3a725bb36586a5113ac25fe9c94553d8d4387c",
+  "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+  "harness_sha256": "fa3962560e18681bebca3f1b6cbff2afa3f50b7083ae576a93b2da811960d12a",
+  "client_source_sha256": "b6737f37e9dc9b76c8bab1b52fefbecafa3658cac9e6aef1603111d06e76c572",
+  "host": {
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "cpu": "AMD Ryzen 7 5800X 8-Core Processor",
+    "logical_cpus": 16,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "loadavg_before": [
+      1.01025390625,
+      0.7998046875,
+      0.46337890625
+    ],
+    "thread_siblings": {
+      "0": "0-1",
+      "1": "0-1",
+      "2": "2-3",
+      "3": "2-3",
+      "4": "4-5",
+      "5": "4-5",
+      "6": "6-7",
+      "7": "6-7",
+      "8": "8-9",
+      "9": "8-9",
+      "10": "10-11",
+      "11": "10-11",
+      "12": "12-13",
+      "13": "12-13",
+      "14": "14-15",
+      "15": "14-15"
+    },
+    "network_sysctls": {
+      "ipv4/ip_local_port_range": "32768\t60999",
+      "ipv4/tcp_tw_reuse": "2",
+      "core/somaxconn": "4096"
+    },
+    "loadavg_after": [
+      7.0419921875,
+      3.4462890625,
+      1.57177734375
+    ]
+  },
+  "config": {
+    "compiler": "/home/arcker/projects/verbose/target/debug/verbosec",
+    "workers": [
+      1,
+      4
+    ],
+    "payloads": [
+      0,
+      1024,
+      3900
+    ],
+    "requests": 30000,
+    "repeats": 3,
+    "warmup": 500,
+    "memory_batches": 4,
+    "memory_requests": 10000,
+    "load_timeout": 120,
+    "server_cpus": [
+      0,
+      2,
+      4,
+      6
+    ],
+    "client_cpus": [
+      8,
+      10,
+      12,
+      14
+    ],
+    "output": "/tmp/verbose-http-baseline-final-2026-09-10.json"
+  },
+  "artifacts": "/tmp/verbose-http-bench-aojyutb_",
+  "builds": [
+    {
+      "mode": "forked",
+      "clients": 1,
+      "port": 54359,
+      "source": "@verbose 0.1.0\n\n-- A fixed process pool reuses private request storage between connections.\n-- Busy workers leave clients in the kernel queue. See docs/pooled-http-workers.md.\nrule echo_body\n  @intention: \"Return the complete request body, preserving its bytes\"\n  @source: http_pooled.intent:2\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: concat(\"\", req.body) }\n  proofs:\n    purity:\n      reads : [req.body]\n      calls : []\n    termination:\n      bound : 4\n\nservice bounded_http\n  @intention: \"Receive and answer one bounded request before its phase deadlines\"\n  @source: http_pooled.intent:3\n  listen:\n    protocol: http_1_0\n    port: 54359\n    max_request: 4096\n  handler: echo_body\n  request_timeout: 2\n  response_timeout: 2\n  concurrency: forked\n",
+      "binary_sha256": "c0912a3bed3ca6cb917894fd381b4b7019a6366ccbb304856a2f8aa6ac92b3d4",
+      "binary_bytes": 39678
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "port": 41983,
+      "source": "@verbose 0.1.0\n\n-- A fixed process pool reuses private request storage between connections.\n-- Busy workers leave clients in the kernel queue. See docs/pooled-http-workers.md.\nrule echo_body\n  @intention: \"Return the complete request body, preserving its bytes\"\n  @source: http_pooled.intent:2\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: concat(\"\", req.body) }\n  proofs:\n    purity:\n      reads : [req.body]\n      calls : []\n    termination:\n      bound : 4\n\nservice bounded_http\n  @intention: \"Receive and answer one bounded request before its phase deadlines\"\n  @source: http_pooled.intent:3\n  listen:\n    protocol: http_1_0\n    port: 41983\n    max_request: 4096\n  handler: echo_body\n  request_timeout: 2\n  response_timeout: 2\n  concurrency: pooled\n  workers: 1\n",
+      "binary_sha256": "355d902d865428ee2dcc89fdf76f5a38637a6e27b34067fb9c2d83ab547e992a",
+      "binary_bytes": 40266
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "port": 41323,
+      "source": "@verbose 0.1.0\n\n-- A fixed process pool reuses private request storage between connections.\n-- Busy workers leave clients in the kernel queue. See docs/pooled-http-workers.md.\nrule echo_body\n  @intention: \"Return the complete request body, preserving its bytes\"\n  @source: http_pooled.intent:2\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: concat(\"\", req.body) }\n  proofs:\n    purity:\n      reads : [req.body]\n      calls : []\n    termination:\n      bound : 4\n\nservice bounded_http\n  @intention: \"Receive and answer one bounded request before its phase deadlines\"\n  @source: http_pooled.intent:3\n  listen:\n    protocol: http_1_0\n    port: 41323\n    max_request: 4096\n  handler: echo_body\n  request_timeout: 2\n  response_timeout: 2\n  concurrency: forked\n",
+      "binary_sha256": "fa4c47844337ef3a54f2ff4231a74d221e2eaa5229f26ea0bc10b40bb3237eea",
+      "binary_bytes": 39678
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "port": 49641,
+      "source": "@verbose 0.1.0\n\n-- A fixed process pool reuses private request storage between connections.\n-- Busy workers leave clients in the kernel queue. See docs/pooled-http-workers.md.\nrule echo_body\n  @intention: \"Return the complete request body, preserving its bytes\"\n  @source: http_pooled.intent:2\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: concat(\"\", req.body) }\n  proofs:\n    purity:\n      reads : [req.body]\n      calls : []\n    termination:\n      bound : 4\n\nservice bounded_http\n  @intention: \"Receive and answer one bounded request before its phase deadlines\"\n  @source: http_pooled.intent:3\n  listen:\n    protocol: http_1_0\n    port: 49641\n    max_request: 4096\n  handler: echo_body\n  request_timeout: 2\n  response_timeout: 2\n  concurrency: pooled\n  workers: 4\n",
+      "binary_sha256": "93b40466bd5a168424815607f7b7583d1337b47b3ffaa2943a386cd303aef2b6",
+      "binary_bytes": 40569
+    }
+  ],
+  "runs": [
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 0,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.139778,
+        "goodput_per_second": 3577.102,
+        "success_latency_us": {
+          "p50": 247.486,
+          "p95": 378.246,
+          "p99": 905.265,
+          "max": 4603.378
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.060235999999999956
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 9.297116,
+        "goodput_per_second": 3226.807,
+        "success_latency_us": {
+          "p50": 251.551,
+          "p95": 453.057,
+          "p99": 1654.945,
+          "max": 21291.795
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.23308700000000004,
+          "system": 3.453938
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 0,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.103763,
+        "goodput_per_second": 4818.67,
+        "success_latency_us": {
+          "p50": 158.975,
+          "p95": 311.603,
+          "p99": 1656.054,
+          "max": 2898.742
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.07015599999999989
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 6.103663,
+        "goodput_per_second": 4915.082,
+        "success_latency_us": {
+          "p50": 148.795,
+          "p95": 403.475,
+          "p99": 1513.397,
+          "max": 10247.407
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.24812000000000012,
+          "system": 3.751143
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 0,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.10383,
+        "goodput_per_second": 4815.574,
+        "success_latency_us": {
+          "p50": 158.568,
+          "p95": 518.138,
+          "p99": 1115.336,
+          "max": 2115.477
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.0755700000000008
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 5.249666,
+        "goodput_per_second": 5714.649,
+        "success_latency_us": {
+          "p50": 139.389,
+          "p95": 301.255,
+          "p99": 917.198,
+          "max": 7172.917
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.14479299999999995,
+          "system": 3.4126449999999995
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 0,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.129031,
+        "goodput_per_second": 3875.028,
+        "success_latency_us": {
+          "p50": 233.063,
+          "p95": 347.785,
+          "p99": 829.668,
+          "max": 3148.822
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.056077999999999406
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 6.889516,
+        "goodput_per_second": 4354.442,
+        "success_latency_us": {
+          "p50": 212.805,
+          "p95": 319.245,
+          "p99": 518.189,
+          "max": 5498.013
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.2001360000000001,
+          "system": 2.7281699999999987
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 0,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.111748,
+        "goodput_per_second": 4474.369,
+        "success_latency_us": {
+          "p50": 211.165,
+          "p95": 287.926,
+          "p99": 396.928,
+          "max": 2068.673
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.05029400000000095
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 7.231218,
+        "goodput_per_second": 4148.678,
+        "success_latency_us": {
+          "p50": 215.989,
+          "p95": 343.068,
+          "p99": 677.774,
+          "max": 8765.109
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.19391599999999998,
+          "system": 2.8631220000000006
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 0,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.073045,
+        "goodput_per_second": 6845.117,
+        "success_latency_us": {
+          "p50": 124.486,
+          "p95": 281.685,
+          "p99": 425.855,
+          "max": 582.513
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.05404800000000165
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 6.483783,
+        "goodput_per_second": 4626.929,
+        "success_latency_us": {
+          "p50": 148.552,
+          "p95": 410.355,
+          "p99": 1873.333,
+          "max": 16977.757
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.2047169999999996,
+          "system": 4.060216999999998
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 1024,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.182955,
+        "goodput_per_second": 2732.92,
+        "success_latency_us": {
+          "p50": 283.272,
+          "p95": 640.942,
+          "p99": 2477.985,
+          "max": 4527.336
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.07856400000000008
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 12.356736,
+        "goodput_per_second": 2427.826,
+        "success_latency_us": {
+          "p50": 287.022,
+          "p95": 680.03,
+          "p99": 3461.15,
+          "max": 33564.635
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.3908490000000002,
+          "system": 4.429627
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 1024,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.146593,
+        "goodput_per_second": 3410.8,
+        "success_latency_us": {
+          "p50": 192.545,
+          "p95": 584.226,
+          "p99": 2310.494,
+          "max": 7526.583
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.01422100000000004,
+          "system": 0.08532300000000248
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 9.916577,
+        "goodput_per_second": 3025.237,
+        "success_latency_us": {
+          "p50": 186.612,
+          "p95": 730.081,
+          "p99": 3765.175,
+          "max": 30267.097
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.43754399999999993,
+          "system": 5.604562000000001
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 1024,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.148198,
+        "goodput_per_second": 3373.874,
+        "success_latency_us": {
+          "p50": 188.551,
+          "p95": 629.905,
+          "p99": 3262.093,
+          "max": 4068.51
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.09897699999999787
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 10.37128,
+        "goodput_per_second": 2892.603,
+        "success_latency_us": {
+          "p50": 187.288,
+          "p95": 813.024,
+          "p99": 3877.236,
+          "max": 34427.088
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.4301529999999998,
+          "system": 5.7640499999999975
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 1024,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.207072,
+        "goodput_per_second": 2414.618,
+        "success_latency_us": {
+          "p50": 293.858,
+          "p95": 865.262,
+          "p99": 2687.32,
+          "max": 6234.247
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.09042999999999779
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 11.739886,
+        "goodput_per_second": 2555.391,
+        "success_latency_us": {
+          "p50": 284.105,
+          "p95": 620.177,
+          "p99": 2659.146,
+          "max": 38201.277
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.4414550000000004,
+          "system": 3.928951000000005
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 1024,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.168938,
+        "goodput_per_second": 2959.659,
+        "success_latency_us": {
+          "p50": 282.099,
+          "p95": 487.917,
+          "p99": 1264.482,
+          "max": 8332.955
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.06761900000000054
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 11.416783,
+        "goodput_per_second": 2627.71,
+        "success_latency_us": {
+          "p50": 280.549,
+          "p95": 568.911,
+          "p99": 2461.408,
+          "max": 39589.58
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.34178199999999936,
+          "system": 4.067273
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 1024,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.111809,
+        "goodput_per_second": 4471.898,
+        "success_latency_us": {
+          "p50": 160.129,
+          "p95": 427.604,
+          "p99": 1688.732,
+          "max": 3252.173
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.011282000000000458,
+          "system": 0.06768800000000397
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 9.312214,
+        "goodput_per_second": 3221.576,
+        "success_latency_us": {
+          "p50": 182.977,
+          "p95": 667.632,
+          "p99": 3356.862,
+          "max": 37188.747
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.3854249999999997,
+          "system": 5.327937999999989
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 3900,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.244846,
+        "goodput_per_second": 2042.101,
+        "success_latency_us": {
+          "p50": 302.015,
+          "p95": 555.068,
+          "p99": 5100.715,
+          "max": 39301.767
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.08260099999999682
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 11.735455,
+        "goodput_per_second": 2556.356,
+        "success_latency_us": {
+          "p50": 287.465,
+          "p95": 565.767,
+          "p99": 2579.859,
+          "max": 41153.193
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.47893399999999975,
+          "system": 4.227109999999996
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 3900,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.125035,
+        "goodput_per_second": 3998.867,
+        "success_latency_us": {
+          "p50": 183.113,
+          "p95": 414.296,
+          "p99": 1093.775,
+          "max": 6998.062
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.01516200000000012,
+          "system": 0.07581100000000163
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 8.602055,
+        "goodput_per_second": 3487.539,
+        "success_latency_us": {
+          "p50": 182.518,
+          "p95": 655.467,
+          "p99": 2556.689,
+          "max": 26051.428
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.7315560000000003,
+          "system": 4.815168
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 3900,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.16009,
+        "goodput_per_second": 3123.236,
+        "success_latency_us": {
+          "p50": 184.836,
+          "p95": 427.227,
+          "p99": 2577.833,
+          "max": 28944.976
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.09275399999999934
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 9.423026,
+        "goodput_per_second": 3183.691,
+        "success_latency_us": {
+          "p50": 189.007,
+          "p95": 682.975,
+          "p99": 3005.175,
+          "max": 29328.471
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.6525559999999997,
+          "system": 5.257615000000001
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 3900,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.19429,
+        "goodput_per_second": 2573.471,
+        "success_latency_us": {
+          "p50": 296.009,
+          "p95": 725.524,
+          "p99": 2090.739,
+          "max": 6113.279
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.012490999999999808,
+          "system": 0.06841599999999914
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 11.389346,
+        "goodput_per_second": 2634.041,
+        "success_latency_us": {
+          "p50": 290.641,
+          "p95": 579.688,
+          "p99": 2069.561,
+          "max": 39125.243
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.5871750000000002,
+          "system": 4.036825000000007
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 1,
+      "body_bytes": 3900,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.183546,
+        "goodput_per_second": 2724.119,
+        "success_latency_us": {
+          "p50": 284.432,
+          "p95": 694.078,
+          "p99": 1737.765,
+          "max": 4022.236
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.03181999999999974,
+          "system": 0.04773099999999886
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 11.289477,
+        "goodput_per_second": 2657.342,
+        "success_latency_us": {
+          "p50": 284.661,
+          "p95": 565.264,
+          "p99": 2217.225,
+          "max": 32899.825
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.5214330000000009,
+          "system": 4.160125999999991
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 1,
+      "body_bytes": 3900,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.115788,
+        "goodput_per_second": 4318.224,
+        "success_latency_us": {
+          "p50": 174.222,
+          "p95": 365.907,
+          "p99": 1385.126,
+          "max": 3646.541
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.00861299999999865,
+          "system": 0.06890200000000846
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 9.717353,
+        "goodput_per_second": 3087.26,
+        "success_latency_us": {
+          "p50": 189.745,
+          "p95": 687.474,
+          "p99": 3301.869,
+          "max": 21913.053
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.5385760000000008,
+          "system": 5.649547999999996
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 0,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.065185,
+        "goodput_per_second": 7670.475,
+        "success_latency_us": {
+          "p50": 318.32,
+          "p95": 1192.094,
+          "p99": 3853.816,
+          "max": 4974.987
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.08133800000000235
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 5.76351,
+        "goodput_per_second": 5205.162,
+        "success_latency_us": {
+          "p50": 289.557,
+          "p95": 3094.697,
+          "p99": 9163.719,
+          "max": 42244.624
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.23061199999999893,
+          "system": 6.215012999999999
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 0,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.03922,
+        "goodput_per_second": 12748.666,
+        "success_latency_us": {
+          "p50": 179.272,
+          "p95": 797.996,
+          "p99": 2610.068,
+          "max": 4180.842
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.08510400000000118
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.888252,
+        "goodput_per_second": 6137.163,
+        "success_latency_us": {
+          "p50": 195.453,
+          "p95": 2396.027,
+          "p99": 9670.363,
+          "max": 83526.67
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.37731600000000043,
+          "system": 11.368193000000005
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 0,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.070531,
+        "goodput_per_second": 7089.047,
+        "success_latency_us": {
+          "p50": 183.61,
+          "p95": 1290.567,
+          "p99": 6007.403,
+          "max": 12436.216
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.022663999999998907,
+          "system": 0.10199000000000069
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.696496,
+        "goodput_per_second": 8115.793,
+        "success_latency_us": {
+          "p50": 204.384,
+          "p95": 1580.204,
+          "p99": 5579.877,
+          "max": 60303.395
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.36833700000000036,
+          "system": 7.83866900000001
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 0,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.059606,
+        "goodput_per_second": 8388.387,
+        "success_latency_us": {
+          "p50": 264.553,
+          "p95": 839.373,
+          "p99": 4101.746,
+          "max": 6077.789
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.07669100000001094
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.935515,
+        "goodput_per_second": 6078.393,
+        "success_latency_us": {
+          "p50": 288.971,
+          "p95": 2455.774,
+          "p99": 6805.805,
+          "max": 40058.842
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.17974599999999974,
+          "system": 5.33622299999999
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 0,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.105233,
+        "goodput_per_second": 4751.374,
+        "success_latency_us": {
+          "p50": 367.227,
+          "p95": 3087.91,
+          "p99": 6271.758,
+          "max": 8349.457
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.010472000000000037,
+          "system": 0.08377399999997692
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.407479,
+        "goodput_per_second": 6806.612,
+        "success_latency_us": {
+          "p50": 288.041,
+          "p95": 1723.635,
+          "p99": 5657.722,
+          "max": 39876.698
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.26928599999999925,
+          "system": 4.7582629999999995
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 0,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.071001,
+        "goodput_per_second": 7042.19,
+        "success_latency_us": {
+          "p50": 190.984,
+          "p95": 941.592,
+          "p99": 5359.284,
+          "max": 14262.556
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.02040899999999901,
+          "system": 0.11224799999999391
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.952488,
+        "goodput_per_second": 7590.155,
+        "success_latency_us": {
+          "p50": 206.794,
+          "p95": 1831.343,
+          "p99": 6260.508,
+          "max": 29591.13
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.24581000000000053,
+          "system": 8.938556000000005
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 1024,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.061451,
+        "goodput_per_second": 8136.548,
+        "success_latency_us": {
+          "p50": 295.513,
+          "p95": 1212.957,
+          "p99": 2781.384,
+          "max": 5151.512
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.08290399999998499
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 5.68308,
+        "goodput_per_second": 5278.827,
+        "success_latency_us": {
+          "p50": 304.002,
+          "p95": 2878.988,
+          "p99": 9123.46,
+          "max": 39213.73
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.488982,
+          "system": 6.434561000000002
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 1024,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.108827,
+        "goodput_per_second": 4594.428,
+        "success_latency_us": {
+          "p50": 214.497,
+          "p95": 3734.64,
+          "p99": 8258.692,
+          "max": 20303.287
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.00938199999999867,
+          "system": 0.16887099999999577
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.696318,
+        "goodput_per_second": 8116.184,
+        "success_latency_us": {
+          "p50": 218.851,
+          "p95": 1580.755,
+          "p99": 4935.933,
+          "max": 29428.994
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.4316020000000016,
+          "system": 8.499240999999984
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 1024,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.038101,
+        "goodput_per_second": 13122.883,
+        "success_latency_us": {
+          "p50": 192.68,
+          "p95": 757.628,
+          "p99": 2377.025,
+          "max": 3705.807
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.10238599999999565
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.350973,
+        "goodput_per_second": 6895.01,
+        "success_latency_us": {
+          "p50": 214.438,
+          "p95": 2130.654,
+          "p99": 7614.812,
+          "max": 44350.9
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.49737400000000065,
+          "system": 10.286597999999998
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 1024,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.072688,
+        "goodput_per_second": 6878.692,
+        "success_latency_us": {
+          "p50": 310.945,
+          "p95": 949.163,
+          "p99": 8891.709,
+          "max": 10046.212
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.08448400000000333
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 5.657188,
+        "goodput_per_second": 5302.988,
+        "success_latency_us": {
+          "p50": 305.958,
+          "p95": 2703.798,
+          "p99": 9026.555,
+          "max": 54113.607
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.4505309999999998,
+          "system": 6.390428000000014
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 1024,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.103173,
+        "goodput_per_second": 4846.228,
+        "success_latency_us": {
+          "p50": 280.396,
+          "p95": 823.019,
+          "p99": 10514.78,
+          "max": 18531.398
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.08920200000000023
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.994845,
+        "goodput_per_second": 6006.192,
+        "success_latency_us": {
+          "p50": 297.835,
+          "p95": 2382.178,
+          "p99": 7573.515,
+          "max": 35938.77
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.5009739999999994,
+          "system": 5.704263999999995
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 1024,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.075093,
+        "goodput_per_second": 6658.368,
+        "success_latency_us": {
+          "p50": 248.395,
+          "p95": 2154.989,
+          "p99": 5464.339,
+          "max": 12567.789
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.011670999999999765,
+          "system": 0.15172599999999647
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.237035,
+        "goodput_per_second": 7080.424,
+        "success_latency_us": {
+          "p50": 216.316,
+          "p95": 1933.42,
+          "p99": 7596.786,
+          "max": 47569.305
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.6542720000000006,
+          "system": 9.699297999999999
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 3900,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.067136,
+        "goodput_per_second": 7447.568,
+        "success_latency_us": {
+          "p50": 305.464,
+          "p95": 1833.628,
+          "p99": 2953.974,
+          "max": 7496.436
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.017528000000000432,
+          "system": 0.07887700000000564
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.993344,
+        "goodput_per_second": 6007.997,
+        "success_latency_us": {
+          "p50": 302.453,
+          "p95": 2482.211,
+          "p99": 7135.736,
+          "max": 37048.277
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.6255220000000001,
+          "system": 5.791470000000004
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 3900,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.099346,
+        "goodput_per_second": 5032.934,
+        "success_latency_us": {
+          "p50": 204.318,
+          "p95": 930.486,
+          "p99": 5183.316,
+          "max": 24919.679
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.01656499999999994,
+          "system": 0.13251999999999953
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.125155,
+        "goodput_per_second": 7272.455,
+        "success_latency_us": {
+          "p50": 215.509,
+          "p95": 1809.962,
+          "p99": 6708.339,
+          "max": 45819.392
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.788646,
+          "system": 9.249695000000003
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 3900,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.077203,
+        "goodput_per_second": 6476.393,
+        "success_latency_us": {
+          "p50": 219.388,
+          "p95": 1657.523,
+          "p99": 7901.279,
+          "max": 12340.133
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.022999999999999687,
+          "system": 0.14949999999998909
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.281799,
+        "goodput_per_second": 7006.402,
+        "success_latency_us": {
+          "p50": 229.297,
+          "p95": 2198.776,
+          "p99": 5619.357,
+          "max": 48412.529
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.8536710000000021,
+          "system": 9.34544600000001
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 3900,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.071921,
+        "goodput_per_second": 6952.057,
+        "success_latency_us": {
+          "p50": 298.457,
+          "p95": 1425.557,
+          "p99": 5034.731,
+          "max": 11025.605
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.10542700000002014
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 5.163059,
+        "goodput_per_second": 5810.508,
+        "success_latency_us": {
+          "p50": 313.447,
+          "p95": 2505.356,
+          "p99": 6398.471,
+          "max": 34681.84
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.5772759999999977,
+          "system": 5.868975999999975
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "forked",
+      "clients": 4,
+      "body_bytes": 3900,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.069181,
+        "goodput_per_second": 7227.453,
+        "success_latency_us": {
+          "p50": 344.162,
+          "p95": 1227.196,
+          "p99": 3506.06,
+          "max": 4157.587
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.029928999999999206,
+          "system": 0.05985699999996541
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.728328,
+        "goodput_per_second": 6344.738,
+        "success_latency_us": {
+          "p50": 304.281,
+          "p95": 2202.157,
+          "p99": 6039.768,
+          "max": 35716.0
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.6967619999999997,
+          "system": 5.375020000000006
+        },
+        "client_exit_status": 0
+      }
+    },
+    {
+      "mode": "pooled",
+      "clients": 4,
+      "body_bytes": 3900,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.071545,
+        "goodput_per_second": 6988.653,
+        "success_latency_us": {
+          "p50": 228.717,
+          "p95": 1916.605,
+          "p99": 4200.882,
+          "max": 8947.119
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.021758999999999418,
+          "system": 0.14143400000000383
+        },
+        "client_exit_status": 0
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.93609,
+        "goodput_per_second": 6077.684,
+        "success_latency_us": {
+          "p50": 218.67,
+          "p95": 2384.171,
+          "p99": 9739.881,
+          "max": 51531.873
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.8468090000000004,
+          "system": 11.379723000000013
+        },
+        "client_exit_status": 0
+      }
+    }
+  ],
+  "memory": [
+    {
+      "workers": 1,
+      "snapshots": [
+        {
+          "processes": [
+            {
+              "pid": 1127154,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127155,
+              "role": "worker",
+              "rss_kib": 60,
+              "pss_kib": 36,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff4ec45148"
+            }
+          ],
+          "total_rss_kib": 116,
+          "total_pss_kib": 68,
+          "total_private_kib": 20,
+          "completed_requests": 500
+        },
+        {
+          "processes": [
+            {
+              "pid": 1127154,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127155,
+              "role": "worker",
+              "rss_kib": 60,
+              "pss_kib": 36,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff4ec45148"
+            }
+          ],
+          "total_rss_kib": 116,
+          "total_pss_kib": 68,
+          "total_private_kib": 20,
+          "completed_requests": 10500
+        },
+        {
+          "processes": [
+            {
+              "pid": 1127154,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127155,
+              "role": "worker",
+              "rss_kib": 60,
+              "pss_kib": 36,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff4ec45148"
+            }
+          ],
+          "total_rss_kib": 116,
+          "total_pss_kib": 68,
+          "total_private_kib": 20,
+          "completed_requests": 20500
+        },
+        {
+          "processes": [
+            {
+              "pid": 1127154,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127155,
+              "role": "worker",
+              "rss_kib": 60,
+              "pss_kib": 36,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff4ec45148"
+            }
+          ],
+          "total_rss_kib": 116,
+          "total_pss_kib": 68,
+          "total_private_kib": 20,
+          "completed_requests": 30500
+        },
+        {
+          "processes": [
+            {
+              "pid": 1127154,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127155,
+              "role": "worker",
+              "rss_kib": 60,
+              "pss_kib": 36,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff4ec45148"
+            }
+          ],
+          "total_rss_kib": 116,
+          "total_pss_kib": 68,
+          "total_private_kib": 20,
+          "completed_requests": 40500
+        }
+      ],
+      "loads": [
+        {
+          "body_bytes": 3900,
+          "attempted": 500,
+          "successful": 500,
+          "failed": 0,
+          "elapsed_seconds": 0.157771,
+          "goodput_per_second": 3169.16,
+          "success_latency_us": {
+            "p50": 185.171,
+            "p95": 638.397,
+            "p99": 3655.153,
+            "max": 8654.874
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.008998999999999313,
+            "system": 0.08998800000000529
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 10000,
+          "successful": 10000,
+          "failed": 0,
+          "elapsed_seconds": 2.606919,
+          "goodput_per_second": 3835.946,
+          "success_latency_us": {
+            "p50": 161.522,
+            "p95": 589.209,
+            "p99": 2891.854,
+            "max": 9530.113
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.06972000000000023,
+            "system": 1.5687049999999658
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 10000,
+          "successful": 10000,
+          "failed": 0,
+          "elapsed_seconds": 3.672295,
+          "goodput_per_second": 2723.093,
+          "success_latency_us": {
+            "p50": 191.837,
+            "p95": 951.182,
+            "p99": 4194.811,
+            "max": 15776.395
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.19833599999999763,
+            "system": 2.076694000000032
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 10000,
+          "successful": 10000,
+          "failed": 0,
+          "elapsed_seconds": 3.787298,
+          "goodput_per_second": 2640.405,
+          "success_latency_us": {
+            "p50": 176.239,
+            "p95": 1035.332,
+            "p99": 4493.947,
+            "max": 33753.977
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.023648000000001446,
+            "system": 2.282097999999962
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 10000,
+          "successful": 10000,
+          "failed": 0,
+          "elapsed_seconds": 3.418367,
+          "goodput_per_second": 2925.373,
+          "success_latency_us": {
+            "p50": 190.841,
+            "p95": 842.928,
+            "p99": 3333.346,
+            "max": 39327.507
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.2523780000000002,
+            "system": 1.9312400000000025
+          },
+          "client_exit_status": 0
+        }
+      ],
+      "stable_pids_fds_and_stack": true
+    },
+    {
+      "workers": 4,
+      "snapshots": [
+        {
+          "processes": [
+            {
+              "pid": 1127304,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127305,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127306,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127307,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127308,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56,
+          "completed_requests": 500
+        },
+        {
+          "processes": [
+            {
+              "pid": 1127304,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127305,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127306,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127307,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127308,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56,
+          "completed_requests": 10500
+        },
+        {
+          "processes": [
+            {
+              "pid": 1127304,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127305,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127306,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127307,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127308,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56,
+          "completed_requests": 20500
+        },
+        {
+          "processes": [
+            {
+              "pid": 1127304,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127305,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127306,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127307,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127308,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56,
+          "completed_requests": 30500
+        },
+        {
+          "processes": [
+            {
+              "pid": 1127304,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 1127305,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127306,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127307,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            },
+            {
+              "pid": 1127308,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffe07f74bc0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56,
+          "completed_requests": 40500
+        }
+      ],
+      "loads": [
+        {
+          "body_bytes": 3900,
+          "attempted": 500,
+          "successful": 500,
+          "failed": 0,
+          "elapsed_seconds": 0.04743,
+          "goodput_per_second": 10541.949,
+          "success_latency_us": {
+            "p50": 216.159,
+            "p95": 1011.01,
+            "p99": 2983.878,
+            "max": 6116.308
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.0,
+            "system": 0.11585900000000038
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 10000,
+          "successful": 10000,
+          "failed": 0,
+          "elapsed_seconds": 1.327114,
+          "goodput_per_second": 7535.15,
+          "success_latency_us": {
+            "p50": 201.678,
+            "p95": 1857.048,
+            "p99": 6223.799,
+            "max": 26111.58
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.14376999999999995,
+            "system": 3.0302430000000413
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 10000,
+          "successful": 10000,
+          "failed": 0,
+          "elapsed_seconds": 1.584083,
+          "goodput_per_second": 6312.8,
+          "success_latency_us": {
+            "p50": 238.549,
+            "p95": 2178.316,
+            "p99": 6661.086,
+            "max": 33919.141
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.2719110000000029,
+            "system": 3.5348409999999717
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 10000,
+          "successful": 10000,
+          "failed": 0,
+          "elapsed_seconds": 1.618611,
+          "goodput_per_second": 6178.138,
+          "success_latency_us": {
+            "p50": 206.584,
+            "p95": 2459.857,
+            "p99": 7956.387,
+            "max": 29111.271
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.19891799999999904,
+            "system": 3.3464910000000145
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 10000,
+          "successful": 10000,
+          "failed": 0,
+          "elapsed_seconds": 1.283918,
+          "goodput_per_second": 7788.659,
+          "success_latency_us": {
+            "p50": 224.964,
+            "p95": 1508.295,
+            "p99": 5442.374,
+            "max": 29140.268
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.2788679999999992,
+            "system": 2.897808999999995
+          },
+          "client_exit_status": 0
+        }
+      ],
+      "stable_pids_fds_and_stack": true
+    }
+  ],
+  "client_sha256": "03049dbb59939fd190adb577989eafabfdc8e5dfd794d72a2b1a6212762d7b6e",
+  "finished_utc": "2026-09-10T15:31:59.669141+00:00"
+}

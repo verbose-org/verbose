@@ -1,5 +1,8 @@
 # Benchmarks: verbosec's native emitter vs gcc / rustc / go
 
+For native HTTP services, see the separate
+[forked/pool throughput and memory baseline](http-worker-benchmarks.md).
+
 This is an honest, reproducible measurement of what a `verbosec`-compiled
 native binary actually buys you, per axis, **including where it loses**.
 Run it yourself with `./tools/benchmark.sh`. The numbers below were measured

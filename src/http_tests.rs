@@ -1,10 +1,18 @@
 //! Socket-level acceptance tests, independent of the native framing machine.
+mod admission_tests;
+mod pool_tests;
+mod shutdown_tests;
+mod text_bounds_tests;
+mod bounded_state_tests;
+mod text_inputs_tests;
+mod text_branches_tests;
 use crate::{
     ast::*,
     http_framing::{reference, Frame},
     lexer::Lexer,
     parser::Parser,
 };
+use std::os::unix::process::CommandExt;
 use std::{
     fs,
     io::{Read, Write},
@@ -32,6 +40,11 @@ struct Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
+        // Dedicated test process group includes forked request children, even
+        // if a test panics while one is stopped or has a long deadline.
+        unsafe {
+            admission_tests::kill(-(self.child.id() as i32), 9);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.bin);
@@ -39,6 +52,12 @@ impl Drop for Server {
 }
 impl Server {
     fn start(source: &str) -> Self {
+        Self::start_with_sigchld(source, false)
+    }
+    fn start_with_sigchld(source: &str, ignore: bool) -> Self {
+        Self::start_with_ignored_signals(source, if ignore { &[17] } else { &[] })
+    }
+    fn start_with_ignored_signals(source: &str, ignored: &[i32]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -54,11 +73,25 @@ impl Server {
             fs::read(&bin).unwrap(),
             "non-deterministic transport emission"
         );
-        let child = Command::new(&bin)
+        let mut command = Command::new(&bin);
+        command
+            .process_group(0)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if !ignored.is_empty() {
+            let ignored = ignored.to_vec();
+            unsafe {
+                command.pre_exec(move || {
+                    for sig in &ignored {
+                        if admission_tests::signal(*sig, 1) == usize::MAX {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = command.spawn().unwrap();
         let mut s = Self { child, port, bin };
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -444,6 +477,10 @@ fn bounded_http_self_hosted_refuses_before_output() {
         for attrs in [
             "  request_timeout: 2\n",
             "  response_timeout: 2\n",
+            "  max_connections: 2\n",
+            "  workers: 2\n",
+            "  concurrency: pooled\n",
+            "  shutdown_timeout: 2\n",
             "  request_timeout: 2\n  response_timeout: 2\n",
         ] {
             for source in [
@@ -457,7 +494,7 @@ fn bounded_http_self_hosted_refuses_before_output() {
                 assert_eq!(
                     output.status.code(),
                     Some(1),
-                    "{entry} accepted HTTP deadline"
+                    "{entry} accepted unsupported HTTP contract"
                 );
                 assert!(output.stdout.is_empty(), "{entry} emitted partial artifact");
             }
@@ -471,6 +508,15 @@ fn bounded_http_self_hosted_refuses_before_output() {
             "{entry} over-reserved identifiers: {output:?}"
         );
         assert!(!output.stdout.is_empty());
+        for name in ["max_connections", "workers", "pooled", "shutdown_timeout"] {
+            let ordinary_name = source.replace("request_timeout", name);
+            let output = run(&ordinary_name);
+            assert!(
+                output.status.success(),
+                "{entry} reserved {name} outside services"
+            );
+            assert!(!output.stdout.is_empty());
+        }
         fs::remove_file(bin).unwrap();
     }
 }

@@ -1,0 +1,33 @@
+@verbose 0.1.0
+
+-- At most eight handler children; close overload before request effects.
+-- One request per connection, with whole-phase receive/send deadlines in seconds.
+-- See docs/bounded-service-concurrency.md for admission and recovery semantics.
+rule echo_body
+  @intention: "Return the complete request body, preserving its bytes"
+  @source: http_capped.intent:2
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: concat("", req.body) }
+  proofs:
+    purity:
+      reads : [req.body]
+      calls : []
+    termination:
+      bound : 4
+
+service bounded_http
+  @intention: "Cap admitted handler children and close excess connections"
+  @source: http_capped.intent:3
+  listen:
+    protocol: http_1_0
+    port: 18961
+    max_request: 4096
+  handler: echo_body
+  request_timeout: 2
+  response_timeout: 2
+  concurrency: forked
+  max_connections: 8

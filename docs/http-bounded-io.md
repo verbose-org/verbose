@@ -82,8 +82,10 @@ The receiver reserves `max_request` bytes plus 128 scratch bytes beyond existing
 service slots. A deterministic static header transition table grows the executable
 by 34 KiB. Neither receive nor send loops allocate dynamically. Existing
 handler expressions may still allocate, and existing response text-range checks
-are not a general proof of response size. This slice does not add a connection
-quota or bound the number of forked children. Deadlines use millisecond resolution.
+are not a general proof of response size. Deadlines use millisecond resolution.
+The separate [admission slice](bounded-service-concurrency.md), implemented on
+2026-09-10, adds an optional cap on admitted forked children. Deadlines alone do
+not bound their number.
 
 ## Native implementation and register lifetimes
 
@@ -124,8 +126,8 @@ WASM and the self-hosted compiler explicitly refuse this transport contract
 before artifact output. The interpreter executes handler rules, not services;
 the transport reference is a test oracle, not an interpreted server runtime.
 Run the normal suite serially, CIDX checks, and self-hosted bootstrap after adding
-its refusal. General buffer/ownership syntax, typed socket results, connection
-quotas, worker pools/threads, TLS, and load qualification remain later work.
+its refusal. General buffer/ownership syntax, typed socket results, worker
+pools/threads, TLS, and load qualification remain later work.
 
 Framing references: [RFC 9112 sections 2–6](https://www.rfc-editor.org/rfc/rfc9112.html),
 with the narrower rejection policy above; Linux [poll](https://man7.org/linux/man-pages/man2/poll.2.html)
