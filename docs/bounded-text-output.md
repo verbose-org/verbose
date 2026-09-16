@@ -29,14 +29,15 @@ Unknown bounds are never accepted as evidence of the annotation.
 Supported scalar expressions are number literals/fields, `length(text)`, scalar
 comparisons, boolean operations and conditionals. Arithmetic, `substring`,
 `json_escape` and other checked primitives are outside this slice. Flat record
-construction supports a wrapper such as `HttpResponse`; conditional records and
-nested records are refused. An annotation applies to a rule's text output only,
+construction supports a wrapper such as `HttpResponse`;
+[conditional records](bounded-text-branches.md) join fields of the same concept.
+Nested record fields are refused. An annotation applies to a rule's text output only,
 not to record-field ranges or service state. Optimization hints on participating
 rules are also refused. Rules elsewhere in the program keep their existing
 acceptance and optimization behavior.
 
 The analysis does not infer correlations between conditions: both branches must
-fit. It stops with a diagnostic after 100,000 visited expression nodes, 256
+fit. It stops with a diagnostic after 100,000 expression/field-join visits, 256
 expression levels or 128 nested calls. Capacity addition uses checked arithmetic.
 
 The annotation bounds the returned value. Native compilation now also assigns

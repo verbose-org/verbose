@@ -56680,7 +56680,7 @@ rule pick
         // http_pooled adds a service-scoped refusal for reusable workers.
         // http_shutdown adds an explicitly refused SIGTERM lifecycle contract.
         // Bounded text capacity/storage examples remain explicit gen0 refusals.
-        const EXPECTED_TOTAL: usize = 171;
+        const EXPECTED_TOTAL: usize = 172;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

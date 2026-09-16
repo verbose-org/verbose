@@ -1,0 +1,5 @@
+Accept a short title and a numeric route choice.
+Require a bounded formatter input.
+Choose one complete formatter input while proving bounds for both alternatives.
+Format the selected record within its declared output capacity.
+Retain the selected fields across aliasing, shadowing and successive calls.
