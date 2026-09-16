@@ -11,6 +11,9 @@ With --check-inputs, trace a constructed record passed to a different concept:
 even an unused argument field must execute once before the callee.
 With --check-branches, trace the condition and the selected record's unused
 field; joining that record must not evaluate the other branch or copy its text.
+With --check-overlay and --reference-compiler, compare exclusive 4 KiB result
+buffers: smaller frames, identical executed instruction/copy counts, and the
+same destination for both arms. No cache-hit or throughput claim is made.
 """
 import argparse
 import collections
@@ -33,10 +36,16 @@ parser.add_argument('--check-inputs', action='store_true',
                     help='trace constructed inputs, record aliases and unused argument evaluation')
 parser.add_argument('--check-branches', action='store_true',
                     help='trace conditional records and selected-branch evaluation')
+parser.add_argument('--check-overlay', action='store_true',
+                    help='compare branch storage with the pre-overlay compiler')
 options = parser.parse_args()
+if options.check_overlay:
+    if not options.reference_compiler or options.check_inputs or options.check_reuse:
+        parser.error('--check-overlay needs --reference-compiler and excludes input/reuse modes')
+    options.check_branches = True
 if options.check_inputs and options.check_branches:
     parser.error('choose --check-inputs or --check-branches')
-if (options.check_inputs or options.check_branches) and options.reference_compiler:
+if (options.check_inputs or options.check_branches) and options.reference_compiler and not options.check_overlay:
     parser.error('input/branch checks run without a reference compiler')
 WORK = Path(tempfile.mkdtemp(prefix='verbose-text-storage-trace-'))
 print(f'Traces: {WORK}', flush=True)
@@ -174,6 +183,35 @@ rule once
     let result = once(saved_argument)''')
     SOURCE = SOURCE.replace('reads : [req, req.code]', 'reads : [req, req.code, req.title]')
     SOURCE = SOURCE.replace('bound : 64', 'bound : 128')
+if options.check_overlay:
+    # Large public capacity, short runtime payload: trace addresses and reserved
+    # bytes independently from the amount of data actually copied.
+    SOURCE = SOURCE.replace('rule once\n', '''rule branch_text
+  @intention: "Own the selected branch buffer"
+  @source: trace.intent:2
+  input:
+    input : Input
+  output:
+    out : text [..4096]
+  logic:
+    out = concat("", input.title)
+  proofs:
+    purity:
+      reads : [input.title]
+      calls : []
+    termination:
+      bound : 8
+rule once
+''', 1)
+    start = SOURCE.index('concept PieceInput\n')
+    SOURCE = SOURCE[:start] + SOURCE[start:].replace('title : text [..8]', 'title : text [..4096]', 1)
+    SOURCE = SOURCE.replace('text [..28]', 'text [..4116]')
+    SOURCE = SOURCE.replace('text [..76]', 'text [..8252]')
+    SOURCE = SOURCE.replace('text [..96]', 'text [..8272]')
+    SOURCE = SOURCE.replace('concat("", req.title)', 'branch_text(req)')
+    argument = argument.replace('concat("", req.title)', 'branch_text(req)')
+    SOURCE = SOURCE.replace('calls : [once, probe, choose]', 'calls : [once, probe, choose, branch_text]')
+    SOURCE = SOURCE.replace('reads : [req, req.code, req.title]', 'reads : [req, req.code]')
 (WORK / 'trace.intent').write_text('Input.\nAliased call.\nShort circuit.\nEager lets and branches.\nInferred relay.\nWider result.\n')
 
 # Linux x86-64 user_regs_struct, as declared by sys/user.h.
@@ -230,6 +268,7 @@ def trace(binary, records, operator, case, reuse_expected=None):
     evaluations = []
     temporary_offsets = collections.defaultdict(list)
     frames, moves, steps = [], 0, 0
+    branch_offsets = []
     pending_copy, copied_bytes, copy_operations = None, 0, 0
     try:
         while True:
@@ -256,6 +295,8 @@ def trace(binary, records, operator, case, reuse_expected=None):
             if pc in sites:
                 counts[sites[pc]] += 1
                 evaluations.append(sites[pc])
+                if sites[pc] == 'decision':
+                    branch_offsets.append([])
             if pc == allocation_pc:
                 frames.append(registers.rbp)
             if frames:
@@ -273,6 +314,10 @@ def trace(binary, records, operator, case, reuse_expected=None):
                             registers.rdi + registers.rcx <= registers.rsi), 'source overlaps writable destination'
                 if not continuing_copy:
                     copy_operations += 1
+                    # Before the callee marker, this copy belongs to the
+                    # selected branch's result. Ignore its zero-length prefix.
+                    if options.check_overlay and registers.rcx and counts['once'] < counts['decision']:
+                        branch_offsets[-1].append(registers.rdi - frames[-1])
                     source_offset = registers.rsi - base
                     for name, prefix in REUSE_PREFIXES.items():
                         if source_offset >= 0 and blob[source_offset:source_offset + len(prefix)] == prefix.encode():
@@ -325,7 +370,7 @@ def trace(binary, records, operator, case, reuse_expected=None):
     return dict(case=case, evaluation_counts=expected_counts, evaluation_order=evaluations, frame_bytes=frame_bytes,
                 region_reused=True, checked_copy_steps=moves, copied_bytes=copied_bytes,
                 copy_operations=copy_operations, temporary_offsets=dict(temporary_offsets),
-                syscalls=dict(syscalls), steps=steps)
+                branch_offsets=branch_offsets, syscalls=dict(syscalls), steps=steps)
 
 
 reports = []
@@ -346,8 +391,10 @@ for operator in ['and', 'or']:
         # Same selected data and markers using the already supported scalar
         # conditional. A record join must add no payload copy to this control.
         control_source = WORK / f'{operator}-scalar-control.verbose'
-        control_source.write_text(source_text.replace(argument,
-            'PieceInput { title: concat("", req.title), code: if choose(req) then 420000000006 else 420000000007 }'))
+        control_argument = 'PieceInput { title: concat("", req.title), code: if choose(req) then 420000000006 else 420000000007 }'
+        if options.check_overlay:
+            control_argument = control_argument.replace('concat("", req.title)', 'branch_text(req)')
+        control_source.write_text(source_text.replace(argument, control_argument))
         control_binary = WORK / f'{operator}-scalar-control'
         subprocess.run([str(options.compiler.resolve()), str(control_source), '--run', 'forward',
                         '--native', str(control_binary)], check=True, capture_output=True)
@@ -370,10 +417,19 @@ for operator in ['and', 'or']:
             before = trace(reference, records, operator, f'{operator}-{case}-reference', False if options.check_reuse else None)
             assert report['frame_bytes'] < before['frame_bytes'], (before, report)
             for metric in ['copied_bytes', 'copy_operations']:
-                if options.check_reuse:
+                if options.check_reuse or options.check_overlay:
                     assert report[metric] == before[metric], (metric, before, report)
                 else:
                     assert report[metric] < before[metric], (metric, before, report)
+            if options.check_overlay:
+                assert report['steps'] == before['steps'], ('executed instructions', before, report)
+                assert report['syscalls'] == before['syscalls']
+                if case == 'repeat':
+                    after_offsets = [v for offsets in report['branch_offsets'] for v in offsets]
+                    before_offsets = [v for offsets in before['branch_offsets'] for v in offsets]
+                    assert len(after_offsets) == len(before_offsets) == len(records)
+                    assert len(set(after_offsets)) == 1, ('exclusive buffers not overlaid', report)
+                    assert len(set(before_offsets)) == 2, ('reference already overlays branches', before)
             comparisons.append(dict(case=report['case'], before=before, after=report))
 (WORK / 'report.json').write_text(json.dumps(reports, indent=2) + '\n')
 if comparisons:

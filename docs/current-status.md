@@ -60,8 +60,12 @@ share values, and storage is reclaimed after output or HTTP response consumption
 Output-position calls and branches pass their destination to the final producer,
 removing intermediate result buffers and copies. Writable text buffers can also
 share storage after their proved last use, including through aliases and branch
-joins. Simultaneously live values remain distinct; scalar/pointer/length slots
-are not reused.
+joins. Buffers created in mutually exclusive `if` arms can also overlap; their
+region remains protected through subsequent alias uses. This placement is used
+only when it shrinks the frame, without adding runtime instructions or copies.
+Values that can be live together remain distinct; scalar/pointer/length slots
+are not reused. Reserved space, actually touched memory and measured cache
+behavior are separate quantities.
 Pure rules can also pass explicitly constructed or returned flat records between
 different input concepts. [Input transfer checks](bounded-text-inputs.md) prove
 field capacities and numeric intervals; fields evaluate once and their owners

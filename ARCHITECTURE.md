@@ -93,6 +93,14 @@ check that storage; unknown bounds must remain explicitly unknown. Apache is a
 useful reference for operational capabilities, not a feature-cloning objective
 or a prerequisite for Verbose to make useful design choices.
 
+Memory efficiency is also an objective: minimize live storage, unnecessary
+copies and the working set to support processor-cache locality. Capacity bounds
+are ceilings, not targets to fill. The compiler should exploit verified
+lifetimes and exclusive execution to reuse storage without runtime management.
+This does not guarantee cache residency: reserved bytes, touched bytes, RSS and
+hardware cache misses must be distinguished in measurements. No particular
+cache size becomes a language contract.
+
 This is already concrete for bounded HTTP reception: `max_request` determines a
 fixed frame buffer, receiving does not grow it, and oversize requests close the
 client. It is not yet a whole-service memory bound: response temporaries, callees,
@@ -110,6 +118,9 @@ lets, shared aliases and a separate ceiling on slots and temporary buffers.
 Output-position calls and branches forward a fresh result destination to the
 producer; other live values retain distinct storage. Text buffers can share
 space after their proved last use, including through aliases and branch joins.
+Buffers created in opposite `if` arms can overlap while their region remains
+protected through all subsequent alias uses. The compiler keeps that placement
+only when it reduces the reserved frame compared with ordinary last-use reuse.
 Placement happens at compilation; scalar/pointer/length slots are not reused.
 Rules can [construct checked record inputs](docs/bounded-text-inputs.md) for
 callees with different concepts. The compiler proves field capacities and numeric

@@ -501,6 +501,7 @@ impl Emit<'_> {
         load(&mut self.code, 0, c.scalar()?);
         self.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
         let otherwise = jump(&mut self.code, &[0x0f, 0x84]);
+        let branch = self.storage.branch();
         let a = self.expr_into(a, env, depth + 1, destination)?;
         let a = self.materialize_input(a)?;
         let mut dest = match (&a, destination) {
@@ -513,6 +514,7 @@ impl Emit<'_> {
         }
         let done = jump(&mut self.code, &[0xe9]);
         self.finish_jump(otherwise);
+        self.storage.otherwise(branch)?;
         let b = self.expr_into(b, env, depth + 1, destination)?;
         let b = self.materialize_input(b)?;
         if destination.is_none() {
@@ -520,6 +522,7 @@ impl Emit<'_> {
         }
         self.join_capacities(&mut dest, &b)?;
         self.finish_jump(done);
+        self.storage.end_branch(branch)?;
         Ok(dest)
     }
     fn join_slots(&mut self, value: &Value) -> Result<Value, NativeError> {

@@ -2,7 +2,8 @@
 //!
 //! Pointer/length slots are never reused. A pointer join records both possible
 //! owners; backwards propagation of its last use keeps either buffer alive.
-//! Intervals follow emitted order, conservatively spanning conditional arms.
+//! Intervals follow emitted order. Structured alternatives can share a region;
+//! that region stays live until the last use of either arm's buffers.
 //! There are no runtime allocation/free operations.
 use super::{address, error, NativeError, FIXED_SCRATCH, FRAME_LIMIT};
 use std::cmp::Reverse;
@@ -22,13 +23,63 @@ struct Buffer {
     context: String,
 }
 
-#[derive(Default)]
 pub(super) struct Storage {
     pointers: BTreeMap<i32, Pointer>,
     buffers: Vec<Buffer>,
     clock: usize,
+    scopes: Vec<Vec<Member>>,
+    current: usize,
+}
+#[derive(Clone, Copy)]
+enum Member {
+    Buffer(usize),
+    Choice(usize, usize),
+}
+#[derive(Clone, Copy)]
+pub(super) struct Branch {
+    parent: usize,
+    left: usize,
+    right: usize,
+}
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            pointers: BTreeMap::new(),
+            buffers: Vec::new(),
+            clock: 0,
+            scopes: vec![Vec::new()],
+            current: 0,
+        }
+    }
 }
 impl Storage {
+    // The condition is emitted before entering either arm. Only destinations
+    // CREATED in these arms may overlap; existing owners remain in their scope.
+    pub(super) fn branch(&mut self) -> Branch {
+        let branch = Branch {
+            parent: self.current,
+            left: self.scopes.len(),
+            right: self.scopes.len() + 1,
+        };
+        self.scopes[self.current].push(Member::Choice(branch.left, branch.right));
+        self.scopes.extend([Vec::new(), Vec::new()]);
+        self.current = branch.left;
+        branch
+    }
+    pub(super) fn otherwise(&mut self, branch: Branch) -> Result<(), NativeError> {
+        if self.current != branch.left {
+            return Err(error("unbalanced storage branch"));
+        }
+        self.current = branch.right;
+        Ok(())
+    }
+    pub(super) fn end_branch(&mut self, branch: Branch) -> Result<(), NativeError> {
+        if self.current != branch.right {
+            return Err(error("unbalanced storage branch"));
+        }
+        self.current = branch.parent;
+        Ok(())
+    }
     pub(super) fn pointer(&mut self, ptr: i32) {
         self.pointers.entry(ptr).or_default();
     }
@@ -75,6 +126,7 @@ impl Storage {
         }
         self.clock += 1;
         node.buffer = Some(self.buffers.len());
+        self.scopes[self.current].push(Member::Buffer(self.buffers.len()));
         // The address exists from entry into this destination's producer, even
         // when its inferred capacity is learned only after emitting the body.
         address(code, 0, 0);
@@ -138,10 +190,11 @@ impl Storage {
         Ok(())
     }
     pub(super) fn layout(&mut self, code: &mut [u8], slots: usize) -> Result<usize, NativeError> {
+        if self.current != 0 {
+            return Err(error("unclosed storage branch"));
+        }
         self.propagate()?;
-        let mut active = BinaryHeap::<Reverse<(usize, usize, usize)>>::new();
-        let mut free = Free::default();
-        let mut extent = 0usize;
+        let mut intervals = Vec::with_capacity(self.buffers.len());
         for buffer in &self.buffers {
             let size = buffer
                 .capacity
@@ -149,37 +202,125 @@ impl Storage {
                 .checked_add(7)
                 .map(|n| n & !7)
                 .ok_or_else(|| error("buffer capacity overflow"))?;
-            while active
-                .peek()
-                .is_some_and(|Reverse((last, _, _))| *last < buffer.first)
-            {
-                let Reverse((_, start, size)) = active.pop().unwrap();
-                free.release(start, size);
+            intervals.push(Interval {
+                size,
+                first: buffer.first,
+                last: buffer.last,
+            });
+        }
+        let (mut extent, mut starts) = place(&intervals)?;
+        if self.scopes.len() > 1 {
+            let (overlaid_extent, overlaid_starts) = self.overlay(&intervals)?;
+            // Retaining a whole branch region can be more conservative than
+            // individual last-use reuse. Never enlarge a frame for this choice;
+            // ties retain the old placement and emitted bytes.
+            if overlaid_extent < extent {
+                extent = overlaid_extent;
+                starts = overlaid_starts;
             }
-            let start = if size == 0 {
-                0
-            } else {
-                free.take(size, extent)
-            };
-            let end = start
-                .checked_add(size)
-                .ok_or_else(|| error("buffer placement overflow"))?;
-            extent = extent.max(end);
-            let frame = slots
-                .checked_add(extent)
-                .and_then(|n| n.checked_add(FIXED_SCRATCH))
-                .ok_or_else(|| error("frame size overflow"))?;
-            if frame > FRAME_LIMIT {
-                return Err(error(format!("{}: invocation frame exceeds {FRAME_LIMIT} bytes (needs {frame} including slots, buffer placement and fixed scratch)", buffer.context)));
-            }
-            let offset = -((slots + end) as i32);
+        }
+        let frame = slots
+            .checked_add(extent)
+            .and_then(|n| n.checked_add(FIXED_SCRATCH))
+            .ok_or_else(|| error("frame size overflow"))?;
+        if frame > FRAME_LIMIT {
+            return Err(error(format!("invocation frame exceeds {FRAME_LIMIT} bytes (needs {frame} including slots, buffer placement and fixed scratch)")));
+        }
+        for (id, buffer) in self.buffers.iter().enumerate() {
+            let offset = -((slots + starts[id] + intervals[id].size) as i32);
             code[buffer.address..buffer.address + 4].copy_from_slice(&offset.to_le_bytes());
-            if size != 0 {
-                active.push(Reverse((buffer.last, start, size)));
-            }
         }
         Ok(slots + extent)
     }
+    fn overlay(&self, buffers: &[Interval]) -> Result<(usize, Vec<usize>), NativeError> {
+        // Children have larger scope indices. Build each arm independently,
+        // then represent both arms by ONE region sized to their maximum. Its
+        // lifetime spans all descendant owners, including aliases used after
+        // the join. This deliberately avoids enumerating execution paths or
+        // pairwise interference, and uses no runtime branch/ownership metadata.
+        let mut regions = vec![
+            Interval {
+                size: 0,
+                first: usize::MAX,
+                last: 0
+            };
+            self.scopes.len()
+        ];
+        let mut offsets = vec![Vec::new(); self.scopes.len()];
+        for (id, scope) in self.scopes.iter().enumerate().rev() {
+            let members: Vec<_> = scope
+                .iter()
+                .map(|member| match *member {
+                    Member::Buffer(b) => buffers[b],
+                    Member::Choice(a, b) => Interval {
+                        size: regions[a].size.max(regions[b].size),
+                        first: regions[a].first.min(regions[b].first),
+                        last: regions[a].last.max(regions[b].last),
+                    },
+                })
+                .collect();
+            let (size, starts) = place(&members)?;
+            regions[id] = Interval {
+                size,
+                first: members.iter().map(|m| m.first).min().unwrap_or(usize::MAX),
+                last: members.iter().map(|m| m.last).max().unwrap_or(0),
+            };
+            offsets[id] = starts;
+        }
+        let mut bases = vec![0usize; self.scopes.len()];
+        let mut starts = vec![0; buffers.len()];
+        for (id, scope) in self.scopes.iter().enumerate() {
+            for (member, offset) in scope.iter().zip(&offsets[id]) {
+                let start = bases[id]
+                    .checked_add(*offset)
+                    .ok_or_else(|| error("branch placement overflow"))?;
+                match *member {
+                    Member::Buffer(b) => starts[b] = start,
+                    Member::Choice(a, b) => {
+                        bases[a] = start;
+                        bases[b] = start;
+                    }
+                }
+            }
+        }
+        Ok((regions[0].size, starts))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Interval {
+    size: usize,
+    first: usize,
+    last: usize,
+}
+fn place(intervals: &[Interval]) -> Result<(usize, Vec<usize>), NativeError> {
+    let mut active = BinaryHeap::<Reverse<(usize, usize, usize)>>::new();
+    let mut free = Free::default();
+    let mut extent = 0usize;
+    let mut starts = Vec::with_capacity(intervals.len());
+    for &Interval { size, first, last } in intervals {
+        // Empty arms have no lifetime. In particular, their sentinel must not
+        // release live regions before the next real allocation in this scope.
+        if size == 0 {
+            starts.push(0);
+            continue;
+        }
+        while active
+            .peek()
+            .is_some_and(|Reverse((end, _, _))| *end < first)
+        {
+            let Reverse((_, start, size)) = active.pop().unwrap();
+            free.release(start, size);
+        }
+        let start = free.take(size, extent);
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| error("buffer placement overflow"))?;
+        extent = extent.max(end);
+        starts.push(start);
+        active.push(Reverse((last, start, size)));
+    }
+    Ok((extent, starts))
 }
 
 // Best fit with adjacent-hole coalescing. Both indices are ordered, making
@@ -313,6 +454,133 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exclusive_owners_overlap_but_their_join_protects_the_region() {
+        let mut s = Storage::default();
+        let mut code = Vec::new();
+        reserve(&mut s, &mut code, -8, 32); // Outer owner.
+        s.pointer(-16);
+        let branch = s.branch();
+        reserve(&mut s, &mut code, -24, 64);
+        s.alias(-16, -24).unwrap();
+        s.otherwise(branch).unwrap();
+        reserve(&mut s, &mut code, -32, 128);
+        s.alias(-16, -32).unwrap();
+        s.end_branch(branch).unwrap();
+        reserve(&mut s, &mut code, -40, 64); // Later work cannot destroy join.
+        s.touch(-8).unwrap();
+        s.touch(-16).unwrap();
+        assert_eq!(s.layout(&mut code, 48).unwrap(), 48 + 32 + 128 + 64);
+        assert!(overlap(span(&s, &code, 1), span(&s, &code, 2)));
+        for a in [0, 3] {
+            for b in [1, 2] {
+                assert!(!overlap(span(&s, &code, a), span(&s, &code, b)));
+            }
+        }
+    }
+
+    #[test]
+    fn branch_grouping_never_increases_the_legacy_frame() {
+        let mut s = Storage::default();
+        let mut code = Vec::new();
+        s.pointer(-8);
+        let branch = s.branch();
+        reserve(&mut s, &mut code, -16, 1024); // Dead temporary.
+        reserve(&mut s, &mut code, -24, 8); // Escaping small result.
+        s.alias(-8, -24).unwrap();
+        s.otherwise(branch).unwrap();
+        reserve(&mut s, &mut code, -32, 8);
+        s.alias(-8, -32).unwrap();
+        s.end_branch(branch).unwrap();
+        reserve(&mut s, &mut code, -40, 512);
+        s.touch(-8).unwrap();
+        // Grouping would hold the whole 1024-byte region through the later
+        // work. The original layout fits that work alongside the small owners.
+        assert_eq!(s.layout(&mut code, 48).unwrap(), 48 + 1024);
+        assert!(!overlap(span(&s, &code, 1), span(&s, &code, 2)));
+    }
+
+    #[test]
+    fn structured_placement_preserves_every_compatible_live_pair() {
+        fn generate(
+            s: &mut Storage,
+            code: &mut Vec<u8>,
+            seed: &mut u32,
+            path: &mut Vec<(usize, bool)>,
+            paths: &mut Vec<Vec<(usize, bool)>>,
+            depth: usize,
+        ) {
+            for _ in 0..4 {
+                *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                if depth < 3 && *seed % 3 == 0 {
+                    let branch = s.branch();
+                    path.push((branch.left, false));
+                    generate(s, code, seed, path, paths, depth + 1);
+                    s.otherwise(branch).unwrap();
+                    path.last_mut().unwrap().1 = true;
+                    generate(s, code, seed, path, paths, depth + 1);
+                    path.pop();
+                    s.end_branch(branch).unwrap();
+                } else {
+                    let ptr = -(paths.len() as i32 + 1) * 8;
+                    reserve(s, code, ptr, ((*seed >> 16) % 257) as usize);
+                    s.buffers.last_mut().unwrap().last += (*seed % 511) as usize;
+                    paths.push(path.clone());
+                }
+            }
+        }
+        for mut seed in [7, 42, 1234, 5678, 9000] {
+            let mut s = Storage::default();
+            let mut code = Vec::new();
+            let mut paths = Vec::new();
+            generate(&mut s, &mut code, &mut seed, &mut Vec::new(), &mut paths, 0);
+            let slots = paths.len() * 8;
+            let frame = s.layout(&mut code, slots).unwrap();
+            let emitted = code.clone();
+            assert_eq!(s.layout(&mut code, slots).unwrap(), frame);
+            assert_eq!(code, emitted);
+            for (i, a) in s.buffers.iter().enumerate() {
+                assert!(span(&s, &code, i).0 >= -(frame as i32));
+                assert!(span(&s, &code, i).1 <= -(slots as i32));
+                for (j, b) in s.buffers.iter().enumerate().skip(i + 1) {
+                    let exclusive = paths[i].iter().any(|(id, arm)| {
+                        paths[j]
+                            .iter()
+                            .any(|(other, side)| id == other && arm != side)
+                    });
+                    if !exclusive
+                        && a.capacity != Some(0)
+                        && b.capacity != Some(0)
+                        && a.first <= b.last
+                        && b.first <= a.last
+                    {
+                        assert!(
+                            !overlap(span(&s, &code, i), span(&s, &code, j)),
+                            "compatible live owners {i}, {j} overlap (seed {seed})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_unbalanced_branches() {
+        let mut s = Storage::default();
+        let mut code = Vec::new();
+        reserve(&mut s, &mut code, -8, 64);
+        let branch = s.branch();
+        assert!(s.end_branch(branch).is_err());
+        assert!(s.layout(&mut code, 16).is_err());
+        s.otherwise(branch).unwrap();
+        assert!(s.otherwise(branch).is_err());
+        s.end_branch(branch).unwrap();
+        reserve(&mut s, &mut code, -16, 64);
+        s.touch(-8).unwrap();
+        assert_eq!(s.layout(&mut code, 16).unwrap(), 144);
+        assert!(!overlap(span(&s, &code, 0), span(&s, &code, 1)));
     }
 
     #[test]

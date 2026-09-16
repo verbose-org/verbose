@@ -63,11 +63,14 @@ copies required by those operations.
 
 Each joined text pointer records both possible owners. Both stay live through
 the joined field's last use, including returned aliases and later caller uses.
-Nested joins reuse the existing provenance graph. Placement remains conservative:
-mutually exclusive branch buffers can still occupy distinct storage, and the
-existing 2 MiB invocation ceiling still applies. Two 1 MiB writable alternatives
-can exceed that ceiling once their slots are included, even with a tiny final
-output. No runtime allocator fallback is introduced.
+Nested joins reuse the existing provenance graph. Since 2026-09-16,
+[native placement](bounded-text-storage.md) can overlay buffers created in
+mutually exclusive arms, including nested choices, while retaining the region
+until all joined aliases have finished using it. The compiler chooses this
+placement only when it reduces the frame compared with ordinary last-use reuse.
+Two exclusive 1 MiB writable alternatives with a tiny output now fit; two 1 MiB
+values live together still exceed the 2 MiB ceiling once slots are included.
+Placement remains conservative, and no runtime allocator fallback is introduced.
 
 ## Backends and services
 
