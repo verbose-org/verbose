@@ -123,8 +123,12 @@ def server(binary, port, cpus, work, label):
         raise RuntimeError(f'unexpected server stdout/stderr: {label}')
 
 
-def load(client, port, clients, requests, payload, cpus, timeout_ms=5000, wall_timeout=120):
-    argv = pinned([str(client), str(port), str(clients), str(requests), str(payload), str(timeout_ms)], cpus)
+def load(client, port, clients, requests, payload, cpus, timeout_ms=5000, wall_timeout=120,
+         alternate_paths=False):
+    argv = [str(client), str(port), str(clients), str(requests), str(payload), str(timeout_ms)]
+    if alternate_paths:
+        argv.append('--alternate-paths')
+    argv = pinned(argv, cpus)
     # Per-operation timeouts are in the client. This wall bound also catches a
     # peer that drips bytes forever without triggering an individual read timeout.
     before = resource.getrusage(resource.RUSAGE_CHILDREN)

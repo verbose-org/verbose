@@ -1,0 +1,6303 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "started_utc": "2026-09-16T08:01:24.208110+00:00",
+  "revision": "78c6e84f443ca1d7b82782e58fc337937be54957",
+  "working_tree_status": "M tools/benchmark_http.py\n M tools/http_load.rs\n M tools/test_http_load.py\n?? docs/bounded-text-http-benchmark.md\n?? tools/benchmark_text_branches.py",
+  "compiler_sha256": {
+    "before": "268411251b00c71b5f7f139e3e83753f4ebd948008073ade16440c6efb32dcec",
+    "after": "371dbc1de334b4ca8c3c6689e361275f191d41d417069cdbd480b0a9d596cfbb"
+  },
+  "harness_sha256": "900f8e42f158912d1c931ce227cfda8d88a9e745c4187e5d7d3ee2f9684127ab",
+  "load_harness_sha256": "36aa9a734f34debe90ecace6f1733bd7f3642fbb08b88e54df1bf6b28d64522f",
+  "client_source_sha256": "a7c9647aff6e3d73168057f3b5785170477349c3d82000e386249d8f5e3084f9",
+  "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+  "artifacts": "/tmp/verbose-branch-http-hnffkclk",
+  "config": {
+    "compiler": "/home/arcker/projects/verbose/target/release/verbosec",
+    "reference_compiler": "/tmp/verbose-branch-storage/reference-verbosec",
+    "reference_revision": "555e402",
+    "workers": [
+      1,
+      4
+    ],
+    "payloads": [
+      0,
+      1024,
+      3900
+    ],
+    "requests": 30000,
+    "warmup": 500,
+    "repeats": 3,
+    "memory_requests": 2000,
+    "load_timeout": 120,
+    "server_cpus": [
+      0,
+      2,
+      4,
+      6
+    ],
+    "client_cpus": [
+      8,
+      10,
+      12,
+      14
+    ],
+    "host_note": "Host activity outside Linux not reported",
+    "output": "/tmp/verbose-merge-memory/bounded-text-http-2026-09-16.json"
+  },
+  "host": {
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "cpu": "AMD Ryzen 7 5800X 8-Core Processor",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "loadavg_before": [
+      0.7470703125,
+      2.97607421875,
+      3.357421875
+    ],
+    "clock_ticks_per_second": 100,
+    "thread_siblings": {
+      "0": "0-1",
+      "1": "0-1",
+      "2": "2-3",
+      "3": "2-3",
+      "4": "4-5",
+      "5": "4-5",
+      "6": "6-7",
+      "7": "6-7",
+      "8": "8-9",
+      "9": "8-9",
+      "10": "10-11",
+      "11": "10-11",
+      "12": "12-13",
+      "13": "12-13",
+      "14": "14-15",
+      "15": "14-15"
+    },
+    "loadavg_after": [
+      4.5703125,
+      3.56591796875,
+      3.521484375
+    ]
+  },
+  "cache_counters": "not measured",
+  "builds": [
+    {
+      "workers": 1,
+      "source": "@verbose 0.1.0\nrule piece\n  @intention: \"Own a bounded copy of the counted binary request body\"\n  @source: branches.intent:1\n  input:\n    input : HttpRequest\n  output:\n    out : text [..4096]\n  logic:\n    out = concat(\"\", input.body)\n  proofs:\n    purity:\n      reads : [input.body]\n      calls : []\n    termination:\n      bound : 8\nrule handle\n  @intention: \"Select an owned body from exactly one branch\"\n  @source: branches.intent:2\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    let selected = if req.path == \"/a\" then HttpResponse { status: 200, body: piece(req) } else HttpResponse { body: piece(req), status: 200 }\n    resp = selected\n  proofs:\n    purity:\n      reads : [req, req.path]\n      calls : [piece]\n    termination:\n      bound : 64\nservice bounded_http\n  @intention: \"Compare placement with identical pooled transport\"\n  @source: branches.intent:3\n  listen:\n    protocol: http_1_0\n    port: 54727\n    max_request: 4096\n  handler: handle\n  request_timeout: 2\n  response_timeout: 2\n  concurrency: pooled\n  workers: 1\n",
+      "port": 54727,
+      "binary_sha256": {
+        "before": "53e9e80396250c2a8febc21bdff79eb63421ad1625b241f75dd3b303258dd450",
+        "after": "4b913d60d4033a503ba074055cdcb21e61a70e413eb939846f3af9463aa77236"
+      },
+      "before_frame_bytes": 8352,
+      "after_frame_bytes": 4256,
+      "saved_frame_bytes": 4096,
+      "binary_bytes": 40800,
+      "only_layout_immediates_differ": true
+    },
+    {
+      "workers": 4,
+      "source": "@verbose 0.1.0\nrule piece\n  @intention: \"Own a bounded copy of the counted binary request body\"\n  @source: branches.intent:1\n  input:\n    input : HttpRequest\n  output:\n    out : text [..4096]\n  logic:\n    out = concat(\"\", input.body)\n  proofs:\n    purity:\n      reads : [input.body]\n      calls : []\n    termination:\n      bound : 8\nrule handle\n  @intention: \"Select an owned body from exactly one branch\"\n  @source: branches.intent:2\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    let selected = if req.path == \"/a\" then HttpResponse { status: 200, body: piece(req) } else HttpResponse { body: piece(req), status: 200 }\n    resp = selected\n  proofs:\n    purity:\n      reads : [req, req.path]\n      calls : [piece]\n    termination:\n      bound : 64\nservice bounded_http\n  @intention: \"Compare placement with identical pooled transport\"\n  @source: branches.intent:3\n  listen:\n    protocol: http_1_0\n    port: 33505\n    max_request: 4096\n  handler: handle\n  request_timeout: 2\n  response_timeout: 2\n  concurrency: pooled\n  workers: 4\n",
+      "port": 33505,
+      "binary_sha256": {
+        "before": "3de0ac80ee42133a4cd97b6f2a11708746863f9179875422fc822ec30ad71878",
+        "after": "9ed0dcd450140348dd94d59cc01d9a1411af1d3eaccdf5d462088ff3b0e74faa"
+      },
+      "before_frame_bytes": 8352,
+      "after_frame_bytes": 4256,
+      "saved_frame_bytes": 4096,
+      "binary_bytes": 41103,
+      "only_layout_immediates_differ": true
+    }
+  ],
+  "runs": [
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 0,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.069402,
+        "goodput_per_second": 7204.369,
+        "success_latency_us": {
+          "p50": 128.542,
+          "p95": 211.354,
+          "p99": 282.758,
+          "max": 347.795
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.04963100000000001
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13067,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13068,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd7365e798"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.908267,
+        "goodput_per_second": 7676.036,
+        "success_latency_us": {
+          "p50": 123.074,
+          "p95": 188.845,
+          "p99": 261.36,
+          "max": 5196.384
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.13153100000000006,
+          "system": 2.488117
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.05,
+        "system": 2.28
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13067,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13068,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd7365e798"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 0,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.082609,
+        "goodput_per_second": 6052.606,
+        "success_latency_us": {
+          "p50": 149.517,
+          "p95": 284.908,
+          "p99": 467.7,
+          "max": 1101.748
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.05667999999999962
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13133,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13134,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdc7f6e968"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.989677,
+        "goodput_per_second": 7519.406,
+        "success_latency_us": {
+          "p50": 121.988,
+          "p95": 202.482,
+          "p99": 338.781,
+          "max": 5740.501
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.142752,
+          "system": 2.53385
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.1,
+        "system": 2.23
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13133,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13134,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdc7f6e968"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 0,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.057886,
+        "goodput_per_second": 8637.626,
+        "success_latency_us": {
+          "p50": 116.654,
+          "p95": 160.34,
+          "p99": 212.988,
+          "max": 362.797
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.014140000000000041,
+          "system": 0.028279000000000387
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13222,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13223,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc21217bf8"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.739219,
+        "goodput_per_second": 8023.067,
+        "success_latency_us": {
+          "p50": 120.242,
+          "p95": 177.214,
+          "p99": 229.807,
+          "max": 3030.206
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.1250610000000001,
+          "system": 2.407425
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.14,
+        "system": 2.08
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13222,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13223,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc21217bf8"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 0,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.061849,
+        "goodput_per_second": 8084.141,
+        "success_latency_us": {
+          "p50": 119.924,
+          "p95": 176.983,
+          "p99": 210.567,
+          "max": 286.212
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.045265999999999806
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13281,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13282,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff3fb0ea98"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.649123,
+        "goodput_per_second": 8221.154,
+        "success_latency_us": {
+          "p50": 118.762,
+          "p95": 173.972,
+          "p99": 226.707,
+          "max": 2415.147
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.11375299999999999,
+          "system": 2.3888289999999994
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.1,
+        "system": 2.06
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13281,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13282,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff3fb0ea98"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 0,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.078731,
+        "goodput_per_second": 6350.712,
+        "success_latency_us": {
+          "p50": 148.025,
+          "p95": 223.888,
+          "p99": 266.816,
+          "max": 2290.746
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.00894600000000012,
+          "system": 0.04472999999999949
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13333,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13334,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdcf8228e8"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.961981,
+        "goodput_per_second": 7571.97,
+        "success_latency_us": {
+          "p50": 122.923,
+          "p95": 194.401,
+          "p99": 317.521,
+          "max": 8526.22
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.13000199999999995,
+          "system": 2.5200329999999997
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.09,
+        "system": 2.23
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13333,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13334,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdcf8228e8"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 0,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.05921,
+        "goodput_per_second": 8444.567,
+        "success_latency_us": {
+          "p50": 118.327,
+          "p95": 160.274,
+          "p99": 182.259,
+          "max": 360.352
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.041677999999999216
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13400,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13403,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc534813d8"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.731244,
+        "goodput_per_second": 8040.215,
+        "success_latency_us": {
+          "p50": 120.238,
+          "p95": 176.216,
+          "p99": 232.196,
+          "max": 2211.812
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.14177499999999998,
+          "system": 2.3665570000000002
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.06,
+        "system": 2.2
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13400,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13403,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc534813d8"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 1024,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.067238,
+        "goodput_per_second": 7436.306,
+        "success_latency_us": {
+          "p50": 122.177,
+          "p95": 207.314,
+          "p99": 345.245,
+          "max": 527.128
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.04887199999999936
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13465,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13466,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 40,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff9df94aa8"
+          }
+        ],
+        "total_rss_kib": 120,
+        "total_pss_kib": 72,
+        "total_private_kib": 24
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.096355,
+        "goodput_per_second": 7323.583,
+        "success_latency_us": {
+          "p50": 122.535,
+          "p95": 209.928,
+          "p99": 339.531,
+          "max": 4803.667
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.20975900000000003,
+          "system": 2.528141999999999
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.1,
+        "system": 2.31
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13465,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13466,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 40,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff9df94aa8"
+          }
+        ],
+        "total_rss_kib": 120,
+        "total_pss_kib": 72,
+        "total_private_kib": 24
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 1024,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.064161,
+        "goodput_per_second": 7792.89,
+        "success_latency_us": {
+          "p50": 123.773,
+          "p95": 188.695,
+          "p99": 230.859,
+          "max": 293.493
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.04517399999999938
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13529,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 34,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13530,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 38,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc5e28c88"
+          }
+        ],
+        "total_rss_kib": 124,
+        "total_pss_kib": 72,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.906353,
+        "goodput_per_second": 7679.797,
+        "success_latency_us": {
+          "p50": 122.147,
+          "p95": 188.647,
+          "p99": 244.174,
+          "max": 1784.091
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.18470699999999995,
+          "system": 2.466394000000001
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.14,
+        "system": 2.18
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13529,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 34,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13530,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 38,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc5e28c88"
+          }
+        ],
+        "total_rss_kib": 124,
+        "total_pss_kib": 72,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 1024,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.078398,
+        "goodput_per_second": 6377.692,
+        "success_latency_us": {
+          "p50": 146.977,
+          "p95": 233.019,
+          "p99": 308.215,
+          "max": 489.031
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.01090800000000014,
+          "system": 0.04363199999999878
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13591,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13593,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcea026838"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.088844,
+        "goodput_per_second": 7337.037,
+        "success_latency_us": {
+          "p50": 123.497,
+          "p95": 203.355,
+          "p99": 312.102,
+          "max": 5819.555
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.129305,
+          "system": 2.6076440000000005
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.16,
+        "system": 2.25
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13591,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13593,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcea026838"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 1024,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.065344,
+        "goodput_per_second": 7651.832,
+        "success_latency_us": {
+          "p50": 120.388,
+          "p95": 183.045,
+          "p99": 260.922,
+          "max": 1467.785
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.04761500000000041
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13650,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13651,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 44,
+            "private_kib": 20,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff218cd088"
+          }
+        ],
+        "total_rss_kib": 124,
+        "total_pss_kib": 76,
+        "total_private_kib": 28
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.957558,
+        "goodput_per_second": 7580.432,
+        "success_latency_us": {
+          "p50": 123.379,
+          "p95": 192.716,
+          "p99": 247.836,
+          "max": 1543.223
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.22823899999999986,
+          "system": 2.4535669999999996
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.05,
+        "system": 2.29
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13650,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13651,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 44,
+            "private_kib": 20,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff218cd088"
+          }
+        ],
+        "total_rss_kib": 124,
+        "total_pss_kib": 76,
+        "total_private_kib": 28
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 1024,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.066157,
+        "goodput_per_second": 7557.783,
+        "success_latency_us": {
+          "p50": 125.475,
+          "p95": 191.383,
+          "p99": 235.992,
+          "max": 276.906
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.015778999999999765,
+          "system": 0.031556000000001916
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13717,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13718,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 40,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe995b9638"
+          }
+        ],
+        "total_rss_kib": 120,
+        "total_pss_kib": 72,
+        "total_private_kib": 24
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 3.93439,
+        "goodput_per_second": 7625.07,
+        "success_latency_us": {
+          "p50": 122.932,
+          "p95": 192.535,
+          "p99": 249.912,
+          "max": 2735.745
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.27370099999999997,
+          "system": 2.394888999999999
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.03,
+        "system": 2.31
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13717,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13718,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 40,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe995b9638"
+          }
+        ],
+        "total_rss_kib": 120,
+        "total_pss_kib": 72,
+        "total_private_kib": 24
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 1024,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.074652,
+        "goodput_per_second": 6697.706,
+        "success_latency_us": {
+          "p50": 141.116,
+          "p95": 211.077,
+          "p99": 284.687,
+          "max": 828.157
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.013025999999999982,
+          "system": 0.039079000000000974
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13830,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 34,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13831,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 38,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7958bc08"
+          }
+        ],
+        "total_rss_kib": 124,
+        "total_pss_kib": 72,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.096669,
+        "goodput_per_second": 7323.023,
+        "success_latency_us": {
+          "p50": 124.295,
+          "p95": 206.601,
+          "p99": 312.983,
+          "max": 3371.879
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.1723889999999999,
+          "system": 2.5743440000000035
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.15,
+        "system": 2.28
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13830,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 34,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13831,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 38,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7958bc08"
+          }
+        ],
+        "total_rss_kib": 124,
+        "total_pss_kib": 72,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 3900,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.063627,
+        "goodput_per_second": 7858.322,
+        "success_latency_us": {
+          "p50": 116.747,
+          "p95": 173.716,
+          "p99": 204.064,
+          "max": 475.889
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.04655299999999585
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13913,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 34,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13914,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 42,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcbf1d9e08"
+          }
+        ],
+        "total_rss_kib": 128,
+        "total_pss_kib": 76,
+        "total_private_kib": 24
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.049793,
+        "goodput_per_second": 7407.787,
+        "success_latency_us": {
+          "p50": 124.009,
+          "p95": 189.309,
+          "p99": 242.554,
+          "max": 3186.834
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.2694580000000002,
+          "system": 2.5080310000000026
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.08,
+        "system": 2.28
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13913,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 34,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13914,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 42,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcbf1d9e08"
+          }
+        ],
+        "total_rss_kib": 128,
+        "total_pss_kib": 76,
+        "total_private_kib": 24
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 3900,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.068994,
+        "goodput_per_second": 7247.059,
+        "success_latency_us": {
+          "p50": 129.993,
+          "p95": 180.661,
+          "p99": 243.203,
+          "max": 356.048
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.008099999999999774,
+          "system": 0.04050099999999901
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 13976,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13977,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff48885328"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.316574,
+        "goodput_per_second": 6949.956,
+        "success_latency_us": {
+          "p50": 128.409,
+          "p95": 208.882,
+          "p99": 308.496,
+          "max": 4563.998
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.3286690000000001,
+          "system": 2.57799
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.16,
+        "system": 2.34
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 13976,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 13977,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff48885328"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 3900,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.068983,
+        "goodput_per_second": 7248.139,
+        "success_latency_us": {
+          "p50": 126.266,
+          "p95": 194.979,
+          "p99": 232.257,
+          "max": 328.804
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.04988800000000282
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14074,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14075,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd969ce448"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.16383,
+        "goodput_per_second": 7204.905,
+        "success_latency_us": {
+          "p50": 126.986,
+          "p95": 195.255,
+          "p99": 256.448,
+          "max": 4415.277
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.2832560000000002,
+          "system": 2.5606359999999952
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.1,
+        "system": 2.3
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14074,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14075,
+            "role": "worker",
+            "rss_kib": 60,
+            "pss_kib": 36,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd969ce448"
+          }
+        ],
+        "total_rss_kib": 116,
+        "total_pss_kib": 68,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 3900,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.072084,
+        "goodput_per_second": 6936.319,
+        "success_latency_us": {
+          "p50": 131.11,
+          "p95": 208.107,
+          "p99": 270.79,
+          "max": 450.041
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.0518470000000022
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14135,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14136,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 40,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff77079608"
+          }
+        ],
+        "total_rss_kib": 120,
+        "total_pss_kib": 72,
+        "total_private_kib": 24
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.343277,
+        "goodput_per_second": 6907.227,
+        "success_latency_us": {
+          "p50": 129.629,
+          "p95": 209.206,
+          "p99": 298.158,
+          "max": 3351.38
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.4522259999999996,
+          "system": 2.454938999999996
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.13,
+        "system": 2.38
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14135,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14136,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 40,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff77079608"
+          }
+        ],
+        "total_rss_kib": 120,
+        "total_pss_kib": 72,
+        "total_private_kib": 24
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 1,
+      "body_bytes": 3900,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.068735,
+        "goodput_per_second": 7274.335,
+        "success_latency_us": {
+          "p50": 121.472,
+          "p95": 199.517,
+          "p99": 234.895,
+          "max": 505.391
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.01653400000000005,
+          "system": 0.03306599999999804
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14237,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14238,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 40,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffef3463ae8"
+          }
+        ],
+        "total_rss_kib": 120,
+        "total_pss_kib": 72,
+        "total_private_kib": 24
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.153242,
+        "goodput_per_second": 7223.273,
+        "success_latency_us": {
+          "p50": 127.073,
+          "p95": 195.663,
+          "p99": 249.468,
+          "max": 1628.28
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.3220079999999994,
+          "system": 2.500934000000001
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.09,
+        "system": 2.31
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14237,
+            "role": "supervisor",
+            "rss_kib": 56,
+            "pss_kib": 32,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14238,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 40,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffef3463ae8"
+          }
+        ],
+        "total_rss_kib": 120,
+        "total_pss_kib": 72,
+        "total_private_kib": 24
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "body_bytes": 3900,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.073283,
+        "goodput_per_second": 6822.911,
+        "success_latency_us": {
+          "p50": 133.496,
+          "p95": 204.382,
+          "p99": 268.129,
+          "max": 477.232
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.05144200000000154
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14314,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 34,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14315,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 38,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc88552ec8"
+          }
+        ],
+        "total_rss_kib": 124,
+        "total_pss_kib": 72,
+        "total_private_kib": 20
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 4.52354,
+        "goodput_per_second": 6631.973,
+        "success_latency_us": {
+          "p50": 132.318,
+          "p95": 224.164,
+          "p99": 351.547,
+          "max": 23313.211
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.3268880000000003,
+          "system": 2.6586909999999975
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.08,
+        "system": 2.53
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14314,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 34,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14315,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 38,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc88552ec8"
+          }
+        ],
+        "total_rss_kib": 124,
+        "total_pss_kib": 72,
+        "total_private_kib": 20
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 0,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.018092,
+        "goodput_per_second": 27635.866,
+        "success_latency_us": {
+          "p50": 137.276,
+          "p95": 189.24,
+          "p99": 233.218,
+          "max": 366.662
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.05032099999999673
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14380,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14381,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdada926c0"
+          },
+          {
+            "pid": 14382,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdada926c0"
+          },
+          {
+            "pid": 14383,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdada926c0"
+          },
+          {
+            "pid": 14384,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdada926c0"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.290112,
+        "goodput_per_second": 23253.798,
+        "success_latency_us": {
+          "p50": 159.316,
+          "p95": 239.331,
+          "p99": 383.554,
+          "max": 17624.31
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.24475300000000022,
+          "system": 3.081661000000004
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.02,
+        "system": 3.05
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14380,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14381,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdada926c0"
+          },
+          {
+            "pid": 14382,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdada926c0"
+          },
+          {
+            "pid": 14383,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdada926c0"
+          },
+          {
+            "pid": 14384,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdada926c0"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 0,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.020444,
+        "goodput_per_second": 24456.629,
+        "success_latency_us": {
+          "p50": 153.639,
+          "p95": 225.299,
+          "p99": 340.343,
+          "max": 507.456
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.011350999999999445,
+          "system": 0.04540099999999825
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14413,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14414,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff522e6720"
+          },
+          {
+            "pid": 14415,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff522e6720"
+          },
+          {
+            "pid": 14416,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff522e6720"
+          },
+          {
+            "pid": 14417,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff522e6720"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.245643,
+        "goodput_per_second": 24083.947,
+        "success_latency_us": {
+          "p50": 155.646,
+          "p95": 231.956,
+          "p99": 356.299,
+          "max": 9775.201
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.1751630000000004,
+          "system": 3.141269000000001
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.09,
+        "system": 2.84
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14413,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14414,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff522e6720"
+          },
+          {
+            "pid": 14415,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff522e6720"
+          },
+          {
+            "pid": 14416,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff522e6720"
+          },
+          {
+            "pid": 14417,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7fff522e6720"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 0,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.020241,
+        "goodput_per_second": 24702.771,
+        "success_latency_us": {
+          "p50": 150.615,
+          "p95": 232.65,
+          "p99": 292.293,
+          "max": 395.276
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.014057000000000208,
+          "system": 0.04216999999999871
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14454,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14455,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc275d89d0"
+          },
+          {
+            "pid": 14456,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc275d89d0"
+          },
+          {
+            "pid": 14457,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc275d89d0"
+          },
+          {
+            "pid": 14458,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc275d89d0"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.209544,
+        "goodput_per_second": 24802.732,
+        "success_latency_us": {
+          "p50": 148.189,
+          "p95": 217.334,
+          "p99": 312.647,
+          "max": 25466.259
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.06223100000000059,
+          "system": 3.211119999999994
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.08,
+        "system": 2.76
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14454,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14455,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc275d89d0"
+          },
+          {
+            "pid": 14456,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc275d89d0"
+          },
+          {
+            "pid": 14457,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc275d89d0"
+          },
+          {
+            "pid": 14458,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc275d89d0"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 0,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.019638,
+        "goodput_per_second": 25460.354,
+        "success_latency_us": {
+          "p50": 147.89,
+          "p95": 213.423,
+          "p99": 240.815,
+          "max": 333.162
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.05502799999999297
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14485,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14486,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffda1aa02f0"
+          },
+          {
+            "pid": 14487,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffda1aa02f0"
+          },
+          {
+            "pid": 14488,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffda1aa02f0"
+          },
+          {
+            "pid": 14489,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffda1aa02f0"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.252436,
+        "goodput_per_second": 23953.318,
+        "success_latency_us": {
+          "p50": 157.371,
+          "p95": 240.11,
+          "p99": 366.785,
+          "max": 4846.052
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.09935399999999994,
+          "system": 3.2479490000000055
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.07,
+        "system": 2.9
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14485,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14486,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffda1aa02f0"
+          },
+          {
+            "pid": 14487,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffda1aa02f0"
+          },
+          {
+            "pid": 14488,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffda1aa02f0"
+          },
+          {
+            "pid": 14489,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffda1aa02f0"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 0,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.020254,
+        "goodput_per_second": 24685.93,
+        "success_latency_us": {
+          "p50": 149.589,
+          "p95": 215.228,
+          "p99": 314.326,
+          "max": 381.4
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.014053000000000537,
+          "system": 0.04215900000001227
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14518,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14519,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd2a5f5220"
+          },
+          {
+            "pid": 14520,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd2a5f5220"
+          },
+          {
+            "pid": 14521,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd2a5f5220"
+          },
+          {
+            "pid": 14522,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd2a5f5220"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.212871,
+        "goodput_per_second": 24734.704,
+        "success_latency_us": {
+          "p50": 150.301,
+          "p95": 226.46,
+          "p99": 362.361,
+          "max": 10142.576
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.15085499999999996,
+          "system": 3.0519079999999974
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.07,
+        "system": 2.73
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14518,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14519,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd2a5f5220"
+          },
+          {
+            "pid": 14520,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd2a5f5220"
+          },
+          {
+            "pid": 14521,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd2a5f5220"
+          },
+          {
+            "pid": 14522,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd2a5f5220"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 0,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.022763,
+        "goodput_per_second": 21965.904,
+        "success_latency_us": {
+          "p50": 164.158,
+          "p95": 274.588,
+          "p99": 337.623,
+          "max": 363.494
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.059810999999996284
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14548,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14549,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc1ac4e650"
+          },
+          {
+            "pid": 14550,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc1ac4e650"
+          },
+          {
+            "pid": 14551,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc1ac4e650"
+          },
+          {
+            "pid": 14552,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc1ac4e650"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.203834,
+        "goodput_per_second": 24920.371,
+        "success_latency_us": {
+          "p50": 148.886,
+          "p95": 234.042,
+          "p99": 373.778,
+          "max": 3099.591
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.16054099999999938,
+          "system": 3.025582
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.08,
+        "system": 2.7
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14548,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14549,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc1ac4e650"
+          },
+          {
+            "pid": 14550,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc1ac4e650"
+          },
+          {
+            "pid": 14551,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc1ac4e650"
+          },
+          {
+            "pid": 14552,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc1ac4e650"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 1024,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.037148,
+        "goodput_per_second": 13459.718,
+        "success_latency_us": {
+          "p50": 207.215,
+          "p95": 693.734,
+          "p99": 1182.289,
+          "max": 2203.083
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.06835599999999431
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14583,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14584,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcdb8b2d30"
+          },
+          {
+            "pid": 14585,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcdb8b2d30"
+          },
+          {
+            "pid": 14586,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcdb8b2d30"
+          },
+          {
+            "pid": 14587,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcdb8b2d30"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.434748,
+        "goodput_per_second": 20909.595,
+        "success_latency_us": {
+          "p50": 165.132,
+          "p95": 281.354,
+          "p99": 547.017,
+          "max": 24624.577
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.25497999999999976,
+          "system": 3.303651000000002
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.06,
+        "system": 3.19
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14583,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14584,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcdb8b2d30"
+          },
+          {
+            "pid": 14585,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcdb8b2d30"
+          },
+          {
+            "pid": 14586,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcdb8b2d30"
+          },
+          {
+            "pid": 14587,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcdb8b2d30"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 1024,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.024652,
+        "goodput_per_second": 20282.158,
+        "success_latency_us": {
+          "p50": 174.512,
+          "p95": 286.82,
+          "p99": 532.452,
+          "max": 672.995
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.06537499999998886
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14623,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14624,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcd9a9a9b0"
+          },
+          {
+            "pid": 14625,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcd9a9a9b0"
+          },
+          {
+            "pid": 14626,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcd9a9a9b0"
+          },
+          {
+            "pid": 14627,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcd9a9a9b0"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.397406,
+        "goodput_per_second": 21468.355,
+        "success_latency_us": {
+          "p50": 169.86,
+          "p95": 269.573,
+          "p99": 420.327,
+          "max": 22571.485
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.3153839999999999,
+          "system": 3.229965000000007
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.1,
+        "system": 3.18
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14623,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14624,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcd9a9a9b0"
+          },
+          {
+            "pid": 14625,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcd9a9a9b0"
+          },
+          {
+            "pid": 14626,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcd9a9a9b0"
+          },
+          {
+            "pid": 14627,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcd9a9a9b0"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 1024,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.026213,
+        "goodput_per_second": 19074.586,
+        "success_latency_us": {
+          "p50": 190.451,
+          "p95": 372.453,
+          "p99": 451.696,
+          "max": 519.077
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.07097399999999254
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14659,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14660,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc508b7740"
+          },
+          {
+            "pid": 14661,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc508b7740"
+          },
+          {
+            "pid": 14662,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc508b7740"
+          },
+          {
+            "pid": 14663,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc508b7740"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.311925,
+        "goodput_per_second": 22867.168,
+        "success_latency_us": {
+          "p50": 160.899,
+          "p95": 243.569,
+          "p99": 386.762,
+          "max": 8651.481
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.23156700000000008,
+          "system": 3.186796000000001
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.09,
+        "system": 3.03
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14659,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14660,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc508b7740"
+          },
+          {
+            "pid": 14661,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc508b7740"
+          },
+          {
+            "pid": 14662,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc508b7740"
+          },
+          {
+            "pid": 14663,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffc508b7740"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 1024,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.019429,
+        "goodput_per_second": 25734.613,
+        "success_latency_us": {
+          "p50": 148.564,
+          "p95": 199.858,
+          "p99": 258.609,
+          "max": 343.374
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.013403000000000276,
+          "system": 0.040207999999992694
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14677,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14678,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7ae25e10"
+          },
+          {
+            "pid": 14679,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7ae25e10"
+          },
+          {
+            "pid": 14680,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7ae25e10"
+          },
+          {
+            "pid": 14681,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7ae25e10"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.323252,
+        "goodput_per_second": 22671.411,
+        "success_latency_us": {
+          "p50": 160.534,
+          "p95": 248.416,
+          "p99": 387.107,
+          "max": 25627.656
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.15697000000000028,
+          "system": 3.244049000000004
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.08,
+        "system": 2.99
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14677,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14678,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7ae25e10"
+          },
+          {
+            "pid": 14679,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7ae25e10"
+          },
+          {
+            "pid": 14680,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7ae25e10"
+          },
+          {
+            "pid": 14681,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe7ae25e10"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 1024,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.019778,
+        "goodput_per_second": 25280.708,
+        "success_latency_us": {
+          "p50": 148.834,
+          "p95": 207.957,
+          "p99": 242.54,
+          "max": 336.135
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.054050000000003706
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14728,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14729,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe0f139110"
+          },
+          {
+            "pid": 14730,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe0f139110"
+          },
+          {
+            "pid": 14731,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe0f139110"
+          },
+          {
+            "pid": 14732,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe0f139110"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.351931,
+        "goodput_per_second": 22190.476,
+        "success_latency_us": {
+          "p50": 166.19,
+          "p95": 253.894,
+          "p99": 391.517,
+          "max": 11430.143
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.20249300000000048,
+          "system": 3.307389999999998
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.09,
+        "system": 3.06
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14728,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14729,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe0f139110"
+          },
+          {
+            "pid": 14730,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe0f139110"
+          },
+          {
+            "pid": 14731,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe0f139110"
+          },
+          {
+            "pid": 14732,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe0f139110"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 1024,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.029992,
+        "goodput_per_second": 16671.123,
+        "success_latency_us": {
+          "p50": 212.185,
+          "p95": 391.25,
+          "p99": 530.466,
+          "max": 837.742
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.009674999999999656,
+          "system": 0.0677299999999974
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14764,
+            "role": "supervisor",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14765,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffebdf93f50"
+          },
+          {
+            "pid": 14766,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffebdf93f50"
+          },
+          {
+            "pid": 14767,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffebdf93f50"
+          },
+          {
+            "pid": 14768,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffebdf93f50"
+          }
+        ],
+        "total_rss_kib": 336,
+        "total_pss_kib": 126,
+        "total_private_kib": 76
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.247125,
+        "goodput_per_second": 24055.328,
+        "success_latency_us": {
+          "p50": 156.602,
+          "p95": 232.816,
+          "p99": 303.932,
+          "max": 6159.419
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.20817000000000085,
+          "system": 3.1225430000000074
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.09,
+        "system": 2.9
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14764,
+            "role": "supervisor",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14765,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffebdf93f50"
+          },
+          {
+            "pid": 14766,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffebdf93f50"
+          },
+          {
+            "pid": 14767,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffebdf93f50"
+          },
+          {
+            "pid": 14768,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffebdf93f50"
+          }
+        ],
+        "total_rss_kib": 336,
+        "total_pss_kib": 126,
+        "total_private_kib": 76
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 3900,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.022555,
+        "goodput_per_second": 22167.913,
+        "success_latency_us": {
+          "p50": 165.841,
+          "p95": 239.697,
+          "p99": 376.938,
+          "max": 577.741
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.06275199999998904
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14785,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14786,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd710cd830"
+          },
+          {
+            "pid": 14787,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd710cd830"
+          },
+          {
+            "pid": 14788,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd710cd830"
+          },
+          {
+            "pid": 14789,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd710cd830"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.561188,
+        "goodput_per_second": 19216.14,
+        "success_latency_us": {
+          "p50": 172.767,
+          "p95": 351.926,
+          "p99": 772.669,
+          "max": 9738.061
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.42710699999999946,
+          "system": 3.3401929999999993
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.08,
+        "system": 3.2
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14785,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14786,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd710cd830"
+          },
+          {
+            "pid": 14787,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd710cd830"
+          },
+          {
+            "pid": 14788,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd710cd830"
+          },
+          {
+            "pid": 14789,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd710cd830"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 3900,
+      "repeat": 0,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.023741,
+        "goodput_per_second": 21060.597,
+        "success_latency_us": {
+          "p50": 179.36,
+          "p95": 246.164,
+          "p99": 295.577,
+          "max": 384.354
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.012848999999999222,
+          "system": 0.05139499999999941
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14832,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14833,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc93df610"
+          },
+          {
+            "pid": 14834,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc93df610"
+          },
+          {
+            "pid": 14835,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc93df610"
+          },
+          {
+            "pid": 14836,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc93df610"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.388451,
+        "goodput_per_second": 21606.805,
+        "success_latency_us": {
+          "p50": 166.279,
+          "p95": 252.807,
+          "p99": 371.771,
+          "max": 29742.737
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.3820180000000004,
+          "system": 3.1868399999999895
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.15,
+        "system": 2.98
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14832,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14833,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc93df610"
+          },
+          {
+            "pid": 14834,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc93df610"
+          },
+          {
+            "pid": 14835,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc93df610"
+          },
+          {
+            "pid": 14836,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffcc93df610"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 3900,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.024051,
+        "goodput_per_second": 20789.149,
+        "success_latency_us": {
+          "p50": 178.544,
+          "p95": 255.333,
+          "p99": 321.482,
+          "max": 400.006
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.0648699999999991
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14872,
+            "role": "supervisor",
+            "rss_kib": 64,
+            "pss_kib": 19,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14873,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 23,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdbae55d30"
+          },
+          {
+            "pid": 14874,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 23,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdbae55d30"
+          },
+          {
+            "pid": 14875,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 23,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdbae55d30"
+          },
+          {
+            "pid": 14876,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 23,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdbae55d30"
+          }
+        ],
+        "total_rss_kib": 336,
+        "total_pss_kib": 111,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.415078,
+        "goodput_per_second": 21200.25,
+        "success_latency_us": {
+          "p50": 168.295,
+          "p95": 255.825,
+          "p99": 369.338,
+          "max": 39025.658
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.33261699999999905,
+          "system": 3.309404999999998
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.12,
+        "system": 3.08
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14872,
+            "role": "supervisor",
+            "rss_kib": 64,
+            "pss_kib": 19,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14873,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 23,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdbae55d30"
+          },
+          {
+            "pid": 14874,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 23,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdbae55d30"
+          },
+          {
+            "pid": 14875,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 23,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdbae55d30"
+          },
+          {
+            "pid": 14876,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 23,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffdbae55d30"
+          }
+        ],
+        "total_rss_kib": 336,
+        "total_pss_kib": 111,
+        "total_private_kib": 56
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 3900,
+      "repeat": 1,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.021821,
+        "goodput_per_second": 22913.67,
+        "success_latency_us": {
+          "p50": 161.834,
+          "p95": 225.309,
+          "p99": 260.439,
+          "max": 386.717
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.0,
+          "system": 0.05920799999999815
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14896,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14897,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe18ae81e0"
+          },
+          {
+            "pid": 14898,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe18ae81e0"
+          },
+          {
+            "pid": 14899,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe18ae81e0"
+          },
+          {
+            "pid": 14900,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe18ae81e0"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.449121,
+        "goodput_per_second": 20702.198,
+        "success_latency_us": {
+          "p50": 172.866,
+          "p95": 271.468,
+          "p99": 476.873,
+          "max": 8185.15
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.4122180000000011,
+          "system": 3.2871710000000007
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.12,
+        "system": 3.18
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14896,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14897,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe18ae81e0"
+          },
+          {
+            "pid": 14898,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe18ae81e0"
+          },
+          {
+            "pid": 14899,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe18ae81e0"
+          },
+          {
+            "pid": 14900,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe18ae81e0"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      }
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "body_bytes": 3900,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.024967,
+        "goodput_per_second": 20026.788,
+        "success_latency_us": {
+          "p50": 177.344,
+          "p95": 263.937,
+          "p99": 378.014,
+          "max": 2324.673
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.015827999999999065,
+          "system": 0.047483999999997195
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14949,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14950,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe3b9d1900"
+          },
+          {
+            "pid": 14951,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe3b9d1900"
+          },
+          {
+            "pid": 14952,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe3b9d1900"
+          },
+          {
+            "pid": 14953,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe3b9d1900"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.289999,
+        "goodput_per_second": 23255.834,
+        "success_latency_us": {
+          "p50": 159.428,
+          "p95": 235.671,
+          "p99": 304.005,
+          "max": 4897.323
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.41380700000000026,
+          "system": 3.041477999999998
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.17,
+        "system": 2.82
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14949,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14950,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe3b9d1900"
+          },
+          {
+            "pid": 14951,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe3b9d1900"
+          },
+          {
+            "pid": 14952,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe3b9d1900"
+          },
+          {
+            "pid": 14953,
+            "role": "worker",
+            "rss_kib": 68,
+            "pss_kib": 26,
+            "private_kib": 16,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffe3b9d1900"
+          }
+        ],
+        "total_rss_kib": 332,
+        "total_pss_kib": 122,
+        "total_private_kib": 72
+      }
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "body_bytes": 3900,
+      "repeat": 2,
+      "warmup": {
+        "attempted": 500,
+        "successful": 500,
+        "failed": 0,
+        "elapsed_seconds": 0.021913,
+        "goodput_per_second": 22817.6,
+        "success_latency_us": {
+          "p50": 159.929,
+          "p95": 231.477,
+          "p99": 290.445,
+          "max": 472.932
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.011953000000000102,
+          "system": 0.04781099999999583
+        },
+        "client_exit_status": 0
+      },
+      "memory_before": {
+        "processes": [
+          {
+            "pid": 14979,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14980,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd49f8e190"
+          },
+          {
+            "pid": 14981,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd49f8e190"
+          },
+          {
+            "pid": 14982,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd49f8e190"
+          },
+          {
+            "pid": 14983,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd49f8e190"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      },
+      "measurement": {
+        "attempted": 30000,
+        "successful": 30000,
+        "failed": 0,
+        "elapsed_seconds": 1.359586,
+        "goodput_per_second": 22065.548,
+        "success_latency_us": {
+          "p50": 163.79,
+          "p95": 244.948,
+          "p99": 346.958,
+          "max": 29541.51
+        },
+        "errors": {
+          "connect": 0,
+          "write": 0,
+          "read": 0,
+          "response": 0
+        },
+        "client_cpu_seconds": {
+          "user": 0.32768199999999936,
+          "system": 3.2066070000000053
+        },
+        "client_exit_status": 0
+      },
+      "server_cpu_seconds": {
+        "user": 0.08,
+        "system": 3.02
+      },
+      "memory_after": {
+        "processes": [
+          {
+            "pid": 14979,
+            "role": "supervisor",
+            "rss_kib": 60,
+            "pss_kib": 18,
+            "private_kib": 8,
+            "fd_count": 3,
+            "idle_stack_pointer": null
+          },
+          {
+            "pid": 14980,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd49f8e190"
+          },
+          {
+            "pid": 14981,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd49f8e190"
+          },
+          {
+            "pid": 14982,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd49f8e190"
+          },
+          {
+            "pid": 14983,
+            "role": "worker",
+            "rss_kib": 64,
+            "pss_kib": 22,
+            "private_kib": 12,
+            "fd_count": 4,
+            "idle_stack_pointer": "0x7ffd49f8e190"
+          }
+        ],
+        "total_rss_kib": 316,
+        "total_pss_kib": 106,
+        "total_private_kib": 56
+      }
+    }
+  ],
+  "memory": [
+    {
+      "variant": "before",
+      "workers": 1,
+      "snapshots": [
+        {
+          "processes": [
+            {
+              "pid": 15003,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15004,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 40,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd8f5b2ca8"
+            }
+          ],
+          "total_rss_kib": 120,
+          "total_pss_kib": 72,
+          "total_private_kib": 24
+        },
+        {
+          "processes": [
+            {
+              "pid": 15003,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15004,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 40,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd8f5b2ca8"
+            }
+          ],
+          "total_rss_kib": 120,
+          "total_pss_kib": 72,
+          "total_private_kib": 24
+        },
+        {
+          "processes": [
+            {
+              "pid": 15003,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15004,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 40,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd8f5b2ca8"
+            }
+          ],
+          "total_rss_kib": 120,
+          "total_pss_kib": 72,
+          "total_private_kib": 24
+        },
+        {
+          "processes": [
+            {
+              "pid": 15003,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15004,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 40,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd8f5b2ca8"
+            }
+          ],
+          "total_rss_kib": 120,
+          "total_pss_kib": 72,
+          "total_private_kib": 24
+        },
+        {
+          "processes": [
+            {
+              "pid": 15003,
+              "role": "supervisor",
+              "rss_kib": 56,
+              "pss_kib": 32,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15004,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 40,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd8f5b2ca8"
+            }
+          ],
+          "total_rss_kib": 120,
+          "total_pss_kib": 72,
+          "total_private_kib": 24
+        }
+      ],
+      "loads": [
+        {
+          "body_bytes": 3900,
+          "attempted": 500,
+          "successful": 500,
+          "failed": 0,
+          "elapsed_seconds": 0.077229,
+          "goodput_per_second": 6474.257,
+          "success_latency_us": {
+            "p50": 137.237,
+            "p95": 222.62,
+            "p99": 379.073,
+            "max": 1082.239
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.017727000000000714,
+            "system": 0.03545299999998974
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.264814,
+          "goodput_per_second": 7552.484,
+          "success_latency_us": {
+            "p50": 127.457,
+            "p95": 190.962,
+            "p99": 233.476,
+            "max": 514.748
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.015242999999999896,
+            "system": 0.16767500000000268
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.298904,
+          "goodput_per_second": 6691.101,
+          "success_latency_us": {
+            "p50": 136.237,
+            "p95": 217.462,
+            "p99": 300.007,
+            "max": 513.548
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.015563000000000216,
+            "system": 0.18947700000001078
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.246143,
+          "goodput_per_second": 8125.354,
+          "success_latency_us": {
+            "p50": 121.023,
+            "p95": 172.497,
+            "p99": 209.778,
+            "max": 504.329
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.0,
+            "system": 0.17029899999999998
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.295681,
+          "goodput_per_second": 6764.04,
+          "success_latency_us": {
+            "p50": 137.705,
+            "p95": 204.66,
+            "p99": 256.43,
+            "max": 838.857
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.019250999999998797,
+            "system": 0.18288599999999633
+          },
+          "client_exit_status": 0
+        }
+      ],
+      "stable_pids_fds_and_stack": true
+    },
+    {
+      "variant": "after",
+      "workers": 1,
+      "snapshots": [
+        {
+          "processes": [
+            {
+              "pid": 15042,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 34,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15043,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 38,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffda4e3fd58"
+            }
+          ],
+          "total_rss_kib": 124,
+          "total_pss_kib": 72,
+          "total_private_kib": 20
+        },
+        {
+          "processes": [
+            {
+              "pid": 15042,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 34,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15043,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 38,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffda4e3fd58"
+            }
+          ],
+          "total_rss_kib": 124,
+          "total_pss_kib": 72,
+          "total_private_kib": 20
+        },
+        {
+          "processes": [
+            {
+              "pid": 15042,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 34,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15043,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 38,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffda4e3fd58"
+            }
+          ],
+          "total_rss_kib": 124,
+          "total_pss_kib": 72,
+          "total_private_kib": 20
+        },
+        {
+          "processes": [
+            {
+              "pid": 15042,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 34,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15043,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 38,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffda4e3fd58"
+            }
+          ],
+          "total_rss_kib": 124,
+          "total_pss_kib": 72,
+          "total_private_kib": 20
+        },
+        {
+          "processes": [
+            {
+              "pid": 15042,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 34,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15043,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 38,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffda4e3fd58"
+            }
+          ],
+          "total_rss_kib": 124,
+          "total_pss_kib": 72,
+          "total_private_kib": 20
+        }
+      ],
+      "loads": [
+        {
+          "body_bytes": 3900,
+          "attempted": 500,
+          "successful": 500,
+          "failed": 0,
+          "elapsed_seconds": 0.071587,
+          "goodput_per_second": 6984.47,
+          "success_latency_us": {
+            "p50": 129.754,
+            "p95": 204.954,
+            "p99": 239.677,
+            "max": 302.624
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.0,
+            "system": 0.050592999999992116
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.360602,
+          "goodput_per_second": 5546.288,
+          "success_latency_us": {
+            "p50": 159.556,
+            "p95": 297.877,
+            "p99": 649.074,
+            "max": 2279.818
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.008785000000001375,
+            "system": 0.21085400000001187
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.331338,
+          "goodput_per_second": 6036.139,
+          "success_latency_us": {
+            "p50": 139.817,
+            "p95": 252.104,
+            "p99": 600.63,
+            "max": 2556.638
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.03168299999999924,
+            "system": 0.1900969999999944
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.276073,
+          "goodput_per_second": 7244.46,
+          "success_latency_us": {
+            "p50": 129.478,
+            "p95": 201.734,
+            "p99": 278.541,
+            "max": 2146.088
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.0,
+            "system": 0.18846200000000124
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.270751,
+          "goodput_per_second": 7386.849,
+          "success_latency_us": {
+            "p50": 119.736,
+            "p95": 193.959,
+            "p99": 254.619,
+            "max": 522.573
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.017735000000000056,
+            "system": 0.16848699999999894
+          },
+          "client_exit_status": 0
+        }
+      ],
+      "stable_pids_fds_and_stack": true
+    },
+    {
+      "variant": "before",
+      "workers": 4,
+      "snapshots": [
+        {
+          "processes": [
+            {
+              "pid": 15106,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15107,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15108,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15109,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15110,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            }
+          ],
+          "total_rss_kib": 332,
+          "total_pss_kib": 122,
+          "total_private_kib": 72
+        },
+        {
+          "processes": [
+            {
+              "pid": 15106,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15107,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15108,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15109,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15110,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            }
+          ],
+          "total_rss_kib": 332,
+          "total_pss_kib": 122,
+          "total_private_kib": 72
+        },
+        {
+          "processes": [
+            {
+              "pid": 15106,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15107,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15108,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15109,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15110,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            }
+          ],
+          "total_rss_kib": 332,
+          "total_pss_kib": 122,
+          "total_private_kib": 72
+        },
+        {
+          "processes": [
+            {
+              "pid": 15106,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15107,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15108,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15109,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15110,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            }
+          ],
+          "total_rss_kib": 332,
+          "total_pss_kib": 122,
+          "total_private_kib": 72
+        },
+        {
+          "processes": [
+            {
+              "pid": 15106,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15107,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15108,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15109,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            },
+            {
+              "pid": 15110,
+              "role": "worker",
+              "rss_kib": 68,
+              "pss_kib": 26,
+              "private_kib": 16,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7fff56488d20"
+            }
+          ],
+          "total_rss_kib": 332,
+          "total_pss_kib": 122,
+          "total_private_kib": 72
+        }
+      ],
+      "loads": [
+        {
+          "body_bytes": 3900,
+          "attempted": 500,
+          "successful": 500,
+          "failed": 0,
+          "elapsed_seconds": 0.020488,
+          "goodput_per_second": 24404.097,
+          "success_latency_us": {
+            "p50": 152.594,
+            "p95": 223.425,
+            "p99": 270.671,
+            "max": 410.984
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.0,
+            "system": 0.05747800000000325
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.073563,
+          "goodput_per_second": 27187.624,
+          "success_latency_us": {
+            "p50": 141.469,
+            "p95": 206.471,
+            "p99": 252.141,
+            "max": 453.578
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.010602000000000444,
+            "system": 0.1908289999999937
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.084334,
+          "goodput_per_second": 23715.26,
+          "success_latency_us": {
+            "p50": 154.958,
+            "p95": 222.199,
+            "p99": 265.328,
+            "max": 1912.417
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.03460899999999967,
+            "system": 0.19034800000000018
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.081692,
+          "goodput_per_second": 24482.174,
+          "success_latency_us": {
+            "p50": 153.574,
+            "p95": 225.394,
+            "p99": 294.684,
+            "max": 2244.382
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.020953999999999695,
+            "system": 0.19906800000001112
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.100121,
+          "goodput_per_second": 19975.881,
+          "success_latency_us": {
+            "p50": 170.935,
+            "p95": 294.584,
+            "p99": 583.319,
+            "max": 4801.592
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.0108119999999996,
+            "system": 0.24867799999999818
+          },
+          "client_exit_status": 0
+        }
+      ],
+      "stable_pids_fds_and_stack": true
+    },
+    {
+      "variant": "after",
+      "workers": 4,
+      "snapshots": [
+        {
+          "processes": [
+            {
+              "pid": 15137,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15138,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15139,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15140,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15141,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56
+        },
+        {
+          "processes": [
+            {
+              "pid": 15137,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15138,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15139,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15140,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15141,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56
+        },
+        {
+          "processes": [
+            {
+              "pid": 15137,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15138,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15139,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15140,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15141,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56
+        },
+        {
+          "processes": [
+            {
+              "pid": 15137,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15138,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15139,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15140,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15141,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56
+        },
+        {
+          "processes": [
+            {
+              "pid": 15137,
+              "role": "supervisor",
+              "rss_kib": 60,
+              "pss_kib": 18,
+              "private_kib": 8,
+              "fd_count": 3,
+              "idle_stack_pointer": null
+            },
+            {
+              "pid": 15138,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15139,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15140,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            },
+            {
+              "pid": 15141,
+              "role": "worker",
+              "rss_kib": 64,
+              "pss_kib": 22,
+              "private_kib": 12,
+              "fd_count": 4,
+              "idle_stack_pointer": "0x7ffd5eedd6c0"
+            }
+          ],
+          "total_rss_kib": 316,
+          "total_pss_kib": 106,
+          "total_private_kib": 56
+        }
+      ],
+      "loads": [
+        {
+          "body_bytes": 3900,
+          "attempted": 500,
+          "successful": 500,
+          "failed": 0,
+          "elapsed_seconds": 0.021293,
+          "goodput_per_second": 23481.656,
+          "success_latency_us": {
+            "p50": 155.549,
+            "p95": 231.689,
+            "p99": 269.832,
+            "max": 378.272
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.0,
+            "system": 0.057389999999998054
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.106827,
+          "goodput_per_second": 18721.905,
+          "success_latency_us": {
+            "p50": 175.142,
+            "p95": 405.125,
+            "p99": 926.528,
+            "max": 3026.098
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.034447000000000116,
+            "system": 0.22964100000000087
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.093799,
+          "goodput_per_second": 21322.215,
+          "success_latency_us": {
+            "p50": 173.365,
+            "p95": 256.745,
+            "p99": 362.954,
+            "max": 839.086
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.04476400000000069,
+            "system": 0.20591699999999946
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 0,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.080516,
+          "goodput_per_second": 24839.658,
+          "success_latency_us": {
+            "p50": 152.98,
+            "p95": 224.301,
+            "p99": 288.659,
+            "max": 458.707
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.02069599999999916,
+            "system": 0.18626199999999926
+          },
+          "client_exit_status": 0
+        },
+        {
+          "body_bytes": 3900,
+          "attempted": 2000,
+          "successful": 2000,
+          "failed": 0,
+          "elapsed_seconds": 0.093698,
+          "goodput_per_second": 21345.171,
+          "success_latency_us": {
+            "p50": 174.862,
+            "p95": 249.89,
+            "p99": 318.224,
+            "max": 707.206
+          },
+          "errors": {
+            "connect": 0,
+            "write": 0,
+            "read": 0,
+            "response": 0
+          },
+          "client_cpu_seconds": {
+            "user": 0.013825000000000642,
+            "system": 0.23502600000000484
+          },
+          "client_exit_status": 0
+        }
+      ],
+      "stable_pids_fds_and_stack": true
+    }
+  ],
+  "client_sha256": "8658471c97f8efd818a22b0ba7bf15303fa6bdef1795f6cfc3edfe5c3a560cf9",
+  "finished_utc": "2026-09-16T08:03:14.411449+00:00"
+}

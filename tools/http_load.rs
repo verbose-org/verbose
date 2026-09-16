@@ -55,8 +55,11 @@ fn percentile(sorted: &[u128], p: usize) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 6 {
-        eprintln!("usage: http_load PORT CLIENTS REQUESTS BODY_BYTES TIMEOUT_MS");
+    let alternate_paths = args.len() == 7 && args[6] == "--alternate-paths";
+    if args.len() != 6 && !alternate_paths {
+        eprintln!(
+            "usage: http_load PORT CLIENTS REQUESTS BODY_BYTES TIMEOUT_MS [--alternate-paths]"
+        );
         std::process::exit(2);
     }
     let port = number(&args, 1, 1, 65535);
@@ -71,7 +74,8 @@ fn main() {
         let barrier = barrier.clone();
         let count = requests / clients + usize::from(client < requests % clients);
         threads.push(std::thread::spawn(move || {
-            let header = format!("POST / HTTP/1.0\r\nContent-Length: {size}\r\n\r\n");
+            let path = if alternate_paths { "/a" } else { "/" };
+            let header = format!("POST {path} HTTP/1.0\r\nContent-Length: {size}\r\n\r\n");
             let response_header = format!("HTTP/1.0 200 OK\r\nContent-Length: {size}\r\n\r\n");
             let mut request = header.as_bytes().to_vec();
             request.resize(header.len() + size, 0);
@@ -81,6 +85,13 @@ fn main() {
             let mut errors = [0usize; 4];
             barrier.wait();
             for sequence in 0..count {
+                if alternate_paths {
+                    request[6] = if (sequence + client) % 2 == 0 {
+                        b'a'
+                    } else {
+                        b'b'
+                    };
+                }
                 // Vary bytes across requests/clients, including NUL and 0xff.
                 // For bodies >= 8 bytes the prefix uniquely identifies a request.
                 let id = (sequence * clients + client) as u64;

@@ -5,6 +5,9 @@ and `concurrency: pooled`. It establishes a baseline for the
 [reusable worker contract](pooled-http-workers.md), including memory reuse.
 It does not measure HTTPS, Apache, or production capacity.
 
+For a before/after comparison of exclusive branch-buffer reuse with a bounded
+text handler, see the [separate storage experiment](bounded-text-http-benchmark.md).
+
 ## Reproduce
 
 On Linux x86-64, with Python 3.10+, rustc 1.73+, and access to loopback sockets and
@@ -155,8 +158,10 @@ client source hashes, request totals, and zero client failures. `cidx validate`
 passed. `cidx run ci` fails in security because the cargo-audit container lacks
 `curl`; it does not reach tests or build. Gitleaks reported no leaks; Trivy exited
 successfully with existing Python dependency findings. This is not an overall CI
-pass. GitHub workflows target `main`; the draft PR stacked on the pool branch
-must be retargeted after its base lands to receive those checks.
+pass at the time of this measurement. The CIDX preset problem was subsequently
+fixed in the bounded-text series. Its integration on 2026-09-16 passed CIDX and
+the full self-hosting bootstrap on GitHub. The original measurement and its
+host-activity caveat remain unchanged.
 
 This slice changes only measurement tools and documentation. The compiler,
 language contract, and service runtime are unchanged from `b26ddc2`; their serial
