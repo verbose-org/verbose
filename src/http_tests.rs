@@ -1,5 +1,11 @@
 //! Socket-level acceptance tests, independent of the native framing machine.
 mod admission_tests;
+mod pool_tests;
+mod shutdown_tests;
+mod text_bounds_tests;
+mod bounded_state_tests;
+mod text_inputs_tests;
+mod text_branches_tests;
 use crate::{
     ast::*,
     http_framing::{reference, Frame},
@@ -49,6 +55,9 @@ impl Server {
         Self::start_with_sigchld(source, false)
     }
     fn start_with_sigchld(source: &str, ignore: bool) -> Self {
+        Self::start_with_ignored_signals(source, if ignore { &[17] } else { &[] })
+    }
+    fn start_with_ignored_signals(source: &str, ignored: &[i32]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -69,11 +78,14 @@ impl Server {
             .process_group(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if ignore {
+        if !ignored.is_empty() {
+            let ignored = ignored.to_vec();
             unsafe {
-                command.pre_exec(|| {
-                    if admission_tests::signal(17, 1) == usize::MAX {
-                        return Err(std::io::Error::last_os_error());
+                command.pre_exec(move || {
+                    for sig in &ignored {
+                        if admission_tests::signal(*sig, 1) == usize::MAX {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     Ok(())
                 });
@@ -466,6 +478,9 @@ fn bounded_http_self_hosted_refuses_before_output() {
             "  request_timeout: 2\n",
             "  response_timeout: 2\n",
             "  max_connections: 2\n",
+            "  workers: 2\n",
+            "  concurrency: pooled\n",
+            "  shutdown_timeout: 2\n",
             "  request_timeout: 2\n  response_timeout: 2\n",
         ] {
             for source in [
@@ -493,13 +508,15 @@ fn bounded_http_self_hosted_refuses_before_output() {
             "{entry} over-reserved identifiers: {output:?}"
         );
         assert!(!output.stdout.is_empty());
-        let ordinary_name = source.replace("request_timeout", "max_connections");
-        let output = run(&ordinary_name);
-        assert!(
-            output.status.success(),
-            "{entry} reserved max_connections outside services"
-        );
-        assert!(!output.stdout.is_empty());
+        for name in ["max_connections", "workers", "pooled", "shutdown_timeout"] {
+            let ordinary_name = source.replace("request_timeout", name);
+            let output = run(&ordinary_name);
+            assert!(
+                output.status.success(),
+                "{entry} reserved {name} outside services"
+            );
+            assert!(!output.stdout.is_empty());
+        }
         fs::remove_file(bin).unwrap();
     }
 }

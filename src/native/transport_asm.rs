@@ -2,7 +2,8 @@ const AX: u8 = 0;
 const BP: u8 = 5;
 
 /// Small local assembler: rel32 labels and the few register operations used by
-/// service transport. Label zero is the failure boundary chosen by the caller.
+/// service transport. Unbound label zero is the caller's failure boundary;
+/// binding zero provides a local cleanup boundary instead.
 pub(super) struct Asm<'a> {
     pub(super) code: &'a mut Vec<u8>,
     labels: Vec<Option<usize>>,
@@ -42,7 +43,7 @@ impl<'a> Asm<'a> {
     pub(super) fn finish(self) -> Vec<usize> {
         let mut fail = vec![];
         for (at, label) in self.jumps {
-            if label == 0 {
+            if label == 0 && self.labels[0].is_none() {
                 fail.push(at);
             } else {
                 let target = self.labels[label].expect("unbound transport label");
@@ -98,5 +99,20 @@ impl<'a> Asm<'a> {
     pub(super) fn syscall(&mut self, n: i32) {
         self.imm(AX, n);
         self.bytes(&[0x0f, 0x05]);
+    }
+    pub(super) fn now_ms(&mut self, timespec: i32) {
+        self.imm(7, 1); // CLOCK_MONOTONIC
+        self.lea(6, timespec);
+        self.syscall(228);
+        self.cmp(AX, 0);
+        self.jump(Some(0x88), 0);
+        self.load(8, timespec);
+        self.imm(1, 1000);
+        self.bytes(&[0x4c, 0x0f, 0xaf, 0xc1]); // imul r8,rcx
+        self.load(AX, timespec + 8);
+        self.imm(2, 0);
+        self.imm(1, 1_000_000);
+        self.bytes(&[0x48, 0xf7, 0xf1]); // div rcx
+        self.rr(0x01, AX, 8);
     }
 }

@@ -14,6 +14,11 @@ inspection, and experimentation also supported. The bundled generators use Claud
 the language and compiler are independent of that choice. Broad model authorability
 remains an evaluation question.
 
+For service evolution, the [memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion)
+asks who owns storage, its capacity and lifetime, and what happens at exhaustion.
+The aim is useful, predictable specialization; matching Apache's feature list is
+not the project's identity or a claim of general superiority.
+
 ## Concrete continuation
 
 The original thought experiment was an LLM producing a binary directly. The
@@ -45,7 +50,36 @@ future work describe the pre-service implementation. `--http-server` remains a
 legacy rule-plus-shell path; `--demo-http` is a hand-emitted probe without Verbose
 source. Use source-declared services to demonstrate the language's effect model.
 
-## Checked literal lookup
+## Bounded values
+
+Rules can declare `out : text [..N]` to require a statically proved result
+capacity in bytes. The analysis follows aliases, branches and acyclic rule
+composition; unknown capacities are refused. Native evaluation uses a fixed
+invocation region with a separate 2 MiB ceiling: lets evaluate once, aliases
+share values, and storage is reclaimed after output or HTTP response consumption.
+Output-position calls and branches pass their destination to the final producer,
+removing intermediate result buffers and copies. Writable text buffers can also
+share storage after their proved last use, including through aliases and branch
+joins. Buffers created in mutually exclusive `if` arms can also overlap; their
+region remains protected through subsequent alias uses. This placement is used
+only when it shrinks the frame, without adding runtime instructions or copies.
+Values that can be live together remain distinct; scalar/pointer/length slots
+are not reused. Reserved space, actually touched memory and measured cache
+behavior are separate quantities.
+Pure rules can also pass explicitly constructed or returned flat records between
+different input concepts. [Input transfer checks](bounded-text-inputs.md) prove
+field capacities and numeric intervals; fields evaluate once and their owners
+remain live through callee and caller uses.
+[Conditional records](bounded-text-branches.md) can select complete values of
+the same concept; field bounds cover both alternatives and only the selected
+branch executes. Their text fields retain their owners without a join-time copy.
+Sequential HTTP services can now copy a complete annotated text call into an
+existing bounded state field. The service keeps its own buffer; the invocation
+region is released after copying. See [persistent text copies](bounded-text-state.md).
+This does not bound process memory or establish general ownership across effects
+or threads.
+See [bounded text results](bounded-text-output.md) and
+[native storage](bounded-text-storage.md) for the limits and backend matrix.
 
 `try_byte_at` returns `Result(number, BoundsError)` with explicit handling or
 propagation checked across the supported acyclic numeric-input rules. The
@@ -61,8 +95,14 @@ the self-hosted compiler refuse this service contract. See the
 connection and existing sequential/forked modes. Forked HTTP services can also
 declare `max_connections` to cap admitted handler children, close overload before
 request effects, and recover slots after child exits. See the
-[admission contract and support matrix](bounded-service-concurrency.md). Worker
-pools, threads, and TLS remain outside the implementation.
+[admission contract and support matrix](bounded-service-concurrency.md).
+Alternatively, `concurrency: pooled` with `workers: N` reuses N isolated worker
+processes and their request frames. Busy workers leave clients in the kernel
+queue; a worker death terminates the pool. See the
+[pool contract and support matrix](pooled-http-workers.md). A pool may also declare
+`shutdown_timeout` to finish accepted requests after supervisor SIGTERM, then
+force termination at its deadline; see [shutdown and failure boundaries](http-pool-shutdown.md).
+Threads, TLS, automatic worker replacement, and listener handoff remain separate.
 
 ## Guarantees and measurements
 
@@ -86,7 +126,8 @@ pools, threads, and TLS remain outside the implementation.
   execution cases. It does not prove correctness for every accepted program.
 - Binary sizes and performance results are measurements for specific programs,
   flags, and revisions. Use the dated [benchmark report](benchmarks.md) and rerun
-  its commands for a new checkout.
+  its commands for a new checkout. The [HTTP worker baseline](http-worker-benchmarks.md)
+  separately measures forked/pool goodput and pool memory reuse.
 
 ## Immutable artifact, changing inputs
 
