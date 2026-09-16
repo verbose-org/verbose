@@ -785,8 +785,10 @@ impl Fragment {
             load(code, 0, source);
             outer_store(code, 0, dest);
         }
-        // Restore caller registers but retain rsp below our buffers until send
-        // completes. The existing accept-loop reset releases them on all paths.
+        // Restore caller registers but retain rsp below our buffers through
+        // service logs and send. Log scratch is allocated below this region;
+        // freeing that scratch must not release the borrowed response. The
+        // existing accept-loop reset releases the region on all client paths.
         load(code, 3, 0);
         code.extend_from_slice(&[0x4c, 0x89, 0xd5]);
         Ok(())

@@ -77,8 +77,9 @@ their existing transport and failure policies; this text contract adds none.
 | Self-hosted compiler | Existing bounded output annotation refusal before ELF or raw machine-code emission |
 
 State-reading handlers still use the existing service emitter. A handler that
-itself participates in the bounded text call graph must still have no state,
-logs or `after` mutations. Effects inside formatters, recursion, collection or
+itself participates in the bounded text call graph must still have no state or
+`after` mutations; [checked logs](bounded-text-logs.md) can borrow its completed
+response. Effects inside formatters, recursion, collection or
 Result storage, resource ownership and thread sharing remain outside this slice.
 No new syntax, callable ABI or general ownership type system is introduced.
 

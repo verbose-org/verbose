@@ -98,6 +98,50 @@ struct Check<'a> {
     native: bool,
 }
 impl Check<'_> {
+    // Service logs borrow completed request/response values. Keep this boundary
+    // closed: the legacy log emitter supports literals and concat descriptors,
+    // not arbitrary evaluation in the bounded handler's lexical environment.
+    fn log_shape(&mut self, e: &Expr, depth: usize) -> Result<(), String> {
+        self.steps += 1;
+        if self.steps > 100_000 || depth > 256 {
+            return Err("bounded text log analysis limit exceeded".into());
+        }
+        match e {
+            Expr::Text(_) | Expr::Number(_) => Ok(()),
+            Expr::Field(base, _) if matches!(base.as_ref(), Expr::Ident(n) if n == "req" || n == "resp") => Ok(()),
+            Expr::Concat(args) if depth == 0 => {
+                for arg in args { self.log_shape(arg, depth + 1)?; }
+                Ok(())
+            }
+            _ => Err("bounded text service logs support text/number literals, req/resp fields and a flat concat only".into()),
+        }
+    }
+
+    fn service_log(&mut self, s: &Service, content: &Expr) -> Result<(), String> {
+        if !matches!(content, Expr::Text(_) | Expr::Concat(_)) {
+            return Err("bounded text service log content must be a text literal or concat(...)".into());
+        }
+        self.log_shape(content, 0)?;
+        let handler = *self.rules.get(s.handler.as_str()).ok_or("missing service handler")?;
+        let response = self.rule(&s.handler)?;
+        let request = crate::verifier::builtin_http_request(i64::from(s.max_request));
+        let mut fields: HashMap<_, _> = request.fields.iter()
+            .map(|f| Ok((f.name.clone(), Self::declared_field(f)?)))
+            .collect::<Result<_, String>>()?;
+        fields.insert("timestamp".into(), Value::Number(i64::MIN, i64::MAX));
+        let env = HashMap::from([
+            ("req".into(), Value::Record("HttpRequest".into(), fields)),
+            ("resp".into(), response),
+        ]);
+        let value = self.expr(content, handler, &env, 0)?;
+        value.require(&Type::Text)?;
+        let capacity = value.capacity()?.ok_or("bounded text service log capacity is unknown")?;
+        if capacity > 1_048_576 {
+            return Err(format!("bounded text service log needs up to {capacity} bytes, exceeds 1048576-byte content limit"));
+        }
+        Ok(())
+    }
+
     fn input_field(&self, concept: &str, name: &str) -> Result<Value, String> {
         let f = self.concepts[concept]
             .fields
@@ -595,8 +639,20 @@ pub(crate) fn verify_mode(p: &Program, native: bool) -> Vec<VerifyError> {
                 }
             }
             Item::Service(s) => {
-                for log in &s.logs {
+                for (index, log) in s.logs.iter().enumerate() {
                     inspect_effect(&log.effect);
+                    if active.contains(&s.handler) {
+                        let result = match &log.effect {
+                            Effect::AppendFile { content, .. } => check.service_log(s, content),
+                            _ => Err("bounded text service logs require append_file".into()),
+                        };
+                        if let Err(message) = result {
+                            errors.push(VerifyError {
+                                context: format!("service '{}' / bounded text log[{index}]", s.name),
+                                message,
+                            });
+                        }
+                    }
                 }
                 for set in &s.after_sets {
                     let mut names = BTreeSet::new();
@@ -631,14 +687,13 @@ pub(crate) fn verify_mode(p: &Program, native: bool) -> Vec<VerifyError> {
         if let Item::Service(s) = item {
             if active.contains(&s.handler)
                 && (s.protocol != Protocol::Http10
-                    || !s.logs.is_empty()
                     || !s.after_sets.is_empty()
                     || !s.state_fields.is_empty())
             {
                 errors.push(VerifyError {
                     context: format!("service '{}' / bounded text output", s.name),
                     message:
-                        "this slice supports an HTTP handler without state, logs or after mutations"
+                        "this slice supports an HTTP handler without state or after mutations"
                             .into(),
                 });
             }

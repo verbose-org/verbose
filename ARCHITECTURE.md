@@ -134,6 +134,11 @@ state](docs/bounded-text-state.md). The compiler checks the destination capacity
 and releases temporary storage after copying. General ownership across resources
 or threads remains a separate contract.
 
+[Service logs](docs/bounded-text-logs.md) can borrow a pure bounded handler's
+completed response. Their separate checked formatting buffers live below the
+response region and are reclaimed after each write; the response remains live
+through sending. This adds a specific synchronous effect boundary.
+
 Worker reuse must preserve request-local lifetimes and demonstrate stable storage
 across requests and failure paths. Shared mutable memory between threads needs an
 explicit ownership/synchronization contract. See the

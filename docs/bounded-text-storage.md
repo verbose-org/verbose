@@ -24,6 +24,10 @@ Lets remain eager, including unused lets. A conditional executes only its select
 branch, and `and`/`or` retain short-circuit evaluation. Nested concats and text
 conditionals can be materialized without the former emitter nesting restriction.
 
+[HTTP service logs](bounded-text-logs.md) may borrow the completed response.
+Its region remains live through their writes and response sending; each log's
+separate formatting buffer is released before the next log.
+
 | Memory question | Contract in this slice |
 |---|---|
 | Owner | The enclosing entry evaluation or HTTP request owns all writable text buffers. Aliases share immutable values. Literals and input fields can be borrowed within that lifetime. |
@@ -131,7 +135,7 @@ participating rules and recursive rules remain outside this subset.
 |---|---|
 | Interpreter | Existing eager lexical value semantics and capacity checks; its Rust allocations are not covered by the native storage ceiling |
 | Native argv / stdin / raw stdin / stream | Fixed invocation storage; output policy and input guards retained |
-| Native HTTP, sequential / forked / pooled | Same storage emitter, pure handler without state, logs or after mutations |
+| Native HTTP, sequential / forked / pooled | Same storage emitter, pure handler without state or after mutations; checked service logs borrow its completed response |
 | Native sequential HTTP `after` | Complete explicitly bounded text call copied into existing owned state before releasing its temporary region |
 | WASM / self-hosted compiler | Explicit refusal of the output contract before artifact emission |
 

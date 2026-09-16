@@ -22422,6 +22422,23 @@ fn rewrite_log_content(expr: &Expr, input_name: &str) -> Expr {
     }
 }
 
+// Bounded handlers run in a separate lexical frame. Log `req` always means
+// the parser-owned request, regardless of the handler parameter or let names.
+// Only the closed literal/field/concat grammar checked by text_bounds reaches
+// this path. Keep the legacy rewrite unchanged for unannotated services.
+fn rewrite_bounded_log_content(expr: &Expr, input_name: &str) -> Expr {
+    match expr {
+        Expr::Field(base, name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "req") && name != "timestamp" =>
+        {
+            Expr::Field(Box::new(Expr::Ident(input_name.into())), name.clone())
+        }
+        Expr::Concat(args) => Expr::Concat(args.iter()
+            .map(|arg| rewrite_bounded_log_content(arg, input_name)).collect()),
+        _ => rewrite_log_content(expr, input_name),
+    }
+}
+
 /// Phase 7 slice 3c: Http10 service whose handler contains one or more
 /// if/else branches producing different HttpResponse records. The handler's
 /// condition evaluation reuses emit_eval_expr (Phase 2's generic expression
@@ -24072,7 +24089,11 @@ fn emit_http10_dynamic_bytes(
         let log_scope = ClientAbortScope::begin();
         for log_block in &service.logs {
             if let Effect::AppendFile { path, content } = &log_block.effect {
-                let rewritten = rewrite_log_content(content, &handler.input_name);
+                let rewritten = if bounded_storage.is_some() {
+                    rewrite_bounded_log_content(content, &handler.input_name)
+                } else {
+                    rewrite_log_content(content, &handler.input_name)
+                };
                 emit_append_file_call(
                     &mut code,
                     path,
@@ -56680,7 +56701,9 @@ rule pick
         // http_pooled adds a service-scoped refusal for reusable workers.
         // http_shutdown adds an explicitly refused SIGTERM lifecycle contract.
         // Bounded text capacity/storage examples remain explicit gen0 refusals.
-        const EXPECTED_TOTAL: usize = 172;
+        // http_bounded_log adds another bounded-text refusal (exit 1, no bytes);
+        // the accepted count stays 97. Pin ELF/raw refusal in text_bounds tests.
+        const EXPECTED_TOTAL: usize = 173;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

@@ -76,6 +76,9 @@ branch executes. Their text fields retain their owners without a join-time copy.
 Sequential HTTP services can now copy a complete annotated text call into an
 existing bounded state field. The service keeps its own buffer; the invocation
 region is released after copying. See [persistent text copies](bounded-text-state.md).
+Pure bounded HTTP handlers can also expose their completed response to
+[checked service logs](bounded-text-logs.md). Log scope and content capacities
+are verified, and response storage stays live through logging and sending.
 This does not bound process memory or establish general ownership across effects
 or threads.
 See [bounded text results](bounded-text-output.md) and

@@ -1,0 +1,51 @@
+@verbose 0.1.0
+
+rule response_text
+  @intention: "Format a request within a checked 4098-byte result capacity"
+  @source: http_bounded_log.intent:1
+  input:
+    request : HttpRequest
+  output:
+    out : text [..4098]
+  logic:
+    out = if request.method == "POST" then concat("[", request.body, "]") else concat("<", request.path, ">")
+  proofs:
+    purity:
+      reads : [request.method, request.body, request.path]
+      calls : []
+    termination:
+      bound : 32
+
+rule handle
+  @intention: "Keep the response alive through aliases and later evaluations"
+  @source: http_bounded_log.intent:2
+  input:
+    incoming : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    let message = response_text(incoming)
+    let saved = message
+    let message = "shadow"
+    let unused = response_text(incoming)
+    resp = HttpResponse { status: 200, body: saved }
+  proofs:
+    purity:
+      reads : [incoming]
+      calls : [response_text]
+    termination:
+      bound : 32
+
+service bounded_log_http
+  @intention: "Borrow a bounded response for a declared log before sending"
+  @source: http_bounded_log.intent:3
+  listen:
+    protocol: http_1_0
+    port: 18966
+    max_request: 4096
+  handler: handle
+  request_timeout: 2
+  response_timeout: 2
+  log:
+    append_file "/tmp/verbose_bounded_response.log" concat(req.timestamp, " ", req.method, " ", req.path, " ", resp.status, " ", resp.body, "\n")
+    on_error: abort
