@@ -226,7 +226,7 @@ pub fn compile_wasm(
     }
     let text_active = crate::text_bounds::active_rules(program);
     if text_active.contains(rule_name) || program.items.iter().any(|i| matches!(i,
-        Item::Service(s) if s.name == rule_name && text_active.contains(&s.handler))) {
+        Item::Service(s) if s.name == rule_name && crate::text_bounds::service_uses_contract(s, &text_active))) {
         return Err(WasmError { message: "WASM does not support bounded text output contracts".into() });
     }
     if crate::bounds::active_rules(program).contains(rule_name) {

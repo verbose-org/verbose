@@ -4,8 +4,15 @@
 result capacities across pure rules. [`http_bounded_text.verbose`](http_bounded_text.verbose)
 uses the same contract in an HTTP formatter.
 [`bounded_text_storage.verbose`](bounded_text_storage.verbose) demonstrates shared
-aliases, shadowing, nested conditional buffers and direct result destinations. See the
+aliases, shadowing, nested conditional buffers, direct result destinations and
+buffer reuse after the last use. [`bounded_text_state.verbose`](bounded_text_state.verbose)
+copies a bounded formatter result into persistent service state; its
+[copy contract](../docs/bounded-text-state.md) specifies ownership and reclamation. See the
 [contract and support matrix](../docs/bounded-text-output.md).
+[`bounded_text_inputs.verbose`](bounded_text_inputs.verbose) constructs checked
+inputs for another concept, preserving field values across calls and aliases.
+[`bounded_text_branches.verbose`](bounded_text_branches.verbose) selects a complete
+record, preserving field bounds and buffer lifetimes across branches and later calls.
 
 Examples show concrete language constructs, compiler entry points, and regression
 cases. Some require imports, resources, a particular backend/ABI, or test setup;

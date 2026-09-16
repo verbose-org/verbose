@@ -49,7 +49,7 @@ fn bounded_text_http_uses_every_service_input_bound() {
         .any(|e| e.message.contains("exceeds declared")));
 }
 
-fn storage_accept_stack(pid: u32) -> String {
+pub(super) fn storage_accept_stack(pid: u32) -> String {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let s = fs::read_to_string(format!("/proc/{pid}/syscall")).unwrap();

@@ -3,3 +3,4 @@ A formatter call encloses the title and appends the identifier within thirty byt
 An alias preserves the computed value when its original name is shadowed; two uses share that computation.
 Conditional delimiters surround the reused text, whose storage lasts through consumption of the final result.
 The selected formatter writes into the final result destination without intermediate result copies.
+Two formatter values are measured in sequence; each buffer can be reused after its last alias is consumed, while numeric lengths remain available.

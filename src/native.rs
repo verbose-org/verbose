@@ -22011,6 +22011,7 @@ fn emit_raw_tcp_dynamic_bytes(
             &text_bindings,
             &state_layout,
             &mut abort_patches,
+            None,
         )?;
         // STEP TAIL: restore rsp to the post-prologue invariant (frees any
         // handler-allocated concat buffer) and loop to the next frame. Every
@@ -22535,10 +22536,20 @@ fn compile_http10_dynamic_service(
     }).collect();
     let program_concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
 
+    let mut bounded_after = HashMap::new();
+    for (index, set) in service.after_sets.iter().enumerate() {
+        if let Some(callee) = crate::text_bounds::state_call(service, handler, set, &program_rules)
+            .map_err(|message| NativeError { message })? {
+            let fragment = bounded_text::prepare(program, &callee.name,
+                &http_request_builtin_concept_native(service.max_request))?;
+            bounded_after.insert(index, fragment);
+        }
+    }
+
     let code = emit_http10_dynamic_bytes(
         service, handler, &offsets, &no_rules, &no_ranges,
         &all_resources, &all_connections, &all_entropies,
-        &program_rules, &program_concepts, storage.as_ref(),
+        &program_rules, &program_concepts, storage.as_ref(), &bounded_after,
     )?;
     write_server_elf(&code, output_path, "service", service.port)
 }
@@ -22886,8 +22897,9 @@ fn emit_after_block(
     text_bindings: &TextBindings,
     layout: &StateLayout,
     abort_patches: &mut Vec<usize>,
+    bounded: Option<(&HashMap<usize, bounded_text::Fragment>, &HashMap<&str, i32>, &TextBindings)>,
 ) -> Result<(), NativeError> {
-    for aset in &service.after_sets {
+    for (index, aset) in service.after_sets.iter().enumerate() {
         let sf = service.state_fields.iter()
             .find(|sf| sf.name == aset.field_name)
             .ok_or_else(|| NativeError {
@@ -22904,6 +22916,12 @@ fn emit_after_block(
                     .find(|(n, ..)| *n == aset.field_name.as_str())
                     .expect("text state field has a slot triple");
                 let n = state_text_bound(sf)?;
+                if let Some((fragments, input_offsets, input_text)) = bounded {
+                    if let Some(fragment) = fragments.get(&index) {
+                        fragment.persist(code, input_offsets, input_text, buf_off, len_slot, n, abort_patches)?;
+                        continue;
+                    }
+                }
                 emit_text_produce_ptrlen(
                     code,
                     &aset.value,
@@ -23106,6 +23124,7 @@ fn emit_http10_dynamic_bytes(
     program_rules: &HashMap<&str, &Rule>,
     program_concepts: &[&Concept],
     bounded_storage: Option<&bounded_text::Fragment>,
+    bounded_after: &HashMap<usize, bounded_text::Fragment>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
@@ -23130,7 +23149,8 @@ fn emit_http10_dynamic_bytes(
     // content references `req.body`. Body parsing in the HTTP parser
     // is conditional on this — the cost (one inline scan for \r\n\r\n
     // and two slot stores) is paid only when body is consumed.
-    let uses_body = expr_uses_field(&handler.logic.value, &handler.input_name, "body")
+    let uses_body = bounded_after.values().any(|fragment| fragment.uses_field("body"))
+        || expr_uses_field(&handler.logic.value, &handler.input_name, "body")
         || handler.logic.bindings.iter().any(|(_, e)| expr_uses_field(e, &handler.input_name, "body"))
         || service.logs.iter().any(|lb| match &lb.effect {
             Effect::AppendFile { content, .. } => expr_uses_field(content, "req", "body"),
@@ -24087,6 +24107,12 @@ fn emit_http10_dynamic_bytes(
     // rejoin the bare close set — the response is already on the wire, the
     // state simply stays unchanged for that request.
     let after_scope = ClientAbortScope::begin();
+    // These are parser-owned inputs, independent of handler let names. A let
+    // called "body" or "path" must not redirect a bounded after call.
+    let mut bounded_input_text = HashMap::new();
+    if uses_body {
+        bounded_input_text.insert("body", (body_ptr_slot, body_len_slot));
+    }
     // Shared with the raw_tcp step-loop emitter since slice `multistep-1`;
     // the copy discipline and the backstop are documented on the helper.
     emit_after_block(
@@ -24100,6 +24126,7 @@ fn emit_http10_dynamic_bytes(
         &http_text_bindings,
         &state_layout,
         &mut abort_patches,
+        Some((bounded_after, offsets, &bounded_input_text)),
     )?;
 
     // ═══ CLOSE + LOOP ══════════════════════════════════════════
@@ -56653,7 +56680,7 @@ rule pick
         // http_pooled adds a service-scoped refusal for reusable workers.
         // http_shutdown adds an explicitly refused SIGTERM lifecycle contract.
         // Bounded text capacity/storage examples remain explicit gen0 refusals.
-        const EXPECTED_TOTAL: usize = 169;
+        const EXPECTED_TOTAL: usize = 172;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
