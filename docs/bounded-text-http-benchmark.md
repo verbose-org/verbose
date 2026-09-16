@@ -116,8 +116,9 @@ p99 improves in four scenarios and worsens in two, including a 22.7% increase
 for four workers and 3900-byte bodies. The shorter run gives a different direction
 for some cases. Three repeats on a shared development host establish neither
 performance equivalence nor that placement caused those timing differences.
-The next timing investigation should focus on the four-worker tails on an
-isolated host with more repeats, and hardware counters if available.
+The follow-up below increases repeats for the four-worker tails on the same
+host after the operator reported no substantial concurrent workload. Host
+isolation and hardware-counter measurements remain outside these experiments.
 
 Memory samples below include the supervisor and are identical across all five
 snapshots after 500, 2500, 4500, 6500 and 8500 requests in the longer run:
@@ -145,3 +146,80 @@ negative control passed. The latter fails before issuing requests when no frame
 reduction exists. Report validation checks source hashes, scenario/repeat counts,
 all request totals and zero failures. This measurement slice changes tools and
 documentation; compiler/runtime sources remain unchanged from the merged series.
+
+## Follow-up with ten pairs on 2026-09-16
+
+The [complete follow-up report](measurements/bounded-text-http-followup-2026-09-16.json)
+records the follow-up from 09:54:48 to 10:03:58 UTC, using the same
+compiler and harness hashes as the longer run above. The checkout was clean at
+`459e8a2`. Before this run, the operator confirmed no substantial concurrent
+workload. No local test or build suite ran during timing. The CPU sets remained
+unchanged; this reported context and affinity still do not establish host
+isolation under WSL2. Hardware cache counters were not measured.
+
+The protocol was chosen before the run: four workers/clients only, all three
+body sizes, ten pairs per size, and 200,000 timed requests per passage. Five
+pairs run before/after and five after/before, alternating in the recorded order.
+Each variant still starts fresh and receives 500 warmup requests. All 60
+passages are retained; durations range from 7.90 to 8.98 seconds. Reproduce with
+the same compilers and permitted CPU sets:
+
+```sh
+python3 tools/benchmark_text_branches.py \
+  --reference-compiler /path/to/reference-verbosec \
+  --reference-revision 555e402 \
+  --workers 4 --payloads 0,1024,3900 \
+  --requests 200000 --repeats 10 \
+  --server-cpus 0,2,4,6 --client-cpus 8,10,12,14 \
+  --host-note 'Describe concurrent host activity for this run' \
+  --output /tmp/bounded-text-http-followup.json
+```
+
+Each entry below is a median across ten passages. The p99 is the median of
+per-passage p99 values, not a pooled percentile. Percentage changes compare
+these medians; positive latency changes mean slower responses.
+
+| Body bytes | Before responses/s | After responses/s | Median change | p99 µs, before → after | p99 change |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 24,733 | 24,957 | +0.9% | 369.2 → 349.6 | −5.3% |
+| 1024 | 23,411 | 23,196 | −0.9% | 371.0 → 370.7 | −0.1% |
+| 3900 | 22,820 | 22,650 | −0.7% | 369.6 → 374.2 | +1.3% |
+
+Pairwise changes provide a separate view of variability. They are calculated
+as `100 × (after / before − 1)` for each adjacent pair, then summarized; they
+need not equal the change between the two medians above.
+
+| Body bytes | Paired goodput change, median (min–max) | Paired p99 change, median (min–max) | Pairs with higher after p99 |
+|---:|---:|---:|---:|
+| 0 | +0.6% (−2.1% to +8.0%) | −4.0% (−19.5% to +3.1%) | 2 / 10 |
+| 1024 | −0.7% (−4.3% to +3.9%) | +1.0% (−10.6% to +11.0%) | 6 / 10 |
+| 3900 | −0.6% (−2.7% to +2.5%) | +3.4% (−12.3% to +9.3%) | 6 / 10 |
+
+Order remains a material limitation. For 3900-byte bodies, the median paired
+p99 change is +5.1% when the after variant runs second, versus −7.8% when it
+runs first. For 1024-byte bodies those values are +3.3% and −6.2%. Each group
+has only five pairs, so this does not establish a cause; it does show why a
+single aggregate should not be interpreted as a pure placement effect.
+
+The previous +22.7% median p99 difference for large bodies is not reproduced
+at that magnitude here. Goodput medians differ by less than 1%, while a small
+placement cost or benefit remains unresolved. These results support retaining
+the memory optimization for this fixture, without claiming zero runtime cost,
+performance equivalence, or improved cache residency. A further causal timing
+study should address order/carryover effects and host isolation, using a
+predefined schedule and, if available, hardware counters.
+
+The reserved handler frame again falls from 8352 to 4256 bytes. Equal-size
+41,103-byte binaries differ only in frame/address immediates. All five idle
+memory snapshots match the previous four-worker result: summed RSS 332 →
+316 KiB, PSS 122 → 106 KiB, and private memory 72 → 56 KiB, including the
+supervisor. This again observes 4 KiB less private memory per worker in this
+fixture; it is not a general process-memory or cache bound.
+
+All **12,047,000 requests** pass: 12,000,000 timed, 30,000 warmups and 17,000 in
+the separate memory phase. Every pool retains its PIDs, descriptors and idle
+stack positions within an instance, and all 124 server stdout/stderr logs are
+empty. Report validation checks all request totals, pair order, source and
+binary hashes, the layout-only difference, and pool identity. The raw report
+is preserved alongside both earlier measurements; no compiler, runtime or
+benchmark code changed for this follow-up.
