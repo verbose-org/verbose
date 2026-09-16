@@ -86,7 +86,10 @@ containing `a7b6335`. The checkout at start was `78c6e84`; its compiler/runtime
 sources are identical to `a7b6335`. Both executable hashes and the measured
 harness/client hashes are recorded. The host was a Ryzen 7 5800X under WSL2
 `5.15.153.1-microsoft-standard-WSL2`, with the disjoint CPU sets in the command
-above. This was a development host; activity outside Linux was not reported.
+above. After the run, the operator confirmed that no substantial concurrent
+workload was running during the measurement. This is reported operating context,
+not measured host isolation. The raw JSON reports retain their original
+"Host activity outside Linux not reported" note, recorded before this clarification.
 
 The [initial calibration](measurements/bounded-text-http-calibration-2026-09-16.json)
 used 30,000 requests per passage. Its 1.20–4.52-second windows motivated increasing
