@@ -114,7 +114,8 @@ fn count_nodes(expr: &Expr) -> usize {
 pub fn optimize_program(program: &Program) -> (Program, OptStats) {
     // Preserve eager evaluation and obligations in the first bounded-result slice.
     // Legacy interval-driven rewrites do not yet carry those obligations.
-    let bounded_rules = crate::bounds::active_rules(program);
+    let mut bounded_rules = crate::bounds::active_rules(program);
+    bounded_rules.extend(crate::text_bounds::active_rules(program));
     // Count nodes before optimization
     let nodes_before: usize = program
         .items
@@ -247,6 +248,7 @@ fn optimize_rule(rule: &Rule, field_ranges: &HashMap<String, (i64, i64)>) -> Rul
         input_ty: rule.input_ty.clone(),
         output_name: rule.output_name.clone(),
         output_ty: rule.output_ty.clone(),
+        output_text_max: rule.output_text_max,
         logic: LogicStmt {
             bindings: inlined_bindings
                 .iter()

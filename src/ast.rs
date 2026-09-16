@@ -673,6 +673,9 @@ pub struct Rule {
     pub input_ty: Type,
     pub output_name: String,
     pub output_ty: Type,
+    /// Optional, statically checked UTF-8 byte capacity of a text result.
+    /// This bounds the value, not temporary storage or the process RSS.
+    pub output_text_max: Option<u32>,
     pub logic: LogicStmt,
     pub proofs: Proofs,
     pub hints: Option<Hints>,

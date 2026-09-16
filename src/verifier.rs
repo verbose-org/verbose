@@ -20,6 +20,7 @@ impl fmt::Display for VerifyError {
 
 pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError> {
     let mut errors = crate::bounds::verify(program);
+    errors.extend(crate::text_bounds::verify(program));
     let bounded_rules = crate::bounds::active_rules(program);
 
     // Phase 7 slice 3a: if any service declares Protocol::Http10, the compiler
@@ -1064,7 +1065,7 @@ fn verify_connection_stub(c: &Connection, base_dir: &StdPath, errors: &mut Vec<V
 /// ≤ this value; the divergence is only ever in the safe direction, and for
 /// a single-service program (every example in the repo, and the only shape
 /// `--run <service>` compiles) the two are identical.
-fn builtin_http_request(body_max: i64) -> Concept {
+pub(crate) fn builtin_http_request(body_max: i64) -> Concept {
     Concept {
         name: "HttpRequest".to_string(),
         intention:
@@ -1097,7 +1098,7 @@ fn builtin_http_request(body_max: i64) -> Concept {
 ///   status : number [100, 599] — valid HTTP status code range
 ///   body   : text [..4096]     — response body (text only in slice 3;
 ///                                binary bodies await bytes primitives)
-fn builtin_http_response() -> Concept {
+pub(crate) fn builtin_http_response() -> Concept {
     Concept {
         name: "HttpResponse".to_string(),
         intention:
@@ -1672,6 +1673,7 @@ fn verify_service(
             .map(|sf| (sf.name.as_str(), sf.max_bytes.unwrap_or(0)))
             .collect();
         if !text_state_bounds.is_empty() {
+            let state_rules: HashMap<_, _> = all_rules.iter().map(|r| (r.name.as_str(), *r)).collect();
             // req.method / req.path bounds come from the concept so the
             // parser and this sizer can never disagree; req.body's bound is
             // THIS service's `max_request` (the concept carries the
@@ -1696,17 +1698,24 @@ fn verify_service(
                     continue;
                 }
                 let n = sf.max_bytes.unwrap_or(0);
-                match text_source_worst_case(
-                    &aset.value,
-                    &handler.input_name,
-                    req_concept,
-                    s.max_request as i64,
-                    &text_state_bounds,
-                    &handler.logic.bindings,
-                    resource_max_bytes,
-                    connection_max_response,
-                    0,
-                ) {
+                let bound = match crate::text_bounds::state_call(s, handler, aset, &state_rules) {
+                    Ok(Some(callee)) => Ok(i64::from(callee.output_text_max.unwrap())),
+                    // The bounded-text pass reports this contract violation
+                    // with the service/set context. Do not guess a bound.
+                    Err(_) => continue,
+                    Ok(None) => text_source_worst_case(
+                        &aset.value,
+                        &handler.input_name,
+                        req_concept,
+                        s.max_request as i64,
+                        &text_state_bounds,
+                        &handler.logic.bindings,
+                        resource_max_bytes,
+                        connection_max_response,
+                        0,
+                    ),
+                };
+                match bound {
                     // Refusal #5 — no compile-time bound for this shape.
                     // The accepted-source list is protocol-aware (slice
                     // multistep-1, design §5.5 #6): a raw_tcp input field is
