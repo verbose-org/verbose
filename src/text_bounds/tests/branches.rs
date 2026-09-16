@@ -218,7 +218,7 @@ fn text_branches_refuse_invalid_alternatives_before_artifact_emission() {
 }
 
 #[test]
-fn text_branches_keep_the_conservative_invocation_limit() {
+fn text_branches_share_large_exclusive_buffers_but_keep_the_invocation_limit() {
     let mut p = fixture();
     root(&mut p, &[], "\"\"");
     let record = || {
@@ -242,6 +242,14 @@ fn text_branches_keep_the_conservative_invocation_limit() {
         ),
     ));
     assert!(verify(&p).is_empty());
+    // The two 1 MiB alternatives now share storage. An unused let is still
+    // eager; both runtime choices execute safely within the 2 MiB frame cap.
+    differential(&p, "compose_text");
+    // A second result live alongside the selected one still cannot fit. Its
+    // owner must remain distinct regardless of which branch was selected.
+    let r = rule(&mut p, "compose_text");
+    r.logic.bindings.push(("other".into(), record()));
+    r.logic.value = expression("concat(length(unused.title), length(other.title))");
     let file = format!("/tmp/verbose-text-branch-frame-{}", std::process::id());
     fs::write(&file, b"preserve").unwrap();
     let error = crate::native::compile_native(&p, "compose_text", &file, false, false).unwrap_err();
@@ -251,6 +259,26 @@ fn text_branches_keep_the_conservative_invocation_limit() {
     );
     assert_eq!(fs::read(&file).unwrap(), b"preserve");
     fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn text_branches_overlay_nested_owned_records_without_changing_evaluation() {
+    let mut p = fixture();
+    root(&mut p, &[
+        ("outer", "concat(\"OUTER:\", request.title)"),
+        ("selected", "if request.code > 0 then (if request.code == 1 then FormatInput { title: concat(\"yes:\", request.title), code: 1 } else FormatInput { code: 0, title: concat(\"max:\", request.title) }) else FormatInput { title: concat(\"no:\", request.title), code: -1 }"),
+        ("saved", "selected"),
+        ("selected", "pack_text(request)"),
+        ("noise", "concat(\"later:\", request.title, request.title)"),
+    ], "concat(outer, saved.title, selected.title, saved.title)");
+    differential(&p, "compose_text");
+    let (optimized, _) = crate::optimizer::optimize_program(&p);
+    differential(&optimized, "compose_text");
+    // An earlier concat operand is live while a later operand chooses and
+    // writes branch-local destinations. Nor may a shared output destination
+    // overlap its branch's temporary, borrowed as an operand of the final copy.
+    root(&mut p, &[], "concat(concat(\"first:\", request.title), if request.code > 0 then concat(\"second:\", request.title) else concat(\"third:\", request.title))");
+    differential(&p, "compose_text");
 }
 
 #[test]
