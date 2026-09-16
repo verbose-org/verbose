@@ -3,6 +3,8 @@
 [`bounded_text.verbose`](bounded_text.verbose) declares and composes checked text
 result capacities across pure rules. [`http_bounded_text.verbose`](http_bounded_text.verbose)
 uses the same contract in an HTTP formatter.
+[`http_bounded_log.verbose`](http_bounded_log.verbose) retains that response
+through declared service logs, with [checked log scope and capacities](../docs/bounded-text-logs.md).
 [`bounded_text_storage.verbose`](bounded_text_storage.verbose) demonstrates shared
 aliases, shadowing, nested conditional buffers, direct result destinations and
 buffer reuse after the last use. [`bounded_text_state.verbose`](bounded_text_state.verbose)
