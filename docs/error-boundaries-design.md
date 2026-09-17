@@ -122,9 +122,10 @@ Under this proposed contract, refuse an interface when:
 - Error construction or handling lacks the required bounds.
 - A backend cannot implement the accepted contract.
 
-Unknown analysis is not evidence of a nonfailing operation. Current acceptance of
-unknown overflow intervals and assumed ranges for unannotated numeric inputs must
-not be reused to certify these stronger obligations. Initial support may refuse
+Unknown analysis is not evidence of a nonfailing operation. The [strict numeric contract](numeric-overflow.md) now refuses unknown overflow
+intervals and uses the full i64 domain for unannotated numeric inputs. These
+properties remain scoped; acceptance of a legacy expression must not be reused
+to certify stronger obligations. Initial support may refuse
 construct combinations rather than claim complete inference.
 
 A fallback converting `Err` to a normal value is allowed only as explicit source

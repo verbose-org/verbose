@@ -3,12 +3,12 @@
 -- Conditional expressions: if/then/else for business pricing logic.
 
 concept Invoice
-  @intention: "An invoice has an amount, a tax rate, and a number of days overdue"
+  @intention: "An invoice has a bounded nonnegative amount, a tax rate from 0 to 100 percent, and days overdue"
   @source: pricing.intent:1
 
   fields:
-    amount       : number
-    tax_rate     : number
+    amount       : number [0, 1000000000]
+    tax_rate     : number [0, 100]
     days_overdue : number
 
 

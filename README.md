@@ -200,7 +200,7 @@ Verified mechanically, against the AST:
 
 - Declared `reads` / `calls` match the actual field accesses and rule invocations
 - `termination.bound` covers the structural AST operation count; recursion checks are separate, and this is not a total runtime step budget
-- `overflow: [min, max]` is checked against the interval when the analysis can compute one; an unknown interval is currently accepted without establishing the hint
+- `overflow: [min, max]` now requires a proved output interval and safe intermediate arithmetic in its [supported pure acyclic subset](docs/numeric-overflow.md); unknown analysis is refused
 - `@layer` discipline (sealed subgraph: `domain → domain` only, etc.)
 - `@source: file:line` references an existing line in the named file
 - Reaction `append_file` paths are string literals — the auditor can grep every file the program can touch
@@ -352,7 +352,7 @@ Compiler verifies and runs:
 ```text
 $ verbosec collections.verbose --run client_blocked --input data.json
 
-verified: 2 concept(s), 3 rule(s); all proofs check out
+verified: 2 concept(s), 3 rule(s); supported source checks passed
 
 executing rule 'client_blocked' on 4 record(s):
   [0] blocked = true     ← Dupont: all invoices overdue
@@ -506,7 +506,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 |---|---|
 | `vectorizable: "reason"` | Checks independence restrictions; eligible native scalar paths can emit SIMD |
 | `parallel: "reason"` | Eligible native paths can distribute work using `fork()` |
-| `overflow: [min, max]` | Requests a range check against the computable interval; an unknown result is not a proof |
+| `overflow: [min, max]` | Requires a known output interval and safe intermediates; unsupported analysis is refused |
 | `field [min, max]` | Supplies range information for analysis and elimination of impossible branches |
 
 A hint's explanation is audit material. Declaring a hint does not mean every

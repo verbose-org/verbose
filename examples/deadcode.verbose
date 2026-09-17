@@ -1,7 +1,8 @@
 @verbose 0.1.0
 
--- Dead code elimination demo: field ranges let the compiler
--- remove branches that can never be taken.
+-- Range-analysis example: the first branch is unreachable on valid input.
+-- The strict overflow contract currently preserves both branches in native
+-- output until dead-branch elimination can preserve all proof obligations.
 
 concept Sensor
   @intention: "A sensor has a temperature value between 0 and 50 degrees"

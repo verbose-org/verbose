@@ -64,6 +64,15 @@ This repo evolves the language. It is the source of truth.
 
 The split is structural: `verbose-org/verbose` is for the language; everything else demonstrates it. This keeps the language pure (no ad-hoc features for one specific use case) and lets POCs be honest demonstrations (they live or die by what the current language can do).
 
+## Current numeric-contract update (2026-09-17)
+
+`hints.overflow` is now strict in the supported pure acyclic scalar subset:
+unknown intervals and unsafe intermediates refuse compilation. Input domains
+are enforced at interpreter/native argv entry. WASM and self-hosted ELF/raw
+emission explicitly refuse the contract. Historical entries below describing
+`hint_overflow_bad` as accepted by gen0 are superseded by this capability refusal,
+not by a self-hosted interval prover. See [the contract](docs/numeric-overflow.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

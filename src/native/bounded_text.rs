@@ -812,6 +812,7 @@ pub(super) fn compile(p: &Program, rule: &Rule, concept: &Concept) -> Result<Vec
         &HashMap::new(),
         None,
         false,
+        false,
     )?;
     fragment.begin(&mut code, &ctx.binding_offsets, &ctx.text_bindings)?;
     match &fragment.result {

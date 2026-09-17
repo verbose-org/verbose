@@ -1,0 +1,47 @@
+@verbose 0.1.0
+
+concept Sample
+  @intention: "A bounded signed reading"
+  @source: strict_overflow.intent:1
+  fields:
+    reading : number [-100, 100]
+
+rule scaled
+  @intention: "Scale with safe intermediate arithmetic and signed division"
+  @source: strict_overflow.intent:2
+  input:
+    sample : Sample
+  output:
+    value : number
+  logic:
+    let product = sample.reading * 3
+    value = product / 2
+  proofs:
+    purity:
+      reads : [sample.reading]
+      calls : []
+    termination:
+      bound : 2
+  hints:
+    overflow : [-150, 150]
+
+rule combined
+  @intention: "Compose the public numeric contract with explicit eager bindings"
+  @source: strict_overflow.intent:3
+  input:
+    incoming : Sample
+  output:
+    value : number
+  logic:
+    let first = scaled(incoming)
+    let alias = first
+    let second = scaled(incoming)
+    value = alias + second + 1
+  proofs:
+    purity:
+      reads : [incoming]
+      calls : [scaled]
+    termination:
+      bound : 4
+  hints:
+    overflow : [-299, 301]

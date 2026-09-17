@@ -208,6 +208,12 @@ pub fn compile_wasm(
     rule_name: &str,
     output_path: &str,
 ) -> Result<(), WasmError> {
+    if let Some(error) = crate::numeric_bounds::verify(program).first() {
+        return Err(WasmError { message: error.to_string() });
+    }
+    if crate::numeric_bounds::active_rules(program).contains(rule_name) {
+        return Err(WasmError { message: "WASM does not support strict overflow contracts and their input guards".into() });
+    }
     if program.items.iter().any(|i| matches!(i, Item::Service(s)
         if s.name == rule_name && s.shutdown_timeout.is_some())) {
         return Err(WasmError { message: "WASM does not support service shutdown_timeout".into() });

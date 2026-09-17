@@ -116,6 +116,7 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
     // Legacy interval-driven rewrites do not yet carry those obligations.
     let mut bounded_rules = crate::bounds::active_rules(program);
     bounded_rules.extend(crate::text_bounds::active_rules(program));
+    bounded_rules.extend(crate::numeric_bounds::active_rules(program));
     // Count nodes before optimization
     let nodes_before: usize = program
         .items
@@ -208,7 +209,7 @@ fn concept_field_ranges<'a>(
         if let Some(concept) = concepts.get(name.as_str()) {
             for field in &concept.fields {
                 if field.ty == Type::Number {
-                    let range = field.range.unwrap_or((0, i32::MAX as i64));
+                    let range = field.range.unwrap_or((i64::MIN, i64::MAX));
                     ranges.insert(field.name.clone(), range);
                 }
             }

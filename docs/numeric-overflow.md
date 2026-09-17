@@ -1,0 +1,109 @@
+# Strict numeric overflow contracts
+
+Implemented 2026-09-17. An existing `hints.overflow: [min, max]` is now a
+checked obligation, not a hint accepted when its analysis is unknown. The
+compiler proves the output interval and the safety of every supported numeric
+operation evaluated by the participating rules. It does not infer a business
+requirement from prose.
+
+```verbose
+logic:
+  let product = sample.reading * 3
+  value = product / 2
+hints:
+  overflow : [-150, 150]
+```
+
+For `reading : number [-100, 100]`, the intermediate product fits `[-300, 300]`
+and the signed result fits `[-150, 150]`. See the complete
+[example](../examples/strict_overflow.verbose), including aliases and calls
+whose input variables have different names.
+
+## What is established
+
+- Eager lets, including unused lets, conditions, operands and both conditional
+  branches are analyzed. A small output does not hide an overflowing intermediate.
+- Addition, subtraction, multiplication, negation and `abs` must fit signed i64.
+  Division/remainder must exclude zero and `MIN / -1` or `MIN % -1`.
+- Undeclared numeric ranges mean the full i64 domain. No nonnegative 32-bit
+  range is invented. Explicit input bounds are checked at execution before the
+  participating entry runs; invalid inputs fail evaluation/exit 1.
+- Calls use the callee's checked public output interval, or its inferred interval
+  if it has no `overflow` declaration. Callers and dependencies participate too,
+  including calls in untaken branches. Every participating rule is analyzed over
+  its declared input domain, independently of an individual invocation.
+- Unknown analysis, incompatible types, excessive analysis or unsafe arithmetic
+  is a compilation error. Diagnostics identify the rule, binding/output, and the
+  failed operation or unsupported obligation.
+
+This is conservative interval analysis. It does not refine an input interval
+from `if` conditions or correlate repeated uses of a value. Even a statically
+untaken branch must satisfy the contract. A safe program can be refused: rewrite
+it or state a narrower input domain that the entry will enforce.
+
+## Scope and representation
+
+Participating rules are pure and acyclic, with number/bool outputs, numeric
+literals/fields, lexical scalar lets, arithmetic, comparisons, boolean operations,
+`min`, `max`, `abs` and conditionals. Inputs are nonempty flat concepts of numbers
+and text; text fields can be carried but not read by checked expressions. Calls
+must be `callee(input)` with the same input concept and an unshadowed input name.
+Numeric local aliases and rebinding are supported. Record construction, collections,
+Results, effects, context inputs, services and reactions are refused in this slice.
+Rules disconnected from the contract retain their existing acceptance rules.
+
+Analysis is limited to 100000 expression visits, 256 expression levels and 128
+nested calls. Native call expansion is separately limited to 100000 nodes and a
+conservative 2 MiB frame ceiling. These are compiler/storage limits, not CPU-time
+or whole-process memory bounds.
+
+Native lowering shares the checked scalar/frame machinery with `try_byte_at`:
+acyclic calls expand into fresh lexical scopes, lets evaluate once and each numeric
+value occupies one 64-bit slot. Input fields and local variables remain distinct
+even when their names match. Arithmetic uses the signed operations whose safety
+was proved. This path avoids legacy constant-division rewrites that do not preserve
+negative signed division. It reserves fixed stack storage, with no allocator or
+runtime interval analysis. General optimizations/SIMD hints are not used on this
+path; correctness and proof preservation take precedence over their optimization.
+No claim of equal performance to the old emission path is made.
+
+## Entry behavior and support
+
+| Path | Support |
+|---|---|
+| Rust verifier | Strict analysis above, including callers/dependencies |
+| Interpreter | Checked input types/bounds before each participating rule |
+| Native Linux x86-64 | Single-rule argv entry, including expanded calls |
+| Native stdin/raw/stream/multi-rule/legacy HTTP | Explicit refusal before artifact creation |
+| WASM | Explicit refusal: contract input guards are not implemented |
+| Self-hosted compiler | Every `overflow` entry refused before ELF/raw emission |
+
+Native numeric arguments must be `[-]digits`, within i64 and any declared field
+range. Incomplete records, empty strings, a sign alone, nondigits and overflowing decimal strings exit
+1 before that record's body. Leading zeroes and negative zero are accepted.
+Number outputs print a decimal plus newline; bool outputs preserve existing
+true/false output and sticky false exit status. Invalid input does not undo output
+from earlier records. Malformed/out-of-range fields and partial trailing records have no stderr
+payload. Too few arguments for the first record retain the existing
+`error: not enough arguments` diagnostic. Interpreter errors retain their
+diagnostic message.
+
+## Migration and remaining limits
+
+Existing `overflow` programs whose claimed proof was unknown can now fail
+compilation. `pricing.verbose` declares amount/tax bounds explicitly so its
+participating arithmetic is provable. Self-hosted compilation of previously
+accepted `overflow` examples is deliberately refused until it can establish this
+contract. This is a capability refusal, not self-hosted interval verification.
+
+The optimizer/native interval helpers also stop inventing nonnegative ranges for
+unbounded fields outside this contract. That correction does not establish a
+general proof for legacy programs. `termination.bound` remains structural;
+business intent, arbitrary effects and source-to-binary equivalence remain outside
+the verifier's guarantees. The CLI therefore reports “supported source checks
+passed”, rather than “all proofs check out”. Its benchmark summary lists declared
+hints without claiming that every backend applied them.
+
+Regression tests cover arithmetic intervals against exhaustive small signed
+domains, i64 extremes, hidden failures, alias/shadowing/call composition, native
+versus interpreter results, malformed inputs and artifact-preserving refusals.

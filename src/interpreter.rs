@@ -300,11 +300,13 @@ pub fn eval_rule_with_value(
 ) -> Result<Value, RuntimeError> {
     // Callers participate even when the bounded callee sits in an untaken
     // branch. Enforce the same input assumptions as the native entry guards.
-    if rule.output_text_max.is_some() || crate::text_bounds::participating(all_rules).contains(&rule.name) {
+    let numeric = crate::numeric_bounds::participating(all_rules).contains(&rule.name);
+    if numeric || rule.output_text_max.is_some() || crate::text_bounds::participating(all_rules).contains(&rule.name) {
+        let contract = if numeric { "strict overflow contract" } else { "bounded text output" };
         let concept = concepts.iter().find(|c| rule.input_ty == Type::Named(c.name.clone()))
-            .ok_or_else(|| RuntimeError { message: "bounded text output: unknown input concept".into() })?;
+            .ok_or_else(|| RuntimeError { message: format!("{contract}: unknown input concept") })?;
         let Value::Record(fields) = &input_value else {
-            return Err(RuntimeError { message: "bounded text output requires a record input".into() });
+            return Err(RuntimeError { message: format!("{contract} requires a record input") });
         };
         for field in &concept.fields {
             let valid = match (&field.ty, fields.get(&field.name)) {
@@ -313,7 +315,7 @@ pub fn eval_rule_with_value(
                 _ => false,
             };
             if !valid {
-                return Err(RuntimeError { message: format!("bounded text output: input field '{}' violates its declared type or bound", field.name) });
+                return Err(RuntimeError { message: format!("{contract}: input field '{}' violates its declared type or bound", field.name) });
             }
         }
     }
@@ -368,8 +370,10 @@ fn eval_expr(
             match (op, &l, &r) {
                 (BinOp::Eq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a == b)),
                 (BinOp::Eq, Value::Text(a), Value::Text(b)) => Ok(Value::Bool(a == b)),
+                (BinOp::Eq, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a == b)),
                 (BinOp::NotEq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a != b)),
                 (BinOp::NotEq, Value::Text(a), Value::Text(b)) => Ok(Value::Bool(a != b)),
+                (BinOp::NotEq, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a != b)),
                 (BinOp::Add, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
                 (BinOp::Sub, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
                 (BinOp::Mul, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),

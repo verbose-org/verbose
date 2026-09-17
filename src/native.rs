@@ -52,6 +52,9 @@ pub fn compile_native_multi(
     if rule_names.len() == 1 {
         return compile_native(program, rule_names[0], output_path, stdin, stream);
     }
+    if rule_names.iter().any(|n| crate::numeric_bounds::active_rules(program).contains(*n)) {
+        return Err(NativeError { message: "strict overflow contracts do not support multi-rule native entry".into() });
+    }
 
     if stream {
         return Err(NativeError { message: "--stream is not supported with multi-rule binaries".into() });
@@ -134,6 +137,15 @@ fn compile_native_code(
 ) -> Result<Vec<u8>, NativeError> {
     if let Some(error) = crate::text_bounds::verify_mode(program, true).first() {
         return Err(NativeError { message: error.to_string() });
+    }
+    if let Some(error) = crate::numeric_bounds::verify(program).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
+    if crate::numeric_bounds::active_rules(program).contains(rule_name) {
+        if stdin_raw || stdin || stream {
+            return Err(NativeError { message: "strict overflow contracts currently support native argv records only".into() });
+        }
+        return bounded::compile(program, rule_name);
     }
     if crate::bounds::active_rules(program).contains(rule_name) {
         if stdin_raw || stdin || stream {
@@ -1191,9 +1203,14 @@ struct RecordLoopCtx<'a> {
 /// to stderr and exit(1). Prevents segfaults on wrong argument count.
 /// Must be emitted AFTER `mov r12, [rsp]`.
 fn emit_argc_guard(code: &mut Vec<u8>, min_argc: i32) {
-    // cmp r12d, min_argc (imm8 — min_argc always < 127 in practice)
-    code.extend_from_slice(&[0x41, 0x83, 0xFC]);
-    code.push(min_argc as u8);
+    // imm8 is signed; wide input concepts need the imm32 form.
+    if min_argc <= 127 {
+        code.extend_from_slice(&[0x41, 0x83, 0xFC]);
+        code.push(min_argc as u8);
+    } else {
+        code.extend_from_slice(&[0x41, 0x81, 0xFC]);
+        code.extend_from_slice(&min_argc.to_le_bytes());
+    }
     // jge .ok (short forward jump, patched below)
     code.push(0x7D);
     let ok_patch = code.len();
@@ -4860,6 +4877,9 @@ fn emit_record_loop_prologue<'a>(
     // callers reserving, 292 rule-binaries across 11 files change bytes; with
     // only `emit_full_program`, 162 across 2.
     reserve_match_binder_pool: bool,
+    // Checked numeric lowering reserves synthetic scratch lets without
+    // evaluating them; its emitter writes each slot before reading it.
+    numeric_scratch: bool,
 ) -> Result<RecordLoopCtx<'a>, NativeError> {
     let n_ctx = context_concept.map_or(0, |c| c.fields.len());
     let nfields = input_concept.fields.len();
@@ -5362,6 +5382,15 @@ fn emit_record_loop_prologue<'a>(
     let exit_patch = code.len();
     code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
+    if numeric_scratch {
+        // A partial final record must fail before dereferencing argv[argc].
+        code.extend_from_slice(&[0x4c, 0x89, 0xf0, 0x48, 0x05]); // mov rax,r14; add rax,nfields
+        code.extend_from_slice(&(nfields as i32).to_le_bytes());
+        code.extend_from_slice(&[0x4c, 0x39, 0xe0, 0x0f, 0x8f]); // cmp rax,r12; jg abort
+        resource_abort_patches.push(code.len());
+        code.extend_from_slice(&[0; 4]);
+    }
+
     // Phase B slice 4a.3: when the input is a group concept (sum type
     // with `variants:` but no `fields:`), treat it as a single i64
     // index slot keyed by the rule's `input_name`. The argv entry is
@@ -5406,7 +5435,11 @@ fn emit_record_loop_prologue<'a>(
         code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
         match field.ty {
             Type::Number => {
-                emit_atoi_inline(code);
+                if numeric_scratch {
+                    emit_checked_atoi_inline(code, &mut resource_abort_patches);
+                } else {
+                    emit_atoi_inline(code);
+                }
                 // Runtime input bounds-check (2026-05-20). When the field
                 // has an explicit `[min, max]` declaration, enforce it at
                 // load time — sys_exit(1) on out-of-range. Surfaces a
@@ -5498,6 +5531,11 @@ fn emit_record_loop_prologue<'a>(
     // let with the same name as a resource at the resource-name check).
     let mut next_slot = -(((n_ctx + nfields) as i32 + 1) * 8);
     for (idx, (name, expr)) in rule.logic.bindings.iter().enumerate() {
+        if numeric_scratch {
+            binding_offsets.insert(name.as_str(), next_slot);
+            next_slot -= 8;
+            continue;
+        }
         if binding_is_text[idx] {
             // Produce (rax, rdx). Note: concat RHS allocates a stack buffer
             // below rsp; it stays live until the record loop epilogue restores
@@ -5771,7 +5809,7 @@ fn emit_full_program<'a>(
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
-    let mut ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, all_entropies, concept_group, true)?;
+    let mut ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, all_entropies, concept_group, true, false)?;
 
     // Phase B slice 4a.2 — build an arena context iff the program
     // declares a concept_group. Non-group programs pass `None` (byte-
@@ -6018,6 +6056,7 @@ fn emit_self_recursive_program<'a>(
         // The SCC's `match`es are emitted inside callables, each of which
         // reserves its own binder pool in its own frame. `_start` never runs
         // one, so it needs none.
+        false,
         false,
     )?;
     // Slice agg-2c — allocate the outermost destination FIRST, so that after
@@ -8094,7 +8133,7 @@ fn emit_text_program<'a>(
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false, false)?;
 
     // Phase 2I — pass the text_bindings built from the prologue's let-eval
     // loop so text-write resolves Ident(let-name) as a BoundText (same path
@@ -8201,7 +8240,7 @@ fn emit_bytes_program<'a>(
         }
     }
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false, false)?;
 
     // The streaming body needs the in-scope bindings the prologue populated so
     // a future le32(<field>) can read a field. r11 is not live here (no arena),
@@ -11098,7 +11137,7 @@ fn emit_result_program<'a>(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false, false)?;
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
@@ -12154,7 +12193,7 @@ fn emit_record_program<'a>(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false, false)?;
 
     emit_eval_record_expr(
         &mut code,
@@ -15188,7 +15227,7 @@ fn emit_reaction_program<'a>(
     // Both Print and AppendFile effects are handled below.
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false)?;
+    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections, all_entropies, concept_group, false, false)?;
 
     // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
     emit_eval_expr(
@@ -15433,7 +15472,7 @@ fn build_field_ranges(concept: &Concept) -> HashMap<&str, (i64, i64)> {
         .iter()
         .filter(|f| f.ty == Type::Number)
         .map(|f| {
-            let range = f.range.unwrap_or((0, i32::MAX as i64));
+            let range = f.range.unwrap_or((i64::MIN, i64::MAX));
             (f.name.as_str(), range)
         })
         .collect()
@@ -19477,6 +19516,50 @@ fn emit_parse_int(
 }
 
 /// Inline atoi: parse null-terminated decimal string at rdi into rax.
+/// Strict contract entry: [-]digits only, representable as an i64. Accumulate
+/// negatively so MIN is accepted without an overflowing positive intermediate.
+fn emit_checked_atoi_inline(code: &mut Vec<u8>, aborts: &mut Vec<usize>) {
+    fn jump(code: &mut Vec<u8>, op: &[u8]) -> usize {
+        code.extend_from_slice(op);
+        let p = code.len();
+        code.extend_from_slice(&[0; 4]);
+        p
+    }
+    fn patch(code: &mut [u8], p: usize, to: usize) {
+        code[p..p + 4].copy_from_slice(&(to as i32 - p as i32 - 4).to_le_bytes());
+    }
+    code.extend_from_slice(&[0x31, 0xc0, 0x31, 0xc9]); // xor eax,eax; xor ecx,ecx
+    code.extend_from_slice(&[0x80, 0x3f, b'-']); // cmp byte [rdi],'-'
+    let unsigned = jump(code, &[0x0f, 0x85]);
+    code.extend_from_slice(&[0xb1, 1, 0x48, 0xff, 0xc7]); // negative flag; inc rdi
+    let target = code.len();
+    patch(code, unsigned, target);
+    // A sign alone and the empty string are not numbers.
+    code.extend_from_slice(&[0x80, 0x3f, 0]);
+    aborts.push(jump(code, &[0x0f, 0x84]));
+    let top = code.len();
+    code.extend_from_slice(&[0x0f, 0xb6, 0x17, 0x84, 0xd2]); // movzx edx,[rdi]; test dl,dl
+    let done = jump(code, &[0x0f, 0x84]);
+    code.extend_from_slice(&[0x83, 0xea, b'0', 0x83, 0xfa, 9]); // digit in 0..9 (unsigned)
+    aborts.push(jump(code, &[0x0f, 0x87]));
+    code.extend_from_slice(&[0x48, 0x6b, 0xc0, 10]); // imul rax,rax,10
+    aborts.push(jump(code, &[0x0f, 0x80])); // jo
+    code.extend_from_slice(&[0x48, 0x29, 0xd0]); // sub rax,rdx
+    aborts.push(jump(code, &[0x0f, 0x80]));
+    code.extend_from_slice(&[0x48, 0xff, 0xc7]);
+    let back = jump(code, &[0xe9]);
+    patch(code, back, top);
+    let target = code.len();
+    patch(code, done, target);
+    code.extend_from_slice(&[0x84, 0xc9]); // test cl,cl
+    let negative = jump(code, &[0x0f, 0x85]);
+    code.extend_from_slice(&[0x48, 0xf7, 0xd8]); // neg rax
+    aborts.push(jump(code, &[0x0f, 0x80]));
+    let target = code.len();
+    patch(code, negative, target);
+}
+
+/// Legacy unvalidated decimal conversion, retained outside strict contracts.
 fn emit_atoi_inline(code: &mut Vec<u8>) {
     // xor rax, rax
     code.extend_from_slice(&[0x48, 0x31, 0xC0]);
@@ -21147,6 +21230,9 @@ pub fn compile_service(
     service_name: &str,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    if let Some(error) = crate::numeric_bounds::verify(program).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
     if let Some(error) = crate::text_bounds::verify_mode(program, true).first() {
         return Err(NativeError { message: error.to_string() });
     }
@@ -25031,6 +25117,9 @@ pub fn compile_http_server(
     port: u16,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    if crate::numeric_bounds::active_rules(program).contains(rule_name) {
+        return Err(NativeError { message: "strict overflow contracts do not support the legacy HTTP shell".into() });
+    }
     // Compile the rule code (argv mode, no stdin/stream).
     // The rule must use the standard push rbp/mov rbp, rsp prologue —
     // vectorized and parallel programs have different stack layouts.
@@ -55593,10 +55682,15 @@ rule two
         // 4. END TO END: the restored files must actually EMIT again. Post-#141
         //    they were refused outright (the truncation guard firing), so this
         //    is the corpus-level statement of the same fix.
-        for file in ["examples/showcase.verbose", "examples/invoices.verbose"] {
+        for file in ["examples/business.verbose", "examples/invoices.verbose"] {
             let (rc, stdout) = run(&emitter, file);
-            assert_eq!(rc, 0, "{file} must emit (exit 0) once `hints:` is consumed");
-            assert!(!stdout.is_empty(), "{file} must emit a non-empty ELF");
+            assert_eq!(rc, 0, "{file} must emit once non-overflow hints are consumed");
+            assert!(!stdout.is_empty());
+        }
+        for file in ["examples/showcase.verbose", "examples/pricing.verbose", "examples/generated.verbose", "examples/deadcode.verbose"] {
+            let (rc, stdout) = run(&emitter, file);
+            assert_eq!(rc, 1, "{file}: self-hosted overflow contracts are unsupported");
+            assert!(stdout.is_empty(), "refusal must precede emission");
         }
 
         // 5. NO BLANKET SKIP — the DEDENT discriminator. A STRAY COLUMN-0
@@ -56694,7 +56788,7 @@ rule pick
         // stays 97; no gaps-table row moves (the record-let row's declared-
         // entry half is unreachable here because the handler gate fires
         // first).
-        const EXPECTED_ACCEPTED: usize = 97;
+        const EXPECTED_ACCEPTED: usize = 93;
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.
@@ -56702,8 +56796,10 @@ rule pick
         // http_shutdown adds an explicitly refused SIGTERM lifecycle contract.
         // Bounded text capacity/storage examples remain explicit gen0 refusals.
         // http_bounded_log adds another bounded-text refusal (exit 1, no bytes);
-        // the accepted count stays 97. Pin ELF/raw refusal in text_bounds tests.
-        const EXPECTED_TOTAL: usize = 173;
+        // Strict overflow refuses the four previously accepted examples:
+        // deadcode, generated, pricing and showcase. The new strict_overflow
+        // example is another refusal. Pin both ELF and raw output separately.
+        const EXPECTED_TOTAL: usize = 174;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
@@ -57030,24 +57126,9 @@ rule pick
             //     needs no new anchor because a parsed RuleDecl already carries
             //     `rd_name_start`, its own name's byte offset. See the
             //     "@layer STRATIFICATION" banner in examples/vexprparse.verbose.
-            // (2) the `hints:` block — 1 of the original 4. `hint_unknown_name`,
-            //     `hint_bare_no_justification` and `hint_overflow_inverted`
-            //     were CLOSED by gen0's `hint_errors` token walk (see
-            //     "HINTS-BLOCK CHECKS" in examples/vexprparse.verbose). This
-            //     one is NOT the same shape as its `_inverted` sibling: it
-            //     needs the declared interval checked AGAINST the rule's
-            //     computed range, i.e. interval arithmetic over the logic.
-            //
-            //     THIS ROW IS NOW ALONE IN NEEDING THAT, and the correction is
-            //     worth keeping: it used to be grouped with
-            //     `termination_bound_short` as "the same absent machinery",
-            //     and that pairing was WRONG. verbosec's `count_operations` is
-            //     a plain structural node count (every arm `1 + sum(children)`,
-            //     literals 0, `Field` a pass-through) — no interval arithmetic
-            //     anywhere — so the termination row was a walk, not an arc, and
-            //     closed as one. `hint_overflow_bad` genuinely needs abstract
-            //     interpretation over the logic; nothing else here does.
-            "hint_overflow_bad",
+            // (2) All overflow contracts now refuse in gen0 until it has
+            // interval proofs and input guards; hint_overflow_bad is mirrored
+            // by capability refusal, not by a self-hosted proof.
             // (3) purity / termination analyses one-directional or absent — was
             //     3, now 0. `purity_reads_extra` and `purity_calls_extra` were
             //     CLOSED 2026-08-14 (`purity_errors` gained `extra_reads` +
@@ -59247,16 +59328,9 @@ rule pick
     /// validity is asserted first, so a mis-written case fails as a fixture
     /// bug instead of being read as a compiler finding.
     ///
-    /// THE ONE DELIBERATE DISAGREEMENT is `overflow_too_narrow`
-    /// (`overflow : [0, 2]` on a rule whose computed range is `[-500, 500]`).
-    /// verbosec refuses it by interval arithmetic; gen0 accepts it and is
-    /// asserted to accept it. Naming the surviving gap in the test — rather
-    /// than omitting the case — is what stops it being quietly forgotten, and
-    /// it is also the discriminator that proves the three closed checks are
-    /// not just "gen0 refuses anything with a hints block".
-    ///
-    /// Verified to FAIL pre-change: against a gen0 built from the parent
-    /// commit all 7 refusing cases came back rc 0.
+    /// Strict overflow migration: valid Rust overflow contracts are explicit
+    /// gen0 refusals until interval proofs and input guards are implemented.
+    /// Other hints retain the accepting/refusing parity matrix.
     #[test]
     #[ignore = "builds gen0 from the full self-source; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
@@ -59379,31 +59453,12 @@ rule pick
             );
 
             let gen0_ok = run_gen0(name, &prog_src);
-            assert_eq!(
-                gen0_ok, vc_ok,
-                "case '{name}' ({entries:?}): gen0 {} it, verbosec {} it.\n\
-                 \n\
-                 gen0 ACCEPTED what verbosec refuses -> `hint_errors` regressed, \
-                 or the block ANCHOR stopped matching. The anchor is the \
-                 four-token run Ident(\"hints\") ':' Newline Indent; if the \
-                 tokenizer's kind codes moved (600 Newline / 700 Indent / \
-                 800 Dedent), every block becomes invisible and this whole \
-                 check silently does nothing.\n\
-                 gen0 REFUSED what verbosec accepts -> a FALSE POSITIVE, the \
-                 failure mode this check must not have. Check the byte values \
-                 in the span_is_* predicate for that hint name, and remember \
-                 `cache_result` has no coverage anywhere in examples/.",
-                if gen0_ok { "accepted" } else { "refused" },
-                if vc_ok { "accepts" } else { "refuses" }
-            );
+            let unsupported = entries.iter().any(|e| e.starts_with("overflow"));
+            assert_eq!(gen0_ok, vc_ok && !unsupported,
+                "case '{name}': non-overflow hints must agree; overflow contracts must refuse in gen0");
         }
 
-        // THE SURVIVING GAP, asserted rather than omitted. `[0, 2]` against a
-        // computed range of [-500, 500] needs interval arithmetic over the
-        // logic; gen0 has none, so it accepts. This case is also the
-        // discriminator that the three closed checks are real: a gen0 that
-        // simply refused every program carrying a `hints:` block would pass
-        // every refusing case above and fail here.
+        // Too-narrow and valid overflow contracts both refuse in gen0.
         let narrow = build(&["overflow : [0, 2]"]);
         let vc_narrow = (|| {
             let t = match crate::lexer::Lexer::new(&narrow).tokenize() { Ok(t) => t, Err(_) => return false };
@@ -59411,16 +59466,7 @@ rule pick
             crate::verifier::verify_program(&p, &tmp).is_empty()
         })();
         assert!(!vc_narrow, "fixture bug: verbosec must refuse overflow [0, 2] on a rule whose range is [-500, 500]");
-        assert!(
-            run_gen0("overflow_too_narrow", &narrow),
-            "gen0 REFUSED `overflow : [0, 2]`. That is the interval-arithmetic \
-             gap (`hint_overflow_bad`), which gen0 is documented NOT to check — \
-             so either a check has become over-broad (it must fire on min > max \
-             only, never on a well-ordered interval), or the gap genuinely \
-             closed, in which case delete `hint_overflow_bad` from the negative \
-             sweep's KNOWN_GAPS, update CLAUDE.md's gaps table and flip this \
-             assertion in the same commit."
-        );
+        assert!(!run_gen0("overflow_too_narrow", &narrow));
 
         let _ = fs::remove_dir_all(&tmp);
     }

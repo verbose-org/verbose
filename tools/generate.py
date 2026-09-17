@@ -306,20 +306,32 @@ The pattern: walk every field access in `logic:`, ask "is the base
 identifier the rule's input variable, or is it bound by a lambda
 above this point?" Only the input-variable accesses go in `reads:`.
 
-### Hints (optional, each MUST carry a string justification)
+### Hints (optional; optimization hints require a string justification)
 
       hints:
         vectorizable : "scalar arithmetic, no calls or cross-element deps"
         parallel     : "each iteration independent of the others"
         cache_result : "expensive pure rule reused multiple times"
-        overflow     : [min, max]                    -- output bounds
+        overflow     : [min, max]                    -- strictly checked numeric contract
+
+`overflow` is a strict numeric obligation. Every intermediate operation,
+including unused lets and conditions, must be safe over the declared input domain.
+Missing numeric bounds mean the full signed i64 range. Unknown analysis is rejected.
+The supported call graph is pure and acyclic: number/bool outputs, numeric scalar
+lets/arithmetic/comparisons/conditions, and `callee(input)` calls forwarding the same
+concept. Bounds are checked on external inputs. Collections, constructed call
+arguments, effects/services and Results are outside this contract. Rewrite the
+calculation or declare justified input bounds when a proof fails; do not remove
+an intended contract just to make compilation succeed. Native argv/interpreter
+support this subset; WASM and self-hosted emission refuse overflow contracts.
 
 ### Rules the verifier will reject
 
 - `reads:` includes a field never touched by `logic:`, OR omits one that is touched.
 - `calls:` includes a rule never invoked, OR omits one that is.
 - `bound:` is less than the actual operation count in `logic:`.
-- A hint lacks a string justification (bare keyword).
+- An optimization hint lacks a string justification (bare keyword).
+- An overflow interval or any intermediate arithmetic cannot be proved safe.
 - `@source` line number falls outside the `.intent` file's range.
 - An expression construct unknown to the grammar above (made-up keyword).
 """

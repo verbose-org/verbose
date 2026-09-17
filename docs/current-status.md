@@ -119,10 +119,11 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   runtime check to the handler's constructor argument to use client-only abort.
 - `termination.bound` counts expression structure, not total runtime work.
   Recursion checks are separate.
-- Overflow hints are checked when an interval can be computed. An unknown interval
-  is currently accepted without establishing the hint. The signed-modulo interval
-  defect is fixed in the Rust verifier; see the regression and remaining limits
-  in the proof document.
+- [Numeric overflow contracts](numeric-overflow.md) now require known intervals
+  and safe intermediate arithmetic across their supported pure acyclic call graph.
+  Unknown analysis is refused; unbounded numeric inputs use the full i64 domain.
+  Interpreter/native argv entries enforce the premises. WASM/self-hosted emission
+  refuses the contract until it can provide those guarantees.
 - Source-to-binary semantic equivalence is not independently proved by the x86
   instruction decoder. Compiler and optimizer correctness remain trusted.
 - The bootstrap checks `gen1 == gen2` for the self-source, plus refusal and

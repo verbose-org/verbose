@@ -43,7 +43,7 @@ See [the contract and support matrix](bounded-text-output.md).
 
 | Field | Category | What the compiler does | Source |
 |---|---|---|---|
-| `overflow: [min, max]` | semantic | Checks `[min, max]` covers the interval when analysis can compute it. An unknown interval is currently accepted without establishing the hint; see the limitations below. | `src/verifier.rs:compute_range` |
+| `overflow: [min, max]` | semantic | Requires a known output interval and safe intermediate arithmetic, with enforced input premises. Unsupported forms are refused; see [numeric contracts](numeric-overflow.md). | `src/numeric_bounds.rs` |
 | `vectorizable: "reason"` | semantic | Verifier enforces "no calls" (independence) + pure logic shape. Native can emit SIMD. The justification string is audit surface — why the AI / human believes SIMD is safe here. | `src/verifier.rs:check_hints` |
 | `parallel: "reason"` | semantic | Same pattern: independence claim, justification is audit surface. | `src/verifier.rs:check_hints` |
 | `cache_result: "reason"` | semantic | Memoization claim, justification is audit surface. | `src/verifier.rs:check_hints` |
@@ -103,13 +103,12 @@ and one call node. It is not a bound on total instructions, iterations, elapsed
 time, or the lifetime of a service. The `structural`, `decreasing`, and `increasing`
 declarations are separate recursion checks.
 
-Overflow analysis can return no interval, including for unsupported expression
-shapes and arithmetic it cannot bound. `check_hints` currently accepts that case;
-an accepted hint is therefore not necessarily an established range. The global
-`all proofs check out` message must be read within this limitation.
-For numeric input fields without a declared range, this pass currently assumes
-`[0, 2147483647]`; it does not establish that arbitrary signed input satisfies
-that assumption. Explicit field ranges remain premises of the interval analysis.
+[Strict numeric overflow analysis](numeric-overflow.md) now refuses unknown
+intervals, including unsafe intermediates in lets and conditions. Unbounded
+numeric fields use the full i64 domain. Interpreter/native argv entries enforce
+the input ranges assumed by participating rules; other entry paths explicitly
+refuse the contract. This is a scoped pure acyclic proof, not a global guarantee
+for legacy programs. The CLI reports `supported source checks passed`.
 
 A **signed-modulo counterexample was reproduced on 2026-09-05**: with
 `value : number [-20, 20]`, a rule returning `value % 10` was accepted with
@@ -119,8 +118,8 @@ bounds follow the dividend's sign and use the largest absolute divisor endpoint.
 The example computes `[-9, 9]`, rejecting `[0, 9]` and accepting `[-9, 9]`.
 Regression tests exhaust small intervals and cover 64-bit extremes. Divisor ranges
 containing zero or a possible `i64::MIN % -1` return an unknown interval; negation
-that cannot fit in an `i64` does too. The unknown-interval limitation above still
-applies. The self-hosted verifier is unchanged.
+that cannot fit in an `i64` does too. The strict numeric contract rejects those cases. The self-hosted compiler now
+refuses every overflow contract until it can implement the proof and entry guards.
 
 `@intention` and hint justification strings carry human-readable meaning. The
 compiler does not prove that those explanations are true. Likewise, a literal
