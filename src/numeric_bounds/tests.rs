@@ -565,12 +565,23 @@ fn two_generation_numeric_contract_self_hosted_refuses_before_emission() {
     let p = parse(include_str!("../../examples/vexprparse.verbose"));
     let dir = std::env::temp_dir().join(format!("verbose-numeric-self-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
+    let source = include_str!("../../examples/strict_overflow.verbose");
+    let clean = source
+        .replace("overflow : [-150, 150]", "cache_result : \"overflow\"")
+        .replace("overflow : [-299, 301]", "cache_result : \"overflow\"")
+        .replace("reading", "overflow")
+        .replace("product", "hints");
     for entry in ["elf_program_src", "x86_program_src"] {
         let bin = dir.join(entry);
         crate::native::compile_native_stdin_raw(&p, entry, bin.to_str().unwrap()).unwrap();
-        for src in [
-            include_str!("../../examples/strict_overflow.verbose").to_owned(),
-            include_str!("../../examples/strict_overflow.verbose").replace("[-150, 150]", "[0, 0]"),
+        for (src, expected_status) in [
+            (source.to_owned(), 1),
+            (source.replace("[-150, 150]", "[0, 0]"), 1),
+            (
+                source.replace("  hints:\n    overflow : [-150, 150]\n", ""),
+                1,
+            ),
+            (clean.clone(), 0),
         ] {
             let mut child = Command::new("sh")
                 .args([
@@ -591,8 +602,8 @@ fn two_generation_numeric_contract_self_hosted_refuses_before_emission() {
                 .write_all(src.as_bytes())
                 .unwrap();
             let out = child.wait_with_output().unwrap();
-            assert_eq!(out.status.code(), Some(1), "{entry}: {out:?}");
-            assert!(out.stdout.is_empty());
+            assert_eq!(out.status.code(), Some(expected_status), "{entry}: {out:?}");
+            assert_eq!(out.stdout.is_empty(), expected_status != 0);
             assert!(out.stderr.is_empty());
         }
     }

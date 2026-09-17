@@ -11017,7 +11017,7 @@ rule hint_block_errors
 -- (`peek_kind == 0`, which `head_tok` also yields for Nil), so the backstop is
 -- the finite token list -- the same argument `tokenize` itself carries.
 rule hint_errors
-  @intention: "Number of hints-block defects verbosec refuses (unknown hint name, missing/empty justification, inverted overflow interval) across the whole program"
+  @intention: "Count unknown hints, missing justifications and unsupported overflow contracts across the whole program"
   @source: vexprparse.intent:63
   input:
     ps : ProgramState
@@ -11034,6 +11034,52 @@ rule hint_errors
     purity:
       reads : [ps.cell, ps.src]
       calls : [peek_kind, advance, span_is_hints, peek_start, peek_len, peek_op_code, hint_block_errors, hint_errors]
+    termination:
+      bound : 512
+
+
+-- The raw x86 probe does not run the full proof verifier. It still refuses
+-- unsupported overflow contracts, without broadening its other acceptance
+-- rules. Anchor this check to hints entries: identifiers and strings spelling
+-- overflow elsewhere are not contracts.
+rule overflow_block_errors
+  @intention: "Detect an unsupported overflow entry in one hints block"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(ps.cell)
+    let isid = peek_is_ident(ps.cell)
+    let nxt = advance(Advance { lst: ps.cell, k: 1 })
+    out = if knd == 0 or knd == 800 then 0 else if knd == 600 or knd == 700 then overflow_block_errors(ProgramState { cell: nxt, src: ps.src }) else if isid == 0 then 0 else if span_is_overflow(SpanCheck { src: ps.src, start: peek_start(ps.cell), len: peek_len(ps.cell) }) == 1 then 1 else overflow_block_errors(ProgramState { cell: hint_skip_line(ParseState { cell: ps.cell }), src: ps.src })
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [peek_kind, peek_is_ident, advance, overflow_block_errors, span_is_overflow, peek_start, peek_len, hint_skip_line]
+    termination:
+      bound : 512
+
+
+rule overflow_contract_errors
+  @intention: "Detect unsupported overflow contracts before raw machine-code emission"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(ps.cell)
+    let nxt = advance(Advance { lst: ps.cell, k: 1 })
+    let is_h = span_is_hints(SpanCheck { src: ps.src, start: peek_start(ps.cell), len: peek_len(ps.cell) })
+    let opened = if is_h == 0 then 0 else if peek_op_code(nxt) == 10 and (peek_kind(advance(Advance { lst: nxt, k: 1 })) == 600 and peek_kind(advance(Advance { lst: nxt, k: 2 })) == 700) then 1 else 0
+    let here = if opened == 1 then overflow_block_errors(ProgramState { cell: advance(Advance { lst: nxt, k: 3 }), src: ps.src }) else 0
+    out = if knd == 0 then 0 else if here > 0 then 1 else overflow_contract_errors(ProgramState { cell: nxt, src: ps.src })
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [peek_kind, advance, span_is_hints, peek_start, peek_len, peek_op_code, overflow_block_errors, overflow_contract_errors]
     termination:
       bound : 512
 
@@ -31327,11 +31373,11 @@ rule x86_program_src
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
     let svcs = parse_services(ProgramState { cell: toks, src: s.source })
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
-    out = concat(abort_if(bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
+    out = concat(abort_if(overflow_contract_errors(ProgramState { cell: toks, src: s.source }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
+      calls : [overflow_contract_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
     termination:
       bound : 256
 
@@ -35641,4 +35687,3 @@ rule count_cells_src
       calls : [tokenize, count_cells]
     termination:
       bound : 256
-
