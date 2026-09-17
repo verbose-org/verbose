@@ -5,6 +5,8 @@ use crate::ast::*;
 use crate::verifier::{walk_expr_children, VerifyError};
 use std::collections::{BTreeSet, HashMap};
 
+pub(crate) mod native_opt;
+
 pub fn has_contract(r: &Rule) -> bool {
     r.hints.as_ref().and_then(|h| h.overflow.as_ref()).is_some()
 }
@@ -95,7 +97,25 @@ struct Check<'a> {
     cache: HashMap<String, Value>,
     steps: usize,
 }
-impl Check<'_> {
+impl<'a> Check<'a> {
+    fn new(p: &'a Program) -> Self {
+        Self {
+            rules: p
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Rule(r) => Some((r.name.as_str(), r)),
+                    _ => None,
+                })
+                .collect(),
+            concepts: iter_all_concepts(&p.items)
+                .map(|c| (c.name.as_str(), c))
+                .collect(),
+            visiting: BTreeSet::new(),
+            cache: HashMap::new(),
+            steps: 0,
+        }
+    }
     fn rule(&mut self, name: &str) -> Result<Value, String> {
         if let Some(v) = self.cache.get(name) {
             return Ok(*v);
@@ -296,22 +316,7 @@ pub fn verify(p: &Program) -> Vec<VerifyError> {
     if active.is_empty() {
         return vec![];
     }
-    let mut check = Check {
-        rules: p
-            .items
-            .iter()
-            .filter_map(|i| match i {
-                Item::Rule(r) => Some((r.name.as_str(), r)),
-                _ => None,
-            })
-            .collect(),
-        concepts: iter_all_concepts(&p.items)
-            .map(|c| (c.name.as_str(), c))
-            .collect(),
-        visiting: BTreeSet::new(),
-        cache: HashMap::new(),
-        steps: 0,
-    };
+    let mut check = Check::new(p);
     let mut errors = Vec::new();
     for name in &active {
         if let Err(message) = check.rule(name) {

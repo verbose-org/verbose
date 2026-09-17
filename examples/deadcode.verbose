@@ -1,8 +1,8 @@
 @verbose 0.1.0
 
 -- Range-analysis example: the first branch is unreachable on valid input.
--- The strict overflow contract currently preserves both branches in native
--- output until dead-branch elimination can preserve all proof obligations.
+-- Both branches must pass strict verification. Native lowering then removes
+-- the impossible branch while retaining the temperature input guard.
 
 concept Sensor
   @intention: "A sensor has a temperature value between 0 and 50 degrees"

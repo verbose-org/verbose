@@ -124,6 +124,9 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   Unknown analysis is refused; unbounded numeric inputs use the full i64 domain.
   Interpreter/native argv entries enforce the premises. WASM/self-hosted emission
   refuses the contract until it can provide those guarantees.
+  After verification, native emission precomputes constants, removes proved
+  impossible branches and reuses dead scalar scratch. Original entry guards and
+  source obligations remain; see [numeric optimization](numeric-optimization.md).
 - Source-to-binary semantic equivalence is not independently proved by the x86
   instruction decoder. Compiler and optimizer correctness remain trusted.
 - The bootstrap checks `gen1 == gen2` for the self-source, plus refusal and

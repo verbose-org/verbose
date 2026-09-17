@@ -73,6 +73,11 @@ emission explicitly refuse the contract. Historical entries below describing
 `hint_overflow_bad` as accepted by gen0 are superseded by this capability refusal,
 not by a self-hosted interval prover. See [the contract](docs/numeric-overflow.md).
 
+Follow-up: native numeric lowering now simplifies only after original-source
+verification, retains every entry guard and sizes reusable scalar scratch from
+peak liveness. Source proofs and the interpreter's acceptance stay unchanged;
+see [numeric optimization](docs/numeric-optimization.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

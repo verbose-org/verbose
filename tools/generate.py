@@ -324,6 +324,9 @@ arguments, effects/services and Results are outside this contract. Rewrite the
 calculation or declare justified input bounds when a proof fails; do not remove
 an intended contract just to make compilation succeed. Native argv/interpreter
 support this subset; WASM and self-hosted emission refuse overflow contracts.
+Native emission can precompute constants and remove proved impossible branches
+after verification. Both source branches and eager lets must still satisfy the
+contract; optimization never excuses an unsafe or unsupported expression.
 
 ### Rules the verifier will reject
 

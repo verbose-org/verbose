@@ -34,6 +34,7 @@ struct Emit<'a> {
     fields: HashMap<&'a str, i32>,
     slots: Vec<i32>,
     next: usize,
+    peak: usize,
     numeric: bool,
 }
 impl Emit<'_> {
@@ -46,6 +47,7 @@ impl Emit<'_> {
                 message: "bounded-result frame estimate exhausted".into(),
             })?;
         self.next += width;
+        self.peak = self.peak.max(self.next);
         store(&mut self.code, slot, false);
         if ty == crate::bounds::result_type() {
             store(&mut self.code, slot + 8, true);
@@ -89,6 +91,30 @@ impl Emit<'_> {
         input: &str,
         env: &HashMap<String, Local>,
     ) -> Result<Type, NativeError> {
+        let mark = self.next;
+        let value = self.expr_inner(e, input, env);
+        // The result is in registers. All slots created by this expression
+        // (including expanded callee locals) are dead, while the caller's
+        // lexical bindings and already-evaluated operands remain below mark.
+        if self.numeric {
+            self.next = mark;
+        }
+        value
+    }
+    fn expr_inner(
+        &mut self,
+        e: &Expr,
+        input: &str,
+        env: &HashMap<String, Local>,
+    ) -> Result<Type, NativeError> {
+        if self.numeric {
+            if let Expr::Binary(BinOp::Eq, a, b) = e {
+                if let (Expr::Number(a), Expr::Number(b)) = (a.as_ref(), b.as_ref()) {
+                    emit_mov_rax_imm(&mut self.code, i64::from(a == b));
+                    return Ok(Type::Bool);
+                }
+            }
+        }
         let result = crate::bounds::result_type();
         match e {
             Expr::Ident(n) if env.contains_key(n) => {
@@ -355,7 +381,55 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
         count(b, &rules, &mut nodes)?;
     }
     count(&r.logic.value, &rules, &mut nodes)?;
-    let nslots = (if numeric { 2 } else { 4 }) * (nodes + r.logic.bindings.len() + 1);
+    // Bound expansion on the original source, including branches later erased.
+    // Keep `numeric` from that source: lowering can erase its last checked call.
+    let lowered;
+    let (rules, r) = if numeric {
+        lowered = crate::numeric_bounds::native_opt::lower(p).map_err(|e| NativeError {
+            message: e.to_string(),
+        })?;
+        let rules: HashMap<_, _> = lowered
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rule(r) => Some((r.name.as_str(), r)),
+                _ => None,
+            })
+            .collect();
+        let r = rules[name];
+        (rules, r)
+    } else {
+        (rules, r)
+    };
+    let estimated = (if numeric { 2 } else { 4 }) * (nodes + r.logic.bindings.len() + 1);
+    if numeric && (concept.fields.len() + 32) * 8 > 2 * 1024 * 1024 {
+        return Err(NativeError {
+            message: "strict overflow frame exceeds 2 MiB".into(),
+        });
+    }
+    // With no context, the prologue puts one word per input at rbp-8 onward,
+    // followed by scalar scratch slots. Emit the body first to measure its
+    // peak live scratch; relative branches stay valid when the prefix is added.
+    let fields = concept
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), -((i as i32 + 1) * 8)))
+        .collect();
+    let slots: Vec<_> = (0..estimated)
+        .map(|i| -(((concept.fields.len() + i) as i32 + 1) * 8))
+        .collect();
+    let mut emit = Emit {
+        code: Vec::new(),
+        rules,
+        fields,
+        slots,
+        next: 0,
+        peak: 0,
+        numeric,
+    };
+    emit.rule(r)?;
+    let nslots = if numeric { emit.peak } else { estimated };
     if numeric && (nslots + concept.fields.len() + 32) * 8 > 2 * 1024 * 1024 {
         return Err(NativeError {
             message: "strict overflow frame exceeds 2 MiB".into(),
@@ -381,30 +455,14 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
         false,
         numeric,
     )?;
-    let slots = frame
+    debug_assert!(frame
         .logic
         .bindings
         .iter()
-        .map(|(n, _)| ctx.binding_offsets[n.as_str()])
-        .collect();
-    let fields = concept
-        .fields
-        .iter()
         .enumerate()
-        // This entry has no context: the prologue stores one word per field
-        // starting at rbp-8. Its combined binding map can be shadowed by a
-        // synthetic scratch name, so it is not the source of field offsets.
-        .map(|(i, f)| (f.name.as_str(), -((i as i32 + 1) * 8)))
-        .collect();
-    let mut emit = Emit {
-        code,
-        rules,
-        fields,
-        slots,
-        next: 0,
-        numeric,
-    };
-    emit.rule(r)?;
+        .all(|(i, (name, _))| ctx.binding_offsets[name.as_str()] == emit.slots[i]));
+    code.append(&mut emit.code);
+    emit.code = code;
     if r.output_ty == crate::bounds::result_type() {
         emit.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
         let err = jump(&mut emit.code, &[0x0f, 0x85]);

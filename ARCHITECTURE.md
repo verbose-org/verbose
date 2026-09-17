@@ -159,6 +159,9 @@ runtime instruction, latency, or service-lifetime budget.
 Range analysis computes intervals for supported expressions. The current hint
 checker for [strict numeric contracts](docs/numeric-overflow.md) refuses unknown
 intervals and verifies intermediate arithmetic and enforced input premises.
+After verification, a private [native simplification pass](docs/numeric-optimization.md)
+uses those premises for constant folding and branch selection; original entry
+guards remain, and scalar scratch is sized from maximum live storage.
 Acceptance therefore does not mean every annotation has been proved. The precise
 boundary and a recorded range-analysis counterexample are in
 [proof classification](docs/spec-proofs.md).
