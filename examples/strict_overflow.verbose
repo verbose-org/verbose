@@ -34,6 +34,7 @@ rule combined
   output:
     value : number
   logic:
+    -- first's slot can be reused after creating alias; alias stays live during second.
     let first = scaled(incoming)
     let alias = first
     let second = scaled(incoming)

@@ -76,7 +76,10 @@ not by a self-hosted interval prover. See [the contract](docs/numeric-overflow.m
 Follow-up: native numeric lowering now simplifies only after original-source
 verification, retains every entry guard and sizes reusable scalar scratch from
 peak liveness. Source proofs and the interpreter's acceptance stay unchanged;
-see [numeric optimization](docs/numeric-optimization.md).
+see [numeric optimization](docs/numeric-optimization.md). Numeric locals now also
+reuse slots after the last complete expression using their definition; this
+compiler-only placement preserves eager evaluation and protects caller values.
+See [local lifetimes](docs/numeric-local-lifetimes.md).
 
 ## Dev workflow (cidx + branch-protected main)
 

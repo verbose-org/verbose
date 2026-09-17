@@ -1,0 +1,513 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "started_utc": "2026-09-17T15:48:46.699177+00:00",
+  "revision": "a33bcb943852b433fbc1d0369d543a6839509156",
+  "working_tree_status": " M ARCHITECTURE.md\n M CLAUDE.md\n M docs/current-status.md\n M docs/numeric-optimization.md\n M docs/numeric-overflow.md\n M examples/README.md\n M examples/strict_overflow.verbose\n M src/native/bounded.rs\n M src/numeric_bounds/tests.rs\n M tools/benchmark_numeric_contract.py\n?? docs/numeric-local-lifetimes.md\n?? src/native/bounded/\n",
+  "compiler_sha256": {
+    "before": "a22c56c95b1fb67aede10b3a0010f690793da52fcdc5cae033387f2b7fbbe082",
+    "after": "4c2f824e416cfee9a9ddb0b2848cb91513c04f0cbac6a02543c36cc7016482d9"
+  },
+  "harness_sha256": "83bb13ae0d01f8906c0381595c18667eb3d56b1bfbf6292178a790afdacf721d",
+  "artifacts": "/tmp/verbose-numeric-bench-qeu7ejxj",
+  "config": {
+    "compiler": "target/release/verbosec",
+    "reference_compiler": "/tmp/verbose-numeric-lifetimes/reference-verbosec",
+    "reference_revision": "a33bcb943852b433fbc1d0369d543a6839509156",
+    "records": 16000,
+    "repeats": 11,
+    "cases": null,
+    "cpu": 2,
+    "host_note": "External host activity not independently measured",
+    "output": "/tmp/verbose-numeric-lifetimes/benchmark.json"
+  },
+  "host": {
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "affinity": [
+      2
+    ],
+    "cpu": "AMD Ryzen 7 5800X 8-Core Processor",
+    "loadavg_before": [
+      4.76953125,
+      3.70654296875,
+      2.6728515625
+    ],
+    "loadavg_after": [
+      4.17431640625,
+      3.64306640625,
+      2.6748046875
+    ]
+  },
+  "cache_counters": "not measured",
+  "cases": [
+    {
+      "name": "constants",
+      "source_sha256": "3bfdef40bfa7a441870cc5b96ca2ba764f5a699b083da316d24849be2f430791",
+      "builds": {
+        "before": {
+          "frame_bytes": 64,
+          "binary_bytes": 604,
+          "sha256": "56d0f19c9e20b14a542debb6d6b7ecae1955ce79250ad78b1728d0ac3b7bd376"
+        },
+        "after": {
+          "frame_bytes": 64,
+          "binary_bytes": 604,
+          "sha256": "56d0f19c9e20b14a542debb6d6b7ecae1955ce79250ad78b1728d0ac3b7bd376"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 18.307342,
+          "after": 14.175267
+        },
+        {
+          "after": 15.353893,
+          "before": 18.609533
+        },
+        {
+          "before": 13.611882,
+          "after": 17.788385
+        },
+        {
+          "after": 18.098797,
+          "before": 13.870599
+        },
+        {
+          "before": 11.997213,
+          "after": 15.650347
+        },
+        {
+          "after": 18.491921,
+          "before": 14.493584
+        },
+        {
+          "before": 14.175579,
+          "after": 14.696371
+        },
+        {
+          "after": 16.829428,
+          "before": 14.024765
+        },
+        {
+          "before": 15.014704,
+          "after": 17.350347
+        },
+        {
+          "after": 16.884476,
+          "before": 17.363749
+        },
+        {
+          "before": 12.631928,
+          "after": 15.704017
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 14.175579,
+          "min_ms": 11.997213,
+          "max_ms": 18.609533,
+          "mad_ms": 0.8391249999999992
+        },
+        "after": {
+          "median_ms": 16.829428,
+          "min_ms": 14.175267,
+          "max_ms": 18.491921,
+          "mad_ms": 1.179081
+        }
+      }
+    },
+    {
+      "name": "arithmetic",
+      "source_sha256": "2e5d2620468f8cd8c4b2c706405248657202d705a1679af5471a941fbeb911d7",
+      "builds": {
+        "before": {
+          "frame_bytes": 64,
+          "binary_bytes": 1352,
+          "sha256": "8dfbed0137d8cc354ea6deefe927e8284b90de8e201a2a15a76314eb79a3d621"
+        },
+        "after": {
+          "frame_bytes": 64,
+          "binary_bytes": 1352,
+          "sha256": "8dfbed0137d8cc354ea6deefe927e8284b90de8e201a2a15a76314eb79a3d621"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 11.319923,
+          "after": 14.032413
+        },
+        {
+          "after": 11.203609,
+          "before": 13.660991
+        },
+        {
+          "before": 14.844883,
+          "after": 13.990808
+        },
+        {
+          "after": 13.235478,
+          "before": 12.671286
+        },
+        {
+          "before": 11.757274,
+          "after": 18.037055
+        },
+        {
+          "after": 19.211944,
+          "before": 20.539832
+        },
+        {
+          "before": 25.430948,
+          "after": 19.247927
+        },
+        {
+          "after": 24.298888,
+          "before": 16.663397
+        },
+        {
+          "before": 17.435657,
+          "after": 18.1147
+        },
+        {
+          "after": 17.32928,
+          "before": 18.475054
+        },
+        {
+          "before": 21.393033,
+          "after": 19.524659
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 16.663397,
+          "min_ms": 11.319923,
+          "max_ms": 25.430948,
+          "mad_ms": 3.8764350000000007
+        },
+        "after": {
+          "median_ms": 18.037055,
+          "min_ms": 11.203609,
+          "max_ms": 24.298888,
+          "mad_ms": 1.487604000000001
+        }
+      }
+    },
+    {
+      "name": "calls",
+      "source_sha256": "0fd22cf73de13428538a92b53c81ef716846e48bd4a5a16229b72af32801ed82",
+      "builds": {
+        "before": {
+          "frame_bytes": 72,
+          "binary_bytes": 78921,
+          "sha256": "e1951b3139a74c27a3d9cb8bf42b41d8b192b11212282bc94e06dd3c8544bb37"
+        },
+        "after": {
+          "frame_bytes": 72,
+          "binary_bytes": 78921,
+          "sha256": "e1951b3139a74c27a3d9cb8bf42b41d8b192b11212282bc94e06dd3c8544bb37"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 53.530247,
+          "after": 49.974306
+        },
+        {
+          "after": 57.019997,
+          "before": 51.316811
+        },
+        {
+          "before": 41.739075,
+          "after": 43.902699
+        },
+        {
+          "after": 47.136895,
+          "before": 47.905987
+        },
+        {
+          "before": 46.039575,
+          "after": 47.021494
+        },
+        {
+          "after": 39.786151,
+          "before": 49.312257
+        },
+        {
+          "before": 46.246752,
+          "after": 46.36345
+        },
+        {
+          "after": 45.438228,
+          "before": 43.119101
+        },
+        {
+          "before": 45.231611,
+          "after": 48.645636
+        },
+        {
+          "after": 45.486692,
+          "before": 47.378931
+        },
+        {
+          "before": 51.963892,
+          "after": 44.154315
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 47.378931,
+          "min_ms": 41.739075,
+          "max_ms": 53.530247,
+          "mad_ms": 2.1473200000000006
+        },
+        "after": {
+          "median_ms": 46.36345,
+          "min_ms": 39.786151,
+          "max_ms": 57.019997,
+          "mad_ms": 2.2091350000000034
+        }
+      }
+    },
+    {
+      "name": "locals",
+      "source_sha256": "fa0bc5cc2fbe969c34da1e0db4cb643727455004d70fd5c0f1c0afe82b8941a1",
+      "builds": {
+        "before": {
+          "frame_bytes": 1080,
+          "binary_bytes": 7364,
+          "sha256": "33d69118c3f72a3df704a3262f0a1f21f7fc4eee3d62d45463fded7159b9f534"
+        },
+        "after": {
+          "frame_bytes": 72,
+          "binary_bytes": 6680,
+          "sha256": "bdb2b09a09f5eda914668164e1ac2dcd25b8c929433283fdfdfbc2bd609e6115"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 21.399715,
+          "after": 22.571152
+        },
+        {
+          "after": 18.135605,
+          "before": 18.681913
+        },
+        {
+          "before": 19.725724,
+          "after": 19.922791
+        },
+        {
+          "after": 21.958216,
+          "before": 19.162971
+        },
+        {
+          "before": 16.420521,
+          "after": 25.255705
+        },
+        {
+          "after": 19.726889,
+          "before": 17.433874
+        },
+        {
+          "before": 20.011311,
+          "after": 18.856519
+        },
+        {
+          "after": 18.500786,
+          "before": 23.002704
+        },
+        {
+          "before": 18.225491,
+          "after": 27.11866
+        },
+        {
+          "after": 23.909489,
+          "before": 19.415198
+        },
+        {
+          "before": 22.560445,
+          "after": 22.17973
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 19.415198,
+          "min_ms": 16.420521,
+          "max_ms": 23.002704,
+          "mad_ms": 1.1897069999999985
+        },
+        "after": {
+          "median_ms": 21.958216,
+          "min_ms": 18.135605,
+          "max_ms": 27.11866,
+          "mad_ms": 2.2313270000000003
+        }
+      }
+    },
+    {
+      "name": "local_calls",
+      "source_sha256": "34d7dc4197cccabcfcb344fd9a5f825e059b9f8a25d2e14c46af28647eaac66a",
+      "builds": {
+        "before": {
+          "frame_bytes": 1088,
+          "binary_bytes": 328421,
+          "sha256": "ea52c9bef3b4ac4a854077b98c9b69794ec7df776fe43d0dd75a23ececefd120"
+        },
+        "after": {
+          "frame_bytes": 80,
+          "binary_bytes": 295448,
+          "sha256": "8821b5569e5b5b28f82aac27d6099956678b0ff53dfa014c7abd8760166d25c7"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 488.177987,
+          "after": 383.737098
+        },
+        {
+          "after": 423.672036,
+          "before": 496.736759
+        },
+        {
+          "before": 490.001495,
+          "after": 452.270908
+        },
+        {
+          "after": 398.642441,
+          "before": 393.608632
+        },
+        {
+          "before": 404.833186,
+          "after": 510.448676
+        },
+        {
+          "after": 465.919037,
+          "before": 420.12385
+        },
+        {
+          "before": 424.659821,
+          "after": 556.548663
+        },
+        {
+          "after": 528.994845,
+          "before": 402.492827
+        },
+        {
+          "before": 411.973185,
+          "after": 408.279531
+        },
+        {
+          "after": 419.972931,
+          "before": 645.783998
+        },
+        {
+          "before": 506.383545,
+          "after": 440.830571
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 424.659821,
+          "min_ms": 393.608632,
+          "max_ms": 645.783998,
+          "mad_ms": 31.051189000000022
+        },
+        "after": {
+          "median_ms": 440.830571,
+          "min_ms": 383.737098,
+          "max_ms": 556.548663,
+          "mad_ms": 32.55104
+        }
+      }
+    },
+    {
+      "name": "live_locals",
+      "source_sha256": "147738b6d4d71a56d192695d48c95ff765a9679647fdfcd0eca2269710bc8b09",
+      "builds": {
+        "before": {
+          "frame_bytes": 1088,
+          "binary_bytes": 12478,
+          "sha256": "fc591c3aa4743b43841d822a2d1502c34e902ece6b92486ddc82b2e77fe1bfd4"
+        },
+        "after": {
+          "frame_bytes": 1088,
+          "binary_bytes": 12478,
+          "sha256": "fc591c3aa4743b43841d822a2d1502c34e902ece6b92486ddc82b2e77fe1bfd4"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 20.96823,
+          "after": 25.303277
+        },
+        {
+          "after": 21.624062,
+          "before": 21.58915
+        },
+        {
+          "before": 22.543983,
+          "after": 19.425733
+        },
+        {
+          "after": 19.304271,
+          "before": 20.691855
+        },
+        {
+          "before": 20.623755,
+          "after": 18.284058
+        },
+        {
+          "after": 21.371164,
+          "before": 18.769236
+        },
+        {
+          "before": 22.332266,
+          "after": 18.755879
+        },
+        {
+          "after": 21.968763,
+          "before": 24.08738
+        },
+        {
+          "before": 24.419698,
+          "after": 19.530837
+        },
+        {
+          "after": 21.117194,
+          "before": 19.626071
+        },
+        {
+          "before": 23.786623,
+          "after": 19.703151
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 21.58915,
+          "min_ms": 18.769236,
+          "max_ms": 24.419698,
+          "mad_ms": 0.9653950000000009
+        },
+        "after": {
+          "median_ms": 19.703151,
+          "min_ms": 18.284058,
+          "max_ms": 25.303277,
+          "mad_ms": 1.414043000000003
+        }
+      }
+    }
+  ],
+  "finished_utc": "2026-09-17T15:49:03.269703+00:00"
+}

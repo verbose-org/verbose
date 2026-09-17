@@ -61,8 +61,16 @@ concept Input
     expression = ' + '.join(['leaf(i)'] * 48)
     calls = leaf + rule('entry', f'if i.x < 0 then {expression} else -({expression})',
                        calls='[leaf]', reads='[i, i.x]', hint=False)
+    lets = '    let v0 = i.x\n' + ''.join(
+        f'    let v{i} = v{i - 1} + i.x\n' for i in range(1, 128))
+    locals_case = rule('entry', 'v127', lets)
+    local_leaf = rule('leaf', 'v127', lets)
+    local_calls = local_leaf + rule('entry', expression, calls='[leaf]', reads='[i]', hint=False)
+    live_lets = ''.join(f'    let v{i} = i.x + {i}\n' for i in range(128))
+    live_locals = rule('entry', ' + '.join(f'v{i}' for i in range(128)), live_lets)
     return {'constants': header + constants, 'arithmetic': header + arithmetic,
-            'calls': header + calls}
+            'calls': header + calls, 'locals': header + locals_case,
+            'local_calls': header + local_calls, 'live_locals': header + live_locals}
 
 
 def frame_bytes(path):
@@ -90,6 +98,8 @@ def main():
     parser.add_argument('--reference-revision', required=True)
     parser.add_argument('--records', type=int, default=16000)
     parser.add_argument('--repeats', type=int, default=11)
+    parser.add_argument('--cases', nargs='+', choices=fixtures().keys(),
+                        help='Selected workloads; default: all')
     parser.add_argument('--cpu', type=int)
     parser.add_argument('--host-note', default='External host activity not independently measured')
     parser.add_argument('--output', type=Path, required=True)
@@ -108,8 +118,8 @@ def main():
     compilers = {'before': args.reference_compiler.resolve(), 'after': args.compiler.resolve()}
     report = {
         'schema_version': 1, 'status': 'running', 'started_utc': datetime.now(timezone.utc).isoformat(),
-        'revision': execute(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip(),
-        'working_tree_status': execute(['git', 'status', '--short'], capture_output=True, text=True).stdout,
+        'revision': execute(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture_output=True, text=True).stdout.strip(),
+        'working_tree_status': execute(['git', 'status', '--short'], cwd=ROOT, capture_output=True, text=True).stdout,
         'compiler_sha256': {label: digest(path) for label, path in compilers.items()},
         'harness_sha256': digest(__file__), 'artifacts': str(work),
         'config': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
@@ -127,6 +137,8 @@ def main():
     records = [values[i % len(values)] for i in range(args.records)]
     try:
         for name, source in fixtures().items():
+            if args.cases and name not in args.cases:
+                continue
             path = work / f'{name}.verbose'
             path.write_text(source)
             row = {'name': name, 'source_sha256': digest(path), 'builds': {}, 'runs_ms': []}

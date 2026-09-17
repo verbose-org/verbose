@@ -305,6 +305,80 @@ fn numeric_native_reuses_scratch_without_clobbering_live_values() {
 }
 
 #[test]
+fn numeric_native_local_storage_depends_on_lifetime_not_binding_count() {
+    let inputs = [(-10, 1), (-1, 5), (0, 3), (10, 5), (11, 1), (0, 6)];
+    for shadow in [false, true] {
+        let mut frames = Vec::new();
+        for n in [2, 128] {
+            let mut lets = "    let value = i.x\n".to_owned();
+            let mut previous = "value".to_owned();
+            for i in 0..n {
+                let name = if shadow {
+                    "value".into()
+                } else {
+                    format!("v{i}")
+                };
+                lets += &format!("    let {name} = {previous} + i.y\n");
+                previous = name;
+            }
+            let p = fixture(&previous, &lets);
+            differential(&p, "checked", &inputs);
+            frames.push(frame_bytes(&native_bytes(&p, "checked")));
+        }
+        assert_eq!(frames[0], frames[1], "shadow={shadow}: {frames:?}");
+        assert!(frames[0] <= 96, "{frames:?}");
+    }
+    let short = fixture("i.x", "    let unused = i.x + i.y\n");
+    let long = fixture("i.x", &"    let unused = i.x + i.y\n".repeat(128));
+    assert_eq!(
+        frame_bytes(&native_bytes(&short, "checked")),
+        frame_bytes(&native_bytes(&long, "checked"))
+    );
+    // Unused nonconstant lets still execute; only their persistent stores vanish.
+    assert!(native_bytes(&long, "checked").len() > native_bytes(&short, "checked").len());
+    differential(&long, "checked", &inputs);
+}
+
+#[test]
+fn numeric_native_local_reuse_preserves_aliases_branches_and_caller_values() {
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .chain([(-11, 1), (11, 1), (0, 6)])
+        .collect();
+    for (expr, lets) in [
+        (
+            "branch + alias",
+            "    let left = i.x * 2\n    let late = i.y * 3\n    let hole = left + 1\n    let left = hole + i.y\n    let alias = late\n    let late = left * 2\n    let unused = i.x + i.y\n    let branch = if i.x < 0 then alias + left else late + alias\n",
+        ),
+        (
+            "if alias == flag then i.x else i.y",
+            "    let flag = i.x < 0\n    let other = i.y > 3\n    let alias = flag\n    let flag = other\n",
+        ),
+        (
+            "x + i.x + y",
+            "    let x = i.y\n    let y = x + i.x\n    let x = y + 1\n",
+        ),
+        ("j", "    let i = i.x\n    let j = i + 1\n"),
+    ] {
+        differential(&fixture(expr, lets), "checked", &inputs);
+    }
+    let mut p = fixture(
+        "value",
+        &("    let value = i.x\n".to_owned() + &"    let value = value + i.y\n".repeat(48)),
+    );
+    let mut caller = rule(&mut fixture(
+        "keep + choice + checked(i)",
+        "    let keep = i.x\n    let first = checked(i)\n    let alias = first\n    let first = checked(i) + keep\n    let choice = if i.x < 0 then alias else first\n    let unused = checked(i)\n",
+    ))
+    .clone();
+    caller.name = "caller".into();
+    caller.hints = None;
+    p.items.push(Item::Rule(caller));
+    differential(&p, "caller", &inputs);
+    assert!(frame_bytes(&native_bytes(&p, "caller")) <= 128);
+}
+
+#[test]
 fn numeric_contract_checks_eager_lets_conditions_and_intermediate_values() {
     let max = i64::MAX;
     for (expr, lets, needle) in [

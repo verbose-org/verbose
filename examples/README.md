@@ -255,4 +255,4 @@ The resource-aware emitter sweep: every native emitter accepts `read()` with the
 fallback and propagation through a rule call and alias. See the
 [contract and backend matrix](../docs/try-byte-at.md).
 
-- [`strict_overflow.verbose`](strict_overflow.verbose): signed arithmetic, precomputed constants, lexical aliases and same-input calls with strictly verified numeric contracts; interpreter/native argv support, other backends explicitly refuse.
+- [`strict_overflow.verbose`](strict_overflow.verbose): signed arithmetic, precomputed constants, lexical aliases and same-input calls with strictly verified numeric contracts; native local slots are reused after last use. Interpreter/native argv support, other backends explicitly refuse.
