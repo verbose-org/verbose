@@ -505,6 +505,24 @@ fn numeric_contract_no_invented_optimizer_domain_or_lost_scope() {
         Expr::If(..)
     ));
     assert_eq!(eval(&optimized, "checked", -1, 1).unwrap().to_string(), "1");
+    // The old invented nonnegative domain selected unsigned constant division
+    // even for negative runtime inputs, including outside overflow contracts.
+    let mut legacy = fixture("i.x / 100", "");
+    rule(&mut legacy).hints = None;
+    fields(&mut legacy)[0].range = None;
+    differential(
+        &legacy,
+        "checked",
+        &[
+            (i64::MIN, 1),
+            (-101, 1),
+            (-100, 1),
+            (-1, 1),
+            (0, 1),
+            (100, 1),
+            (i64::MAX, 1),
+        ],
+    );
     let p = fixture(
         "if i.x > 0 and i.y > 0 then 1 else 2",
         "    let false = 99\n",
