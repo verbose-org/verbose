@@ -1,6 +1,8 @@
 //! Dedicated two-word Result(number, BoundsError) lowering. Values never use
 //! pointers: rax is the tag (0/1), rdx the byte or zero. Every temporary and
 //! lexical binding has a frame slot; call expansion is acyclic and eager.
+//! Also used for strict numeric contracts: scalar slots are one word, scratch
+//! is not zero-initialized, and the entry validates complete i64 arguments.
 use super::*;
 
 fn jump(code: &mut Vec<u8>, opcode: &[u8]) -> usize {
@@ -32,13 +34,18 @@ struct Emit<'a> {
     fields: HashMap<&'a str, i32>,
     slots: Vec<i32>,
     next: usize,
+    numeric: bool,
 }
 impl Emit<'_> {
     fn save(&mut self, ty: Type) -> Result<Local, NativeError> {
-        let slot = *self.slots.get(self.next + 1).ok_or_else(|| NativeError {
-            message: "bounded-result frame estimate exhausted".into(),
-        })?;
-        self.next += 2;
+        let width = if self.numeric { 1 } else { 2 };
+        let slot = *self
+            .slots
+            .get(self.next + width - 1)
+            .ok_or_else(|| NativeError {
+                message: "bounded-result frame estimate exhausted".into(),
+            })?;
+        self.next += width;
         store(&mut self.code, slot, false);
         if ty == crate::bounds::result_type() {
             store(&mut self.code, slot + 8, true);
@@ -92,7 +99,16 @@ impl Emit<'_> {
                 }
                 Ok(l.ty.clone())
             }
-            Expr::Number(_) | Expr::Field(_, _) | Expr::Ident(_) => {
+            Expr::Field(_, name) => {
+                // Input fields and lexical scalars occupy separate namespaces.
+                // A let named `x` must not change a later read of `input.x`.
+                let slot = *self.fields.get(name.as_str()).ok_or_else(|| NativeError {
+                    message: format!("unknown checked input field '{name}'"),
+                })?;
+                load(&mut self.code, slot, false);
+                Ok(Type::Number)
+            }
+            Expr::Number(_) | Expr::Ident(_) => {
                 self.scalar(e, input, env)?;
                 Ok(
                     if matches!(e, Expr::Ident(n) if n == "true" || n == "false") {
@@ -194,16 +210,21 @@ impl Emit<'_> {
                 patch(&mut self.code, done);
                 Ok(ty)
             }
-            Expr::Binary(BinOp::And, a, b) => self.expr(
-                &Expr::If(a.clone(), b.clone(), Box::new(Expr::Ident("false".into()))),
-                input,
-                env,
-            ),
-            Expr::Binary(BinOp::Or, a, b) => self.expr(
-                &Expr::If(a.clone(), Box::new(Expr::Ident("true".into())), b.clone()),
-                input,
-                env,
-            ),
+            Expr::Binary(op @ (BinOp::And | BinOp::Or), a, b) => {
+                self.expr(a, input, env)?;
+                self.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
+                let done = jump(
+                    &mut self.code,
+                    if *op == BinOp::And {
+                        &[0x0f, 0x84]
+                    } else {
+                        &[0x0f, 0x85]
+                    },
+                );
+                self.expr(b, input, env)?;
+                patch(&mut self.code, done);
+                Ok(Type::Bool)
+            }
             // Evaluate subterms once, then use the established scalar emitter
             // solely on frame loads. Synthetic identifiers cannot collide with
             // source names because this scope contains only the generated ones.
@@ -275,6 +296,12 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
             message: e.to_string(),
         });
     }
+    let numeric = crate::numeric_bounds::active_rules(p).contains(name);
+    if let Some(e) = crate::numeric_bounds::verify(p).first() {
+        return Err(NativeError {
+            message: e.to_string(),
+        });
+    }
     let rules: HashMap<_, _> = p
         .items
         .iter()
@@ -328,7 +355,12 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
         count(b, &rules, &mut nodes)?;
     }
     count(&r.logic.value, &rules, &mut nodes)?;
-    let nslots = 4 * (nodes + r.logic.bindings.len() + 1);
+    let nslots = (if numeric { 2 } else { 4 }) * (nodes + r.logic.bindings.len() + 1);
+    if numeric && (nslots + concept.fields.len() + 32) * 8 > 2 * 1024 * 1024 {
+        return Err(NativeError {
+            message: "strict overflow frame exceeds 2 MiB".into(),
+        });
+    }
     let mut frame = r.clone();
     frame.output_ty = Type::Number;
     frame.logic.value = Expr::Number(0);
@@ -347,6 +379,7 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
         &HashMap::new(),
         None,
         false,
+        numeric,
     )?;
     let slots = frame
         .logic
@@ -357,7 +390,11 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
     let fields = concept
         .fields
         .iter()
-        .map(|f| (f.name.as_str(), ctx.binding_offsets[f.name.as_str()]))
+        .enumerate()
+        // This entry has no context: the prologue stores one word per field
+        // starting at rbp-8. Its combined binding map can be shadowed by a
+        // synthetic scratch name, so it is not the source of field offsets.
+        .map(|(i, f)| (f.name.as_str(), -((i as i32 + 1) * 8)))
         .collect();
     let mut emit = Emit {
         code,
@@ -365,6 +402,7 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
         fields,
         slots,
         next: 0,
+        numeric,
     };
     emit.rule(r)?;
     if r.output_ty == crate::bounds::result_type() {

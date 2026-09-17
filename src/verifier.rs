@@ -21,6 +21,7 @@ impl fmt::Display for VerifyError {
 pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError> {
     let mut errors = crate::bounds::verify(program);
     errors.extend(crate::text_bounds::verify(program));
+    errors.extend(crate::numeric_bounds::verify(program));
     let bounded_rules = crate::bounds::active_rules(program);
 
     // Phase 7 slice 3a: if any service declares Protocol::Http10, the compiler
@@ -3049,7 +3050,7 @@ fn verify_rule(
     check_termination(rule, concepts, group_concept_owner, errors);
 
     if let Some(hints) = &rule.hints {
-        check_hints(rule, hints, &facts, concepts, errors);
+        check_hints(rule, hints, &facts, errors);
     }
 
     if let Some(caller_layer) = rule.layer {
@@ -4758,7 +4759,6 @@ fn check_hints(
     rule: &Rule,
     hints: &Hints,
     facts: &LogicFacts,
-    concepts: &HashMap<String, &Concept>,
     errors: &mut Vec<VerifyError>,
 ) {
     if hints.vectorizable.is_some() {
@@ -4770,47 +4770,8 @@ fn check_hints(
         }
     }
 
-    if let Some(overflow) = &hints.overflow {
-        if overflow.min > overflow.max {
-            errors.push(VerifyError {
-                context: format!("rule '{}' / hints.overflow", rule.name),
-                message: format!(
-                    "invalid overflow bounds: min {} > max {}",
-                    overflow.min, overflow.max
-                ),
-            });
-        } else {
-            // Build field ranges from concept (assume i64 full range if no overflow hint on fields)
-            // For POC: fields are assumed to have the range declared in the overflow hint's context
-            // We use a conservative default range for input fields
-            let mut field_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-            if let Type::Named(concept_name) = &rule.input_ty {
-                if let Some(concept) = concepts.get(concept_name) {
-                    for field in &concept.fields {
-                        if field.ty == Type::Number {
-                            let range = field.range.unwrap_or((0, i32::MAX as i64));
-                            field_ranges.insert(field.name.as_str(), range);
-                        }
-                    }
-                }
-            }
-
-            if let Some((actual_min, actual_max)) =
-                compute_range(&rule.logic.value, &field_ranges, &rule.input_name)
-            {
-                if actual_min < overflow.min || actual_max > overflow.max {
-                    errors.push(VerifyError {
-                        context: format!("rule '{}' / hints.overflow", rule.name),
-                        message: format!(
-                            "computed range [{}, {}] exceeds declared [{}, {}]",
-                            actual_min, actual_max, overflow.min, overflow.max
-                        ),
-                    });
-                }
-            }
-            // If compute_range returns None, we can't verify — we accept the hint but don't optimize
-        }
-    }
+    // Numeric contracts, including eager lets and conditions, are checked by
+    // numeric_bounds over the participating call graph before this traversal.
 }
 
 fn verify_source_ref(sref: &SourceRef, base_dir: &StdPath) -> Result<(), String> {

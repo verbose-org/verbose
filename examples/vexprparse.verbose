@@ -8915,6 +8915,9 @@ rule span_is_proofs
       bound : 64
 
 
+-- Current contract (2026-09-17): all overflow hints are refused before
+-- emission; interval proof support remains unavailable. Historical notes below
+-- describe the earlier shape-only verifier. See docs/numeric-overflow.md.
 -- span_is_hints: 1 iff the span src[start..start+len] is exactly the 5 bytes
 -- "hints" (h=104 i=105 n=110 t=116 s=115). Same flat fixed-width shape as
 -- span_is_proofs, length-guarded first. Recognizes the `hints:` block header —
@@ -10950,20 +10953,12 @@ rule hint_skip_line
       bound : 256
 
 
--- hint_entry_error: the verdict for ONE `<name> : <value>` entry, with ps.cell
--- on the name. Sums three independent charges (an entry can only realistically
--- earn one, but summing avoids any ordering assumption):
---   * unknown name  -> 1
---   * a known trust-based hint with no `:`, a non-string value, or the empty
---     string `""` -> 1
---   * `overflow : [min, max]` fully recognised with min > max -> 1
--- Every guard is conservative: a shape that does not parse charges nothing.
--- `ps.cell` is reused as the inert fallback cell for the unrecognised branches
--- (it is an Ident, so `peek_op_code` and `peek_is_num` both read 0 on it) --
--- deliberately, rather than `TokenList::Nil`, which would allocate an arena
--- node per call for no reason.
+-- Strict overflow contract (2026-09-17): this compiler does not yet prove
+-- arithmetic intervals or enforce their input premises. Refuse every overflow
+-- entry before ELF/raw emission, including valid Rust-compiler contracts.
+-- Names and justification checks for the other hints remain unchanged.
 rule hint_entry_error
-  @intention: "Number of verbosec-refused defects in one hints-block entry (unknown name, missing/empty justification, inverted overflow interval)"
+  @intention: "Reject unsupported overflow contracts, unknown hints and missing or empty justifications"
   @source: vexprparse.intent:63
   input:
     ps : ProgramState
@@ -10978,24 +10973,11 @@ rule hint_entry_error
     let has_colon = if peek_op_code(n1) == 10 then 1 else 0
     let n2 = advance(Advance { lst: n1, k: 1 })
     let just_bad = if known == 0 then 0 else if is_ov == 1 then 0 else if has_colon == 0 then 1 else if peek_is_str(n2) == 0 then 1 else if peek_str_len(n2) <= 2 then 1 else 0
-    let has_lb = if is_ov == 1 and (has_colon == 1 and peek_op_code(n2) == 25) then 1 else 0
-    let m1raw = if has_lb == 1 then advance(Advance { lst: n2, k: 1 }) else ps.cell
-    let m1neg = if peek_op_code(m1raw) == 14 then 1 else 0
-    let m1cell = if m1neg == 1 then advance(Advance { lst: m1raw, k: 1 }) else m1raw
-    let minv = if m1neg == 1 then 0 - peek_value(m1cell) else peek_value(m1cell)
-    let c1 = advance(Advance { lst: m1cell, k: 1 })
-    let has_comma = if peek_op_code(c1) == 11 then 1 else 0
-    let m2raw = if has_comma == 1 then advance(Advance { lst: c1, k: 1 }) else ps.cell
-    let m2neg = if peek_op_code(m2raw) == 14 then 1 else 0
-    let m2cell = if m2neg == 1 then advance(Advance { lst: m2raw, k: 1 }) else m2raw
-    let maxv = if m2neg == 1 then 0 - peek_value(m2cell) else peek_value(m2cell)
-    let both_num = if peek_is_num(m1cell) == 1 and peek_is_num(m2cell) == 1 then 1 else 0
-    let ovf_bad = if has_lb == 1 and (has_comma == 1 and (both_num == 1 and minv > maxv)) then 1 else 0
-    out = (if known == 0 then 1 else 0) + (just_bad + ovf_bad)
+    out = (if known == 0 then 1 else 0) + (just_bad + is_ov)
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_start, peek_len, span_is_overflow, span_is_hint_name, advance, peek_op_code, peek_is_str, peek_str_len, peek_value, peek_is_num]
+      calls : [peek_start, peek_len, span_is_overflow, span_is_hint_name, advance, peek_op_code, peek_is_str, peek_str_len]
     termination:
       bound : 256
 
@@ -11035,7 +11017,7 @@ rule hint_block_errors
 -- (`peek_kind == 0`, which `head_tok` also yields for Nil), so the backstop is
 -- the finite token list -- the same argument `tokenize` itself carries.
 rule hint_errors
-  @intention: "Number of hints-block defects verbosec refuses (unknown hint name, missing/empty justification, inverted overflow interval) across the whole program"
+  @intention: "Count unknown hints, missing justifications and unsupported overflow contracts across the whole program"
   @source: vexprparse.intent:63
   input:
     ps : ProgramState
@@ -11052,6 +11034,52 @@ rule hint_errors
     purity:
       reads : [ps.cell, ps.src]
       calls : [peek_kind, advance, span_is_hints, peek_start, peek_len, peek_op_code, hint_block_errors, hint_errors]
+    termination:
+      bound : 512
+
+
+-- The raw x86 probe does not run the full proof verifier. It still refuses
+-- unsupported overflow contracts, without broadening its other acceptance
+-- rules. Anchor this check to hints entries: identifiers and strings spelling
+-- overflow elsewhere are not contracts.
+rule overflow_block_errors
+  @intention: "Detect an unsupported overflow entry in one hints block"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(ps.cell)
+    let isid = peek_is_ident(ps.cell)
+    let nxt = advance(Advance { lst: ps.cell, k: 1 })
+    out = if knd == 0 or knd == 800 then 0 else if knd == 600 or knd == 700 then overflow_block_errors(ProgramState { cell: nxt, src: ps.src }) else if isid == 0 then 0 else if span_is_overflow(SpanCheck { src: ps.src, start: peek_start(ps.cell), len: peek_len(ps.cell) }) == 1 then 1 else overflow_block_errors(ProgramState { cell: hint_skip_line(ParseState { cell: ps.cell }), src: ps.src })
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [peek_kind, peek_is_ident, advance, overflow_block_errors, span_is_overflow, peek_start, peek_len, hint_skip_line]
+    termination:
+      bound : 512
+
+
+rule overflow_contract_errors
+  @intention: "Detect unsupported overflow contracts before raw machine-code emission"
+  @source: vexprparse.intent:63
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(ps.cell)
+    let nxt = advance(Advance { lst: ps.cell, k: 1 })
+    let is_h = span_is_hints(SpanCheck { src: ps.src, start: peek_start(ps.cell), len: peek_len(ps.cell) })
+    let opened = if is_h == 0 then 0 else if peek_op_code(nxt) == 10 and (peek_kind(advance(Advance { lst: nxt, k: 1 })) == 600 and peek_kind(advance(Advance { lst: nxt, k: 2 })) == 700) then 1 else 0
+    let here = if opened == 1 then overflow_block_errors(ProgramState { cell: advance(Advance { lst: nxt, k: 3 }), src: ps.src }) else 0
+    out = if knd == 0 then 0 else if here > 0 then 1 else overflow_contract_errors(ProgramState { cell: nxt, src: ps.src })
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [peek_kind, advance, span_is_hints, peek_start, peek_len, peek_op_code, overflow_block_errors, overflow_contract_errors]
     termination:
       bound : 512
 
@@ -31345,11 +31373,11 @@ rule x86_program_src
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
     let svcs = parse_services(ProgramState { cell: toks, src: s.source })
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
-    out = concat(abort_if(bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
+    out = concat(abort_if(overflow_contract_errors(ProgramState { cell: toks, src: s.source }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
+      calls : [overflow_contract_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
     termination:
       bound : 256
 
@@ -35659,4 +35687,3 @@ rule count_cells_src
       calls : [tokenize, count_cells]
     termination:
       bound : 256
-

@@ -5,6 +5,7 @@ use std::process;
 
 mod ast;
 mod bounds;
+mod numeric_bounds;
 mod text_bounds;
 mod http_framing;
 #[cfg(test)]
@@ -221,7 +222,7 @@ fn real_main() {
     let json_output = args.iter().any(|a| a == "--json");
     if !json_output {
         println!(
-            "verified: {} concept(s), {} rule(s); all proofs check out",
+            "verified: {} concept(s), {} rule(s); supported source checks passed",
             n_concepts, n_rules
         );
     }
@@ -280,13 +281,13 @@ fn real_main() {
         }
         println!();
         if !hints_list.is_empty() {
-            println!("  Hints exploited:  {}", hints_list.join(", "));
+            println!("  Hints declared:   {}", hints_list.join(", "));
         }
         let elim = opt_stats.nodes_before.saturating_sub(opt_stats.nodes_after);
         if elim > 0 {
             println!("  Optimizations:    {} AST nodes eliminated", elim);
         }
-        println!("  Proofs verified:  purity, termination");
+        println!("  Checks passed:    declared reads/calls, structural termination checks");
     } else if let Some(output) = native_output {
         let native_rule_str = find_flag(&args, "--run").unwrap_or_else(|| {
             // No explicit --run target: a service is a program entry point,
