@@ -506,7 +506,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 |---|---|
 | `vectorizable: "reason"` | Checks independence restrictions; eligible native scalar paths can emit SIMD |
 | `parallel: "reason"` | Eligible native paths can distribute work using `fork()` |
-| `overflow: [min, max]` | Requires a known output interval and safe intermediates; unsupported analysis is refused |
+| `overflow: [min, max]` | Requires a known output interval and safe intermediates; native lowering then precomputes proved constants/branches while preserving entry guards |
 | `field [min, max]` | Supplies range information for analysis and elimination of impossible branches |
 
 A hint's explanation is audit material. Declaring a hint does not mean every

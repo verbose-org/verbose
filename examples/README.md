@@ -67,7 +67,7 @@ If you want to know what a feature *looks like* in source, find it below and rea
 | `business.verbose` | Arithmetic, rule composition (`important_invoice` calls `total_with_tax`), `parallel:` hint. |
 | `pricing.verbose` | Nested if/else + let bindings with enforced numeric input bounds. |
 | `clients.verbose` | Text fields + text equality (`field == "literal"`). |
-| `deadcode.verbose` | Unreachable branch from declared field ranges (`number [0, 50]`); strict overflow currently preserves both branches. |
+| `deadcode.verbose` | Native elimination of a proved unreachable branch (`number [0, 50]`), after checking both branches and retaining the input guard. |
 | `collections.verbose` | `all` / `any` quantifiers on a nested input collection. |
 
 ## Result types (Phase 2A / 2B / 2D / 2F)
@@ -255,4 +255,4 @@ The resource-aware emitter sweep: every native emitter accepts `read()` with the
 fallback and propagation through a rule call and alias. See the
 [contract and backend matrix](../docs/try-byte-at.md).
 
-- [`strict_overflow.verbose`](strict_overflow.verbose): signed arithmetic, lexical aliases and same-input calls with strictly verified numeric contracts; interpreter/native argv support, other backends explicitly refuse.
+- [`strict_overflow.verbose`](strict_overflow.verbose): signed arithmetic, precomputed constants, lexical aliases and same-input calls with strictly verified numeric contracts; interpreter/native argv support, other backends explicitly refuse.

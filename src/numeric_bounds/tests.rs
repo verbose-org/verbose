@@ -133,6 +133,177 @@ fn differential(p: &Program, name: &str, inputs: &[(i64, i64)]) {
     fs::remove_file(path).unwrap();
 }
 
+fn native_bytes(p: &Program, name: &str) -> Vec<u8> {
+    let path = format!("/tmp/verbose-numeric-layout-{}", std::process::id());
+    crate::native::compile_native(p, name, &path, false, false).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    fs::remove_file(path).unwrap();
+    bytes
+}
+
+fn frame_bytes(bytes: &[u8]) -> u32 {
+    let prologue = [0x55, 0x48, 0x89, 0xe5, 0x48, 0x81, 0xec];
+    let at = bytes
+        .windows(prologue.len())
+        .position(|b| b == prologue)
+        .unwrap()
+        + prologue.len();
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+#[test]
+fn numeric_native_precomputes_only_after_source_verification() {
+    let p = fixture(
+        "if i.x <= 10 then answer else 42",
+        "    let factor = 12 / -5\n    let alias = factor\n    let answer = abs(-7) + alias + (-7 % 3) + min(2, 3)\n",
+    );
+    assert_eq!(
+        native_bytes(&p, "checked"),
+        native_bytes(&fixture("6", ""), "checked")
+    );
+    differential(
+        &p,
+        "checked",
+        &[(-10, 1), (10, 5), (-11, 1), (11, 1), (0, 6)],
+    );
+    for expr in [
+        "if 1 == 1 then 6 else 1 / 0",
+        "if i.x <= 10 then 6 else parse_int(\"bad\")",
+    ] {
+        assert!(native_opt::lower(&fixture(expr, "")).is_err());
+    }
+    let bad = fixture("6", "    let unused = 9223372036854775807 + 1\n");
+    assert!(native_opt::lower(&bad).is_err());
+    let mut p = fixture("i.x", "");
+    let mut caller = rule(&mut p).clone();
+    caller.name = "caller".into();
+    caller.hints = None;
+    caller.logic.value = Expr::If(
+        Box::new(Expr::Binary(
+            BinOp::Eq,
+            Box::new(Expr::Number(0)),
+            Box::new(Expr::Number(1)),
+        )),
+        Box::new(Expr::Call("checked".into(), vec![Expr::Ident("i".into())])),
+        Box::new(Expr::Number(7)),
+    );
+    p.items.push(Item::Rule(caller));
+    assert!(active_rules(&p).contains("caller"));
+    assert!(!active_rules(&native_opt::lower(&p).unwrap()).contains("caller"));
+    // Even when its last checked call disappears, this entry keeps ALL guards.
+    differential(&p, "caller", &[(0, 1), (11, 1), (-11, 1), (0, 6), (0, 0)]);
+    for op in [BinOp::Gt, BinOp::Lt] {
+        let Item::Rule(caller) = p.items.last_mut().unwrap() else {
+            unreachable!()
+        };
+        caller.output_ty = Type::Bool;
+        caller.logic.value = Expr::Binary(
+            op,
+            Box::new(Expr::Call("checked".into(), vec![Expr::Ident("i".into())])),
+            Box::new(Expr::Number(-1001)),
+        );
+        differential(&p, "caller", &[(0, 1), (10, 5), (11, 1)]);
+    }
+    for (expr, expected) in [
+        ("(-9223372036854775807 - 1) / 2", i64::MIN / 2),
+        ("(-9223372036854775807 - 1) % 7", i64::MIN % 7),
+    ] {
+        let mut p = fixture(expr, "");
+        full(&mut p);
+        let mut constant = fixture("0", "");
+        full(&mut constant);
+        rule(&mut constant).logic.value = Expr::Number(expected);
+        assert_eq!(
+            native_bytes(&p, "checked"),
+            native_bytes(&constant, "checked")
+        );
+        differential(&p, "checked", &[(0, 1), (11, 1)]);
+    }
+
+    // Native expansion is still bounded on the original source, before a
+    // constant branch could erase a large acyclic call tree.
+    let mut p = fixture("0", "");
+    let mut previous = "checked".to_owned();
+    for i in 0..17 {
+        let mut next = rule(&mut p).clone();
+        next.name = format!("chain_{i}");
+        next.hints = None;
+        let call = Expr::Call(previous, vec![Expr::Ident("i".into())]);
+        next.logic.value = Expr::Binary(BinOp::Add, Box::new(call.clone()), Box::new(call));
+        previous = next.name.clone();
+        p.items.push(Item::Rule(next));
+    }
+    let mut caller = rule(&mut p).clone();
+    caller.name = "caller".into();
+    caller.hints = None;
+    caller.logic.value = Expr::If(
+        Box::new(Expr::Binary(
+            BinOp::Eq,
+            Box::new(Expr::Number(0)),
+            Box::new(Expr::Number(0)),
+        )),
+        Box::new(Expr::Number(7)),
+        Box::new(Expr::Call(previous, vec![Expr::Ident("i".into())])),
+    );
+    p.items.push(Item::Rule(caller));
+    assert!(native_opt::lower(&p).is_ok());
+    let path = format!("/tmp/verbose-numeric-limit-{}", std::process::id());
+    fs::write(&path, b"existing").unwrap();
+    let error = crate::native::compile_native(&p, "caller", &path, false, false).unwrap_err();
+    assert!(error.message.contains("100000 nodes"), "{error}");
+    assert_eq!(fs::read(&path).unwrap(), b"existing");
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn numeric_native_reuses_scratch_without_clobbering_live_values() {
+    let leaf = (0..24).fold("i.x".to_owned(), |expr, _| format!("{expr} + i.y"));
+    let mut p = fixture(&leaf, "    let x = i.x + i.y\n");
+    let mut caller = rule(&mut p).clone();
+    caller.name = "caller".into();
+    caller.input_name = "incoming".into();
+    caller.hints = None;
+    caller.logic.bindings = vec![
+        (
+            "x".into(),
+            Expr::Field(Box::new(Expr::Ident("incoming".into())), "x".into()),
+        ),
+        ("alias".into(), Expr::Ident("x".into())),
+    ];
+    let call = Expr::Call("checked".into(), vec![Expr::Ident("incoming".into())]);
+    let mut frames = Vec::new();
+    for n in [2, 48] {
+        let sum = (1..n).fold(call.clone(), |acc, _| {
+            Expr::Binary(BinOp::Add, Box::new(acc), Box::new(call.clone()))
+        });
+        caller.logic.value = Expr::Binary(
+            BinOp::Add,
+            Box::new(Expr::Ident("alias".into())),
+            Box::new(Expr::If(
+                Box::new(Expr::Binary(
+                    BinOp::Lt,
+                    Box::new(Expr::Ident("x".into())),
+                    Box::new(Expr::Number(0)),
+                )),
+                Box::new(sum.clone()),
+                Box::new(Expr::Neg(Box::new(sum))),
+            )),
+        );
+        p.items.push(Item::Rule(caller.clone()));
+        differential(&p, "caller", &[(-10, 1), (-1, 5), (0, 3), (10, 5), (11, 1)]);
+        frames.push(frame_bytes(&native_bytes(&p, "caller")));
+        p.items.pop();
+    }
+    assert_eq!(
+        frames[0], frames[1],
+        "sequential calls and exclusive branches reuse scratch"
+    );
+    assert!(
+        frames[0] <= 128,
+        "only the live scalar values need slots: {frames:?}"
+    );
+}
+
 #[test]
 fn numeric_contract_checks_eager_lets_conditions_and_intermediate_values() {
     let max = i64::MAX;

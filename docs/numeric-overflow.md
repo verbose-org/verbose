@@ -8,7 +8,8 @@ requirement from prose.
 
 ```verbose
 logic:
-  let product = sample.reading * 3
+  let factor = 1 + 2
+  let product = sample.reading * factor
   value = product / 2
 hints:
   overflow : [-150, 150]
@@ -53,19 +54,46 @@ Results, effects, context inputs, services and reactions are refused in this sli
 Rules disconnected from the contract retain their existing acceptance rules.
 
 Analysis is limited to 100000 expression visits, 256 expression levels and 128
-nested calls. Native call expansion is separately limited to 100000 nodes and a
-conservative 2 MiB frame ceiling. These are compiler/storage limits, not CPU-time
-or whole-process memory bounds.
+nested calls. Native call expansion is separately limited to 100000 nodes on the
+original source, before simplification, and a conservative 2 MiB frame ceiling
+based on live storage. These are compiler/storage limits, not CPU-time or
+whole-process memory bounds.
 
 Native lowering shares the checked scalar/frame machinery with `try_byte_at`:
-acyclic calls expand into fresh lexical scopes, lets evaluate once and each numeric
-value occupies one 64-bit slot. Input fields and local variables remain distinct
+acyclic calls expand into fresh lexical scopes and each stored numeric value
+occupies one 64-bit slot. Input fields and local variables remain distinct
 even when their names match. Arithmetic uses the signed operations whose safety
 was proved. This path avoids legacy constant-division rewrites that do not preserve
 negative signed division. It reserves fixed stack storage, with no allocator or
-runtime interval analysis. General optimizations/SIMD hints are not used on this
-path; correctness and proof preservation take precedence over their optimization.
-No claim of equal performance to the old emission path is made.
+runtime interval analysis. Numeric expression temporaries and expanded callee
+locals are released after their result reaches registers. Sequential calls and
+exclusive branches reuse those slots; live caller values keep their storage.
+The frame is sized from the emitter's maximum live slot count. Nonconstant lets
+still evaluate once in source order and remain live until their rule returns;
+this is not full last-use analysis.
+
+## Native simplification after verification
+
+The original source is checked first, including eager unused lets and both
+branches. A private native emission view then precomputes constants, substitutes
+constant aliases, and removes branches decided by enforced input ranges and
+checked callee output intervals. Constant lets can disappear only after that
+proof: the supported arithmetic is pure and cannot fail within its input domain.
+An unsafe unused let or an unsupported expression in an impossible branch still
+refuses compilation. The general source optimizer and interpreter retain the
+original rules and obligations.
+
+Every original input guard stays in place, even when simplification removes the
+last call connecting an entry to its numeric contract or makes its result constant.
+Missing or malformed arguments and out-of-domain values therefore keep their
+original failure behavior. Signed constant division/remainder preserve truncation
+toward zero, including negative values and i64 extremes.
+
+No speculative code motion, retry, SIMD or parallel lowering is enabled by this
+pass. Its unknown facts mean “keep the expression”, after strict verification has
+already established safety. Comparisons do not refine branch-local domains or
+establish correlations between repeated values. See the reproducible
+[numeric benchmark](numeric-optimization.md) for scope and measured costs.
 
 ## Entry behavior and support
 

@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "started_utc": "2026-09-17T15:13:10.783919+00:00",
+  "revision": "0cfda1d3335a448be186b2a0ea012b46b3f4dc55",
+  "working_tree_status": " M CLAUDE.md\n M docs/current-status.md\n M docs/numeric-overflow.md\n M examples/README.md\n M examples/deadcode.verbose\n M examples/strict_overflow.verbose\n M src/native/bounded.rs\n M src/numeric_bounds.rs\n M src/numeric_bounds/tests.rs\n M tools/generate.py\n?? src/numeric_bounds/native_opt.rs\n?? tools/benchmark_numeric_contract.py\n",
+  "compiler_sha256": {
+    "before": "7c0bfcdb1faea4c111bd3a6d7447b1570a0e22e637b5c83a3f069cf1cb3dfce6",
+    "after": "a22c56c95b1fb67aede10b3a0010f690793da52fcdc5cae033387f2b7fbbe082"
+  },
+  "harness_sha256": "572eacb85b20aa43ab7217186a675f57fd595c9d148366216128eca9401726de",
+  "artifacts": "/tmp/verbose-numeric-bench-ud4b6bf_",
+  "config": {
+    "compiler": "/home/arcker/projects/verbose/target/release/verbosec",
+    "reference_compiler": "/tmp/verbose-numeric-opt/reference-verbosec",
+    "reference_revision": "0cfda1d3335a448be186b2a0ea012b46b3f4dc55",
+    "records": 16000,
+    "repeats": 11,
+    "cpu": 2,
+    "host_note": "External host activity not independently measured",
+    "output": "/tmp/verbose-numeric-opt/benchmark.json"
+  },
+  "host": {
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "affinity": [
+      2
+    ],
+    "cpu": "AMD Ryzen 7 5800X 8-Core Processor",
+    "loadavg_before": [
+      0.66943359375,
+      1.12060546875,
+      1.45654296875
+    ],
+    "loadavg_after": [
+      0.66943359375,
+      1.12060546875,
+      1.45654296875
+    ]
+  },
+  "cache_counters": "not measured",
+  "cases": [
+    {
+      "name": "constants",
+      "source_sha256": "3bfdef40bfa7a441870cc5b96ca2ba764f5a699b083da316d24849be2f430791",
+      "builds": {
+        "before": {
+          "frame_bytes": 3248,
+          "binary_bytes": 4017,
+          "sha256": "a57cc5b1f512d65929532fb5502dcb2bf9794b52eb51dc069e23c6b151f57ac9"
+        },
+        "after": {
+          "frame_bytes": 64,
+          "binary_bytes": 604,
+          "sha256": "56d0f19c9e20b14a542debb6d6b7ecae1955ce79250ad78b1728d0ac3b7bd376"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 11.742063,
+          "after": 9.069443
+        },
+        {
+          "after": 8.479046,
+          "before": 12.573326
+        },
+        {
+          "before": 11.737214,
+          "after": 7.775734
+        },
+        {
+          "after": 7.906245,
+          "before": 10.646723
+        },
+        {
+          "before": 11.002288,
+          "after": 8.295135
+        },
+        {
+          "after": 7.931043,
+          "before": 10.632444
+        },
+        {
+          "before": 10.997491,
+          "after": 8.183779
+        },
+        {
+          "after": 7.994063,
+          "before": 11.602091
+        },
+        {
+          "before": 13.627576,
+          "after": 10.369833
+        },
+        {
+          "after": 11.669192,
+          "before": 13.714633
+        },
+        {
+          "before": 12.907274,
+          "after": 9.116386
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 11.737214,
+          "min_ms": 10.632444,
+          "max_ms": 13.714633,
+          "mad_ms": 0.836112
+        },
+        "after": {
+          "median_ms": 8.295135,
+          "min_ms": 7.775734,
+          "max_ms": 11.669192,
+          "mad_ms": 0.38888999999999996
+        }
+      }
+    },
+    {
+      "name": "arithmetic",
+      "source_sha256": "2e5d2620468f8cd8c4b2c706405248657202d705a1679af5471a941fbeb911d7",
+      "builds": {
+        "before": {
+          "frame_bytes": 1200,
+          "binary_bytes": 1448,
+          "sha256": "9d6b815d886ed91a33a14edeb9ce58d61232d2bb9de0624ecfde18900b69d654"
+        },
+        "after": {
+          "frame_bytes": 64,
+          "binary_bytes": 1352,
+          "sha256": "8dfbed0137d8cc354ea6deefe927e8284b90de8e201a2a15a76314eb79a3d621"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 8.745042,
+          "after": 8.690573
+        },
+        {
+          "after": 8.698823,
+          "before": 8.857939
+        },
+        {
+          "before": 9.235746,
+          "after": 8.320752
+        },
+        {
+          "after": 8.213341,
+          "before": 8.240614
+        },
+        {
+          "before": 8.596155,
+          "after": 8.276146
+        },
+        {
+          "after": 8.306566,
+          "before": 8.338478
+        },
+        {
+          "before": 9.129694,
+          "after": 8.551982
+        },
+        {
+          "after": 8.407412,
+          "before": 8.224401
+        },
+        {
+          "before": 8.839211,
+          "after": 8.512722
+        },
+        {
+          "after": 8.247886,
+          "before": 8.489974
+        },
+        {
+          "before": 8.692032,
+          "after": 8.268666
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 8.692032,
+          "min_ms": 8.224401,
+          "max_ms": 9.235746,
+          "mad_ms": 0.20205799999999918
+        },
+        "after": {
+          "median_ms": 8.320752,
+          "min_ms": 8.213341,
+          "max_ms": 8.698823,
+          "mad_ms": 0.08666000000000018
+        }
+      }
+    },
+    {
+      "name": "calls",
+      "source_sha256": "0fd22cf73de13428538a92b53c81ef716846e48bd4a5a16229b72af32801ed82",
+      "builds": {
+        "before": {
+          "frame_bytes": 113792,
+          "binary_bytes": 92700,
+          "sha256": "eaf90302586a2f7fdeb89bee41307a96121a6e2413029360ec57e23feed7ae89"
+        },
+        "after": {
+          "frame_bytes": 72,
+          "binary_bytes": 78921,
+          "sha256": "e1951b3139a74c27a3d9cb8bf42b41d8b192b11212282bc94e06dd3c8544bb37"
+        }
+      },
+      "runs_ms": [
+        {
+          "before": 32.598572,
+          "after": 32.875456
+        },
+        {
+          "after": 32.672299,
+          "before": 33.182212
+        },
+        {
+          "before": 32.90603,
+          "after": 32.73738
+        },
+        {
+          "after": 32.551734,
+          "before": 33.192789
+        },
+        {
+          "before": 32.791953,
+          "after": 32.574202
+        },
+        {
+          "after": 34.076685,
+          "before": 32.720618
+        },
+        {
+          "before": 36.489454,
+          "after": 36.61659
+        },
+        {
+          "after": 33.918455,
+          "before": 33.998034
+        },
+        {
+          "before": 36.86751,
+          "after": 37.546225
+        },
+        {
+          "after": 34.383288,
+          "before": 35.618645
+        },
+        {
+          "before": 32.636781,
+          "after": 32.193029
+        }
+      ],
+      "checked_values": 201,
+      "entry_failures_agree": true,
+      "summary": {
+        "before": {
+          "median_ms": 33.182212,
+          "min_ms": 32.598572,
+          "max_ms": 36.86751,
+          "mad_ms": 0.5454310000000007
+        },
+        "after": {
+          "median_ms": 32.875456,
+          "min_ms": 32.193029,
+          "max_ms": 37.546225,
+          "mad_ms": 0.682426999999997
+        }
+      }
+    }
+  ],
+  "finished_utc": "2026-09-17T15:13:12.344105+00:00"
+}

@@ -14,14 +14,15 @@ rule scaled
   output:
     value : number
   logic:
-    let product = sample.reading * 3
+    let factor = 1 + 2
+    let product = sample.reading * factor
     value = product / 2
   proofs:
     purity:
       reads : [sample.reading]
       calls : []
     termination:
-      bound : 2
+      bound : 3
   hints:
     overflow : [-150, 150]
 
