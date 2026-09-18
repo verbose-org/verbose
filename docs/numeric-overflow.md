@@ -69,8 +69,11 @@ runtime interval analysis. Numeric expression temporaries and expanded callee
 locals are released after their result reaches registers. Sequential calls and
 exclusive branches reuse those slots; live caller values keep their storage.
 The frame is sized from the emitter's maximum live slot count. Nonconstant lets
-still evaluate once in source order and remain live until their rule returns;
-this is not full last-use analysis.
+still evaluate once in source order. Their slots can now be reused after the last
+complete expression that reads them, including through lexical aliases and
+shadowing. Unused nonconstant lets execute without a persistent result slot.
+There is no reuse partway through an expression or branch-specific shortening
+of local lifetimes; see [numeric local storage](numeric-local-lifetimes.md).
 
 ## Native simplification after verification
 

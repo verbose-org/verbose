@@ -162,6 +162,8 @@ intervals and verifies intermediate arithmetic and enforced input premises.
 After verification, a private [native simplification pass](docs/numeric-optimization.md)
 uses those premises for constant folding and branch selection; original entry
 guards remain, and scalar scratch is sized from maximum live storage.
+Numeric local slots can also be reused after their last enclosing expression;
+[lexical lifetime analysis](docs/numeric-local-lifetimes.md) runs only at compilation.
 Acceptance therefore does not mean every annotation has been proved. The precise
 boundary and a recorded range-analysis counterexample are in
 [proof classification](docs/spec-proofs.md).

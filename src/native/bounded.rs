@@ -1,9 +1,12 @@
 //! Dedicated two-word Result(number, BoundsError) lowering. Values never use
 //! pointers: rax is the tag (0/1), rdx the byte or zero. Every temporary and
 //! lexical binding has a frame slot; call expansion is acyclic and eager.
-//! Also used for strict numeric contracts: scalar slots are one word, scratch
-//! is not zero-initialized, and the entry validates complete i64 arguments.
+//! Also used for strict numeric contracts: scalar slots are one word and reused
+//! after their last enclosing expression. Scratch is not zero-initialized, and
+//! the entry validates complete i64 arguments.
 use super::*;
+
+mod liveness;
 
 fn jump(code: &mut Vec<u8>, opcode: &[u8]) -> usize {
     code.extend_from_slice(opcode);
@@ -55,12 +58,36 @@ impl Emit<'_> {
         Ok(Local { slot, ty })
     }
     fn rule(&mut self, r: &Rule) -> Result<Type, NativeError> {
+        if self.numeric {
+            return self.numeric_rule(r);
+        }
         let mut env = HashMap::new();
         for (name, expr) in &r.logic.bindings {
             let ty = self.expr(expr, &r.input_name, &env)?;
             let local = self.save(ty)?;
             env.insert(name.clone(), local);
         }
+        self.expr(&r.logic.value, &r.input_name, &env)
+    }
+    fn numeric_rule(&mut self, r: &Rule) -> Result<Type, NativeError> {
+        let plan = liveness::Plan::for_rule(r);
+        let base = self.next;
+        let mut env = HashMap::new();
+        for (i, (name, expr)) in r.logic.bindings.iter().enumerate() {
+            self.next = base + plan.prefixes[i];
+            // Keep eager source order, including unused nonconstant lets.
+            let ty = self.expr(expr, &r.input_name, &env)?;
+            if let Some(slot) = plan.slots[i] {
+                // The initializer finished; its last-use operands can now be
+                // overwritten by the result without moving another live value.
+                self.next = base + slot;
+                let local = self.save(ty)?;
+                env.insert(name.clone(), local);
+            } else {
+                env.remove(name);
+            }
+        }
+        self.next = base + plan.prefixes[r.logic.bindings.len()];
         self.expr(&r.logic.value, &r.input_name, &env)
     }
     fn scalar(

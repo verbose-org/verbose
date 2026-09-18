@@ -36,7 +36,9 @@ Numeric values use one word. An expression's temporary slots can be reused once
 its result is in registers. The caller's live operands and local bindings remain
 allocated while a callee runs; callee locals become reusable on return. Exclusive
 branches use the same available scratch. Nonconstant lets retain their source
-order and lifetime until their rule returns; this is not last-use allocation.
+order. A subsequent [local-lifetime pass](numeric-local-lifetimes.md) now reuses
+their slots after the last complete expression that reads them; the measurements
+below describe the initial PR #229 implementation, before that follow-up.
 
 The emitter measures its maximum live slot count and reserves that storage once
 per process, plus input and existing entry/output bookkeeping. The conservative
@@ -84,6 +86,7 @@ python3 tools/benchmark_numeric_contract.py \
   --compiler target/release/verbosec \
   --reference-compiler /path/to/verbosec-from-0cfda1d \
   --reference-revision 0cfda1d3335a448be186b2a0ea012b46b3f4dc55 \
+  --cases constants arithmetic calls \
   --records 16000 --repeats 11 --cpu 2 \
   --output /tmp/numeric-comparison.json
 ```

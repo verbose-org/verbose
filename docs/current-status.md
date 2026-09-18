@@ -127,6 +127,8 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   After verification, native emission precomputes constants, removes proved
   impossible branches and reuses dead scalar scratch. Original entry guards and
   source obligations remain; see [numeric optimization](numeric-optimization.md).
+  [Numeric local lifetimes](numeric-local-lifetimes.md) also allow slots to be
+  reused after their last enclosing expression, with no runtime lifetime tracking.
 - Source-to-binary semantic equivalence is not independently proved by the x86
   instruction decoder. Compiler and optimizer correctness remain trusted.
 - The bootstrap checks `gen1 == gen2` for the self-source, plus refusal and
