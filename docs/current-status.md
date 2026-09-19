@@ -129,6 +129,9 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   source obligations remain; see [numeric optimization](numeric-optimization.md).
   [Numeric local lifetimes](numeric-local-lifetimes.md) also allow slots to be
   reused after their last enclosing expression, with no runtime lifetime tracking.
+  The [numeric benchmark](numeric-benchmark.md) separates elapsed and child CPU
+  time and marks inconsistent clock accounting inconclusive. Frame savings are
+  established; the recorded timings do not settle small runtime-cost differences.
 - Source-to-binary semantic equivalence is not independently proved by the x86
   instruction decoder. Compiler and optimizer correctness remain trusted.
 - The bootstrap checks `gen1 == gen2` for the self-source, plus refusal and

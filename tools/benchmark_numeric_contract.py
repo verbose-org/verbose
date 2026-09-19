@@ -1,8 +1,9 @@
 """Compare strict numeric native emission on Linux x86-64.
 
-Checks output/exit parity before timing identical argv records. Timings include
-process startup, decimal parsing and writes to /dev/null. Frame sizes describe
-reserved stack storage, not process RSS or measured hardware cache residency.
+Checks output/exit parity before timing identical argv records. Reports elapsed
+time and child CPU time separately, including process startup, decimal parsing
+and writes to /dev/null. Argument strings are prepared before timing. Frame sizes
+describe reserved stack storage, not RSS or measured hardware cache residency.
 Only the Python standard library and two supplied compiler binaries are needed.
 """
 import argparse
@@ -12,9 +13,11 @@ import json
 import os
 from pathlib import Path
 import platform
+import resource
 import statistics
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -91,13 +94,90 @@ def signature(result):
     return result.returncode, result.stdout, result.stderr
 
 
+def cpu_exceeds_wall(cpu_ms, wall_ms):
+    # A deliberately generous diagnostic tolerance, not an accuracy guarantee:
+    # allow 20 ms for short samples or 5% for longer ones.
+    return cpu_ms > wall_ms + max(20, wall_ms * .05)
+
+
+def run_measured(command, *, timeout=120, stdout=subprocess.DEVNULL):
+    """One serial, waited-for child; no other children run in this interval."""
+    accounting_start = time.perf_counter_ns()
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    start = time.perf_counter_ns()
+    result = subprocess.run(command, stdout=stdout, stderr=subprocess.PIPE,
+                            check=True, timeout=timeout)
+    wall_ms = (time.perf_counter_ns() - start) / 1e6
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    accounting_wall_ms = (time.perf_counter_ns() - accounting_start) / 1e6
+    if result.stderr:
+        raise RuntimeError(f'timed native execution wrote stderr: {result.stderr!r}')
+    user_ms = (after.ru_utime - before.ru_utime) * 1000
+    system_ms = (after.ru_stime - before.ru_stime) * 1000
+    sample = {'wall_ms': wall_ms, 'accounting_wall_ms': accounting_wall_ms,
+              'user_ms': user_ms, 'system_ms': system_ms,
+              'cpu_ms': user_ms + system_ms}
+    for key, attr in [('voluntary_switches', 'ru_nvcsw'), ('involuntary_switches', 'ru_nivcsw'),
+                      ('minor_faults', 'ru_minflt'), ('major_faults', 'ru_majflt')]:
+        sample[key] = getattr(after, attr) - getattr(before, attr)
+    if any(v < 0 for v in sample.values()):
+        raise RuntimeError(f'non-monotonic child accounting: {sample}')
+    sample['cpu_exceeds_wall_tolerance'] = cpu_exceeds_wall(sample['cpu_ms'], accounting_wall_ms)
+    return sample, result.stdout
+
+
+def measure(command, *, timeout=120):
+    return run_measured(command, timeout=timeout)[0]
+
+
+def clock_probe():
+    """A single-thread probe independent of the compiler and its native output."""
+    code = '''import json,time
+wall = time.perf_counter()
+cpu = time.process_time()
+while time.perf_counter() - wall < .3:
+    pass
+print(json.dumps({"wall_ms": (time.perf_counter()-wall)*1000,
+                  "cpu_ms": (time.process_time()-cpu)*1000}))
+'''
+    sample, output = run_measured([sys.executable, '-I', '-S', '-c', code], stdout=subprocess.PIPE)
+    sample['inner'] = json.loads(output)
+    sample['inner']['cpu_exceeds_wall_tolerance'] = cpu_exceeds_wall(
+        sample['inner']['cpu_ms'], sample['inner']['wall_ms'])
+    return sample
+
+
+def distribution(values):
+    median = statistics.median(values)
+    return {'median': median, 'min': min(values), 'max': max(values),
+            'mad': statistics.median(abs(v - median) for v in values)}
+
+
+def summarize(runs):
+    summary = {}
+    for metric in ['wall_ms', 'cpu_ms', 'user_ms', 'system_ms']:
+        summary[metric] = {
+            label: distribution([run[label][metric] for run in runs])
+            for label in ['before', 'after']
+        }
+        # Keep paired comparisons. A zero CPU reading has no defined ratio;
+        # never silently drop it or fabricate a percentage.
+        summary[metric]['paired_change_pct'] = (
+            distribution([(run['after'][metric] / run['before'][metric] - 1) * 100
+                          for run in runs])
+            if all(run['before'][metric] > 0 for run in runs) else None
+        )
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler', type=Path, default=ROOT / 'target/release/verbosec')
     parser.add_argument('--reference-compiler', type=Path, required=True)
     parser.add_argument('--reference-revision', required=True)
     parser.add_argument('--records', type=int, default=16000)
-    parser.add_argument('--repeats', type=int, default=11)
+    parser.add_argument('--repeats', type=int, default=32,
+                        help='Paired samples; use an even count to balance AB/BA order (default: 32)')
     parser.add_argument('--cases', nargs='+', choices=fixtures().keys(),
                         help='Selected workloads; default: all')
     parser.add_argument('--cpu', type=int)
@@ -117,16 +197,22 @@ def main():
     (work / 'numeric.intent').write_text('Measure pure arithmetic under enforced input bounds.\n')
     compilers = {'before': args.reference_compiler.resolve(), 'after': args.compiler.resolve()}
     report = {
-        'schema_version': 1, 'status': 'running', 'started_utc': datetime.now(timezone.utc).isoformat(),
+        'schema_version': 2, 'status': 'running', 'started_utc': datetime.now(timezone.utc).isoformat(),
         'revision': execute(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture_output=True, text=True).stdout.strip(),
         'working_tree_status': execute(['git', 'status', '--short'], cwd=ROOT, capture_output=True, text=True).stdout,
         'compiler_sha256': {label: digest(path) for label, path in compilers.items()},
         'harness_sha256': digest(__file__), 'artifacts': str(work),
+        'timing': {'wall': 'process launch, execution and wait; argument strings prepared beforehand',
+                   'cpu': 'RUSAGE_CHILDREN delta after one serial child has terminated and been waited for',
+                   'order': 'alternating AB/BA pairs', 'balanced_order': args.repeats % 2 == 0,
+                   'cpu_consistency_tolerance': 'max(20 ms, 5% of enclosing wall interval); diagnostic only',
+                   'python': platform.python_version(),
+                   'perf_counter_resolution_seconds': time.get_clock_info('perf_counter').resolution},
         'config': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         'host': {'kernel': platform.release(), 'affinity': sorted(os.sched_getaffinity(0)),
                  'cpu': next(line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
                              if line.startswith('model name')), 'loadavg_before': os.getloadavg()},
-        'cache_counters': 'not measured', 'cases': [],
+        'cache_counters': 'not measured', 'clock_probes': [], 'cases': [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -134,14 +220,15 @@ def main():
         args.output.write_text(json.dumps(report, indent=2) + '\n')
 
     values = list(range(-100, 101))
-    records = [values[i % len(values)] for i in range(args.records)]
+    records = [str(values[i % len(values)]) for i in range(args.records)]
     try:
+        report['clock_probes'].append(clock_probe())
         for name, source in fixtures().items():
             if args.cases and name not in args.cases:
                 continue
             path = work / f'{name}.verbose'
             path.write_text(source)
-            row = {'name': name, 'source_sha256': digest(path), 'builds': {}, 'runs_ms': []}
+            row = {'name': name, 'source_sha256': digest(path), 'builds': {}, 'runs': []}
             report['cases'].append(row)
             binaries = {}
             for label, compiler in compilers.items():
@@ -171,26 +258,32 @@ def main():
                     raise RuntimeError(f'{name}: entry failure mismatch for {bad}')
             row['checked_values'] = len(values)
             row['entry_failures_agree'] = True
-            for binary in binaries.values():
-                for _ in range(2):
-                    execute([binary, *records], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+            row['identical_binary'] = row['builds']['before']['sha256'] == row['builds']['after']['sha256']
+            commands = {label: [str(binary), *records] for label, binary in binaries.items()}
+            row['warmups'] = {label: [measure(command) for _ in range(2)]
+                              for label, command in commands.items()}
             for repeat in range(args.repeats):
-                sample = {}
                 order = ('before', 'after') if repeat % 2 == 0 else ('after', 'before')
+                sample = {'order': list(order)}
                 for label in order:
-                    start = time.perf_counter_ns()
-                    execute([binaries[label], *records], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
-                    sample[label] = (time.perf_counter_ns() - start) / 1e6
-                row['runs_ms'].append(sample)
-            row['summary'] = {}
-            for label in compilers:
-                times = [run[label] for run in row['runs_ms']]
-                median = statistics.median(times)
-                row['summary'][label] = {'median_ms': median, 'min_ms': min(times), 'max_ms': max(times),
-                                         'mad_ms': statistics.median(abs(t - median) for t in times)}
+                    sample[label] = measure(commands[label])
+                row['runs'].append(sample)
+            row['summary'] = summarize(row['runs'])
             save()
-            print(name, row['builds'], row['summary'], flush=True)
-        report['status'] = 'ok'
+            print(name, row['builds'], {k: row['summary'][k] for k in ['wall_ms', 'cpu_ms']}, flush=True)
+        report['clock_probes'].append(clock_probe())
+        inconsistent_probes = sum(p['cpu_exceeds_wall_tolerance'] or
+                                  p['inner']['cpu_exceeds_wall_tolerance'] for p in report['clock_probes'])
+        inconsistent_samples = sum(run[label]['cpu_exceeds_wall_tolerance']
+                                   for row in report['cases'] for run in row['runs']
+                                   for label in ['before', 'after'])
+        inconsistent_warmups = sum(sample['cpu_exceeds_wall_tolerance']
+                                   for row in report['cases'] for samples in row['warmups'].values()
+                                   for sample in samples)
+        report['cpu_consistency'] = {'inconsistent_probes': inconsistent_probes,
+                                     'inconsistent_samples': inconsistent_samples,
+                                     'inconsistent_warmups': inconsistent_warmups}
+        report['status'] = 'inconclusive' if any(report['cpu_consistency'].values()) else 'ok'
     except Exception as error:
         report['status'] = 'failed'
         report['error'] = str(error)
@@ -199,6 +292,10 @@ def main():
         report['host']['loadavg_after'] = os.getloadavg()
         report['finished_utc'] = datetime.now(timezone.utc).isoformat()
         save()
+    if report['status'] == 'inconclusive':
+        print('CPU accounting exceeds the single-thread wall-time tolerance. '
+              'Raw data retained; CPU comparisons are inconclusive.', file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == '__main__':
