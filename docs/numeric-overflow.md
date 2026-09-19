@@ -37,12 +37,17 @@ whose input variables have different names.
   is a compilation error. Diagnostics identify the rule, binding/output, and the
   failed operation or unsupported obligation.
 
-This is conservative interval analysis. Direct scalar comparisons in `if`
+This is conservative analysis with at most two intervals per numeric fact.
+Direct scalar comparisons in `if`
 conditions can now refine the selected arm's interval; see
 [numeric branch guards](numeric-guards.md). Every branch still has an obligation,
 including statically untaken branches. The analysis does not establish general
 correlations between expressions. A safe program can be refused: rewrite it or
 state a narrower input domain that the entry will enforce.
+An explicit `!= 0` can exclude zero even when a value may have either sign.
+Computed domains use at most four interval pairs per operation; excess result
+pieces widen to their enclosing interval. Public `overflow` declarations remain
+single intervals. See the [precision budget](numeric-guards.md#nonzero-values-and-bounded-analysis).
 
 ## Scope and representation
 

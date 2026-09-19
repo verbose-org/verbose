@@ -16,8 +16,8 @@ pub(super) struct Scope<'a> {
     input: &'a str,
     // Sparse: cloning a nested branch copies only its established facts, not
     // every enclosing let. Names denote fixed definitions within an expression.
-    local_facts: HashMap<String, (i64, i64)>,
-    field_facts: HashMap<String, (i64, i64)>,
+    local_facts: HashMap<String, Ranges>,
+    field_facts: HashMap<String, Ranges>,
 }
 
 impl<'a> Scope<'a> {
@@ -34,29 +34,26 @@ impl<'a> Scope<'a> {
     pub fn local(&self, name: &str) -> Option<Value> {
         let v = *self.locals.get(name)?;
         Some(match v {
-            Value::Number(lo, hi) => {
-                let (lo, hi) = self.local_facts.get(name).copied().unwrap_or((lo, hi));
-                Value::Number(lo, hi)
+            Value::Number(ranges) => {
+                Value::Number(self.local_facts.get(name).copied().unwrap_or(ranges))
             }
             Value::Bool => v,
         })
     }
 
-    pub fn field(&self, name: &str) -> Option<(i64, i64)> {
+    pub fn field(&self, name: &str) -> Option<Ranges> {
         let f = self
             .concept
             .fields
             .iter()
             .find(|f| f.name == name && f.ty == Type::Number)?;
-        Some(
-            self.field_facts
-                .get(name)
-                .copied()
-                .unwrap_or(f.range.unwrap_or((i64::MIN, i64::MAX))),
-        )
+        Some(self.field_facts.get(name).copied().unwrap_or_else(|| {
+            let (lo, hi) = f.range.unwrap_or((i64::MIN, i64::MAX));
+            Ranges::interval(lo, hi)
+        }))
     }
 
-    fn scalar(&self, e: &Expr) -> Option<(Place, (i64, i64))> {
+    fn scalar(&self, e: &Expr) -> Option<(Place, Ranges)> {
         match e {
             Expr::Ident(n) => Some((Place::Local(n.clone()), self.local(n)?.number().ok()?)),
             Expr::Field(base, n) if matches!(base.as_ref(), Expr::Ident(n) if n == self.input && !self.locals.contains_key(n)) => {
@@ -98,7 +95,7 @@ impl<'a> Scope<'a> {
                             .map(|(s, n)| (s, reverse(op), n))
                     });
                 if let Some(((place, range), op, n)) = candidate {
-                    let Some(range) = restrict(range, op, n) else {
+                    let Some(range) = range.restrict(op, n) else {
                         return false;
                     };
                     match place {
@@ -147,24 +144,6 @@ fn reverse(op: BinOp) -> BinOp {
     }
 }
 
-fn restrict((lo, hi): (i64, i64), op: BinOp, n: i64) -> Option<(i64, i64)> {
-    // i128 makes strict comparisons at MIN/MAX ordinary interval operations.
-    let (lo, hi, n) = (lo as i128, hi as i128, n as i128);
-    let (lo, hi) = match op {
-        BinOp::Eq => (lo.max(n), hi.min(n)),
-        BinOp::NotEq if lo == n => (lo + 1, hi),
-        BinOp::NotEq if hi == n => (lo, hi - 1),
-        // A single interval cannot represent a hole. Keep the original range.
-        BinOp::NotEq => (lo, hi),
-        BinOp::Lt => (lo, hi.min(n - 1)),
-        BinOp::LtEq => (lo, hi.min(n)),
-        BinOp::Gt => (lo.max(n + 1), hi),
-        BinOp::GtEq => (lo.max(n), hi),
-        _ => unreachable!("normalized comparison"),
-    };
-    (lo <= hi).then_some((lo as i64, hi as i64))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,9 +177,12 @@ mod tests {
                         BinOp::GtEq,
                     ] {
                         for truth in [false, true] {
-                            let range = restrict((lo, hi), comparison(op, truth).unwrap(), n);
-                            if let Some((a, b)) = range {
-                                assert!(lo <= a && a <= b && b <= hi);
+                            let range = Ranges::interval(lo, hi)
+                                .restrict(comparison(op, truth).unwrap(), n);
+                            if let Some(r) = range {
+                                for (a, b) in r.pieces() {
+                                    assert!(lo <= a && a <= b && b <= hi);
+                                }
                             }
                             for &x in values.iter().filter(|&&x| lo <= x && x <= hi) {
                                 let actual = match op {
@@ -214,7 +196,9 @@ mod tests {
                                 };
                                 if actual == truth {
                                     assert!(
-                                        range.is_some_and(|(a, b)| a <= x && x <= b),
+                                        range.is_some_and(|r| r
+                                            .pieces()
+                                            .any(|(a, b)| a <= x && x <= b)),
                                         "{lo}..{hi}, {x} {op:?} {n} == {truth}: {range:?}"
                                     );
                                 }

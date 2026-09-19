@@ -1,0 +1,27 @@
+@verbose 0.1.0
+
+concept Division
+  @intention: "Bound the numerator and allow every signed i64 divisor"
+  @source: nonzero_numeric.intent:1
+  fields:
+    numerator : number [-100, 100]
+    divisor : number
+
+rule quotient
+  @intention: "Use an explicit nonzero condition and a zero fallback"
+  @source: nonzero_numeric.intent:2
+  input:
+    division : Division
+  output:
+    out : number
+  logic:
+    let divisor = division.divisor
+    out = if divisor != 0 then division.numerator / divisor else 0
+  proofs:
+    purity:
+      reads : [division.numerator, division.divisor]
+      calls : []
+    termination:
+      bound : 10
+  hints:
+    overflow : [-100, 100]

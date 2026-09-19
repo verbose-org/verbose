@@ -56800,7 +56800,8 @@ rule pick
         // deadcode, generated, pricing and showcase. The new strict_overflow
         // example is another refusal. Pin both ELF and raw output separately.
         // guarded_numeric is also refused by the existing overflow gate.
-        const EXPECTED_TOTAL: usize = 175;
+        // nonzero_numeric retains the same explicit overflow capability refusal.
+        const EXPECTED_TOTAL: usize = 176;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
