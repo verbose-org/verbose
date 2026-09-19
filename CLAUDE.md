@@ -81,6 +81,13 @@ reuse slots after the last complete expression using their definition; this
 compiler-only placement preserves eager evaluation and protects caller values.
 See [local lifetimes](docs/numeric-local-lifetimes.md).
 
+Follow-up (2026-09-19): explicit scalar/literal comparisons in `if` conditions
+can now justify safe arithmetic in their selected arms. Facts stay branch-local;
+eager lets, complete conditions and callees retain independent obligations.
+See [numeric branch guards](docs/numeric-guards.md). This supersedes the earlier
+restriction against branch-local interval refinement without adding runtime
+proof bookkeeping, allocation or garbage collection to native programs.
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

@@ -27,8 +27,10 @@ unsupported native entry modes retain their explicit refusals.
 
 This view is private to native emission. Source proofs, rule participation and
 interpreter input checks use the original program. `--stats` still reports the
-shared AST optimizer, not this later native pass. There is no branch-local range
-refinement, correlation analysis, SIMD or parallel lowering in this slice.
+shared AST optimizer, not this later native pass. The native simplifier does not
+refine branch-local ranges or perform correlation analysis, SIMD or parallel
+lowering. A subsequent [verification extension](numeric-guards.md) now uses
+explicit guards to prove selected-arm arithmetic before this pass runs.
 
 ## Stack storage
 

@@ -122,6 +122,9 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
 - [Numeric overflow contracts](numeric-overflow.md) now require known intervals
   and safe intermediate arithmetic across their supported pure acyclic call graph.
   Unknown analysis is refused; unbounded numeric inputs use the full i64 domain.
+  [Numeric branch guards](numeric-guards.md) use explicit scalar/literal comparisons
+  to justify arithmetic within selected `if` arms. Facts stay local; eager
+  calculations and callees retain their independent obligations.
   Interpreter/native argv entries enforce the premises. WASM/self-hosted emission
   refuses the contract until it can provide those guarantees.
   After verification, native emission precomputes constants, removes proved

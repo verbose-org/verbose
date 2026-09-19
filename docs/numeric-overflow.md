@@ -37,10 +37,12 @@ whose input variables have different names.
   is a compilation error. Diagnostics identify the rule, binding/output, and the
   failed operation or unsupported obligation.
 
-This is conservative interval analysis. It does not refine an input interval
-from `if` conditions or correlate repeated uses of a value. Even a statically
-untaken branch must satisfy the contract. A safe program can be refused: rewrite
-it or state a narrower input domain that the entry will enforce.
+This is conservative interval analysis. Direct scalar comparisons in `if`
+conditions can now refine the selected arm's interval; see
+[numeric branch guards](numeric-guards.md). Every branch still has an obligation,
+including statically untaken branches. The analysis does not establish general
+correlations between expressions. A safe program can be refused: rewrite it or
+state a narrower input domain that the entry will enforce.
 
 ## Scope and representation
 
@@ -94,9 +96,9 @@ toward zero, including negative values and i64 extremes.
 
 No speculative code motion, retry, SIMD or parallel lowering is enabled by this
 pass. Its unknown facts mean “keep the expression”, after strict verification has
-already established safety. Comparisons do not refine branch-local domains or
-establish correlations between repeated values. See the reproducible
-[numeric benchmark](numeric-optimization.md) for scope and measured costs.
+already established safety. The native simplifier remains conservative over
+whole-rule intervals; branch-local refinement belongs to verification. See the
+reproducible [numeric benchmark](numeric-optimization.md) for scope and measured costs.
 
 ## Entry behavior and support
 

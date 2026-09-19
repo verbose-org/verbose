@@ -159,6 +159,9 @@ runtime instruction, latency, or service-lifetime budget.
 Range analysis computes intervals for supported expressions. The current hint
 checker for [strict numeric contracts](docs/numeric-overflow.md) refuses unknown
 intervals and verifies intermediate arithmetic and enforced input premises.
+Explicit [numeric branch guards](docs/numeric-guards.md) can narrow the intervals
+used to verify a selected `if` arm. Facts stay local to that arm, with no runtime
+proof tracking or propagation of caller assumptions into independent callees.
 After verification, a private [native simplification pass](docs/numeric-optimization.md)
 uses those premises for constant folding and branch selection; original entry
 guards remain, and scalar scratch is sized from maximum live storage.
