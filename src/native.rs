@@ -56801,7 +56801,8 @@ rule pick
         // example is another refusal. Pin both ELF and raw output separately.
         // guarded_numeric is also refused by the existing overflow gate.
         // nonzero_numeric retains the same explicit overflow capability refusal.
-        const EXPECTED_TOTAL: usize = 176;
+        // capped_counter also requires the unsupported strict numeric contract.
+        const EXPECTED_TOTAL: usize = 177;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");
