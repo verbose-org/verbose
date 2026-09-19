@@ -12,7 +12,11 @@ enum Fact {
 impl From<Value> for Fact {
     fn from(v: Value) -> Self {
         match v {
-            Value::Number(lo, hi) => Self::Number(lo, hi),
+            Value::Number(ranges) => {
+                // Native folding deliberately uses only the conservative hull.
+                let (lo, hi) = ranges.hull();
+                Self::Number(lo, hi)
+            }
             Value::Bool => Self::Bool(None),
         }
     }

@@ -1,0 +1,2 @@
+A numerator is bounded to [-100, 100], while its divisor may be any signed i64.
+Divide the numerator by a nonzero divisor with truncation toward zero; return zero when the divisor is zero.

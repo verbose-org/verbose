@@ -257,3 +257,4 @@ fallback and propagation through a rule call and alias. See the
 
 - [`strict_overflow.verbose`](strict_overflow.verbose): signed arithmetic, precomputed constants, lexical aliases and same-input calls with strictly verified numeric contracts; native local slots are reused after last use. Interpreter/native argv support, other backends explicitly refuse.
 - [`guarded_numeric.verbose`](guarded_numeric.verbose): explicit branch conditions prove safe division and an increment capped at i64::MAX over the full i64 input domain. The verifier checks branch-local numeric intervals; no runtime proof bookkeeping is added.
+- [`nonzero_numeric.verbose`](nonzero_numeric.verbose): one explicit `!= 0` guard permits a negative or positive divisor. The compiler keeps at most two intervals per fact and verifies every arithmetic case before native emission.

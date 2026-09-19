@@ -125,6 +125,9 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   [Numeric branch guards](numeric-guards.md) use explicit scalar/literal comparisons
   to justify arithmetic within selected `if` arms. Facts stay local; eager
   calculations and callees retain their independent obligations.
+  Numeric facts can retain two separate intervals, allowing explicit nonzero
+  guards and nonzero computed values. A fixed precision budget keeps the analysis
+  bounded; no interval-set representation is added to native program values.
   Interpreter/native argv entries enforce the premises. WASM/self-hosted emission
   refuses the contract until it can provide those guarantees.
   After verification, native emission precomputes constants, removes proved

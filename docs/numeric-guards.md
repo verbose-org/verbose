@@ -1,6 +1,7 @@
 # Numeric branch guards
 
-Implemented 2026-09-19. Within the existing [strict overflow contract](numeric-overflow.md),
+Implemented 2026-09-19, with a subsequent bounded two-interval extension. Within
+the existing [strict overflow contract](numeric-overflow.md),
 an explicit `if` comparison can justify arithmetic in its selected arm. The
 compiler checks that justification; an LLM's assertion of safety is insufficient.
 The syntax is unchanged. Native programs gain no allocator, garbage collection
@@ -9,21 +10,23 @@ or runtime proof bookkeeping.
 ```verbose
 logic:
   let divisor = reading.value
-  out = if divisor > 0 then 100 / divisor else if divisor < 0 then 100 / divisor else 0
+  out = if divisor != 0 then 100 / divisor else 0
 hints:
   overflow : [-100, 100]
 ```
 
-For a full-i64 `reading.value`, the first division has a divisor in `[1, MAX]`,
-the second in `[MIN, -1]`, and the remaining path returns zero. The dividend is
-100, so neither division can encounter `MIN / -1`. Signed division truncates
+For a full-i64 `reading.value`, the division has a divisor in the union
+`[MIN, -1] ∪ [1, MAX]`, and the other path returns zero. The dividend is
+100, so the division cannot encounter `MIN / -1`. Signed division truncates
 toward zero. The fallback is source behavior, not a compiler-selected recovery
-policy. The complete [example](../examples/guarded_numeric.verbose) also shows an
-explicit increment that keeps `MAX` unchanged.
+policy. The complete [nonzero example](../examples/nonzero_numeric.verbose)
+also accepts a numerator bounded to `[-100, 100]`. The original
+[sign-guard example](../examples/guarded_numeric.verbose) remains supported and
+also shows an explicit increment that keeps `MAX` unchanged.
 
 ```sh
-cargo run -- examples/guarded_numeric.verbose --run ratio --native /tmp/ratio
-/tmp/ratio -3 0 4
+cargo run -- examples/nonzero_numeric.verbose --run quotient --native /tmp/quotient
+/tmp/quotient 100 -3 100 0 100 4
 # -33
 # 0
 # 25
@@ -44,8 +47,9 @@ cargo run -- examples/guarded_numeric.verbose --run ratio --native /tmp/ratio
   narrows that alias only; it does not narrow its original value or another alias.
   Boolean lets do not retain relations to the scalars that created them.
 - Facts end at the branch boundary. A resulting numeric value carries the union
-  of both checked result intervals, but no facts escape into another binding,
-  operand or sibling branch. Callees continue to verify independently over their
+  of both checked result domains, within the two-interval limit below. Constraints
+  on existing values do not escape into another binding, operand or sibling
+  branch. Callees continue to verify independently over their
   entire declared input domain. A caller's guard cannot excuse an unsafe callee.
 
 The complete condition is verified before either arm, using only facts already
@@ -55,12 +59,45 @@ before the `if`, or `divisor > 0 and 100 / divisor > 0` as its condition, still
 fails if the prior interval includes zero. This slice does not add verification
 based on short-circuit boolean evaluation.
 
+## Nonzero values and bounded analysis
+
+Each numeric fact is now a union of at most **two** nonempty signed intervals.
+An interior `!=` can split a range: excluding zero from `[-10, 10]` produces
+`[-10, -1] ∪ [1, 10]`. Arithmetic checks each interval pair before joining
+the results, so a nonzero divisor still requires protection against `MIN / -1`
+and `MIN % -1`. For full-i64 numerator/divisor fields, a guard such as
+`divisor != 0 and divisor != -1` establishes both requirements. Zero remains
+possible after some computations: a nonzero `x` does not make `x + 1` or
+`x * 0` nonzero. Unary arithmetic, `min` and `max` also check the represented
+pieces rather than copying an exclusion flag onto their results.
+
+Result domains can pass through eager lets, aliases, conditional results and
+independently checked unannotated callees. For example, a callee returning either
+`-2` or `2` has an inferred domain excluding zero. An explicit `overflow: [min, max]`
+still exposes that complete public interval to callers, even if its implementation
+produces fewer values. If that declaration includes zero, a caller needs its own
+guard before dividing by the result. There is no new public union type or syntax.
+
+The limit is a precision budget, not a new obligation on runtime values:
+
+- A branch join or arithmetic result needing more than two disjoint intervals
+  uses the enclosing interval from the lowest to highest endpoint. It may thereby
+  include values the program never produces. Every potentially unsafe operation
+  is checked **before** joining results; widening cannot hide overflow or a
+  zero divisor.
+- A further `!=` that would create a third interval keeps the prior domain.
+  That new exclusion cannot justify an operation, while previously proved facts
+  remain available. For `x` in `[-10, 10]`, `x != 0 and x != 2` can still justify
+  `100 / x`, but does not prove `100 / (x - 2)` in this slice. Guard order can
+  affect which facts fit this fixed precision budget.
+- Every operation handles at most four interval pairs with a fixed temporary
+  workspace in the compiler. There is no enumeration of combinations of source
+  branches, no growing interval list and no runtime representation of these sets.
+  Unknown safety after a loss of precision is refused with the existing rule,
+  binding/branch and operation diagnostic.
+
 ## Conservative refusals
 
-The domain is a single interval. Removing an endpoint with `!=` can narrow it;
-removing an interior point cannot. Consequently, for a divisor in `[-10, 10]`,
-`if divisor != 0 then 100 / divisor else 0` is still refused. Explicit positive
-and negative branches, as above, state intervals the verifier can represent.
 Comparisons of two variables, arithmetic expressions, boolean aliases, calls or
 named constants add no relational facts in this slice. Their expressions remain
 subject to all ordinary type and arithmetic checks.
@@ -94,12 +131,13 @@ execution time, whole-program memory safety or whole-process memory usage.
 
 This widens the set of provable programs. The branch itself still executes when
 its outcome depends on input; the extra analysis runs only in the Rust compiler.
-Native simplification continues to use conservative whole-rule intervals and
-checked callee result intervals. Original-source verification happens first.
+Native simplification continues to use conservative enclosing intervals and
+checked callee result intervals; it does not use holes to precompute comparisons.
+Original-source verification happens first.
 No execution-speed, cache or memory-size improvement is claimed for this slice.
 
 Tests compare interpreter/native values, stdout, stderr and exit status across
 both arms, malformed/out-of-domain entries, lexical scopes and i64 boundaries.
 Refusals cover leaked facts, eager evaluation, unsafe callees, contradictory
-conditions, unrepresentable nonzero ranges and unsupported constructs. Interval
+conditions, precision-limit refusals and unsupported constructs. Interval
 tests check containment against concrete comparisons, including MIN/MAX.

@@ -619,7 +619,6 @@ fn numeric_guards_do_not_invent_or_leak_proof_facts() {
             "",
             "includes zero",
         ),
-        ("if i.x != 0 then 100 / i.x else 0", "", "includes zero"),
         (
             "if i.x + 1 > 0 then 100 / (i.x + 1) else 0",
             "",
@@ -693,6 +692,183 @@ fn numeric_guards_callee_result_facts_remain_valid_during_native_folding() {
             eval(&p, "checked", x, 1).unwrap().to_string(),
             (100 / (x.abs() + 1)).to_string()
         );
+    }
+}
+
+#[test]
+fn numeric_nonzero_guards_preserve_arithmetic_and_lexical_values() {
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .chain([(-11, 1), (11, 1), (0, 0), (0, 6)])
+        .collect();
+    for (expr, lets) in [
+        ("if i.x != 0 then 100 / i.x else 0", ""),
+        ("if 0 != i.x then 100 % i.x else 0", ""),
+        ("if i.x == 0 then 0 else 100 / i.x", ""),
+        ("if not (i.x == 0) then 100 / i.x else 0", ""),
+        ("if i.x != 0 then 100 / -i.x else 0", ""),
+        ("if i.x != 0 then 100 / abs(i.x) else 0", ""),
+        ("if i.x != 0 then 100 / min(i.x, -1) else 0", ""),
+        ("if i.x != 0 then 100 / max(i.x, 1) else 0", ""),
+        ("if i.x != -1 then 100 / (i.x + 1) else 0", ""),
+        ("if i.x != 1 then 100 / (i.x - 1) else 0", ""),
+        ("if i.x != 0 then 100 / (i.x * 2) else 0", ""),
+        ("if i.x != 0 and i.x != 2 then 100 / i.x else 0", ""),
+        ("if divisor != 0 then 100 / divisor else 0", "    let divisor = i.x + i.y\n"),
+        ("100 / (divisor + 1)", "    let divisor = if i.x < 0 then -2 else 2\n"),
+        ("100 / alias", "    let divisor = if i.x < 0 then -2 else 2\n    let alias = divisor\n    let divisor = 0\n"),
+        ("if i.x != 0 then if i.x == 0 then 7 else 100 / i.x else 0", ""),
+    ] {
+        differential(&fixture(expr, lets), "checked", &inputs);
+    }
+    let mut p = fixture("if i.x != 0 then 100 / i.x else 0", "");
+    fields(&mut p)[0].range = None;
+    differential(
+        &p,
+        "checked",
+        &[
+            (i64::MIN, 1),
+            (i64::MIN + 1, 1),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+            (i64::MAX, 1),
+        ],
+    );
+}
+
+#[test]
+fn numeric_nonzero_still_requires_the_min_over_minus_one_guard() {
+    let values = [
+        i64::MIN,
+        i64::MIN + 1,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    let inputs: Vec<_> = values
+        .iter()
+        .flat_map(|&x| values.map(|y| (x, y)))
+        .collect();
+    for expr in [
+        "if i.y != 0 and i.y != -1 then i.x / i.y else 0",
+        "if i.y != -1 and i.y != 0 then i.x % i.y else 0",
+        "if i.y == 0 or i.y == -1 then 0 else i.x / i.y",
+        "if i.y != 0 and i.x >= -9223372036854775807 then i.x / i.y else 0",
+    ] {
+        let mut p = fixture(expr, "");
+        for f in fields(&mut p) {
+            f.range = None;
+        }
+        full(&mut p);
+        differential(&p, "checked", &inputs);
+    }
+    for expr in [
+        "if i.y != 0 then i.x / i.y else 0",
+        "if i.y != 0 then i.x % i.y else 0",
+    ] {
+        let mut p = fixture(expr, "");
+        for f in fields(&mut p) {
+            f.range = None;
+        }
+        full(&mut p);
+        refuses(&p, "MIN / -1");
+    }
+}
+
+#[test]
+fn numeric_nonzero_callee_results_preserve_public_contracts_and_native_folding() {
+    let mut p = fixture("100 / saved", "    let saved = denominator(i)\n");
+    let mut callee = rule(&mut fixture("if i.x < 0 then -2 else 2", "")).clone();
+    callee.name = "denominator".into();
+    callee.hints = None;
+    callee.input_name = "other".into();
+    callee.logic.value =
+        crate::optimizer::substitute_ident(&callee.logic.value, "i", &Expr::Ident("other".into()));
+    p.items.push(Item::Rule(callee));
+    let inputs: Vec<_> = (-10..=10)
+        .map(|x| (x, 1))
+        .chain([(-11, 1), (11, 1)])
+        .collect();
+    differential(&p, "checked", &inputs);
+    for x in -10..=10 {
+        assert_eq!(
+            eval(&p, "checked", x, 1).unwrap().to_string(),
+            if x < 0 { "-50" } else { "50" }
+        );
+    }
+    // An explicit public interval promises the full interval, including zero.
+    let hints = rule(&mut fixture("0", "")).hints.clone();
+    if let Item::Rule(callee) = p.items.last_mut().unwrap() {
+        callee.hints = hints;
+    }
+    refuses(&p, "includes zero");
+}
+
+#[test]
+fn numeric_nonzero_never_reuses_stale_exclusions_or_hides_widened_holes() {
+    for (expr, lets, needle) in [
+        (
+            "if i.x != 0 then 100 / (i.x * 0) else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if i.x != 0 then 100 / (i.x + 1) else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if i.x != 0 then 100 / min(i.x, 0) else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if i.x != 0 then 100 / max(i.x, 0) else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if alias != 0 then 100 / i.x else 0",
+            "    let alias = i.x\n",
+            "includes zero",
+        ),
+        (
+            "if i.x != 0 and 100 / i.x > 0 then 1 else 0",
+            "",
+            "if condition",
+        ),
+        (
+            "if i.x != 0 then 100 / i.x else 100 / i.x",
+            "",
+            "else branch",
+        ),
+        (
+            "if i.x != 0 and i.x == 0 then 100 / i.x else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if i.x != 0 then if i.x == 0 then 1 / 0 else 0 else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if i.x != 0 and i.x != 2 then 100 / (i.x - 2) else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "100 / divisor",
+            "    let divisor = if i.x < 0 then -2 else if i.y < 3 then 2 else 4\n",
+            "includes zero",
+        ),
+    ] {
+        refuses(&fixture(expr, lets), needle);
     }
 }
 
@@ -837,7 +1013,8 @@ fn numeric_contract_interval_arithmetic_covers_concrete_signed_values() {
             for c in -4..=4 {
                 for d in c..=4 {
                     for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod] {
-                        if let Ok(Value::Number(lo, hi)) = arithmetic(op, (a, b), (c, d)) {
+                        if let Ok(Value::Number(ranges)) = arithmetic(op, (a, b), (c, d)) {
+                            let (lo, hi) = ranges.hull();
                             for x in a..=b {
                                 for y in c..=d {
                                     let value = match op {
@@ -981,6 +1158,7 @@ fn numeric_contract_existing_examples_verify() {
         "deadcode",
         "strict_overflow",
         "guarded_numeric",
+        "nonzero_numeric",
     ] {
         let p = parse(&fs::read_to_string(format!("examples/{f}.verbose")).unwrap());
         let errors = crate::verifier::verify_program(&p, Path::new("examples"));
@@ -1102,6 +1280,10 @@ fn two_generation_numeric_contract_self_hosted_refuses_before_emission() {
             (clean.clone(), 0),
             (
                 include_str!("../../examples/guarded_numeric.verbose").to_owned(),
+                1,
+            ),
+            (
+                include_str!("../../examples/nonzero_numeric.verbose").to_owned(),
                 1,
             ),
         ] {

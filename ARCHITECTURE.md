@@ -162,6 +162,10 @@ intervals and verifies intermediate arithmetic and enforced input premises.
 Explicit [numeric branch guards](docs/numeric-guards.md) can narrow the intervals
 used to verify a selected `if` arm. Facts stay local to that arm, with no runtime
 proof tracking or propagation of caller assumptions into independent callees.
+Numeric facts retain at most two intervals, so a nonzero guard can distinguish
+negative and positive divisors. Arithmetic checks at most four interval pairs;
+result sets exceeding that precision widen conservatively. These are compiler
+facts, while native numbers retain their existing one-word representation.
 After verification, a private [native simplification pass](docs/numeric-optimization.md)
 uses those premises for constant folding and branch selection; original entry
 guards remain, and scalar scratch is sized from maximum live storage.

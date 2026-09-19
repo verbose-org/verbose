@@ -6,6 +6,8 @@ use crate::verifier::{walk_expr_children, VerifyError};
 use std::collections::{BTreeSet, HashMap};
 
 mod guards;
+mod ranges;
+use ranges::Ranges;
 pub(crate) mod native_opt;
 use guards::Scope;
 
@@ -68,13 +70,13 @@ pub fn active_rules(p: &Program) -> BTreeSet<String> {
 
 #[derive(Clone, Copy, Debug)]
 enum Value {
-    Number(i64, i64),
+    Number(Ranges),
     Bool,
 }
 impl Value {
-    fn number(self) -> Result<(i64, i64), String> {
+    fn number(self) -> Result<Ranges, String> {
         match self {
-            Self::Number(a, b) => Ok((a, b)),
+            Self::Number(r) => Ok(r),
             _ => Err("expected number, found bool".into()),
         }
     }
@@ -188,7 +190,7 @@ impl<'a> Check<'a> {
                     h.min, h.max
                 ));
             }
-            let (lo, hi) = value.number()?;
+            let (lo, hi) = value.number()?.hull();
             if lo < h.min || hi > h.max {
                 return Err(format!(
                     "computed range [{lo}, {hi}] exceeds declared [{}, {}]",
@@ -196,7 +198,7 @@ impl<'a> Check<'a> {
                 ));
             }
             // Callers rely on the public declaration, not implementation details.
-            return Ok(Value::Number(h.min, h.max));
+            return Ok(Value::Number(Ranges::interval(h.min, h.max)));
         }
         Ok(value)
     }
@@ -216,7 +218,7 @@ impl<'a> Check<'a> {
         }
         let mut eval = |e: &Expr| self.expr(e, r, scope, depth + 1);
         match e {
-            Expr::Number(n) => Ok(Value::Number(*n, *n)),
+            Expr::Number(n) => Ok(Value::Number(Ranges::interval(*n, *n))),
             Expr::Ident(n) => scope.local(n).ok_or_else(|| format!("unknown scalar binding '{n}'")),
             Expr::Field(base, name) => {
                 if !matches!(base.as_ref(), Expr::Ident(n) if n == &r.input_name && !scope.locals.contains_key(n)) {
@@ -224,8 +226,7 @@ impl<'a> Check<'a> {
                 }
                 let f = scope.concept.fields.iter().find(|f| f.name == *name).ok_or("unknown input field")?;
                 if f.ty != Type::Number { return Err(format!("field '{name}': only numeric field reads are supported")); }
-                let (lo, hi) = scope.field(name).expect("checked numeric field");
-                Ok(Value::Number(lo, hi))
+                Ok(Value::Number(scope.field(name).expect("checked numeric field")))
             }
             Expr::If(cond, a, b) => {
                 eval(cond).map_err(|e| format!("if condition: {e}"))?.boolean()?;
@@ -236,22 +237,26 @@ impl<'a> Check<'a> {
                 let b = self.expr(b, r, &scope.branch(cond, false), depth + 1)
                     .map_err(|e| format!("else branch: {e}"))?;
                 match (a, b) {
-                    (Value::Number(a, b), Value::Number(c, d)) => Ok(Value::Number(a.min(c), b.max(d))),
+                    (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a.join(b))),
                     (Value::Bool, Value::Bool) => Ok(Value::Bool),
                     _ => Err("conditional branches have different types".into()),
                 }
             }
             Expr::Not(v) => { eval(v)?.boolean()?; Ok(Value::Bool) }
             Expr::Neg(v) | Expr::Abs(v) => {
-                let (lo, hi) = eval(v)?.number()?;
-                if lo == i64::MIN { return Err("unary arithmetic may overflow i64 at MIN".into()); }
-                if matches!(e, Expr::Neg(_)) { Ok(Value::Number(-hi, -lo)) }
-                else { Ok(Value::Number(if lo <= 0 && hi >= 0 { 0 } else { lo.abs().min(hi.abs()) }, lo.abs().max(hi.abs()))) }
+                let ranges = eval(v)?.number()?.map(|(lo, hi)| {
+                    if lo == i64::MIN { return Err("unary arithmetic may overflow i64 at MIN".into()); }
+                    Ok(if matches!(e, Expr::Neg(_)) { (-hi, -lo) }
+                    else { (if lo <= 0 && hi >= 0 { 0 } else { lo.abs().min(hi.abs()) }, lo.abs().max(hi.abs())) })
+                })?;
+                Ok(Value::Number(ranges))
             }
             Expr::Min(a, b) | Expr::Max(a, b) => {
-                let (a, bnd) = eval(a)?.number()?;
-                let (c, d) = eval(b)?.number()?;
-                Ok(if matches!(e, Expr::Min(..)) { Value::Number(a.min(c), bnd.min(d)) } else { Value::Number(a.max(c), bnd.max(d)) })
+                let a = eval(a)?.number()?;
+                let b = eval(b)?.number()?;
+                Ok(Value::Number(a.pairwise(b, |(a, bnd), (c, d)| {
+                    Ok(if matches!(e, Expr::Min(..)) { (a.min(c), bnd.min(d)) } else { (a.max(c), bnd.max(d)) })
+                })?))
             }
             Expr::Binary(op, a, b) => {
                 let a = eval(a).map_err(|e| format!("left operand of {op:?}: {e}"))?;
@@ -261,9 +266,7 @@ impl<'a> Check<'a> {
                     BinOp::Eq | BinOp::NotEq if a.ty() == b.ty() => Ok(Value::Bool),
                     BinOp::Gt | BinOp::GtEq | BinOp::Lt | BinOp::LtEq => { a.number()?; b.number()?; Ok(Value::Bool) }
                     _ => {
-                        let (lo, hi) = a.number()?;
-                        let (rl, rh) = b.number()?;
-                        arithmetic(*op, (lo, hi), (rl, rh))
+                        Ok(Value::Number(a.number()?.arithmetic(*op, b.number()?)?))
                     }
                 }
             }
@@ -313,7 +316,7 @@ fn arithmetic(op: BinOp, (a, b): (i64, i64), (c, d): (i64, i64)) -> Result<Value
     if lo < i64::MIN as i128 || hi > i64::MAX as i128 {
         return Err(format!("{op:?}: intermediate range [{lo}, {hi}] may overflow i64; tighten enforced input bounds or rewrite the calculation"));
     }
-    Ok(Value::Number(lo as i64, hi as i64))
+    Ok(Value::Number(Ranges::interval(lo as i64, hi as i64)))
 }
 
 pub fn verify(p: &Program) -> Vec<VerifyError> {
