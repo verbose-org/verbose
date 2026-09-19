@@ -1,0 +1,2 @@
+The counter and its configured ceiling are signed i64 numbers in [0, 9223372036854775807].
+Increment the counter by one only when it is below the ceiling; preserve values already at or above the ceiling.

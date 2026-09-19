@@ -873,6 +873,241 @@ fn numeric_nonzero_never_reuses_stale_exclusions_or_hides_widened_holes() {
 }
 
 #[test]
+fn numeric_scalar_guards_transfer_both_operands_without_runtime_changes() {
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .chain([(-11, 1), (11, 1), (0, 0), (0, 6)])
+        .collect();
+    for (expr, lets) in [
+        ("if i.x > i.y then 100 / i.x else 0", ""),
+        ("if i.x >= i.y then 100 / i.x else 0", ""),
+        ("if i.x == i.y then 100 / i.x else 0", ""),
+        ("if i.x != i.y then 0 else 100 / i.x", ""),
+        ("if i.x < i.y then 0 else 100 / i.x", ""),
+        ("if i.x <= i.y then 0 else 100 / i.x", ""),
+        ("if i.y < i.x then 100 / i.x else 0", ""),
+        ("if not (i.y > i.x) then 100 / i.x else 0", ""),
+        (
+            "if i.x >= bound then 100 / i.x else 0",
+            "    let bound = i.y + 1\n",
+        ),
+        ("if x >= i.y then 100 / x else 0", "    let x = i.x\n"),
+        (
+            "if alias >= i.y then 100 / alias else 0",
+            "    let x = i.x\n    let alias = x\n    let x = 0\n",
+        ),
+        (
+            "if i.x != zero then 100 / i.x else 0",
+            "    let zero = 2 - 2\n",
+        ),
+        (
+            "if i.x == d then 100 / i.x else 0",
+            "    let d = if i.x < 0 then -2 else 2\n",
+        ),
+        (
+            "if i.x != d then 0 else 100 / i.x",
+            "    let d = if i.x < 0 then -2 else 2\n",
+        ),
+        ("if i.x >= i.y and i.y > 0 then 100 / i.x else 0", ""),
+        ("if i.x < i.y or i.y <= 0 then 0 else 100 / i.x", ""),
+    ] {
+        differential(&fixture(expr, lets), "checked", &inputs);
+    }
+}
+
+#[test]
+fn numeric_scalar_guards_bound_increment_and_decrement_at_i64_extremes() {
+    let edges = [
+        i64::MIN,
+        i64::MIN + 1,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    let inputs: Vec<_> = edges
+        .into_iter()
+        .flat_map(|x| edges.map(|y| (x, y)))
+        .collect();
+    for expr in [
+        "if i.x < i.y then i.x + 1 else i.x",
+        "if i.y > i.x then i.x + 1 else i.x",
+        "if i.x >= i.y then i.x else i.x + 1",
+        "if i.x > i.y then i.x - 1 else i.x",
+        "if i.x < i.y then i.y - 1 else i.y",
+        "if i.x > i.y then i.y + 1 else i.y",
+    ] {
+        let mut p = fixture(expr, "");
+        for f in fields(&mut p) {
+            f.range = None;
+        }
+        full(&mut p);
+        differential(&p, "checked", &inputs);
+    }
+    for expr in [
+        "if i.x <= i.y then i.x + 1 else i.x",
+        "if i.x >= i.y then i.x - 1 else i.x",
+        "if i.x < i.y then i.x - 1 else i.x",
+        "if i.x > i.y then i.x + 1 else i.x",
+        "if i.x < i.x then i.x + 1 else i.x",
+        "if i.x <= i.x then i.x + 1 else i.x",
+        "if i.x != i.x then i.x + 1 else i.x",
+        "if i.x == i.x then i.x + 1 else i.x",
+    ] {
+        let mut p = fixture(expr, "");
+        for f in fields(&mut p) {
+            f.range = None;
+        }
+        full(&mut p);
+        refuses(&p, "may overflow i64");
+    }
+}
+
+#[test]
+fn numeric_scalar_guards_keep_eager_scope_and_precision_obligations() {
+    for (expr, lets, needle) in [
+        (
+            "if i.x >= i.y then q else 0",
+            "    let q = 100 / i.x\n",
+            "let 'q'",
+        ),
+        (
+            "if i.x >= i.y and 100 / i.x > 0 then 1 else 0",
+            "",
+            "if condition",
+        ),
+        (
+            "if i.x >= i.y then 100 / i.x else 100 / i.x",
+            "",
+            "else branch",
+        ),
+        (
+            "(if i.x >= i.y then 100 / i.x else 0) + 100 / i.x",
+            "",
+            "includes zero",
+        ),
+        (
+            "100 / i.x",
+            "    let q = if i.x >= i.y then 100 / i.x else 0\n",
+            "includes zero",
+        ),
+        (
+            "if alias >= i.y then 100 / i.x else 0",
+            "    let alias = i.x\n",
+            "includes zero",
+        ),
+        (
+            "if alias >= i.y then 100 / x else 0",
+            "    let x = i.x\n    let alias = x\n    let x = 0\n",
+            "includes zero",
+        ),
+        (
+            "if checked then 100 / i.x else 0",
+            "    let checked = i.x >= i.y\n",
+            "includes zero",
+        ),
+        (
+            "if i.x >= i.y + 0 then 100 / i.x else 0",
+            "",
+            "includes zero",
+        ),
+        ("if i.x != i.y then 100 / i.x else 0", "", "includes zero"),
+        (
+            "if i.x >= i.y then 100 / (i.x - 1) else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if i.x >= i.y or i.x == 0 then 100 / i.x else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if i.x >= i.y and i.x <= 0 then 100 / i.x else 0",
+            "",
+            "includes zero",
+        ),
+        (
+            "if i.x != 0 and zero != same then 100 / i.x else 0",
+            "    let zero = 0\n    let same = 0\n",
+            "includes zero",
+        ),
+        (
+            "if i.x >= i.y then if i.x < 0 then 1 / 0 else 0 else 0",
+            "",
+            "includes zero",
+        ),
+        ("if i.x >= i.y then 0 else i.x < i.y", "", "different types"),
+        (
+            "if i.x == flag then 0 else 0",
+            "    let flag = i.y > 0\n",
+            "expected number",
+        ),
+    ] {
+        refuses(&fixture(expr, lets), needle);
+    }
+    // A single source-order pass, not a relation graph or fixed-point solver.
+    let mut p = fixture("if i.x >= i.y and i.y > 0 then 100 / i.x else 0", "");
+    fields(&mut p)[1].range = Some((-10, 10));
+    refuses(&p, "includes zero");
+    rule(&mut p).logic.value = rule(&mut fixture(
+        "if i.y > 0 and i.x >= i.y then 100 / i.x else 0",
+        "",
+    ))
+    .logic
+    .value
+    .clone();
+    differential(
+        &p,
+        "checked",
+        &[(-10, -1), (0, 0), (0, 1), (1, 1), (10, 10)],
+    );
+    // No retained x/y relation to prove the sign of their difference.
+    let mut p = fixture("if i.x > i.y then 100 / (i.x - i.y) else 0", "");
+    fields(&mut p)[1].range = Some((-10, 10));
+    refuses(&p, "includes zero");
+}
+
+#[test]
+fn numeric_scalar_guards_keep_callee_domains_independent_and_public() {
+    let mut p = fixture("if i.x >= i.y then denominator(i) else 0", "");
+    let mut callee = rule(&mut fixture("100 / i.x", "")).clone();
+    callee.name = "denominator".into();
+    callee.hints = None;
+    p.items.push(Item::Rule(callee));
+    refuses(&p, "includes zero");
+    // An independently verified result may instead be bound and compared.
+    if let Item::Rule(callee) = p.items.last_mut().unwrap() {
+        callee.logic.value = rule(&mut fixture("if i.x < 0 then -2 else 2", ""))
+            .logic
+            .value
+            .clone();
+        callee.input_name = "other".into();
+        callee.logic.value = crate::optimizer::substitute_ident(
+            &callee.logic.value,
+            "i",
+            &Expr::Ident("other".into()),
+        );
+    }
+    let caller = rule(&mut fixture(
+        "if i.x == d then 100 / i.x else 0",
+        "    let d = denominator(i)\n",
+    ))
+    .logic
+    .clone();
+    rule(&mut p).logic = caller;
+    differential(&p, "checked", &[(-2, 1), (0, 1), (2, 1), (5, 1)]);
+    let public = rule(&mut fixture("0", "")).hints.clone();
+    if let Item::Rule(callee) = p.items.last_mut().unwrap() {
+        callee.hints = public;
+    }
+    refuses(&p, "includes zero");
+}
+
+#[test]
 fn numeric_contract_lexical_scope_calls_and_signed_arithmetic_agree() {
     let inputs: Vec<_> = (-10..=10)
         .map(|x| (x, 3))
@@ -1159,6 +1394,7 @@ fn numeric_contract_existing_examples_verify() {
         "strict_overflow",
         "guarded_numeric",
         "nonzero_numeric",
+        "capped_counter",
     ] {
         let p = parse(&fs::read_to_string(format!("examples/{f}.verbose")).unwrap());
         let errors = crate::verifier::verify_program(&p, Path::new("examples"));
@@ -1284,6 +1520,10 @@ fn two_generation_numeric_contract_self_hosted_refuses_before_emission() {
             ),
             (
                 include_str!("../../examples/nonzero_numeric.verbose").to_owned(),
+                1,
+            ),
+            (
+                include_str!("../../examples/capped_counter.verbose").to_owned(),
                 1,
             ),
         ] {

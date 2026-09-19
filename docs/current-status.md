@@ -128,6 +128,9 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   Numeric facts can retain two separate intervals, allowing explicit nonzero
   guards and nonzero computed values. A fixed precision budget keeps the analysis
   bounded; no interval-set representation is added to native program values.
+  Direct scalar comparisons now transfer checked operand bounds within a branch,
+  including configured ceilings and equality with a nonzero result. This is one
+  source-order pass with fixed precision, without a general relation solver.
   Interpreter/native argv entries enforce the premises. WASM/self-hosted emission
   refuses the contract until it can provide those guarantees.
   After verification, native emission precomputes constants, removes proved

@@ -45,6 +45,9 @@ including statically untaken branches. The analysis does not establish general
 correlations between expressions. A safe program can be refused: rewrite it or
 state a narrower input domain that the entry will enforce.
 An explicit `!= 0` can exclude zero even when a value may have either sign.
+Direct comparisons between numeric fields/lets can transfer their checked bounds
+in both directions within a branch. Equality preserves represented holes within
+the fixed precision budget; no graph of relations or fixed-point solver is added.
 Computed domains use at most four interval pairs per operation; excess result
 pieces widen to their enclosing interval. Public `overflow` declarations remain
 single intervals. See the [precision budget](numeric-guards.md#nonzero-values-and-bounded-analysis).

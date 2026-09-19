@@ -1,9 +1,9 @@
-//! Branch-local numeric facts. Only direct comparisons with signed literals
-//! refine a scalar; no alias relation, boolean binding or callee premise is
+//! Branch-local numeric facts. Direct comparisons of scalars and signed literals
+//! refine their domains; no alias relation, boolean binding or callee premise is
 //! invented. The complete condition has already passed strict verification.
 use super::*;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum Place {
     Local(String),
     Field(String),
@@ -63,6 +63,24 @@ impl<'a> Scope<'a> {
         }
     }
 
+    fn operand(&self, e: &Expr) -> Option<(Option<Place>, Ranges)> {
+        self.scalar(e)
+            .map(|(place, range)| (Some(place), range))
+            .or_else(|| literal(e).map(|n| (None, Ranges::interval(n, n))))
+    }
+
+    fn record(&mut self, place: Option<Place>, range: Ranges) {
+        match place {
+            Some(Place::Local(name)) => {
+                self.local_facts.insert(name, range);
+            }
+            Some(Place::Field(name)) => {
+                self.field_facts.insert(name, range);
+            }
+            None => {}
+        }
+    }
+
     pub fn branch(&self, condition: &Expr, truth: bool) -> Self {
         let mut branch = self.clone();
         if !branch.assume(condition, truth) {
@@ -85,24 +103,25 @@ impl<'a> Scope<'a> {
                 let Some(op) = comparison(*op, truth) else {
                     return true;
                 };
-                let candidate = self
-                    .scalar(a)
-                    .zip(literal(b))
-                    .map(|(s, n)| (s, op, n))
-                    .or_else(|| {
-                        self.scalar(b)
-                            .zip(literal(a))
-                            .map(|(s, n)| (s, reverse(op), n))
-                    });
-                if let Some(((place, range), op, n)) = candidate {
-                    let Some(range) = range.restrict(op, n) else {
-                        return false;
-                    };
-                    match place {
-                        Place::Local(name) => self.local_facts.insert(name, range),
-                        Place::Field(name) => self.field_facts.insert(name, range),
-                    };
+                let Some(((a_place, a), (b_place, b))) = self.operand(a).zip(self.operand(b))
+                else {
+                    return true;
+                };
+                if a_place == b_place {
+                    // Literal-only comparisons keep their existing behavior.
+                    // A scalar compared with itself adds no facts either:
+                    // in particular x < x must not narrow x twice.
+                    return true;
                 }
+                // Snapshot BOTH operands before recording either projection.
+                let Some(a_refined) = a.constrain(op, b) else {
+                    return false;
+                };
+                let Some(b_refined) = b.constrain(reverse(op), a) else {
+                    return false;
+                };
+                self.record(a_place, a_refined);
+                self.record(b_place, b_refined);
                 true
             }
             _ => true,

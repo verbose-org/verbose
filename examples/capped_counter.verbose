@@ -1,0 +1,27 @@
+@verbose 0.1.0
+
+concept Counter
+  @intention: "Accept a nonnegative counter and its configured ceiling"
+  @source: capped_counter.intent:1
+  fields:
+    value : number [0, 9223372036854775807]
+    ceiling : number [0, 9223372036854775807]
+
+rule advance
+  @intention: "Increment below the ceiling and preserve an already reached or exceeded value"
+  @source: capped_counter.intent:2
+  input:
+    counter : Counter
+  output:
+    out : number
+  logic:
+    let ceiling = counter.ceiling
+    out = if counter.value < ceiling then counter.value + 1 else counter.value
+  proofs:
+    purity:
+      reads : [counter.value, counter.ceiling]
+      calls : []
+    termination:
+      bound : 10
+  hints:
+    overflow : [0, 9223372036854775807]

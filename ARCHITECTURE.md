@@ -166,6 +166,9 @@ Numeric facts retain at most two intervals, so a nonzero guard can distinguish
 negative and positive divisors. Arithmetic checks at most four interval pairs;
 result sets exceeding that precision widen conservatively. These are compiler
 facts, while native numbers retain their existing one-word representation.
+Direct scalar comparisons project both operands' checked domains into their
+selected branch. Projections use the prior domains and fixed interval capacity;
+the compiler stores no relation graph and performs no fixed-point iteration.
 After verification, a private [native simplification pass](docs/numeric-optimization.md)
 uses those premises for constant folding and branch selection; original entry
 guards remain, and scalar scratch is sized from maximum live storage.

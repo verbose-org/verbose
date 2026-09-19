@@ -95,6 +95,12 @@ that exceed the fixed capacity cannot justify safety. Public overflow declaratio
 remain single intervals, and native numeric storage is unchanged. See the
 [precision budget](docs/numeric-guards.md#nonzero-values-and-bounded-analysis).
 
+Direct comparisons between numeric fields/lets can now transfer both operands'
+checked bounds within a branch, including dynamic ceilings and equality with a
+nonzero domain. The analysis projects prior domains in one source-order pass;
+it adds no relation graph, fixed-point solver or runtime storage. See
+[scalar bounds](docs/numeric-guards.md#comparing-scalar-bounds).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

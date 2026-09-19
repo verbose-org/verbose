@@ -1,7 +1,7 @@
 # Numeric branch guards
 
-Implemented 2026-09-19, with a subsequent bounded two-interval extension. Within
-the existing [strict overflow contract](numeric-overflow.md),
+Implemented 2026-09-19, with bounded two-interval and scalar-comparison extensions.
+Within the existing [strict overflow contract](numeric-overflow.md),
 an explicit `if` comparison can justify arithmetic in its selected arm. The
 compiler checks that justification; an LLM's assertion of safety is insufficient.
 The syntax is unchanged. Native programs gain no allocator, garbage collection
@@ -35,9 +35,10 @@ cargo run -- examples/nonzero_numeric.verbose --run quotient --native /tmp/quoti
 ## Facts and their lifetime
 
 - A direct numeric input field or lexical numeric let can be compared with a
-  signed integer literal using `==`, `!=`, `<`, `<=`, `>`, or `>=`. Either operand
-  order is accepted. The selected branch intersects the previous interval with
-  the comparison; the opposite branch uses its negation.
+  signed integer literal or another direct numeric field/let using `==`, `!=`,
+  `<`, `<=`, `>`, or `>=`. Either operand order is accepted. The selected branch
+  restricts each operand's domain using the comparison; the opposite branch
+  uses its negation. Comparisons of a scalar with itself add no new facts.
 - `not` reverses the fact. A true `and` establishes both operand facts; a false
   `or` establishes both negated facts. A false `and` or true `or` does not select
   which operand supplied the outcome, so it adds no facts. Nested `if`s can
@@ -58,6 +59,48 @@ the condition's own prospective facts. For example, `let q = 100 / divisor`
 before the `if`, or `divisor > 0 and 100 / divisor > 0` as its condition, still
 fails if the prior interval includes zero. This slice does not add verification
 based on short-circuit boolean evaluation.
+
+## Comparing scalar bounds
+
+An explicit comparison can now use both operands' checked domains. For example,
+`if counter < ceiling then counter + 1 else counter` is safe even when either
+value can reach MAX: the true branch establishes `counter <= MAX - 1`. See the
+complete [capped counter](../examples/capped_counter.verbose), with nonnegative
+input bounds checked at entry. It preserves a value already above its ceiling;
+it does not silently clamp it.
+
+```sh
+cargo run -- examples/capped_counter.verbose --run advance --native /tmp/counter
+/tmp/counter 4 5 5 5 7 5 9223372036854775807 9223372036854775807
+# 5
+# 5
+# 7
+# 9223372036854775807
+```
+
+For `x < y`, the verifier intersects x's domain with values below y's largest
+possible value, and y's domain with values above x's smallest possible value.
+Non-strict comparisons include the endpoint; `>` and `>=` reverse the operands.
+Both projections use the domains from **before** that comparison. Equality
+intersects the two domains, including represented holes when the result fits
+the two-interval budget. Inequality excludes a value only when the other operand
+has exactly one possible value. Thus `x != zero`, with `let zero = 2 - 2`, can
+justify `100 / x`; `x != y` with a varying y does not generally exclude zero.
+
+Computed bounds can be bound to a numeric let and then compared. The computation
+must first pass its own checks. A checked callee result can likewise supply a
+bound; an explicit public overflow interval remains the caller's premise.
+Arithmetic expressions and calls directly inside a comparison do not supply
+refinement in this slice. Boolean aliases do not preserve comparisons either.
+
+This remains one source-order pass over each selected guard, not a stored graph
+of relations or a solver iterated until nothing changes. With both x and y in
+`[-10, 10]`, `y > 0 and x >= y` can prove `100 / x`; `x >= y and y > 0` cannot
+in this slice, because the first comparison saw y's original domain. A nested
+guard can make that order explicit. Nor does `x > y` necessarily prove
+`100 / (x - y)`: subsequent arithmetic uses the independent projected domains,
+which may still overlap. No relation or alias identity escapes a branch or
+becomes a premise for a separately verified callee.
 
 ## Nonzero values and bounded analysis
 
@@ -90,7 +133,10 @@ The limit is a precision budget, not a new obligation on runtime values:
   remain available. For `x` in `[-10, 10]`, `x != 0 and x != 2` can still justify
   `100 / x`, but does not prove `100 / (x - 2)` in this slice. Guard order can
   affect which facts fit this fixed precision budget.
-- Every operation handles at most four interval pairs with a fixed temporary
+- An equality intersection needing a third interval also keeps each operand's
+  prior domain. It cannot fill an existing hole or pretend the exact intersection
+  fits. Each projection checks at most four interval intersections in fixed space.
+- Every arithmetic operation handles at most four interval pairs with a fixed temporary
   workspace in the compiler. There is no enumeration of combinations of source
   branches, no growing interval list and no runtime representation of these sets.
   Unknown safety after a loss of precision is refused with the existing rule,
@@ -98,8 +144,8 @@ The limit is a precision budget, not a new obligation on runtime values:
 
 ## Conservative refusals
 
-Comparisons of two variables, arithmetic expressions, boolean aliases, calls or
-named constants add no relational facts in this slice. Their expressions remain
+Comparisons involving arithmetic expressions, boolean aliases, calls or global
+named constants add no refinement in this slice. Their expressions remain
 subject to all ordinary type and arithmetic checks.
 
 The existing lexer cannot spell `-9223372036854775808` as a signed source literal;
@@ -112,6 +158,13 @@ enclosing facts, with all newly collected facts discarded. There is no empty-ran
 proof that silently accepts an invalid operation or an effect in a dead branch.
 An unsafe constant such as `1 / 0` is refused even in an impossible arm. Failure
 diagnostics retain the rule, binding/output, arm and unsafe operation.
+
+A newly understood scalar comparison can reveal a contradiction that earlier
+versions did not recognize. For example, with two separate zero-valued lets,
+`x != 0 and zero != same` now produces an empty constraint set: its arm is
+checked with the enclosing facts, without retaining the new `x != 0` fact.
+Such a rule can therefore be refused where the previous verifier accepted it.
+This preserves the existing treatment of recognized impossible arms.
 
 The existing expression, nesting, call-expansion and native frame limits remain.
 The compiler stores sparse branch facts and does no path enumeration. There is

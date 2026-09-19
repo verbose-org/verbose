@@ -100,6 +100,39 @@ impl Ranges {
         })
     }
 
+    /// Project one checked comparison onto this operand, using the other
+    /// operand's prior domain. No relation is stored or iterated to a fixed point.
+    pub fn constrain(self, op: BinOp, other: Self) -> Option<Self> {
+        let (lo, hi) = other.hull();
+        match op {
+            BinOp::Lt | BinOp::LtEq => self.restrict(op, hi),
+            BinOp::Gt | BinOp::GtEq => self.restrict(op, lo),
+            BinOp::NotEq if lo == hi => self.restrict(op, lo),
+            BinOp::NotEq => Some(self),
+            BinOp::Eq => {
+                let mut pieces = [(0, 0); 4];
+                let mut len = 0;
+                for (a, b) in self.pieces() {
+                    for (c, d) in other.pieces() {
+                        if a.max(c) <= b.min(d) {
+                            pieces[len] = (a.max(c), b.min(d));
+                            len += 1;
+                        }
+                    }
+                }
+                // Intersections of canonical disjoint pieces are disjoint too.
+                // Keep prior facts if exact equality needs a third piece, as
+                // for an additional != guard; do not fill a previously known hole.
+                if len > 2 {
+                    Some(self)
+                } else {
+                    Self::collect(pieces[..len].iter().copied())
+                }
+            }
+            _ => unreachable!("normalized numeric comparison"),
+        }
+    }
+
     pub fn restrict(self, op: BinOp, n: i64) -> Option<Self> {
         let n = n as i128;
         let mut pieces = [(0, 0); 4];
@@ -159,6 +192,96 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn scalar_comparison_projections_cover_concrete_pairs_and_i64_edges() {
+        let mut domains = domains();
+        for (lo, hi) in [
+            (i64::MIN, i64::MIN),
+            (i64::MIN, -1),
+            (i64::MIN, i64::MAX),
+            (1, i64::MAX),
+            (i64::MAX, i64::MAX),
+        ] {
+            domains.push(Ranges::interval(lo, hi));
+        }
+        domains.push(Ranges::interval(i64::MIN, -1).join(Ranges::interval(1, i64::MAX)));
+        let values = [
+            i64::MIN,
+            i64::MIN + 1,
+            -3,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            3,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for &a in &domains {
+            for &b in &domains {
+                for op in [
+                    BinOp::Eq,
+                    BinOp::NotEq,
+                    BinOp::Lt,
+                    BinOp::LtEq,
+                    BinOp::Gt,
+                    BinOp::GtEq,
+                ] {
+                    let refined = a.constrain(op, b);
+                    for x in values.into_iter().filter(|&x| contains(a, x)) {
+                        for y in values.into_iter().filter(|&y| contains(b, y)) {
+                            let matches = match op {
+                                BinOp::Eq => x == y,
+                                BinOp::NotEq => x != y,
+                                BinOp::Lt => x < y,
+                                BinOp::LtEq => x <= y,
+                                BinOp::Gt => x > y,
+                                BinOp::GtEq => x >= y,
+                                _ => unreachable!(),
+                            };
+                            if matches {
+                                assert!(
+                                    refined.is_some_and(|r| contains(r, x)),
+                                    "{a:?} {op:?} {b:?}: lost {x} for {y}"
+                                );
+                            }
+                        }
+                    }
+                    if let Some(r) = refined {
+                        for x in values {
+                            assert!(
+                                !contains(r, x) || contains(a, x),
+                                "guard enlarged prior domain"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_equality_preserves_holes_and_retains_prior_facts_at_capacity() {
+        let a = Ranges::interval(-10, -1).join(Ranges::interval(1, 10));
+        let b = Ranges::interval(-5, 5).join(Ranges::interval(8, 12));
+        // Exact intersection needs three pieces; neither operand may lose its
+        // prior hole, nor pretend that the new equality fits the precision cap.
+        assert_eq!(a.constrain(BinOp::Eq, b), Some(a));
+        assert_eq!(b.constrain(BinOp::Eq, a), Some(b));
+        let c = Ranges::interval(-2, -2).join(Ranges::interval(2, 2));
+        assert_eq!(a.constrain(BinOp::Eq, c), Some(c));
+        assert!(c.constrain(BinOp::Eq, Ranges::interval(0, 0)).is_none());
+        assert_eq!(a.constrain(BinOp::NotEq, c), Some(a));
+        assert_eq!(
+            a.constrain(BinOp::NotEq, Ranges::interval(-1, -1))
+                .unwrap()
+                .pieces()
+                .collect::<Vec<_>>(),
+            [(-10, -2), (1, 10)]
+        );
     }
 
     #[test]
