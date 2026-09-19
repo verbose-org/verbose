@@ -83,6 +83,11 @@ the established improvement is storage size, with further quiet-host timing
 needed for a runtime-cost conclusion. Both series, including every sample, are
 retained.
 
+The user subsequently reported no heavy workload during those measurements.
+The [updated measurement protocol](numeric-benchmark.md) separates child CPU
+accounting from elapsed time and refuses incoherent CPU comparisons. This
+measurement work does not change the storage placement or original binaries.
+
 Timings include Python argument setup, process startup, parsing and output
 syscalls. External Windows activity was not independently measured. Reserved
 storage and ELF sizes are deterministic; RSS and hardware cache counters were

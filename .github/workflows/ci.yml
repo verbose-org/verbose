@@ -48,6 +48,9 @@ jobs:
           cargo run -- examples/reactions.verbose
           cargo run -- examples/app.verbose
 
+      - name: Validate numeric benchmark harness
+        run: python3 tools/test_numeric_benchmark.py -v
+
       - name: Benchmark
         run: cargo run -- examples/invoices.verbose --benchmark --run important_invoice
 

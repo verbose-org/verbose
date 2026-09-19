@@ -49,6 +49,8 @@ about OS stack limits, process RSS or which CPU cache contains the stack.
 ## Reproducible comparison
 
 Harness: [benchmark_numeric_contract.py](../tools/benchmark_numeric_contract.py).
+The harness now uses a [version-2 measurement protocol](numeric-benchmark.md);
+the observations below retain the original version-1 timing scope.
 [Raw observations](measurements/numeric-native-2026-09-17.json) include compiler
 and fixture hashes, candidate working-tree state, all samples and host metadata.
 The reference was rebuilt from merged PR #228, commit `0cfda1d`; the candidate
