@@ -1,0 +1,44 @@
+@verbose 0.1.0
+
+concept Reading
+  @intention: "A signed reading with the full i64 input domain"
+  @source: guarded_numeric.intent:1
+  fields:
+    value : number
+
+rule ratio
+  @intention: "Use explicit sign guards and a zero fallback for signed division"
+  @source: guarded_numeric.intent:2
+  input:
+    reading : Reading
+  output:
+    out : number
+  logic:
+    let divisor = reading.value
+    out = if divisor > 0 then 100 / divisor else if divisor < 0 then 100 / divisor else 0
+  proofs:
+    purity:
+      reads : [reading.value]
+      calls : []
+    termination:
+      bound : 20
+  hints:
+    overflow : [-100, 100]
+
+rule increment
+  @intention: "An explicit condition prevents incrementing beyond i64::MAX"
+  @source: guarded_numeric.intent:3
+  input:
+    reading : Reading
+  output:
+    out : number
+  logic:
+    out = if reading.value < 9223372036854775807 then reading.value + 1 else reading.value
+  proofs:
+    purity:
+      reads : [reading.value]
+      calls : []
+    termination:
+      bound : 10
+  hints:
+    overflow : [-9223372036854775807, 9223372036854775807]

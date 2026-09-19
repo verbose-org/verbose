@@ -103,7 +103,8 @@ and one call node. It is not a bound on total instructions, iterations, elapsed
 time, or the lifetime of a service. The `structural`, `decreasing`, and `increasing`
 declarations are separate recursion checks.
 
-[Strict numeric overflow analysis](numeric-overflow.md) now refuses unknown
+[Strict numeric overflow analysis](numeric-overflow.md), including
+[branch-local numeric guards](numeric-guards.md), now refuses unknown
 intervals, including unsafe intermediates in lets and conditions. Unbounded
 numeric fields use the full i64 domain. Interpreter/native argv entries enforce
 the input ranges assumed by participating rules; other entry paths explicitly

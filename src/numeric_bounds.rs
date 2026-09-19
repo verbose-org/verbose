@@ -5,7 +5,9 @@ use crate::ast::*;
 use crate::verifier::{walk_expr_children, VerifyError};
 use std::collections::{BTreeSet, HashMap};
 
+mod guards;
 pub(crate) mod native_opt;
+use guards::Scope;
 
 pub fn has_contract(r: &Rule) -> bool {
     r.hints.as_ref().and_then(|h| h.overflow.as_ref()).is_some()
@@ -169,12 +171,12 @@ impl<'a> Check<'a> {
         let mut env = HashMap::new();
         for (n, e) in &r.logic.bindings {
             let v = self
-                .expr(e, r, c, &env, 0)
+                .expr(e, r, &Scope::new(r, c, &env), 0)
                 .map_err(|e| format!("let '{n}': {e}"))?;
             env.insert(n.clone(), v);
         }
         let value = self
-            .expr(&r.logic.value, r, c, &env, 0)
+            .expr(&r.logic.value, r, &Scope::new(r, c, &env), 0)
             .map_err(|e| format!("output '{}': {e}", r.output_name))?;
         if value.ty() != r.output_ty {
             return Err("computed output type differs from declaration".into());
@@ -202,8 +204,7 @@ impl<'a> Check<'a> {
         &mut self,
         e: &Expr,
         r: &Rule,
-        c: &Concept,
-        env: &HashMap<String, Value>,
+        scope: &Scope<'_>,
         depth: usize,
     ) -> Result<Value, String> {
         self.steps += 1;
@@ -213,23 +214,27 @@ impl<'a> Check<'a> {
         if depth >= 256 {
             return Err("analysis exceeds 256 expression levels".into());
         }
-        let mut eval = |e: &Expr| self.expr(e, r, c, env, depth + 1);
+        let mut eval = |e: &Expr| self.expr(e, r, scope, depth + 1);
         match e {
             Expr::Number(n) => Ok(Value::Number(*n, *n)),
-            Expr::Ident(n) => env.get(n).copied().ok_or_else(|| format!("unknown scalar binding '{n}'")),
+            Expr::Ident(n) => scope.local(n).ok_or_else(|| format!("unknown scalar binding '{n}'")),
             Expr::Field(base, name) => {
-                if !matches!(base.as_ref(), Expr::Ident(n) if n == &r.input_name && !env.contains_key(n)) {
+                if !matches!(base.as_ref(), Expr::Ident(n) if n == &r.input_name && !scope.locals.contains_key(n)) {
                     return Err("only unshadowed numeric input fields are supported".into());
                 }
-                let f = c.fields.iter().find(|f| f.name == *name).ok_or("unknown input field")?;
+                let f = scope.concept.fields.iter().find(|f| f.name == *name).ok_or("unknown input field")?;
                 if f.ty != Type::Number { return Err(format!("field '{name}': only numeric field reads are supported")); }
-                let (lo, hi) = f.range.unwrap_or((i64::MIN, i64::MAX));
+                let (lo, hi) = scope.field(name).expect("checked numeric field");
                 Ok(Value::Number(lo, hi))
             }
             Expr::If(cond, a, b) => {
                 eval(cond).map_err(|e| format!("if condition: {e}"))?.boolean()?;
-                let a = eval(a).map_err(|e| format!("then branch: {e}"))?;
-                let b = eval(b).map_err(|e| format!("else branch: {e}"))?;
+                // Check the complete guard first. Its facts apply only to the
+                // selected arm, never to eager operands or preceding lets.
+                let a = self.expr(a, r, &scope.branch(cond, true), depth + 1)
+                    .map_err(|e| format!("then branch: {e}"))?;
+                let b = self.expr(b, r, &scope.branch(cond, false), depth + 1)
+                    .map_err(|e| format!("else branch: {e}"))?;
                 match (a, b) {
                     (Value::Number(a, b), Value::Number(c, d)) => Ok(Value::Number(a.min(c), b.max(d))),
                     (Value::Bool, Value::Bool) => Ok(Value::Bool),
@@ -264,7 +269,7 @@ impl<'a> Check<'a> {
             }
             Expr::Call(name, args) => {
                 let callee = self.rules.get(name.as_str()).ok_or("unknown callee")?;
-                if args.len() != 1 || !matches!(&args[0], Expr::Ident(n) if n == &r.input_name && !env.contains_key(n)) || callee.input_ty != r.input_ty {
+                if args.len() != 1 || !matches!(&args[0], Expr::Ident(n) if n == &r.input_name && !scope.locals.contains_key(n)) || callee.input_ty != r.input_ty {
                     return Err(format!("call '{name}': requires callee(input) with the same input concept; input bounds must be preserved"));
                 }
                 self.rule(name)
