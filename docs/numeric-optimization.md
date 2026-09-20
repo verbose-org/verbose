@@ -27,10 +27,92 @@ unsupported native entry modes retain their explicit refusals.
 
 This view is private to native emission. Source proofs, rule participation and
 interpreter input checks use the original program. `--stats` still reports the
-shared AST optimizer, not this later native pass. The native simplifier does not
-refine branch-local ranges or perform correlation analysis, SIMD or parallel
-lowering. A subsequent [verification extension](numeric-guards.md) now uses
-explicit guards to prove selected-arm arithmetic before this pass runs.
+shared AST optimizer, not this later native pass. The native simplifier performs
+no general correlation analysis, SIMD or parallel lowering.
+
+## Simplification inside checked branches
+
+Implemented 2026-09-20. After original-source verification, the native pass now
+reuses the [numeric guard analysis](numeric-guards.md) to refine each selected
+arm. A nested comparison already decided by those bounds disappears, and a
+scalar constrained to a single value can be substituted in arithmetic. For
+example, inside `if x > 0`, the test `x <= 0` is false; inside `if x == 3`,
+`x * price` can become `3 * price`. The outer guard still executes when its
+outcome depends on input.
+
+The guard is the original condition, before its own constants were substituted.
+Each arm gets a separate sparse scope. Facts do not leak into siblings, later
+operands or earlier eager lets; they do not follow alias identity or specialize
+a callee under its caller's premises. Shadowing clears the previous definition's
+numeric and boolean facts, including when the new result is unknown to this
+pass. Pure computations proved constant may disappear; other lets retain their
+evaluation order.
+
+The pass keeps the existing conservative interval hull for arithmetic and
+comparison decisions. In particular, a two-piece nonzero domain crossing zero
+does not suffice to fold a nested comparison with zero. The verifier can prove
+more than the optimizer uses. Unknown optimization facts mean retaining code,
+not weakening or rerunning the source contract. The existing interval, expression,
+depth, call-expansion and frame limits remain; no relation solver or path
+enumeration is introduced.
+
+Every source branch is checked **before** this pass. An invalid operation in
+an impossible arm still refuses compilation. All original input checks remain,
+even if a branch-local fact removes the final call connecting an unannotated
+entry to a strict numeric rule. No backend gains support for the contract:
+WASM, self-hosted emission and alternate native entry modes retain their refusals.
+
+See [guarded_total.verbose](../examples/guarded_total.verbose). Its zero-quantity
+arm can return zero without multiplication, and the positive-quantity test in
+the other arm is redundant under the declared nonnegative quantity domain.
+Numeric storage is still one word, with fixed frame reservation and no runtime
+proof metadata or allocator. This slice makes no execution-speed, CPU-cache or
+RSS claim.
+
+### Branch-folding layout observations
+
+[Raw observations and complete fixtures](measurements/numeric-branch-folding-2026-09-20.json)
+compare the same sources with merged PR #234 (`fe50ca3`) and this change. The
+report records source/compiler/binary hashes and the candidate lowering-file hash.
+These are deterministic emitted sizes, not timings or process-memory measurements.
+
+| Fixture | ELF bytes, before → after | Reserved frame bytes, before → after |
+|---|---:|---:|
+| Guarded line-item total | 922 → 818 | 72 → 72 |
+| Synthetic deep arithmetic in an impossible nested arm | 1974 → 783 | 304 → 72 |
+| Existing guarded increment | 638 → 641 | 64 → 64 |
+
+The increment grows by three bytes: its MAX fallback can now load a known
+64-bit immediate instead of reading the input slot. Substitution is not a promise
+that every binary shrinks. The deep-arm fixture demonstrates eliminated temporary
+storage; it is not a workload-wide memory or speed claim. Both compilers match
+integer oracles and the interpreter on 36 total cases and 105 synthetic cases,
+plus invalid/partial input checks. The changed increment and the adjacent ratio
+entry each match on 205 inputs including MIN/MAX and eight entry-compatibility
+cases. Allocation syscall traces for the total and synthetic cases are empty.
+
+To reproduce the layout sizes, build the two compiler revisions and run this
+from the repository root, replacing the two compiler paths:
+
+```python
+import json, subprocess, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, "tools")
+from benchmark_numeric_contract import frame_bytes
+
+report = json.loads(Path("docs/measurements/numeric-branch-folding-2026-09-20.json").read_text())
+for row in report["cases"]:
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        source = directory / row["source_file"]
+        source.write_text(row["source"])
+        (directory / row["intent_file"]).write_text(row["intent"])
+        for compiler in ["/path/to/reference-verbosec", "/path/to/candidate-verbosec"]:
+            binary = directory / "program"
+            subprocess.run([compiler, str(source), "--run", row["entry"],
+                            "--native", str(binary)], check=True)
+            print(row["name"], compiler, binary.stat().st_size, frame_bytes(binary))
+```
 
 ## Stack storage
 

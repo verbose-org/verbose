@@ -101,6 +101,13 @@ nonzero domain. The analysis projects prior domains in one source-order pass;
 it adds no relation graph, fixed-point solver or runtime storage. See
 [scalar bounds](docs/numeric-guards.md#comparing-scalar-bounds).
 
+Follow-up (2026-09-20): native simplification now reuses branch scopes after
+complete source verification. It can remove decided nested tests and substitute
+singleton scalars, while retaining conservative interval hulls, independent
+callee contracts and every original entry guard. No new acceptance rule,
+runtime proof storage or allocator is introduced. See
+[branch simplification](docs/numeric-optimization.md#simplification-inside-checked-branches).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

@@ -1,0 +1,2 @@
+Quantity is an integer in [0, 1000] and unit price is an integer in [0, 1000000].
+Multiply quantity by unit price in the zero and positive cases, with a final zero fallback; the compiler must verify every branch before simplifying redundant guards.

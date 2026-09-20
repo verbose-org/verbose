@@ -1,0 +1,95 @@
+{
+  "date": "2026-09-20",
+  "reference_revision": "fe50ca3b7f3be0347443a47178d0c8f7e9be1e86",
+  "reference_compiler_sha256": "2ad80c6235921bf9f2a9eea80525b472bbafde044d8591f6cc987e84a9a25200",
+  "candidate_compiler_sha256": "fb0e9ea9ed8caff07f822a56abeef0354a109c002e86f912b7cdca0cf173c17a",
+  "candidate_native_opt_sha256": "99602f2e02fc7ba18a6402ece737e8a166b24b5bcf86c6a20f46a9ae25d321cf",
+  "scope": "Deterministic ELF/frame sizes, not timing, RSS or cache measurements.",
+  "cases": [
+    {
+      "name": "guarded_total",
+      "source_sha256": "6e5fa9048606f7bde8871311c192fa9f7e93e45a3ddfbb9bc2ab66dbb4c63e01",
+      "valid_cases": 36,
+      "invalid_cases": 7,
+      "binaries": [
+        {
+          "version": "reference",
+          "elf_bytes": 922,
+          "frame_bytes": 72,
+          "sha256": "1d47ff3c42798a2328af2c90ea110d00f8457b3a192dee97f154343389e28853"
+        },
+        {
+          "version": "candidate",
+          "elf_bytes": 818,
+          "frame_bytes": 72,
+          "sha256": "a9382db73fa66593508b43875648e06d3881d4c2ec91ed95e6467c00341e1c8c"
+        }
+      ],
+      "source_file": "guarded_total.verbose",
+      "source": "@verbose 0.1.0\n\nconcept LineItem\n  @intention: \"Bound quantity and integer unit price before calculating a total\"\n  @source: guarded_total.intent:1\n  fields:\n    quantity : number [0, 1000]\n    unit_price : number [0, 1000000]\n\nrule total\n  @intention: \"Calculate the zero and positive quantity cases with explicit guards\"\n  @source: guarded_total.intent:2\n  input:\n    item : LineItem\n  output:\n    out : number\n  logic:\n    out = if item.quantity == 0 then item.quantity * item.unit_price else if item.quantity > 0 then item.quantity * item.unit_price else 0\n  proofs:\n    purity:\n      reads : [item.quantity, item.unit_price]\n      calls : []\n    termination:\n      bound : 20\n  hints:\n    overflow : [0, 1000000000]\n",
+      "intent_file": "guarded_total.intent",
+      "intent": "Quantity is an integer in [0, 1000] and unit price is an integer in [0, 1000000].\nMultiply quantity by unit price in the zero and positive cases, with a final zero fallback; the compiler must verify every branch before simplifying redundant guards.\n",
+      "entry": "total"
+    },
+    {
+      "name": "deep_dead_arm",
+      "source_sha256": "863d3e320cff44d1b643d082d1d14f0e2ccd8460f04c466f6b57715a19076cd0",
+      "valid_cases": 105,
+      "invalid_cases": 5,
+      "binaries": [
+        {
+          "version": "reference",
+          "elf_bytes": 1974,
+          "frame_bytes": 304,
+          "sha256": "8ad6eb602c878c0c465db12fe3a211689a6e901ebcb8f7d3270b9cfd394f5694"
+        },
+        {
+          "version": "candidate",
+          "elf_bytes": 783,
+          "frame_bytes": 72,
+          "sha256": "7ca08a49083c2564838710eb28aaef85c6c12c7a42ef6b5ce279b569125c6e58"
+        }
+      ],
+      "source_file": "deep.verbose",
+      "source": "@verbose 0.1.0\nconcept Input\n  @intention: \"Bound a numeric code-size fixture\"\n  @source: deep.intent:1\n  fields:\n    x : number [-10, 10]\n    y : number [1, 5]\nrule checked\n  @intention: \"Check an impossible arm before removing its arithmetic\"\n  @source: deep.intent:1\n  input:\n    i : Input\n  output:\n    out : number\n  logic:\n    out = if i.x > 0 then if i.x <= 0 then i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y + (i.y)))))))))))))))))))))))))))))) else i.x else 0\n  proofs:\n    purity:\n      reads : [i.x, i.y]\n      calls : []\n    termination:\n      bound : 1000\n  hints:\n    overflow : [-1000, 1000]\n",
+      "intent_file": "deep.intent",
+      "intent": "A bounded synthetic case for checking code and frame size.\n",
+      "entry": "checked"
+    },
+    {
+      "name": "existing_increment",
+      "source_file": "guarded_numeric.verbose",
+      "source": "@verbose 0.1.0\n\nconcept Reading\n  @intention: \"A signed reading with the full i64 input domain\"\n  @source: guarded_numeric.intent:1\n  fields:\n    value : number\n\nrule ratio\n  @intention: \"Use explicit sign guards and a zero fallback for signed division\"\n  @source: guarded_numeric.intent:2\n  input:\n    reading : Reading\n  output:\n    out : number\n  logic:\n    let divisor = reading.value\n    out = if divisor > 0 then 100 / divisor else if divisor < 0 then 100 / divisor else 0\n  proofs:\n    purity:\n      reads : [reading.value]\n      calls : []\n    termination:\n      bound : 20\n  hints:\n    overflow : [-100, 100]\n\nrule increment\n  @intention: \"An explicit condition prevents incrementing beyond i64::MAX\"\n  @source: guarded_numeric.intent:3\n  input:\n    reading : Reading\n  output:\n    out : number\n  logic:\n    out = if reading.value < 9223372036854775807 then reading.value + 1 else reading.value\n  proofs:\n    purity:\n      reads : [reading.value]\n      calls : []\n    termination:\n      bound : 10\n  hints:\n    overflow : [-9223372036854775807, 9223372036854775807]\n",
+      "intent_file": "guarded_numeric.intent",
+      "intent": "A signed reading may occupy the full i64 domain.\nDivide 100 by a nonzero reading, using signed truncation toward zero; return zero for a zero reading.\nIncrement a reading unless it is already i64::MAX, in which case retain that maximum.\n",
+      "entry": "increment",
+      "valid_cases": 205,
+      "entry_compatibility_cases": 8,
+      "binaries": [
+        {
+          "version": "reference",
+          "elf_bytes": 638,
+          "frame_bytes": 64,
+          "sha256": "af193f6d900678089b4b28531d27eb637cdeb783198fa4daca2cea7e53c967d3"
+        },
+        {
+          "version": "candidate",
+          "elf_bytes": 641,
+          "frame_bytes": 64,
+          "sha256": "af8e1f89194928f9d639ff304d8ea24c9857f6ed8b1db1940ec7a38f0afe190c"
+        }
+      ]
+    }
+  ],
+  "validation": "Both compilers agree with integer oracles and candidate interpreter on all valid cases; invalid and partial records retain stdout/stderr/status; allocation syscall traces are empty; four unsupported-backend refusals preserve artifacts. The changed existing increment and its neighboring ratio entry each pass 205 oracle/reference/candidate/interpreter cases and eight entry-compatibility cases.",
+  "corpus": {
+    "existing_examples": 177,
+    "emitted": 175,
+    "unchanged_elfs": 174,
+    "changed": [
+      "guarded_numeric.verbose::increment"
+    ],
+    "refusals": 2,
+    "diagnostics": "unchanged except the reported artifact size"
+  }
+}

@@ -256,6 +256,290 @@ fn numeric_native_precomputes_only_after_source_verification() {
 }
 
 #[test]
+fn numeric_native_branch_facts_match_explicitly_simplified_programs() {
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .chain([(-11, 1), (11, 1), (0, 0), (0, 6)])
+        .collect();
+    for (source, simplified, lets) in [
+        (
+            "if i.x > 0 then if i.x <= 0 then 42 else i.x + i.y else 0",
+            "if i.x > 0 then i.x + i.y else 0",
+            "",
+        ),
+        (
+            "if i.x == 3 then i.x * i.y else 0",
+            "if i.x == 3 then 3 * i.y else 0",
+            "",
+        ),
+        (
+            "if i.x > 0 then i.x else if i.x <= 0 then -i.x else 42",
+            "if i.x > 0 then i.x else -i.x",
+            "",
+        ),
+        (
+            "if i.x >= i.y then if i.x > 0 then 100 / i.x else 0 else 0",
+            "if i.x >= i.y then 100 / i.x else 0",
+            "",
+        ),
+        (
+            "if not (d <= 0) then if d < 1 then 42 else d else 0",
+            "if not (d <= 0) then d else 0",
+            "    let d = i.x\n",
+        ),
+        (
+            "if i.x > 0 and i.y > 0 then if i.x < 1 then 42 else i.x else 0",
+            "if i.x > 0 and i.y > 0 then i.x else 0",
+            "",
+        ),
+        (
+            "if i.x <= 0 or i.y <= 0 then 0 else if i.x <= 0 then 42 else i.x",
+            "if i.x <= 0 or i.y <= 0 then 0 else i.x",
+            "",
+        ),
+        (
+            "if d == i.y then if d == 0 then 42 else d else 0",
+            "if d == i.y then d else 0",
+            "    let d = i.x\n",
+        ),
+    ] {
+        let p = fixture(source, lets);
+        assert_eq!(
+            native_bytes(&p, "checked"),
+            native_bytes(&fixture(simplified, lets), "checked"),
+            "{source}"
+        );
+        differential(&p, "checked", &inputs);
+    }
+    // A safe but impossible branch's temporary tree must not reserve runtime
+    // stack space after the original source has passed verification.
+    let deep = (0..30).fold("i.y".to_owned(), |e, _| format!("i.y + ({e})"));
+    let p = fixture(
+        &format!("if i.x > 0 then if i.x <= 0 then {deep} else i.x else 0"),
+        "",
+    );
+    assert_eq!(
+        native_bytes(&p, "checked"),
+        native_bytes(&fixture("if i.x > 0 then i.x else 0", ""), "checked")
+    );
+}
+
+#[test]
+fn numeric_native_branch_facts_do_not_escape_or_follow_aliases() {
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .collect();
+    for (expr, lets) in [
+        ("(if i.x == 0 then i.x else 7) + i.x", ""),
+        (
+            "(if i.x > 0 then i.x else 0) + (if i.x < 0 then -i.x else 0)",
+            "",
+        ),
+        (
+            "if alias > 0 then if value > 0 then value else -value else alias",
+            "    let value = i.x\n    let alias = value\n    let value = i.y - 3\n",
+        ),
+        (
+            "if value > 0 then if i.x > 0 then value else i.x else 0",
+            "    let value = i.y\n",
+        ),
+        (
+            "if i > 0 then if i <= 0 then 42 else i else 0",
+            "    let i = i.x\n",
+        ),
+        (
+            "if flag then if i.x > 0 then 11 else 12 else 13",
+            "    let flag = i.x > 0\n",
+        ),
+        ("if i.x > 0 then if i.x < i.y then i.x else i.y else 0", ""),
+        ("if i.x != 0 then if i.x == 0 then 42 else i.x else 0", ""),
+    ] {
+        differential(&fixture(expr, lets), "checked", &inputs);
+    }
+    // This pass still uses hulls, not holes or alias equalities. Pin the
+    // unproved nested test so future changes must justify their precision.
+    for (expr, lets) in [
+        ("if i.x != 0 then if i.x == 0 then 42 else i.x else 0", ""),
+        (
+            "if d > 0 then if i.x > 0 then 11 else 12 else 13",
+            "    let d = i.x\n",
+        ),
+    ] {
+        let mut p = native_opt::lower(&fixture(expr, lets)).unwrap();
+        let Expr::If(_, yes, _) = &rule(&mut p).logic.value else {
+            panic!("outer test required");
+        };
+        assert!(
+            matches!(yes.as_ref(), Expr::If(..)),
+            "unproved nested test disappeared: {expr}"
+        );
+    }
+}
+
+#[test]
+fn numeric_native_branch_folding_forgets_shadowed_unknown_results() {
+    let inputs: Vec<_> = (-10..=10).map(|x| (x, 1)).collect();
+    for (expr, lets) in [
+        (
+            "value",
+            "    let value = 42\n    let value = if i.x != 0 then 100 / i.x else 0\n",
+        ),
+        (
+            "if flag then 11 else 12",
+            "    let flag = 1 == 1\n    let flag = (if i.x != 0 then 100 / i.x else 0) > 5\n",
+        ),
+        (
+            "if i > 0 then i else -i",
+            "    let i = if i.x != 0 then 100 / i.x else 0\n",
+        ),
+        (
+            "if same then q else 0",
+            "    let q = if i.x == 0 then i.x else 0\n    let same = q == 0\n",
+        ),
+    ] {
+        differential(&fixture(expr, lets), "checked", &inputs);
+    }
+}
+
+#[test]
+fn numeric_native_branch_folding_keeps_original_obligations_and_entry_guards() {
+    let path = format!(
+        "/tmp/verbose-numeric-folding-refusal-{}",
+        std::process::id()
+    );
+    for p in [
+        fixture("if i.x > 0 then if i.x <= 0 then 1 / 0 else i.x else 0", ""),
+        fixture(
+            "if i.x > 0 then if i.x <= 0 then parse_int(\"bad\") else i.x else 0",
+            "",
+        ),
+        fixture("if i.x == 0 then 0 else q", "    let q = 100 / i.x\n"),
+        fixture(
+            "if i.x > 0 then 1 else 0",
+            "    let unused = 9223372036854775807 + 1\n",
+        ),
+    ] {
+        assert!(native_opt::lower(&p).is_err());
+        fs::write(&path, b"existing artifact").unwrap();
+        assert!(crate::native::compile_native(&p, "checked", &path, false, false).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"existing artifact");
+    }
+    fs::remove_file(&path).unwrap();
+    let mut p = fixture("i.x + i.y", "");
+    let mut caller = rule(&mut fixture(
+        "if i.x > 0 then if i.x <= 0 then checked(i) else 7 else 7",
+        "",
+    ))
+    .clone();
+    caller.name = "caller".into();
+    caller.hints = None;
+    p.items.push(Item::Rule(caller));
+    let lowered = native_opt::lower(&p).unwrap();
+    assert!(active_rules(&p).contains("caller"));
+    assert!(!active_rules(&lowered).contains("caller"));
+    differential(
+        &p,
+        "caller",
+        &[(-11, 1), (-10, 1), (0, 1), (10, 5), (11, 1), (0, 0), (0, 6)],
+    );
+    // Caller facts do not specialize the independently compiled callee.
+    rule(&mut p).logic.value = rule(&mut fixture("if i.x <= 0 then 9 else 10", ""))
+        .logic
+        .value
+        .clone();
+    let mut lowered = native_opt::lower(&p).unwrap();
+    assert!(matches!(rule(&mut lowered).logic.value, Expr::If(..)));
+
+    // Boolean outputs keep their existing false exit status, even when branch
+    // facts erase the entire output calculation or the last checked call.
+    for expression in [
+        "if i.x > 0 then i.x <= 0 else if i.x <= 0 then i.x > 0 else checked(i) > 0",
+        "if i.x > 0 then i.x <= 0 else if i.x <= 0 then i.x == -1 else checked(i) > 0",
+    ] {
+        let Item::Rule(caller) = p.items.last_mut().unwrap() else {
+            unreachable!()
+        };
+        caller.output_ty = Type::Bool;
+        caller.logic.value = rule(&mut fixture(expression, "")).logic.value.clone();
+        assert!(!active_rules(&native_opt::lower(&p).unwrap()).contains("caller"));
+        differential(
+            &p,
+            "caller",
+            &[(-11, 1), (-1, 1), (0, 1), (10, 5), (11, 1), (0, 6)],
+        );
+    }
+    crate::native::compile_native(&p, "caller", &path, false, false).unwrap();
+    for (args, output) in [
+        (["-1", "1", "1", "1"], "true\nfalse\n"),
+        (["1", "1", "-1", "1"], "false\ntrue\n"),
+        (["-1", "1", "bad", "1"], "true\n"),
+    ] {
+        let out = Command::new(&path).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(out.stdout, output.as_bytes());
+        assert!(out.stderr.is_empty());
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn numeric_native_branch_folding_at_i64_edges_preserves_signed_results() {
+    let edges = [
+        i64::MIN,
+        i64::MIN + 1,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    let inputs: Vec<_> = edges
+        .into_iter()
+        .flat_map(|x| edges.map(|y| (x, y)))
+        .collect();
+    for (source, simplified) in [
+        (
+            "if i.x < i.y then if i.x < 9223372036854775807 then i.x + 1 else 0 else i.x",
+            "if i.x < i.y then i.x + 1 else i.x",
+        ),
+        (
+            "if i.x > i.y then if i.y < 9223372036854775807 then i.y + 1 else 0 else i.y",
+            "if i.x > i.y then i.y + 1 else i.y",
+        ),
+        (
+            "if i.x == -1 then i.x / 2 else i.x",
+            "if i.x == -1 then 0 else i.x",
+        ),
+        (
+            "if i.x == -1 then i.x % 2 else i.x",
+            "if i.x == -1 then -1 else i.x",
+        ),
+        (
+            "if i.x >= 9223372036854775807 then i.x / 9223372036854775807 else i.x",
+            "if i.x >= 9223372036854775807 then 1 else i.x",
+        ),
+    ] {
+        let make = |s| {
+            let mut p = fixture(s, "");
+            for f in fields(&mut p) {
+                f.range = None;
+            }
+            full(&mut p);
+            p
+        };
+        let p = make(source);
+        assert_eq!(
+            native_bytes(&p, "checked"),
+            native_bytes(&make(simplified), "checked"),
+            "{source}"
+        );
+        differential(&p, "checked", &inputs);
+    }
+}
+
+#[test]
 fn numeric_native_reuses_scratch_without_clobbering_live_values() {
     let leaf = (0..24).fold("i.x".to_owned(), |expr, _| format!("{expr} + i.y"));
     let mut p = fixture(&leaf, "    let x = i.x + i.y\n");
@@ -1395,6 +1679,7 @@ fn numeric_contract_existing_examples_verify() {
         "guarded_numeric",
         "nonzero_numeric",
         "capped_counter",
+        "guarded_total",
     ] {
         let p = parse(&fs::read_to_string(format!("examples/{f}.verbose")).unwrap());
         let errors = crate::verifier::verify_program(&p, Path::new("examples"));
@@ -1524,6 +1809,10 @@ fn two_generation_numeric_contract_self_hosted_refuses_before_emission() {
             ),
             (
                 include_str!("../../examples/capped_counter.verbose").to_owned(),
+                1,
+            ),
+            (
+                include_str!("../../examples/guarded_total.verbose").to_owned(),
                 1,
             ),
         ] {

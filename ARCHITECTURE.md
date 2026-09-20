@@ -170,7 +170,8 @@ Direct scalar comparisons project both operands' checked domains into their
 selected branch. Projections use the prior domains and fixed interval capacity;
 the compiler stores no relation graph and performs no fixed-point iteration.
 After verification, a private [native simplification pass](docs/numeric-optimization.md)
-uses those premises for constant folding and branch selection; original entry
+uses those premises and branch-local bounds for constant folding and branch
+selection, including redundant nested tests and singleton scalars; original entry
 guards remain, and scalar scratch is sized from maximum live storage.
 Numeric local slots can also be reused after their last enclosing expression;
 [lexical lifetime analysis](docs/numeric-local-lifetimes.md) runs only at compilation.

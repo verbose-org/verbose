@@ -104,8 +104,10 @@ toward zero, including negative values and i64 extremes.
 
 No speculative code motion, retry, SIMD or parallel lowering is enabled by this
 pass. Its unknown facts mean “keep the expression”, after strict verification has
-already established safety. The native simplifier remains conservative over
-whole-rule intervals; branch-local refinement belongs to verification. See the
+already established safety. The native simplifier now uses selected-arm bounds
+to remove decided nested tests and substitute singleton values, while retaining
+conservative interval hulls. It reuses the guard analysis only after verifying
+the complete original source. See the
 reproducible [numeric benchmark](numeric-optimization.md) for scope and measured costs.
 
 ## Entry behavior and support

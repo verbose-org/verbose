@@ -184,10 +184,13 @@ execution time, whole-program memory safety or whole-process memory usage.
 
 This widens the set of provable programs. The branch itself still executes when
 its outcome depends on input; the extra analysis runs only in the Rust compiler.
-Native simplification continues to use conservative enclosing intervals and
-checked callee result intervals; it does not use holes to precompute comparisons.
-Original-source verification happens first.
-No execution-speed, cache or memory-size improvement is claimed for this slice.
+Native simplification now reuses branch-local facts after original-source
+verification to remove decided nested tests and substitute singleton scalars.
+It continues to use conservative enclosing intervals and checked callee result
+intervals; it does not use holes to precompute comparisons. See
+[native branch simplification](numeric-optimization.md#simplification-inside-checked-branches).
+The guard-verification extensions themselves make no execution-speed, cache or
+memory-size claim.
 
 Tests compare interpreter/native values, stdout, stderr and exit status across
 both arms, malformed/out-of-domain entries, lexical scopes and i64 boundaries.
