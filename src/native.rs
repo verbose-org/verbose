@@ -56804,7 +56804,8 @@ rule pick
         // capped_counter also requires the unsupported strict numeric contract.
         // guarded_total keeps that refusal before any native branch simplification.
         // guarded_magnitude adds another example refused by the overflow gate.
-        const EXPECTED_TOTAL: usize = 179;
+        // scalar_identities keeps the same explicit strict-numeric refusal.
+        const EXPECTED_TOTAL: usize = 180;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

@@ -259,6 +259,7 @@ impl<'a> Check<'a> {
                 })?))
             }
             Expr::Binary(op, a, b) => {
+                let repeated = scope.same_scalar(a, b);
                 let a = eval(a).map_err(|e| format!("left operand of {op:?}: {e}"))?;
                 let b = eval(b).map_err(|e| format!("right operand of {op:?}: {e}"))?;
                 match op {
@@ -266,7 +267,9 @@ impl<'a> Check<'a> {
                     BinOp::Eq | BinOp::NotEq if a.ty() == b.ty() => Ok(Value::Bool),
                     BinOp::Gt | BinOp::GtEq | BinOp::Lt | BinOp::LtEq => { a.number()?; b.number()?; Ok(Value::Bool) }
                     _ => {
-                        Ok(Value::Number(a.number()?.arithmetic(*op, b.number()?)?))
+                        let a = a.number()?;
+                        let b = b.number()?;
+                        Ok(Value::Number(if repeated { a.repeated_arithmetic(*op)? } else { a.arithmetic(*op, b)? }))
                     }
                 }
             }

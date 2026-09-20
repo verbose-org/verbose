@@ -139,6 +139,17 @@ fn binary(op: BinOp, left: Fact, right: Fact) -> Fact {
     }
 }
 
+fn repeated_binary(op: BinOp, value: Ranges) -> Fact {
+    match op {
+        BinOp::Eq | BinOp::LtEq | BinOp::GtEq => Fact::Bool(Some(true)),
+        BinOp::NotEq | BinOp::Lt | BinOp::Gt => Fact::Bool(Some(false)),
+        _ => value
+            .repeated_arithmetic(op)
+            .map(Fact::Number)
+            .unwrap_or(Fact::Unknown),
+    }
+}
+
 struct Fold<'a> {
     // Numeric domains share the verifier's sparse branch scopes. Only known
     // boolean constants need a separate map; guards never refine booleans.
@@ -207,12 +218,16 @@ impl Fold<'_> {
                 )
             }
             Expr::Binary(op, a, b) => {
+                // Identity belongs to the original lexical reads, not to equal
+                // ranges or to expression trees produced by simplification.
+                let repeated = scope.same_scalar(a, b);
                 let (a, af) = self.expr(a, scope);
                 let (b, bf) = self.expr(b, scope);
-                (
-                    Expr::Binary(*op, Box::new(a), Box::new(b)),
-                    binary(*op, af, bf),
-                )
+                let fact = match (repeated, af, bf) {
+                    (true, Fact::Number(value), Fact::Number(_)) => repeated_binary(*op, value),
+                    _ => binary(*op, af, bf),
+                };
+                (Expr::Binary(*op, Box::new(a), Box::new(b)), fact)
             }
             Expr::Not(a) | Expr::Neg(a) | Expr::Abs(a) => {
                 let (a, af) = self.expr(a, scope);

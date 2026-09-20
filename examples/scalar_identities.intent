@@ -1,0 +1,4 @@
+Accept any signed i64 reading; enforce numeric input parsing before execution.
+Square readings in [-3037000499, 3037000499], returning zero outside that safe domain. The square is in [0, 9223372030926249001].
+Divide each nonzero reading by itself, including i64::MIN, and return zero for zero. The result is in [0, 1].
+Subtract each reading from itself, including the signed extremes, and prove the result is exactly zero.

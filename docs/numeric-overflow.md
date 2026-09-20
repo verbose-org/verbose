@@ -38,6 +38,10 @@ whose input variables have different names.
   failed operation or unsupported obligation.
 
 This is conservative analysis with at most two intervals per numeric fact.
+Two direct reads of the same numeric field or current local definition now
+share one value for arithmetic: `x - x` is zero, a safe `x * x` is nonnegative,
+and a proved nonzero `x / x` is one. Equal intervals on different values do not
+establish this identity. See [repeated scalars](numeric-identities.md).
 Direct scalar comparisons in `if`
 conditions can now refine the selected arm's interval; see
 [numeric branch guards](numeric-guards.md). Every branch still has an obligation,
