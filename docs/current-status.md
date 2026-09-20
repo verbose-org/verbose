@@ -138,6 +138,9 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   bounds to remove redundant nested tests and substitute singleton scalars.
   It preserves up to two intervals through numeric operations and calls, so
   proved nonzero values can eliminate zero tests even across both signs.
+  [Repeated numeric reads](numeric-identities.md) now establish cancellation,
+  nonnegative squares and nonzero self-division within the same fixed domain
+  budget. This recognizes the same field/local, not arbitrary equal expressions.
   Original entry guards and source obligations remain; see
   [numeric optimization](numeric-optimization.md).
   [Numeric local lifetimes](numeric-local-lifetimes.md) also allow slots to be

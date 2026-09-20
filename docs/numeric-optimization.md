@@ -148,6 +148,12 @@ The facts exist only in the compiler. Native numbers remain one word; there is
 no new runtime metadata, allocator or GC. WASM, self-hosted emission and alternate
 native entry modes retain their existing refusals for strict numeric contracts.
 
+The [repeated-scalar extension](numeric-identities.md) also uses the identity
+of two direct reads of the same numeric field/local. It can prove cancellation,
+squares and nonzero self-division, then fold constant results and self-comparisons
+after checking the full source. It does not equate distinct values merely because
+their domains match.
+
 ### Disjoint-domain layout observations
 
 [Raw observations and complete fixtures](measurements/numeric-disjoint-folding-2026-09-20.json)

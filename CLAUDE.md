@@ -115,6 +115,13 @@ public callee contracts and original source/entry checks remain. This supersedes
 the native hull-only limitation above without changing runtime numeric storage.
 See [disjoint numeric domains](docs/numeric-optimization.md#preserving-disjoint-numeric-domains).
 
+Repeated direct reads of the same numeric field/current local now share one
+value during strict arithmetic verification. Cancellation, squares, doubling
+and nonzero self-division/remainder use at most two interval pieces; native
+lowering also folds decided self-comparisons after source verification. Aliases,
+equal domains and repeated calls do not establish identity. See
+[numeric scalar identities](docs/numeric-identities.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

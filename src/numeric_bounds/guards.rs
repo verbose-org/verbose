@@ -63,6 +63,14 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// Only two direct reads of the same current numeric definition qualify.
+    /// Equal domains, aliases, calls and structurally equal computations do not.
+    pub fn same_scalar(&self, left: &Expr, right: &Expr) -> bool {
+        self.scalar(left)
+            .zip(self.scalar(right))
+            .is_some_and(|((left, _), (right, _))| left == right)
+    }
+
     fn operand(&self, e: &Expr) -> Option<(Option<Place>, Ranges)> {
         self.scalar(e)
             .map(|(place, range)| (Some(place), range))

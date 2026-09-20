@@ -152,6 +152,231 @@ fn frame_bytes(bytes: &[u8]) -> u32 {
 }
 
 #[test]
+fn numeric_repeated_scalars_prove_full_i64_cancellation_and_nonzero_identity() {
+    let inputs = [
+        i64::MIN,
+        i64::MIN + 1,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        i64::MAX - 1,
+        i64::MAX,
+    ]
+    .map(|x| (x, 1));
+    for (expression, simplified, lets) in [
+        ("i.x - i.x", "0", ""),
+        (
+            "if i.x != 0 then i.x / i.x else 0",
+            "if i.x != 0 then 1 else 0",
+            "",
+        ),
+        ("if i.x != 0 then i.x % i.x else 0", "0", ""),
+        (
+            "if value != 0 then value / value else 0",
+            "if value != 0 then 1 else 0",
+            "    let value = i.x\n",
+        ),
+    ] {
+        let make = |e| {
+            let mut p = fixture(e, lets);
+            fields(&mut p)[0].range = None;
+            p
+        };
+        let p = make(expression);
+        assert_eq!(
+            native_bytes(&p, "checked"),
+            native_bytes(&make(simplified), "checked"),
+            "{expression}"
+        );
+        differential(&p, "checked", &inputs);
+    }
+    for op in ["==", "!=", "<", "<=", ">", ">="] {
+        let mut p = fixture(&format!("if i.x {op} i.x then 7 else 9"), "");
+        fields(&mut p)[0].range = None;
+        let expected = if matches!(op, "==" | "<=" | ">=") {
+            7
+        } else {
+            9
+        };
+        assert!(
+            matches!(rule(&mut native_opt::lower(&p).unwrap()).logic.value, Expr::Number(n) if n == expected)
+        );
+        differential(&p, "checked", &inputs);
+    }
+}
+
+#[test]
+fn numeric_repeated_arithmetic_preserves_sign_pieces_and_square_extrema() {
+    let small: Vec<_> = (-10..=10).map(|x| (x, 1)).collect();
+    for (expression, lets) in [
+        ("i.x * i.x", ""),
+        ("100 / (d + d)", "    let d = if i.x < 0 then -2 else 2\n"),
+        ("d * d", "    let d = if i.x < 0 then -2 else 2\n"),
+        ("if i.x != 0 then 100 / (i.x * i.x) else 0", ""),
+        (
+            "(x - x) + alias",
+            "    let x = i.x\n    let alias = x\n    let x = i.y\n",
+        ),
+        ("i - i", "    let i = i.x\n"),
+    ] {
+        differential(&fixture(expression, lets), "checked", &small);
+    }
+    for (expression, bound, inputs) in [
+        (
+            "i.x * i.x",
+            3_037_000_499,
+            vec![
+                -3_037_000_499,
+                -3_037_000_498,
+                -1,
+                0,
+                1,
+                3_037_000_498,
+                3_037_000_499,
+            ],
+        ),
+        (
+            "i.x + i.x",
+            i64::MAX / 2,
+            vec![-(i64::MAX / 2), -1, 0, 1, i64::MAX / 2],
+        ),
+    ] {
+        let mut p = fixture(expression, "");
+        fields(&mut p)[0].range = Some((-bound, bound));
+        full(&mut p);
+        if expression.contains('*') {
+            rule(&mut p)
+                .hints
+                .as_mut()
+                .unwrap()
+                .overflow
+                .as_mut()
+                .unwrap()
+                .min = 0;
+        }
+        let inputs: Vec<_> = inputs
+            .into_iter()
+            .chain([-bound - 1, bound + 1])
+            .map(|x| (x, 1))
+            .collect();
+        differential(&p, "checked", &inputs);
+    }
+}
+
+#[test]
+fn numeric_repeated_operands_do_not_invent_aliases_or_skip_original_failures() {
+    let artifact = format!(
+        "/tmp/verbose-numeric-identity-refusal-{}",
+        std::process::id()
+    );
+    for (expression, lets, needle) in [
+        ("i.x / i.x", "", "includes zero"),
+        ("i.x % i.x", "", "includes zero"),
+        ("i.x + i.x", "", "may overflow"),
+        ("i.x * i.x", "", "may overflow"),
+        ("i.x - i.y", "", "may overflow"),
+        ("i.x - alias", "    let alias = i.x\n", "may overflow"),
+        ("if i.y != 0 then i.x / i.y else 0", "", "MIN / -1"),
+        (
+            "if i.x != 0 then i.x / alias else 0",
+            "    let alias = i.x\n",
+            "includes zero",
+        ),
+        ("if i.x == i.x then 0 else i.x + 1", "", "else branch"),
+        ("(i.x + 1) - (i.x + 1)", "", "left operand"),
+        (
+            "bad - bad",
+            "    let bad = parse_int(\"bad\")\n",
+            "unsupported expression",
+        ),
+    ] {
+        let mut p = fixture(expression, lets);
+        for f in fields(&mut p) {
+            f.range = None;
+        }
+        full(&mut p);
+        refuses(&p, needle);
+        assert!(native_opt::lower(&p).is_err());
+        fs::write(&artifact, b"existing artifact").unwrap();
+        assert!(crate::native::compile_native(&p, "checked", &artifact, false, false).is_err());
+        assert_eq!(fs::read(&artifact).unwrap(), b"existing artifact");
+    }
+    fs::remove_file(artifact).unwrap();
+    // An exact zero can reveal a contradiction that older Cartesian bounds
+    // missed. Keep the existing policy: discard every new fact in that guard,
+    // then check the impossible arm against its enclosing domain.
+    refuses(
+        &fixture(
+            "if zero != 0 and i.x != 0 then 100 / i.x else 0",
+            "    let zero = i.x - i.x\n",
+        ),
+        "includes zero",
+    );
+    // Two same-input pure calls are not two direct scalar reads. Their declared
+    // intervals cannot establish an identity just by being equal.
+    let mut p = fixture("i.x", "");
+    fields(&mut p)[0].range = None;
+    full(&mut p);
+    let mut caller = rule(&mut fixture("checked(i) - checked(i)", "")).clone();
+    caller.name = "caller".into();
+    p.items.push(Item::Rule(caller));
+    refuses(&p, "may overflow");
+    // Numeric fields and locals with the same spelling remain different places.
+    let p = fixture("x - i.x", "    let x = i.y\n");
+    differential(&p, "checked", &[(-10, 1), (0, 1), (10, 5)]);
+    // Distinct fields with identical ranges can have distinct values at runtime.
+    let mut p = fixture("if i.x == i.y then 7 else i.x - i.y", "");
+    fields(&mut p)[1].range = Some((-10, 10));
+    differential(&p, "checked", &[(-10, 10), (0, 0), (10, -10)]);
+}
+
+#[test]
+fn numeric_repeated_scalars_keep_entry_guards_and_boolean_status_after_call_removal() {
+    let mut p = fixture("i.x - i.x", "");
+    fields(&mut p)[0].range = None;
+    let mut caller = rule(&mut fixture("0", "")).clone();
+    caller.name = "caller".into();
+    caller.hints = None;
+    caller.output_ty = Type::Bool;
+    p.items.push(Item::Rule(caller));
+    let path = format!("/tmp/verbose-numeric-identity-entry-{}", std::process::id());
+    for expression in [
+        "if i.x == i.x then i.x != i.x else checked(i) > 0",
+        "if i.x == i.x then i.x < 0 else checked(i) > 0",
+    ] {
+        let Item::Rule(caller) = p.items.last_mut().unwrap() else {
+            unreachable!()
+        };
+        caller.logic.value = rule(&mut fixture(expression, "")).logic.value.clone();
+        assert!(active_rules(&p).contains("caller"));
+        assert!(!active_rules(&native_opt::lower(&p).unwrap()).contains("caller"));
+        differential(
+            &p,
+            "caller",
+            &[(i64::MIN, 1), (-1, 1), (0, 1), (i64::MAX, 5), (0, 6)],
+        );
+    }
+    crate::native::compile_native(&p, "caller", &path, false, false).unwrap();
+    for (args, output, stderr) in [
+        (vec!["-1", "1", "1", "1"], "true\nfalse\n", ""),
+        (vec!["1", "1", "-1", "1"], "false\ntrue\n", ""),
+        (vec!["-1", "1", "bad", "1"], "true\n", ""),
+        (vec!["-1", "1", "0"], "true\n", ""),
+        (vec!["0", "6"], "", ""),
+        (vec!["9223372036854775808", "1"], "", ""),
+        (vec![], "", "error: not enough arguments\n"),
+    ] {
+        let actual = Command::new(&path).args(args).output().unwrap();
+        assert_eq!(actual.status.code(), Some(1));
+        assert_eq!(actual.stdout, output.as_bytes());
+        assert_eq!(actual.stderr, stderr.as_bytes());
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn numeric_native_precomputes_only_after_source_verification() {
     let p = fixture(
         "if i.x <= 10 then answer else 42",

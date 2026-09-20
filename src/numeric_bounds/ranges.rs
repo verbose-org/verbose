@@ -100,6 +100,39 @@ impl Ranges {
         })
     }
 
+    /// Both operands read the SAME numeric scalar. This is not justified by
+    /// equal domains alone. Check at most two pieces, without cross-pairing
+    /// distinct possible values of that one scalar.
+    pub fn repeated_arithmetic(self, op: BinOp) -> Result<Self, String> {
+        match op {
+            BinOp::Sub => Ok(Self::interval(0, 0)),
+            BinOp::Div | BinOp::Mod => {
+                if self.pieces().any(|(lo, hi)| lo <= 0 && hi >= 0) {
+                    return Err(format!("{op:?}: repeated divisor domain includes zero"));
+                }
+                // MIN / MIN == 1 and MIN % MIN == 0 are safe. MIN / -1
+                // cannot arise from two reads of this same immutable scalar.
+                let n = if op == BinOp::Div { 1 } else { 0 };
+                Ok(Self::interval(n, n))
+            }
+            BinOp::Add | BinOp::Mul => self.map(|a| {
+                // The ordinary interval check proves both endpoints fit i64.
+                // For a square, its only additional extremum is zero when
+                // this piece crosses zero. All pieces are checked before join.
+                let (lo, hi) = super::arithmetic(op, a, a)?.number()?.hull();
+                Ok((
+                    if op == BinOp::Mul && a.0 <= 0 && a.1 >= 0 {
+                        0
+                    } else {
+                        lo
+                    },
+                    hi,
+                ))
+            }),
+            _ => Err("incompatible repeated operands".into()),
+        }
+    }
+
     /// Project one checked comparison onto this operand, using the other
     /// operand's prior domain. No relation is stored or iterated to a fixed point.
     pub fn constrain(self, op: BinOp, other: Self) -> Option<Self> {
@@ -192,6 +225,88 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn repeated_arithmetic_covers_each_same_value_and_checks_i64_edges() {
+        for domain in domains() {
+            for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod] {
+                let result = domain.repeated_arithmetic(op);
+                if matches!(op, BinOp::Div | BinOp::Mod) && contains(domain, 0) {
+                    assert!(result.unwrap_err().contains("includes zero"));
+                    continue;
+                }
+                let result = result.unwrap();
+                let values: Vec<_> = (-3..=3)
+                    .filter(|&x| contains(domain, x))
+                    .map(|x| match op {
+                        BinOp::Add => x + x,
+                        BinOp::Sub => x - x,
+                        BinOp::Mul => x * x,
+                        BinOp::Div => x / x,
+                        BinOp::Mod => x % x,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                for &x in &values {
+                    assert!(contains(result, x), "{domain:?} {op:?}: lost {x}");
+                }
+                assert_eq!(
+                    result.hull(),
+                    (*values.iter().min().unwrap(), *values.iter().max().unwrap())
+                );
+            }
+        }
+        let full = Ranges::interval(i64::MIN, i64::MAX);
+        assert_eq!(
+            full.repeated_arithmetic(BinOp::Sub).unwrap(),
+            Ranges::interval(0, 0)
+        );
+        let nonzero = full.restrict(BinOp::NotEq, 0).unwrap();
+        assert_eq!(
+            nonzero.repeated_arithmetic(BinOp::Div).unwrap(),
+            Ranges::interval(1, 1)
+        );
+        assert_eq!(
+            nonzero.repeated_arithmetic(BinOp::Mod).unwrap(),
+            Ranges::interval(0, 0)
+        );
+        // Ordinary independent operands must still reject the MIN / -1 pair.
+        assert!(nonzero.arithmetic(BinOp::Div, nonzero).is_err());
+        let half = Ranges::interval(i64::MIN / 2, i64::MAX / 2);
+        assert_eq!(
+            half.repeated_arithmetic(BinOp::Add).unwrap().hull(),
+            (i64::MIN, i64::MAX - 1)
+        );
+        let root = 3_037_000_499;
+        assert_eq!(
+            Ranges::interval(-root, root)
+                .repeated_arithmetic(BinOp::Mul)
+                .unwrap()
+                .hull(),
+            (0, root * root)
+        );
+        for domain in [
+            full,
+            Ranges::interval(i64::MIN / 2 - 1, 0),
+            Ranges::interval(0, i64::MAX / 2 + 1),
+        ] {
+            assert!(domain.repeated_arithmetic(BinOp::Add).is_err());
+        }
+        for domain in [
+            full,
+            Ranges::interval(-root - 1, root),
+            Ranges::interval(-root, root + 1),
+            Ranges::interval(-1, -1).join(Ranges::interval(root + 1, root + 1)),
+        ] {
+            assert!(domain.repeated_arithmetic(BinOp::Mul).is_err());
+        }
+        let signs = Ranges::interval(-2, -2).join(Ranges::interval(2, 2));
+        assert!(!contains(signs.repeated_arithmetic(BinOp::Add).unwrap(), 0));
+        assert_eq!(
+            signs.repeated_arithmetic(BinOp::Mul).unwrap(),
+            Ranges::interval(4, 4)
+        );
     }
 
     #[test]

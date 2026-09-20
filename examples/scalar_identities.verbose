@@ -1,0 +1,61 @@
+@verbose 0.1.0
+
+concept Reading
+  @intention: "Accept a signed i64 reading with no narrower input interval"
+  @source: scalar_identities.intent:1
+  fields:
+    value : number
+
+rule square
+  @intention: "Square the reading only within the safe domain and return zero outside it"
+  @source: scalar_identities.intent:2
+  input:
+    sample : Reading
+  output:
+    out : number
+  logic:
+    out = if sample.value >= -3037000499 and sample.value <= 3037000499 then sample.value * sample.value else 0
+  proofs:
+    purity:
+      reads : [sample.value]
+      calls : []
+    termination:
+      bound : 20
+  hints:
+    overflow : [0, 9223372030926249001]
+
+rule unit
+  @intention: "Divide a nonzero reading by itself and return zero for zero"
+  @source: scalar_identities.intent:3
+  input:
+    sample : Reading
+  output:
+    out : number
+  logic:
+    out = if sample.value != 0 then sample.value / sample.value else 0
+  proofs:
+    purity:
+      reads : [sample.value]
+      calls : []
+    termination:
+      bound : 10
+  hints:
+    overflow : [0, 1]
+
+rule cancel
+  @intention: "Subtract the reading from itself with an exactly zero output contract"
+  @source: scalar_identities.intent:4
+  input:
+    sample : Reading
+  output:
+    out : number
+  logic:
+    out = sample.value - sample.value
+  proofs:
+    purity:
+      reads : [sample.value]
+      calls : []
+    termination:
+      bound : 3
+  hints:
+    overflow : [0, 0]
