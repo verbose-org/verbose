@@ -82,6 +82,11 @@ runtime free list, reference counting, tracing collector, extra lifetime check
 or relocation copy. Scalar words retain their representation and eager order.
 This is [compile-time placement, not runtime garbage collection](memory-management.md).
 
+A [subsequent direct-operand pass](numeric-operands.md) also avoids making a
+scratch copy of a numeric field/local that already has a stable slot. Computed
+operands retain scratch; the complete-expression lifetimes described here keep
+the directly read values alive.
+
 ### Shared-scratch layout observations
 
 [Raw observations and complete fixtures](measurements/numeric-scratch-reuse-2026-09-20.json)

@@ -181,6 +181,10 @@ measurements. They do not imply that every source becomes smaller or faster.
 
 ## Stack storage
 
+[Direct operand reads](numeric-operands.md) now let scalar operations read stable
+input/local slots without an intermediate copy. Computed operands still evaluate
+once into scratch, and signed literal operations keep their checked lowering.
+
 Numeric values use one word. An expression's temporary slots can be reused once
 its result is in registers. The caller's live operands and local bindings remain
 allocated while a callee runs; callee locals become reusable on return. Exclusive
