@@ -1,0 +1,26 @@
+@verbose 0.1.0
+
+concept Movement
+  @intention: "Bound signed quantity and integer unit price before calculating magnitude"
+  @source: guarded_magnitude.intent:1
+  fields:
+    quantity : number [-1000, 1000]
+    unit_price : number [0, 1000000]
+
+rule magnitude
+  @intention: "Calculate absolute movement value with explicit nonzero and positive magnitude guards"
+  @source: guarded_magnitude.intent:2
+  input:
+    item : Movement
+  output:
+    out : number
+  logic:
+    out = if item.quantity != 0 then if abs(item.quantity) > 0 then abs(item.quantity) * item.unit_price else 0 else 0
+  proofs:
+    purity:
+      reads : [item.quantity, item.unit_price]
+      calls : []
+    termination:
+      bound : 30
+  hints:
+    overflow : [0, 1000000000]

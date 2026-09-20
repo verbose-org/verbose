@@ -108,6 +108,13 @@ callee contracts and every original entry guard. No new acceptance rule,
 runtime proof storage or allocator is introduced. See
 [branch simplification](docs/numeric-optimization.md#simplification-inside-checked-branches).
 
+The next native follow-up retains the verifier's two-piece domains through
+lets, branches, arithmetic and checked calls. A comparison folds only when all
+at most four interval pairs agree. The same fixed precision budget, independent
+public callee contracts and original source/entry checks remain. This supersedes
+the native hull-only limitation above without changing runtime numeric storage.
+See [disjoint numeric domains](docs/numeric-optimization.md#preserving-disjoint-numeric-domains).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

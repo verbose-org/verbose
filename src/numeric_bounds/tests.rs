@@ -302,6 +302,11 @@ fn numeric_native_branch_facts_match_explicitly_simplified_programs() {
             "if d == i.y then d else 0",
             "    let d = i.x\n",
         ),
+        (
+            "if i.x != 0 then if i.x == 0 then 42 else i.x else 0",
+            "if i.x != 0 then i.x else 0",
+            "",
+        ),
     ] {
         let p = fixture(source, lets);
         assert_eq!(
@@ -356,10 +361,13 @@ fn numeric_native_branch_facts_do_not_escape_or_follow_aliases() {
     ] {
         differential(&fixture(expr, lets), "checked", &inputs);
     }
-    // This pass still uses hulls, not holes or alias equalities. Pin the
-    // unproved nested test so future changes must justify their precision.
+    // Branch facts still do not follow alias equalities or boolean bindings.
+    // Pin unproved tests so future changes must justify their precision.
     for (expr, lets) in [
-        ("if i.x != 0 then if i.x == 0 then 42 else i.x else 0", ""),
+        (
+            "if flag then if i.x > 0 then 11 else 12 else 13",
+            "    let flag = i.x > 0\n",
+        ),
         (
             "if d > 0 then if i.x > 0 then 11 else 12 else 13",
             "    let d = i.x\n",
@@ -379,26 +387,155 @@ fn numeric_native_branch_facts_do_not_escape_or_follow_aliases() {
 #[test]
 fn numeric_native_branch_folding_forgets_shadowed_unknown_results() {
     let inputs: Vec<_> = (-10..=10).map(|x| (x, 1)).collect();
+    // The source checker gives -5 % 3 the conservative range [-2, 0].
+    // Joined with 1 and 3, that yields [-2, 1] U {3}, excluding 2.
+    // Exact native folding narrows the remainder to -2, but the resulting
+    // THREE pieces {-2, 1, 3} exceed capacity and widen to [-2, 3]. Thus d - 2
+    // may contain zero for the optimizer, and its division becomes Unknown.
+    // This precision loss must not preserve a shadowed constant or boolean.
+    let prefix = "    let d = if i.x < 0 then -5 % 3 else if i.x == 0 then 1 else 3\n";
     for (expr, lets) in [
         (
             "value",
-            "    let value = 42\n    let value = if i.x != 0 then 100 / i.x else 0\n",
+            "    let value = 42\n    let value = 100 / (d - 2)\n",
         ),
         (
             "if flag then 11 else 12",
-            "    let flag = 1 == 1\n    let flag = (if i.x != 0 then 100 / i.x else 0) > 5\n",
+            "    let flag = 1 == 1\n    let flag = 100 / (d - 2) > 5\n",
         ),
-        (
-            "if i > 0 then i else -i",
-            "    let i = if i.x != 0 then 100 / i.x else 0\n",
-        ),
+        ("if i > 0 then i else -i", "    let i = 100 / (d - 2)\n"),
         (
             "if same then q else 0",
             "    let q = if i.x == 0 then i.x else 0\n    let same = q == 0\n",
         ),
     ] {
-        differential(&fixture(expr, lets), "checked", &inputs);
+        differential(
+            &fixture(expr, &format!("{prefix}{lets}")),
+            "checked",
+            &inputs,
+        );
     }
+}
+
+#[test]
+fn numeric_native_disjoint_values_survive_aliases_arithmetic_and_calls() {
+    let inputs: Vec<_> = (-10..=10)
+        .map(|x| (x, 1))
+        .chain([(11, 1), (0, 6)])
+        .collect();
+    let lets = "    let d = if i.x < 0 then -4 else 4\n    let alias = d\n";
+    for expression in [
+        "alias",
+        "-alias",
+        "abs(alias)",
+        "alias + 1",
+        "alias - 1",
+        "alias * 2",
+        "alias / 2",
+        "min(alias, 2)",
+        "max(alias, -2)",
+    ] {
+        let p = fixture(&format!("if {expression} == 0 then 42 else alias"), lets);
+        assert_eq!(
+            native_bytes(&p, "checked"),
+            native_bytes(&fixture("alias", lets), "checked"),
+            "{expression}"
+        );
+        differential(&p, "checked", &inputs);
+    }
+    let p = fixture(
+        "if i.x != 0 then if abs(i.x) > 0 then 100 / i.x else 42 else 0",
+        "",
+    );
+    assert_eq!(
+        native_bytes(&p, "checked"),
+        native_bytes(&fixture("if i.x != 0 then 100 / i.x else 0", ""), "checked")
+    );
+    differential(&p, "checked", &inputs);
+
+    // An unannotated helper's checked two-piece output survives calls. An
+    // explicit public interval still hides that implementation detail.
+    let mut p = fixture("if i.x < 0 then -2 else 2", "");
+    rule(&mut p).hints = None;
+    let mut caller = rule(&mut fixture(
+        "if d == 0 then 42 else d",
+        "    let d = checked(i)\n",
+    ))
+    .clone();
+    caller.name = "caller".into();
+    p.items.push(Item::Rule(caller));
+    let lower_caller = |p: &Program| {
+        let lowered = native_opt::lower(p).unwrap();
+        match lowered.items.last().unwrap() {
+            Item::Rule(r) => r.logic.value.clone(),
+            _ => unreachable!(),
+        }
+    };
+    assert!(matches!(lower_caller(&p), Expr::Ident(n) if n == "d"));
+    differential(&p, "caller", &inputs);
+    rule(&mut p).hints = rule(&mut fixture("0", "")).hints.clone();
+    assert!(matches!(lower_caller(&p), Expr::If(..)));
+    differential(&p, "caller", &inputs);
+}
+
+#[test]
+fn numeric_native_disjoint_precision_loss_keeps_undecided_tests() {
+    let inputs: Vec<_> = (-10..=10).map(|x| (x, 1)).collect();
+    for (expression, lets) in [
+        // Three separate values exceed the capacity. Rejoining cannot carry
+        // the old nonzero exclusion across a branch that actually returns 0.
+        (
+            "if d == 0 then 99 else d",
+            "    let d = if i.x < 0 then -2 else 2\n    let d = if i.x == 0 then 0 else d\n",
+        ),
+        // Integer division rounds toward zero, even for a nonzero numerator.
+        (
+            "if d == 0 then 99 else d",
+            "    let d = if i.x == 0 then 1 else i.x\n    let d = d / 2\n",
+        ),
+        // These comparisons disagree across the negative and positive pieces.
+        (
+            "if d > 0 then 11 else 12",
+            "    let d = if i.x < 0 then -2 else 2\n",
+        ),
+        (
+            "if d == e then 11 else 12",
+            "    let d = if i.x < 0 then -2 else 2\n    let e = if i.x > 0 then -2 else 2\n",
+        ),
+        // Branch-local nonzero facts do not escape into a subsequent operand.
+        (
+            "if d == 0 then 99 else d",
+            "    let d = (if i.x != 0 then i.x else 0) + i.x\n",
+        ),
+    ] {
+        let p = fixture(expression, lets);
+        assert!(
+            matches!(
+                rule(&mut native_opt::lower(&p).unwrap()).logic.value,
+                Expr::If(..)
+            ),
+            "{lets}{expression}"
+        );
+        differential(&p, "checked", &inputs);
+    }
+    // A guard needing a third piece retains prior facts. It must neither
+    // erase the earlier hole nor claim precision beyond the fixed capacity.
+    let p = fixture(
+        "if i.x != 0 then if i.x != 2 then if i.x == 2 then 42 else i.x else 2 else 0",
+        "",
+    );
+    let mut lowered = native_opt::lower(&p).unwrap();
+    let Expr::If(_, yes, _) = &rule(&mut lowered).logic.value else {
+        panic!("outer test required")
+    };
+    let Expr::If(_, yes, _) = yes.as_ref() else {
+        panic!("second exclusion required")
+    };
+    assert!(
+        matches!(yes.as_ref(), Expr::If(..)),
+        "third-piece fact was invented"
+    );
+    differential(&p, "checked", &inputs);
 }
 
 #[test]
@@ -409,6 +546,10 @@ fn numeric_native_branch_folding_keeps_original_obligations_and_entry_guards() {
     );
     for p in [
         fixture("if i.x > 0 then if i.x <= 0 then 1 / 0 else i.x else 0", ""),
+        fixture(
+            "if i.x != 0 then if i.x == 0 then 1 / 0 else i.x else 0",
+            "",
+        ),
         fixture(
             "if i.x > 0 then if i.x <= 0 then parse_int(\"bad\") else i.x else 0",
             "",
@@ -453,6 +594,8 @@ fn numeric_native_branch_folding_keeps_original_obligations_and_entry_guards() {
     // Boolean outputs keep their existing false exit status, even when branch
     // facts erase the entire output calculation or the last checked call.
     for expression in [
+        "if i.x != 0 then i.x == 0 else if i.x == 0 then i.x != 0 else checked(i) > 0",
+        "if i.x != 0 then i.x == 0 else if i.x == 0 then i.x == 0 else checked(i) > 0",
         "if i.x > 0 then i.x <= 0 else if i.x <= 0 then i.x > 0 else checked(i) > 0",
         "if i.x > 0 then i.x <= 0 else if i.x <= 0 then i.x == -1 else checked(i) > 0",
     ] {
@@ -500,6 +643,10 @@ fn numeric_native_branch_folding_at_i64_edges_preserves_signed_results() {
         .flat_map(|x| edges.map(|y| (x, y)))
         .collect();
     for (source, simplified) in [
+        (
+            "if i.x != 0 then if i.x == 0 then 42 else i.x else 0",
+            "if i.x != 0 then i.x else 0",
+        ),
         (
             "if i.x < i.y then if i.x < 9223372036854775807 then i.x + 1 else 0 else i.x",
             "if i.x < i.y then i.x + 1 else i.x",

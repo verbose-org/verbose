@@ -13,7 +13,7 @@ because its result could be discarded. The original 100000-node call-expansion
 limit also applies before a dead call tree can be removed.
 
 The native pass uses enforced numeric field domains, lexical constant aliases,
-and checked callee output intervals. It folds constant arithmetic, including
+and checked callee output domains. It folds constant arithmetic, including
 signed division/remainder; precomputes known comparisons and boolean operations;
 and selects a branch when its condition is proved. Constant lets can disappear
 because their computation is proved pure and nonfailing. Unknown optimization
@@ -48,13 +48,11 @@ numeric and boolean facts, including when the new result is unknown to this
 pass. Pure computations proved constant may disappear; other lets retain their
 evaluation order.
 
-The pass keeps the existing conservative interval hull for arithmetic and
-comparison decisions. In particular, a two-piece nonzero domain crossing zero
-does not suffice to fold a nested comparison with zero. The verifier can prove
-more than the optimizer uses. Unknown optimization facts mean retaining code,
-not weakening or rerunning the source contract. The existing interval, expression,
-depth, call-expansion and frame limits remain; no relation solver or path
-enumeration is introduced.
+The initial branch-folding slice used conservative interval hulls for arithmetic
+and comparison decisions. The follow-up below preserves two-piece domains too.
+Unknown optimization facts mean retaining code, not weakening or rerunning the
+source contract. The existing interval, expression, depth, call-expansion and
+frame limits remain; no relation solver or path enumeration is introduced.
 
 Every source branch is checked **before** this pass. An invalid operation in
 an impossible arm still refuses compilation. All original input checks remain,
@@ -113,6 +111,66 @@ for row in report["cases"]:
                             "--native", str(binary)], check=True)
             print(row["name"], compiler, binary.stat().st_size, frame_bytes(binary))
 ```
+
+## Preserving disjoint numeric domains
+
+Implemented 2026-09-20, following PR #235. A native optimization fact now retains
+the verifier's union of at most two signed intervals instead of immediately
+replacing it with its hull. Inside `if x != 0`, a domain such as `[-10, -1]` plus
+`[1, 10]` proves `x == 0` false and `abs(x) > 0` true. Such tests can disappear;
+the outer input-dependent nonzero guard still executes.
+
+Lets, aliases, branch joins, arithmetic, negation, absolute value, `min` and
+`max` preserve the same fixed representation when possible. Every arithmetic
+pair is checked before joining its results. A comparison folds only if all
+interval pairs agree: knowing `x` is either negative or positive does **not**
+decide `x > 0`. Unannotated acyclic callees can provide checked two-piece output
+domains; an explicit public `overflow` declaration still provides only its
+declared single interval. Caller guards never specialize a callee.
+
+This reuses the [existing precision budget](numeric-guards.md#nonzero-values-and-bounded-analysis):
+at most four interval pairs, at most two retained pieces, and conservative
+widening when a join or calculation needs more. A guard requiring a third piece
+retains its prior facts. Exclusions are recomputed through arithmetic: dividing
+a nonzero value by two can produce zero, and replacing a local clears its old
+facts. General remainder ranges remain conservative; exact singleton remainders
+still fold. Unknown facts keep code intact.
+
+See [guarded_magnitude.verbose](../examples/guarded_magnitude.verbose): signed
+quantity can be negative or positive, and its nonzero guard proves that its
+absolute magnitude is positive. The compiler checks the complete source before
+removing that redundant inner test. Tests cover all one-/two-interval subsets
+of `[-3, 3]`, signed i64 edges, shadowing, precision loss, call contracts and
+unchanged boolean output/exit behavior. All original entry guards and source
+refusals remain, including unsafe operations in impossible arms.
+
+The facts exist only in the compiler. Native numbers remain one word; there is
+no new runtime metadata, allocator or GC. WASM, self-hosted emission and alternate
+native entry modes retain their existing refusals for strict numeric contracts.
+
+### Disjoint-domain layout observations
+
+[Raw observations and complete fixtures](measurements/numeric-disjoint-folding-2026-09-20.json)
+compare merged PR #235 (`a6b2122`) with this follow-up. Compiler, source, lowering
+file and binary hashes are recorded alongside the tested inputs and expected
+integer outputs. Reuse the reproduction snippet above with this report path.
+
+| Fixture | ELF bytes, before → after | Reserved frame bytes, before → after |
+|---|---:|---:|
+| Guarded signed movement magnitude | 925 → 837 | 72 → 72 |
+| Synthetic deep arithmetic behind an impossible zero test | 1974 → 783 | 304 → 72 |
+
+Both native versions and both interpreters agree with integer oracles on 54
+magnitude cases and 105 synthetic cases. Each native case also checks ten
+missing/malformed/out-of-range argument sequences and a partial record after
+valid output, including stderr and exit status. The four allocation-syscall
+traces are empty; four unsupported-backend refusals preserve existing artifacts.
+The 178 existing top-level examples retain the same compiler diagnostics and
+176 byte-identical native artifacts, with the same two refusals. A repeated
+reference compilation also reproduces every artifact and diagnostic.
+
+These are deterministic code/frame observations, not CPU timing, RSS or cache
+measurements. They do not imply that every source becomes smaller or faster.
 
 ## Stack storage
 
