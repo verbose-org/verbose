@@ -1011,5 +1011,6 @@
       "examples/collections.verbose",
       "examples/showcase.verbose"
     ]
-  }
+  },
+  "candidate_revision": "90e672c306300d36793efe9380b1ce752682fb45"
 }

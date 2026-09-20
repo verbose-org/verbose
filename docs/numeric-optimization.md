@@ -151,9 +151,10 @@ native entry modes retain their existing refusals for strict numeric contracts.
 ### Disjoint-domain layout observations
 
 [Raw observations and complete fixtures](measurements/numeric-disjoint-folding-2026-09-20.json)
-compare merged PR #235 (`a6b2122`) with this follow-up. Compiler, source, lowering
-file and binary hashes are recorded alongside the tested inputs and expected
-integer outputs. Reuse the reproduction snippet above with this report path.
+compare merged PR #235 (`a6b2122`) with optimization commit `90e672c`. Compiler,
+source, lowering file and binary hashes are recorded alongside the tested inputs
+and expected integer outputs. Reuse the reproduction snippet above with this
+report path.
 
 | Fixture | ELF bytes, before → after | Reserved frame bytes, before → after |
 |---|---:|---:|
