@@ -1,0 +1,26 @@
+@verbose 0.1.0
+
+concept LineItem
+  @intention: "Bound quantity and integer unit price before calculating a total"
+  @source: guarded_total.intent:1
+  fields:
+    quantity : number [0, 1000]
+    unit_price : number [0, 1000000]
+
+rule total
+  @intention: "Calculate the zero and positive quantity cases with explicit guards"
+  @source: guarded_total.intent:2
+  input:
+    item : LineItem
+  output:
+    out : number
+  logic:
+    out = if item.quantity == 0 then item.quantity * item.unit_price else if item.quantity > 0 then item.quantity * item.unit_price else 0
+  proofs:
+    purity:
+      reads : [item.quantity, item.unit_price]
+      calls : []
+    termination:
+      bound : 20
+  hints:
+    overflow : [0, 1000000000]

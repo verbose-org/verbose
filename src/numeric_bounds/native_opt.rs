@@ -118,23 +118,52 @@ fn binary(op: BinOp, left: Fact, right: Fact) -> Fact {
 }
 
 struct Fold<'a> {
-    fields: HashMap<&'a str, Fact>,
-    locals: HashMap<String, Fact>,
+    // Numeric domains share the verifier's sparse branch scopes. Only known
+    // boolean constants need a separate map; guards never refine booleans.
+    values: HashMap<String, Value>,
+    bools: HashMap<String, bool>,
     calls: &'a HashMap<String, Fact>,
 }
 impl Fold<'_> {
-    fn expr(&self, e: &Expr) -> (Expr, Fact) {
+    fn bind(&mut self, name: &str, fact: Fact) {
+        // Every let introduces a new definition, including unknown results.
+        // Do not leave the previous definition's facts behind on shadowing.
+        self.values.remove(name);
+        self.bools.remove(name);
+        match fact {
+            Fact::Number(lo, hi) => {
+                self.values
+                    .insert(name.into(), Value::Number(Ranges::interval(lo, hi)));
+            }
+            Fact::Bool(value) => {
+                self.values.insert(name.into(), Value::Bool);
+                if let Some(value) = value {
+                    self.bools.insert(name.into(), value);
+                }
+            }
+            // A loss of precision can make valid arithmetic unknown to this
+            // pass. Leave its binding and uses intact; invent no domain for it.
+            Fact::Unknown => {}
+        }
+    }
+
+    fn expr(&self, e: &Expr, scope: &Scope<'_>) -> (Expr, Fact) {
         let (lowered, fact) = match e {
             Expr::Number(n) => (e.clone(), Fact::Number(*n, *n)),
             Expr::Ident(n) => (
                 e.clone(),
-                self.locals.get(n).copied().unwrap_or(Fact::Unknown),
+                self.bools
+                    .get(n)
+                    .copied()
+                    .map(|v| Fact::Bool(Some(v)))
+                    .or_else(|| scope.local(n).map(Fact::from))
+                    .unwrap_or(Fact::Unknown),
             ),
             Expr::Field(_, n) => (
                 e.clone(),
-                self.fields
-                    .get(n.as_str())
-                    .copied()
+                scope
+                    .field(n)
+                    .map(|ranges| Fact::from(Value::Number(ranges)))
                     .unwrap_or(Fact::Unknown),
             ),
             Expr::Call(n, _) => (
@@ -142,25 +171,30 @@ impl Fold<'_> {
                 self.calls.get(n).copied().unwrap_or(Fact::Unknown),
             ),
             Expr::If(c, a, b) => {
-                let (c, cf) = self.expr(c);
+                let (condition, cf) = self.expr(c, scope);
                 // Both source branches were checked before any transformation.
+                // Refine from the ORIGINAL condition: folding its scalars first
+                // must not change which lexical definitions the guard describes.
                 if let Fact::Bool(Some(v)) = cf {
-                    return self.expr(if v { a } else { b });
+                    return self.expr(if v { a } else { b }, &scope.branch(c, v));
                 }
-                let (a, af) = self.expr(a);
-                let (b, bf) = self.expr(b);
-                (Expr::If(Box::new(c), Box::new(a), Box::new(b)), af.join(bf))
+                let (a, af) = self.expr(a, &scope.branch(c, true));
+                let (b, bf) = self.expr(b, &scope.branch(c, false));
+                (
+                    Expr::If(Box::new(condition), Box::new(a), Box::new(b)),
+                    af.join(bf),
+                )
             }
             Expr::Binary(op, a, b) => {
-                let (a, af) = self.expr(a);
-                let (b, bf) = self.expr(b);
+                let (a, af) = self.expr(a, scope);
+                let (b, bf) = self.expr(b, scope);
                 (
                     Expr::Binary(*op, Box::new(a), Box::new(b)),
                     binary(*op, af, bf),
                 )
             }
             Expr::Not(a) | Expr::Neg(a) | Expr::Abs(a) => {
-                let (a, af) = self.expr(a);
+                let (a, af) = self.expr(a, scope);
                 match e {
                     Expr::Not(_) => (
                         Expr::Not(Box::new(a)),
@@ -199,8 +233,8 @@ impl Fold<'_> {
                 }
             }
             Expr::Min(a, b) | Expr::Max(a, b) => {
-                let (a, af) = self.expr(a);
-                let (b, bf) = self.expr(b);
+                let (a, af) = self.expr(a, scope);
+                let (b, bf) = self.expr(b, scope);
                 let is_min = matches!(e, Expr::Min(..));
                 let fact = match (af, bf) {
                     (Fact::Number(a, b), Fact::Number(c, d)) => {
@@ -254,32 +288,24 @@ pub(crate) fn lower(p: &Program) -> Result<Program, VerifyError> {
         let Type::Named(name) = &r.input_ty else {
             unreachable!("verified flat input");
         };
+        let concept = check.concepts[name.as_str()];
         let mut fold = Fold {
-            fields: check.concepts[name.as_str()]
-                .fields
-                .iter()
-                .filter_map(|f| {
-                    if f.ty == Type::Number {
-                        let (lo, hi) = f.range.unwrap_or((i64::MIN, i64::MAX));
-                        Some((f.name.as_str(), Fact::Number(lo, hi)))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            locals: HashMap::new(),
+            values: HashMap::new(),
+            bools: HashMap::new(),
             calls: &calls,
         };
         let mut bindings = Vec::new();
         for (name, expr) in &r.logic.bindings {
-            let (expr, fact) = fold.expr(expr);
-            fold.locals.insert(name.clone(), fact);
+            let (expr, fact) = fold.expr(expr, &Scope::new(r, concept, &fold.values));
+            fold.bind(name, fact);
             // Pure, proved constants cannot fail; all their uses are substituted.
             if fact.constant().is_none() {
                 bindings.push((name.clone(), expr));
             }
         }
-        r.logic.value = fold.expr(&r.logic.value).0;
+        r.logic.value = fold
+            .expr(&r.logic.value, &Scope::new(r, concept, &fold.values))
+            .0;
         r.logic.bindings = bindings;
     }
     Ok(lowered)

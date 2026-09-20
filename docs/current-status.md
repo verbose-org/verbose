@@ -134,7 +134,9 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   Interpreter/native argv entries enforce the premises. WASM/self-hosted emission
   refuses the contract until it can provide those guarantees.
   After verification, native emission precomputes constants, removes proved
-  impossible branches and reuses dead scalar scratch. Original entry guards and
+  impossible branches and reuses dead scalar scratch. It also uses branch-local
+  bounds to remove redundant nested tests and substitute singleton scalars.
+  Original entry guards and
   source obligations remain; see [numeric optimization](numeric-optimization.md).
   [Numeric local lifetimes](numeric-local-lifetimes.md) also allow slots to be
   reused after their last enclosing expression, with no runtime lifetime tracking.
