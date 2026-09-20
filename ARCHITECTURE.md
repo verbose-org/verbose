@@ -101,6 +101,10 @@ This does not guarantee cache residency: reserved bytes, touched bytes, RSS and
 hardware cache misses must be distinguished in measurements. No particular
 cache size becomes a language contract.
 
+The [memory-management overview](docs/memory-management.md) distinguishes static
+slot/buffer reuse and scoped arenas from runtime garbage collection. These are
+implemented mechanisms with specific contracts, not a whole-process memory proof.
+
 This is already concrete for bounded HTTP reception: `max_request` determines a
 fixed frame buffer, receiving does not grow it, and oversize requests close the
 client. It is not yet a whole-service memory bound: response temporaries, callees,

@@ -11,6 +11,10 @@ the last complete binding or output expression that reads it. A shadowing let's
 initializer still reads the previous definition. Both arms of an `if` count as
 possible uses; the analysis does not shorten lifetimes separately inside arms.
 
+The placement description and measurements below record the initial 2026-09-17
+implementation. The [shared-scratch follow-up](#sharing-dead-slots-with-expression-scratch)
+removes its restriction that scratch must sit above all live locals.
+
 After an expression puts its result in registers, the slots of locals whose last
 use was in that expression are available for the next binding. The allocator
 chooses the lowest available slot. It never moves a live value to close a hole.
@@ -37,6 +41,72 @@ dead-result stores disappear, and shorter frame offsets may reduce instruction
 size. This is not register allocation or last-use tracking inside an expression.
 Holes below a live local are reused by later bindings, not expression scratch.
 The existing conservative 2 MiB frame limit still applies.
+
+## Sharing dead slots with expression scratch
+
+Implemented 2026-09-20, following PR #237. A single compile-time slot pool now
+serves numeric locals and expression temporaries throughout an expanded entry.
+Any free slot can hold subsequent scratch or a callee local, including a hole
+below a still-live caller value. The compiler picks the lowest free slot; it
+never moves a live value to make room.
+
+```verbose
+let early = input.x + 1
+let keep = input.y + 2
+let unused = early + input.x
+out = keep + computation(input)
+```
+
+After the third initializer, `early` is dead. Its slot can now hold an operand
+or a temporary inside `computation`, while `keep` remains protected. The unused
+initializer still executes. The result of an expression reaches registers before
+its scratch is released; already evaluated operands remain allocated until their
+enclosing expression finishes. A callee releases only its own locals. Opposite
+arms of a branch reuse scratch after each arm's result, while locals read in
+either arm remain protected through the complete conditional.
+
+Last-use analysis still follows lexical definitions: aliases keep their copied
+numeric values, and a shadowing initializer reads the previous definition.
+There is no finer last-use analysis within an expression, call specialization,
+register allocation or change to numeric proofs. Input fields keep their separate
+entry slots. The two-word BoundsError path and bounded text placement are separate.
+
+The compiler maintains one free set and a stack of temporary slot identities.
+Free-set operations are logarithmic in the peak slot count; lifetime schedules
+are linear in binding count, with one visit per local read. Existing source and
+call-expansion limits still bound the work. Branches are traversed structurally,
+without enumerating execution paths or building pairwise conflict graphs.
+
+Only frame size and slot offsets change in the generated program. There is no
+runtime free list, reference counting, tracing collector, extra lifetime check
+or relocation copy. Scalar words retain their representation and eager order.
+This is [compile-time placement, not runtime garbage collection](memory-management.md).
+
+### Shared-scratch layout observations
+
+[Raw observations and complete fixtures](measurements/numeric-scratch-reuse-2026-09-20.json)
+compare merged PR #237 (`c06240f`) with this implementation, identified by compiler
+and source hashes. Both compilers accept all three sources. Reuse the
+[layout reproduction snippet](numeric-optimization.md#branch-folding-layout-observations)
+with this report path to rebuild them.
+
+| Fixture | ELF bytes, before → after | Reserved frame bytes, before → after |
+|---|---:|---:|
+| 32 dead locals below a live value, then deep arithmetic | 6225 → 6144 | 840 → 584 |
+| The same holes reused by successive expanded calls | 8825 → 8663 | 848 → 592 |
+| Control retaining all 32 locals through the final expression | 7505 → 7505 | 840 → 840 |
+
+Each fixture matches both interpreters and native versions against an integer
+oracle on 105 input records. Ten invalid argument sequences and malformed/partial
+records after valid output preserve stdout, stderr and status. All six allocation
+syscall traces are empty; four unsupported entry-mode refusals preserve existing
+artifacts. The all-live control is byte-identical: values that remain necessary
+cannot share their slots. These synthetic observations establish code/frame
+sizes, not CPU speed, process RSS or hardware cache behavior.
+
+The 180 existing top-level examples retain identical compiler diagnostics and
+178 byte-identical native artifacts, with the same two refusals. A repeated
+reference compilation also reproduces every artifact and diagnostic.
 
 Smaller reserved frames do not by themselves establish lower RSS or better cache
 hit rates. Timing must be compared independently; the benchmark includes a case

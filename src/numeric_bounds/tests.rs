@@ -961,6 +961,121 @@ fn numeric_native_reuses_scratch_without_clobbering_live_values() {
 }
 
 #[test]
+fn numeric_native_scratch_fills_holes_below_live_locals() {
+    // The early locals all die in one complete expression. The later local
+    // remains live above their holes while a deep expression needs scratch.
+    let deep = (0..63).fold("i.x".to_owned(), |e, _| format!("i.x + ({e})"));
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .chain([(-11, 1), (11, 1), (0, 6)])
+        .collect();
+    let mut frames = Vec::new();
+    for n in [0, 8, 32] {
+        let mut lets = String::new();
+        for i in 0..n {
+            lets += &format!("    let early{i} = i.x + {i}\n");
+        }
+        lets += "    let keep = i.y + 2\n";
+        let sum = (0..n)
+            .map(|i| format!("early{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        if n > 0 {
+            lets += &format!("    let unused = {sum}\n");
+        }
+        let p = fixture(&format!("keep + ({deep})"), &lets);
+        differential(&p, "checked", &inputs);
+        frames.push(frame_bytes(&native_bytes(&p, "checked")));
+        if n == 32 {
+            // Keeping those values alive through the deep computation must
+            // still require separate slots, even if their domains are equal.
+            let mut live = fixture(&format!("(keep + ({deep})) + ({sum})"), &lets);
+            full(&mut live);
+            differential(&live, "checked", &inputs);
+            assert!(frame_bytes(&native_bytes(&live, "checked")) > frames[2]);
+        }
+    }
+    assert_eq!(
+        frames,
+        vec![frames[0]; 3],
+        "dead locals must not lift scratch"
+    );
+}
+
+#[test]
+fn numeric_native_shared_scratch_keeps_caller_operands_and_callee_locals() {
+    let deep = (0..15).fold("alias".to_owned(), |e, _| format!("i.x + ({e})"));
+    let mut p = fixture(
+        &format!("keep + ({deep})"),
+        "    let early = i.x + 1\n    let keep = i.y + 2\n    let unused = early + i.x\n    let alias = keep\n    let keep = i.x * 2\n",
+    );
+    let mut caller = rule(&mut fixture(
+        "keep + (if i.x < 0 then checked(i) + (checked(i) + alias) else alias - checked(i))",
+        "    let early = i.x + 3\n    let keep = i.y + 4\n    let unused = early + i.x\n    let alias = keep\n    let keep = checked(i) + alias\n    let unused = checked(i)\n",
+    ))
+    .clone();
+    caller.name = "caller".into();
+    caller.hints = None;
+    caller.input_name = "incoming".into();
+    for (_, value) in &mut caller.logic.bindings {
+        *value = crate::optimizer::substitute_ident(value, "i", &Expr::Ident("incoming".into()));
+    }
+    caller.logic.value = crate::optimizer::substitute_ident(
+        &caller.logic.value,
+        "i",
+        &Expr::Ident("incoming".into()),
+    );
+    p.items.push(Item::Rule(caller));
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .chain([(-11, 1), (11, 1), (0, 6)])
+        .collect();
+    differential(&p, "caller", &inputs);
+
+    // One-word storage still preserves signed extremes and numeric/boolean
+    // locals. A definition used in either arm stays live through the whole if.
+    for expression in [
+        "if flag then min(keep, i.x) else max(keep, i.x)",
+        "if flag then keep < i.x else keep == i.x",
+    ] {
+        let mut p = fixture(
+            expression,
+            "    let early = i.x\n    let keep = i.y\n    let unused = early < i.y\n    let flag = i.x < 0\n",
+        );
+        for f in fields(&mut p) {
+            f.range = None;
+        }
+        full(&mut p);
+        if expression.contains("keep <") {
+            let mut helper = rule(&mut fixture("i.x", "")).clone();
+            helper.name = "number".into();
+            helper.hints = rule(&mut p).hints.clone();
+            rule(&mut p).output_ty = Type::Bool;
+            rule(&mut p).hints = None;
+            rule(&mut p).logic.bindings.push((
+                "unused".into(),
+                Expr::Call("number".into(), vec![Expr::Ident("i".into())]),
+            ));
+            p.items.push(Item::Rule(helper));
+        }
+        differential(
+            &p,
+            "checked",
+            &[
+                (i64::MIN, i64::MAX),
+                (i64::MAX, i64::MIN),
+                (i64::MIN, i64::MIN),
+                (i64::MAX, i64::MAX),
+                (-1, 0),
+                (0, -1),
+                (0, 0),
+                (1, 0),
+            ],
+        );
+    }
+}
+
+#[test]
 fn numeric_native_local_storage_depends_on_lifetime_not_binding_count() {
     let inputs = [(-10, 1), (-1, 5), (0, 3), (10, 5), (11, 1), (0, 6)];
     for shadow in [false, true] {

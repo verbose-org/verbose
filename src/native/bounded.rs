@@ -2,8 +2,8 @@
 //! pointers: rax is the tag (0/1), rdx the byte or zero. Every temporary and
 //! lexical binding has a frame slot; call expansion is acyclic and eager.
 //! Also used for strict numeric contracts: scalar slots are one word and reused
-//! after their last enclosing expression. Scratch is not zero-initialized, and
-//! the entry validates complete i64 arguments.
+//! after their last enclosing expression, including by subsequent scratch and
+//! expanded calls. Scratch is not zero-initialized; entry checks complete i64s.
 use super::*;
 
 mod liveness;
@@ -39,10 +39,27 @@ struct Emit<'a> {
     next: usize,
     peak: usize,
     numeric: bool,
+    numeric_slots: liveness::Slots,
+    temporaries: Vec<usize>,
 }
 impl Emit<'_> {
+    fn numeric_local(&mut self, ty: Type) -> Result<(usize, Local), NativeError> {
+        let index = self.numeric_slots.allocate();
+        let slot = *self.slots.get(index).ok_or_else(|| NativeError {
+            message: "strict overflow frame estimate exhausted".into(),
+        })?;
+        self.peak = self.peak.max(index + 1);
+        store(&mut self.code, slot, false);
+        Ok((index, Local { slot, ty }))
+    }
+
     fn save(&mut self, ty: Type) -> Result<Local, NativeError> {
-        let width = if self.numeric { 1 } else { 2 };
+        if self.numeric {
+            let (index, local) = self.numeric_local(ty)?;
+            self.temporaries.push(index);
+            return Ok(local);
+        }
+        let width = 2;
         let slot = *self
             .slots
             .get(self.next + width - 1)
@@ -71,24 +88,32 @@ impl Emit<'_> {
     }
     fn numeric_rule(&mut self, r: &Rule) -> Result<Type, NativeError> {
         let plan = liveness::Plan::for_rule(r);
-        let base = self.next;
+        let mut slots = vec![None; r.logic.bindings.len()];
         let mut env = HashMap::new();
         for (i, (name, expr)) in r.logic.bindings.iter().enumerate() {
-            self.next = base + plan.prefixes[i];
             // Keep eager source order, including unused nonconstant lets.
             let ty = self.expr(expr, &r.input_name, &env)?;
-            if let Some(slot) = plan.slots[i] {
+            for &definition in &plan.releases[i] {
+                self.numeric_slots
+                    .release(slots[definition].take().unwrap());
+            }
+            if plan.used[i] {
                 // The initializer finished; its last-use operands can now be
                 // overwritten by the result without moving another live value.
-                self.next = base + slot;
-                let local = self.save(ty)?;
+                let (index, local) = self.numeric_local(ty)?;
+                slots[i] = Some(index);
                 env.insert(name.clone(), local);
             } else {
                 env.remove(name);
             }
         }
-        self.next = base + plan.prefixes[r.logic.bindings.len()];
-        self.expr(&r.logic.value, &r.input_name, &env)
+        let ty = self.expr(&r.logic.value, &r.input_name, &env)?;
+        for &definition in &plan.releases[r.logic.bindings.len()] {
+            self.numeric_slots
+                .release(slots[definition].take().unwrap());
+        }
+        debug_assert!(slots.iter().all(Option::is_none));
+        Ok(ty)
     }
     fn scalar(
         &mut self,
@@ -118,13 +143,16 @@ impl Emit<'_> {
         input: &str,
         env: &HashMap<String, Local>,
     ) -> Result<Type, NativeError> {
-        let mark = self.next;
+        let mark = self.temporaries.len();
         let value = self.expr_inner(e, input, env);
         // The result is in registers. All slots created by this expression
-        // (including expanded callee locals) are dead, while the caller's
-        // lexical bindings and already-evaluated operands remain below mark.
+        // are dead. Caller operands and lexical locals remain allocated, even
+        // when their physical slots are interleaved with this scratch. Expanded
+        // callees release their own locals after producing their result.
         if self.numeric {
-            self.next = mark;
+            for slot in self.temporaries.drain(mark..) {
+                self.numeric_slots.release(slot);
+            }
         }
         value
     }
@@ -454,6 +482,8 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
         next: 0,
         peak: 0,
         numeric,
+        numeric_slots: liveness::Slots::default(),
+        temporaries: Vec::new(),
     };
     emit.rule(r)?;
     let nslots = if numeric { emit.peak } else { estimated };

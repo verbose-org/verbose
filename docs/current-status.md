@@ -19,6 +19,9 @@ asks who owns storage, its capacity and lifetime, and what happens at exhaustion
 The aim is useful, predictable specialization; matching Apache's feature list is
 not the project's identity or a claim of general superiority.
 
+[Memory management](memory-management.md) distinguishes compile-time slot/buffer
+reuse and scoped arenas from runtime garbage collection, with the current limits.
+
 ## Concrete continuation
 
 The original thought experiment was an LLM producing a binary directly. The
@@ -145,6 +148,8 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   [numeric optimization](numeric-optimization.md).
   [Numeric local lifetimes](numeric-local-lifetimes.md) also allow slots to be
   reused after their last enclosing expression, with no runtime lifetime tracking.
+  Expression scratch and expanded callees can reuse those dead slots even below
+  still-live locals; caller operands remain protected throughout evaluation.
   The [numeric benchmark](numeric-benchmark.md) separates elapsed and child CPU
   time and marks inconsistent clock accounting inconclusive. Frame savings are
   established; the recorded timings do not settle small runtime-cost differences.

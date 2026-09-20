@@ -122,6 +122,12 @@ lowering also folds decided self-comparisons after source verification. Aliases,
 equal domains and repeated calls do not establish identity. See
 [numeric scalar identities](docs/numeric-identities.md).
 
+Numeric scratch and expanded callee locals now share dead scalar slots with
+bindings, including holes below still-live caller values. Placement runs only
+in the compiler; complete-expression lifetimes and input/source checks remain.
+See [shared scratch](docs/numeric-local-lifetimes.md#sharing-dead-slots-with-expression-scratch)
+and [memory management versus GC](docs/memory-management.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.
