@@ -1,13 +1,13 @@
-//! Scalar binding lifetimes in a verified numeric rule. Slots are released
-//! between complete binding expressions, never partway through a branch or call.
+//! Scalar binding lifetimes and compile-time slot placement. Locals are released
+//! between complete binding expressions. Scratch can reuse any already dead slot.
 use crate::ast::{Expr, Rule};
 use std::collections::{BTreeSet, HashMap};
 
 pub(super) struct Plan {
-    /// Reusable slot for each binding; unused values need no persistent slot.
-    pub slots: Vec<Option<usize>>,
-    /// Scratch starts above every live local before each binding and the output.
-    pub prefixes: Vec<usize>,
+    /// Whether a binding needs a persistent slot after its initializer.
+    pub used: Vec<bool>,
+    /// Definitions that die after each complete binding/output expression.
+    pub releases: Vec<Vec<usize>>,
 }
 
 impl Plan {
@@ -32,33 +32,38 @@ impl Plan {
         uses(&rule.logic.value, &scope, &mut last, n);
 
         let mut releases = vec![Vec::new(); n + 1];
-        let mut live = BTreeSet::new();
-        let mut free = BTreeSet::new();
-        let mut count = 0;
-        let mut slots = Vec::with_capacity(n);
-        let mut prefixes = Vec::with_capacity(n + 1);
-        for i in 0..=n {
-            // All locals referenced anywhere in this expression remain intact
-            // until its result reaches registers. Holes below this prefix are
-            // available for later bindings, not for expression scratch.
-            prefixes.push(live.last().map_or(0, |slot| slot + 1));
-            for slot in &releases[i] {
-                live.remove(slot);
-                free.insert(*slot);
-            }
-            if let Some(Some(end)) = last.get(i) {
-                let slot = free.pop_first().unwrap_or_else(|| {
-                    let slot = count;
-                    count += 1;
-                    slot
-                });
-                live.insert(slot);
-                releases[*end].push(slot);
-                slots.push(Some(slot));
-            } else if i < n {
-                slots.push(None);
+        for (definition, end) in last.iter().enumerate() {
+            if let Some(end) = end {
+                releases[*end].push(definition);
             }
         }
-        Self { slots, prefixes }
+        Self {
+            used: last.iter().map(Option::is_some).collect(),
+            releases,
+        }
+    }
+}
+
+/// Shared by locals and expression scratch across expanded calls. This free
+/// set exists only in the compiler; runtime values carry no allocation metadata.
+#[derive(Default)]
+pub(super) struct Slots {
+    free: BTreeSet<usize>,
+    count: usize,
+}
+
+impl Slots {
+    pub fn allocate(&mut self) -> usize {
+        self.free.pop_first().unwrap_or_else(|| {
+            let slot = self.count;
+            self.count += 1;
+            slot
+        })
+    }
+
+    pub fn release(&mut self, slot: usize) {
+        debug_assert!(slot < self.count);
+        let inserted = self.free.insert(slot);
+        debug_assert!(inserted, "slot released twice");
     }
 }
