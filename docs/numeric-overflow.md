@@ -90,7 +90,7 @@ of local lifetimes; see [numeric local storage](numeric-local-lifetimes.md).
 The original source is checked first, including eager unused lets and both
 branches. A private native emission view then precomputes constants, substitutes
 constant aliases, and removes branches decided by enforced input ranges and
-checked callee output intervals. Constant lets can disappear only after that
+checked callee output domains. Constant lets can disappear only after that
 proof: the supported arithmetic is pure and cannot fail within its input domain.
 An unsafe unused let or an unsupported expression in an impossible branch still
 refuses compilation. The general source optimizer and interpreter retain the
@@ -105,9 +105,11 @@ toward zero, including negative values and i64 extremes.
 No speculative code motion, retry, SIMD or parallel lowering is enabled by this
 pass. Its unknown facts mean “keep the expression”, after strict verification has
 already established safety. The native simplifier now uses selected-arm bounds
-to remove decided nested tests and substitute singleton values, while retaining
-conservative interval hulls. It reuses the guard analysis only after verifying
-the complete original source. See the
+to remove decided nested tests and substitute singleton values. It retains up
+to two intervals through operations, branch joins and checked calls, allowing
+nonzero facts across both signs to eliminate zero tests. Decisions must agree
+across every interval pair; excess precision widens conservatively. It reuses
+the guard analysis only after verifying the complete original source. See the
 reproducible [numeric benchmark](numeric-optimization.md) for scope and measured costs.
 
 ## Entry behavior and support

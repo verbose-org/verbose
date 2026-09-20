@@ -136,8 +136,10 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   After verification, native emission precomputes constants, removes proved
   impossible branches and reuses dead scalar scratch. It also uses branch-local
   bounds to remove redundant nested tests and substitute singleton scalars.
-  Original entry guards and
-  source obligations remain; see [numeric optimization](numeric-optimization.md).
+  It preserves up to two intervals through numeric operations and calls, so
+  proved nonzero values can eliminate zero tests even across both signs.
+  Original entry guards and source obligations remain; see
+  [numeric optimization](numeric-optimization.md).
   [Numeric local lifetimes](numeric-local-lifetimes.md) also allow slots to be
   reused after their last enclosing expression, with no runtime lifetime tracking.
   The [numeric benchmark](numeric-benchmark.md) separates elapsed and child CPU

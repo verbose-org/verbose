@@ -3,20 +3,16 @@
 //! The emitter must retain the original entry classification and input guards.
 use super::*;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fact {
-    Number(i64, i64),
+    Number(Ranges),
     Bool(Option<bool>),
     Unknown,
 }
 impl From<Value> for Fact {
     fn from(v: Value) -> Self {
         match v {
-            Value::Number(ranges) => {
-                // Native folding deliberately uses only the conservative hull.
-                let (lo, hi) = ranges.hull();
-                Self::Number(lo, hi)
-            }
+            Value::Number(ranges) => Self::Number(ranges),
             Value::Bool => Self::Bool(None),
         }
     }
@@ -24,7 +20,10 @@ impl From<Value> for Fact {
 impl Fact {
     fn constant(self) -> Option<Expr> {
         match self {
-            Self::Number(lo, hi) if lo == hi => Some(Expr::Number(lo)),
+            Self::Number(ranges) => {
+                let (lo, hi) = ranges.hull();
+                (lo == hi).then_some(Expr::Number(lo))
+            }
             // The AST has no bool literal. Keep its type explicit, without
             // inventing an identifier that a user binding could shadow.
             Self::Bool(Some(v)) => Some(Expr::Binary(
@@ -37,14 +36,14 @@ impl Fact {
     }
     fn join(self, other: Self) -> Self {
         match (self, other) {
-            (Self::Number(a, b), Self::Number(c, d)) => Self::Number(a.min(c), b.max(d)),
+            (Self::Number(a), Self::Number(b)) => Self::Number(a.join(b)),
             (Self::Bool(a), Self::Bool(b)) => Self::Bool(if a == b { a } else { None }),
             _ => Self::Unknown,
         }
     }
 }
 
-fn compare(op: BinOp, (a, b): (i64, i64), (c, d): (i64, i64)) -> Option<bool> {
+fn compare_interval(op: BinOp, (a, b): (i64, i64), (c, d): (i64, i64)) -> Option<bool> {
     match op {
         BinOp::Eq | BinOp::NotEq => {
             let eq = if b < c || d < a {
@@ -74,26 +73,49 @@ fn compare(op: BinOp, (a, b): (i64, i64), (c, d): (i64, i64)) -> Option<bool> {
                 None
             }
         }
-        BinOp::Gt => compare(BinOp::Lt, (c, d), (a, b)),
-        BinOp::GtEq => compare(BinOp::LtEq, (c, d), (a, b)),
+        BinOp::Gt => compare_interval(BinOp::Lt, (c, d), (a, b)),
+        BinOp::GtEq => compare_interval(BinOp::LtEq, (c, d), (a, b)),
         _ => None,
     }
 }
 
+fn compare(op: BinOp, left: Ranges, right: Ranges) -> Option<bool> {
+    // A decision must hold for EVERY pair, including pieces of opposite signs.
+    // The verifier's fixed domain capacity bounds this to four comparisons.
+    let mut result = None;
+    for a in left.pieces() {
+        for b in right.pieces() {
+            let decision = compare_interval(op, a, b)?;
+            if result.is_some_and(|previous| previous != decision) {
+                return None;
+            }
+            result = Some(decision);
+        }
+    }
+    result
+}
+
 fn binary(op: BinOp, left: Fact, right: Fact) -> Fact {
     match (left, right) {
-        (Fact::Number(a, b), Fact::Number(c, d)) => match op {
-            BinOp::Mod if a == b && c == d => a
-                .checked_rem(c)
-                .map(|v| Fact::Number(v, v))
-                .unwrap_or(Fact::Unknown),
-            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
-                Fact::Bool(compare(op, (a, b), (c, d)))
+        (Fact::Number(left), Fact::Number(right)) => {
+            let (a, b) = left.hull();
+            let (c, d) = right.hull();
+            match op {
+                // Preserve exact singleton remainder folding: the general
+                // remainder range deliberately includes additional values.
+                BinOp::Mod if a == b && c == d => a
+                    .checked_rem(c)
+                    .map(|v| Fact::Number(Ranges::interval(v, v)))
+                    .unwrap_or(Fact::Unknown),
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+                    Fact::Bool(compare(op, left, right))
+                }
+                _ => left
+                    .arithmetic(op, right)
+                    .map(Fact::Number)
+                    .unwrap_or(Fact::Unknown),
             }
-            _ => arithmetic(op, (a, b), (c, d))
-                .map(Fact::from)
-                .unwrap_or(Fact::Unknown),
-        },
+        }
         (Fact::Bool(a), Fact::Bool(b)) => Fact::Bool(match op {
             BinOp::Eq => a.zip(b).map(|(a, b)| a == b),
             BinOp::NotEq => a.zip(b).map(|(a, b)| a != b),
@@ -131,9 +153,8 @@ impl Fold<'_> {
         self.values.remove(name);
         self.bools.remove(name);
         match fact {
-            Fact::Number(lo, hi) => {
-                self.values
-                    .insert(name.into(), Value::Number(Ranges::interval(lo, hi)));
+            Fact::Number(ranges) => {
+                self.values.insert(name.into(), Value::Number(ranges));
             }
             Fact::Bool(value) => {
                 self.values.insert(name.into(), Value::Bool);
@@ -149,7 +170,7 @@ impl Fold<'_> {
 
     fn expr(&self, e: &Expr, scope: &Scope<'_>) -> (Expr, Fact) {
         let (lowered, fact) = match e {
-            Expr::Number(n) => (e.clone(), Fact::Number(*n, *n)),
+            Expr::Number(n) => (e.clone(), Fact::Number(Ranges::interval(*n, *n))),
             Expr::Ident(n) => (
                 e.clone(),
                 self.bools
@@ -206,10 +227,13 @@ impl Fold<'_> {
                     Expr::Neg(_) => (
                         Expr::Neg(Box::new(a)),
                         match af {
-                            Fact::Number(lo, hi) => hi
-                                .checked_neg()
-                                .zip(lo.checked_neg())
-                                .map(|(a, b)| Fact::Number(a, b))
+                            Fact::Number(ranges) => ranges
+                                .map(|(lo, hi)| {
+                                    hi.checked_neg()
+                                        .zip(lo.checked_neg())
+                                        .ok_or_else(|| "negation may overflow".into())
+                                })
+                                .map(Fact::Number)
                                 .unwrap_or(Fact::Unknown),
                             _ => Fact::Unknown,
                         },
@@ -217,15 +241,19 @@ impl Fold<'_> {
                     _ => (
                         Expr::Abs(Box::new(a)),
                         match af {
-                            Fact::Number(lo, hi) => lo
-                                .checked_abs()
-                                .zip(hi.checked_abs())
-                                .map(|(a, b)| {
-                                    Fact::Number(
-                                        if lo <= 0 && hi >= 0 { 0 } else { a.min(b) },
-                                        a.max(b),
-                                    )
+                            Fact::Number(ranges) => ranges
+                                .map(|(lo, hi)| {
+                                    lo.checked_abs()
+                                        .zip(hi.checked_abs())
+                                        .map(|(a, b)| {
+                                            (
+                                                if lo <= 0 && hi >= 0 { 0 } else { a.min(b) },
+                                                a.max(b),
+                                            )
+                                        })
+                                        .ok_or_else(|| "absolute value may overflow".into())
                                 })
+                                .map(Fact::Number)
                                 .unwrap_or(Fact::Unknown),
                             _ => Fact::Unknown,
                         },
@@ -237,13 +265,16 @@ impl Fold<'_> {
                 let (b, bf) = self.expr(b, scope);
                 let is_min = matches!(e, Expr::Min(..));
                 let fact = match (af, bf) {
-                    (Fact::Number(a, b), Fact::Number(c, d)) => {
-                        if is_min {
-                            Fact::Number(a.min(c), b.min(d))
-                        } else {
-                            Fact::Number(a.max(c), b.max(d))
-                        }
-                    }
+                    (Fact::Number(left), Fact::Number(right)) => left
+                        .pairwise(right, |(a, b), (c, d)| {
+                            Ok(if is_min {
+                                (a.min(c), b.min(d))
+                            } else {
+                                (a.max(c), b.max(d))
+                            })
+                        })
+                        .map(Fact::Number)
+                        .unwrap_or(Fact::Unknown),
                     _ => Fact::Unknown,
                 };
                 (
@@ -329,7 +360,9 @@ mod tests {
                             BinOp::Gt,
                             BinOp::GtEq,
                         ] {
-                            if let Some(proved) = compare(op, (a, b), (c, d)) {
+                            if let Some(proved) =
+                                compare(op, Ranges::interval(a, b), Ranges::interval(c, d))
+                            {
                                 for x in a..=b {
                                     for y in c..=d {
                                         let actual = match op {
@@ -381,5 +414,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn numeric_native_disjoint_comparisons_require_unanimous_pairs() {
+        // Every nonempty subset of [-3, 3] representable by <= 2 intervals.
+        let mut domains = Vec::new();
+        for mask in 1u32..128 {
+            let mut pieces = Vec::new();
+            let mut bit = 0;
+            while bit < 7 {
+                if mask & (1 << bit) == 0 {
+                    bit += 1;
+                    continue;
+                }
+                let lo = bit;
+                while bit < 7 && mask & (1 << bit) != 0 {
+                    bit += 1;
+                }
+                pieces.push(Ranges::interval(lo - 3, bit - 4));
+            }
+            if pieces.len() <= 2 {
+                domains.push(pieces.into_iter().reduce(Ranges::join).unwrap());
+            }
+        }
+        for &left in &domains {
+            for &right in &domains {
+                for op in [
+                    BinOp::Eq,
+                    BinOp::NotEq,
+                    BinOp::Lt,
+                    BinOp::LtEq,
+                    BinOp::Gt,
+                    BinOp::GtEq,
+                ] {
+                    let actual: Vec<_> = left
+                        .pieces()
+                        .flat_map(|(lo, hi)| lo..=hi)
+                        .flat_map(|x| {
+                            right
+                                .pieces()
+                                .flat_map(|(lo, hi)| lo..=hi)
+                                .map(move |y| match op {
+                                    BinOp::Eq => x == y,
+                                    BinOp::NotEq => x != y,
+                                    BinOp::Lt => x < y,
+                                    BinOp::LtEq => x <= y,
+                                    BinOp::Gt => x > y,
+                                    BinOp::GtEq => x >= y,
+                                    _ => unreachable!(),
+                                })
+                        })
+                        .collect();
+                    let expected = actual.iter().all(|v| *v == actual[0]).then_some(actual[0]);
+                    assert_eq!(
+                        compare(op, left, right),
+                        expected,
+                        "{left:?} {op:?} {right:?}"
+                    );
+                }
+            }
+        }
+        let extremes =
+            Ranges::interval(i64::MIN, i64::MIN).join(Ranges::interval(i64::MAX, i64::MAX));
+        assert_eq!(
+            compare(
+                BinOp::Eq,
+                extremes,
+                Ranges::interval(i64::MIN + 1, i64::MAX - 1)
+            ),
+            Some(false)
+        );
+        assert_eq!(compare(BinOp::Lt, extremes, Ranges::interval(0, 0)), None);
+        assert_eq!(
+            binary(
+                BinOp::Div,
+                Fact::Number(extremes),
+                Fact::Number(Ranges::interval(-1, -1))
+            ),
+            Fact::Unknown
+        );
+        assert_eq!(
+            binary(
+                BinOp::Mod,
+                Fact::Number(extremes),
+                Fact::Number(Ranges::interval(-1, -1))
+            ),
+            Fact::Unknown
+        );
     }
 }
