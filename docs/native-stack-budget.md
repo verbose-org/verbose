@@ -119,7 +119,7 @@ outer frame + saved outer rbp
 
 This analysis adds no instructions, runtime allocation or GC to supported native
 entries. No transport budget is implied: a rule reaching a declaration, even
-through an unannotated caller, refuses stdin/raw/stream, multiple native entries,
+through an unannotated caller, refuses stdin/raw/stream,
 the legacy HTTP shell, and service/reaction uses. Unrelated unannotated entries
 retain their existing support.
 
@@ -131,6 +131,11 @@ for validating these reusable contracts. The present `native_stack` declaration
 still describes only the supported standalone argv entry; a whole-program or
 whole-service memory budget requires further analysis and an explicit scope.
 
+Checked rules can now also run as [sequential argv phases](sequential-stack-budgets.md)
+using `--run a,b,c`. With no stack values retained between phases, their aggregate
+bound is the maximum of the individual bounds; a failed phase stops the sequence.
+Each source declaration keeps its standalone-entry meaning.
+
 ## Inspecting the result
 
 ```sh
@@ -139,7 +144,8 @@ target/release/verbosec examples/native_stack.verbose --stack-report --run magni
 target/release/verbosec examples/native_stack.verbose --stack-report --run magnitude --json
 ```
 
-`--stack-report` writes no artifact, defaults to the last rule and refuses
+`--stack-report` writes no artifact, defaults to the last rule and accepts a
+comma-separated phase selection. It refuses
 compilation, execution or other input-mode flags in the same command. Unknown or
 unsupported entries fail with a diagnostic and nonzero status. An exceeded
 declaration fails source verification before a success report or artifact is
@@ -180,7 +186,8 @@ inspect the report rather than treating a budget as ABI stability.
 | Rust source verification | Checks every declared native entry budget |
 | Rust interpreter CLI | Verifies the native property, then interprets values; interpreter storage is not bounded by it |
 | Rust native, single argv entry | Supported; the declaration adds no runtime instructions |
-| Native stdin/raw/stream/multiple entries | Refused for entries reaching a budget declaration; strict numeric restrictions also remain |
+| Native sequential argv phases | Supported for checked phases over the same input concept; bounds combine by maximum |
+| Native stdin/raw/stream | Refused for entries reaching a budget declaration; strict numeric restrictions also remain |
 | HTTP/service/reaction contexts | Refused when they reach a budget declaration, including calls in after mutations or logs |
 | WASM | Refuses programs declaring `native_stack` before writing an artifact |
 | Self-hosted diagnostics, ELF and raw x86 emission | Detect and refuse the proof key; no stack planner yet |

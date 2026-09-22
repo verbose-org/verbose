@@ -1,0 +1,4 @@
+Accept a label of at most eight UTF-8 bytes and a signed i64 reading for batch analysis.
+Clamp readings to [-100, 100] with a checked native stack budget.
+Classify each clamped reading as nonnegative; stop the sequence after this phase if any result is false.
+Format original labels and readings with bounded text storage; select phases in the required order when compiling.

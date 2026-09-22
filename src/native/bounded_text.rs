@@ -806,7 +806,7 @@ impl Fragment {
 }
 
 pub(super) fn compile(p: &Program, rule: &Rule, concept: &Concept) -> Result<Vec<u8>, NativeError> {
-    Ok(compile_with_layout(p, rule, concept)?.0)
+    Ok(compile_phase(p, rule, concept, EntryEnd::Exit)?.0)
 }
 
 pub(super) fn stack_report(
@@ -814,13 +814,14 @@ pub(super) fn stack_report(
     rule: &Rule,
     concept: &Concept,
 ) -> Result<crate::stack_budget::Report, NativeError> {
-    Ok(compile_with_layout(p, rule, concept)?.1)
+    Ok(compile_phase(p, rule, concept, EntryEnd::Exit)?.1)
 }
 
-fn compile_with_layout(
+pub(super) fn compile_phase(
     p: &Program,
     rule: &Rule,
     concept: &Concept,
+    end: EntryEnd,
 ) -> Result<(Vec<u8>, crate::stack_budget::Report), NativeError> {
     let fragment = prepare(p, &rule.name, concept)?;
     let mut input = rule.clone();
@@ -903,7 +904,7 @@ fn compile_with_layout(
     }
     let back = jump(&mut code, &[0xe9]);
     patch(&mut code, back, ctx.loop_top);
-    emit_record_loop_epilogue(&mut code, &ctx);
+    emit_record_loop_end(&mut code, &ctx, end);
     let report = crate::stack_budget::Report {
         rule: rule.name.clone(),
         declared_bytes: rule.proofs.native_stack,

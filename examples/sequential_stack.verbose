@@ -1,0 +1,61 @@
+@verbose 0.1.0
+
+concept Reading
+  @intention: "A named signed reading for batch analysis"
+  @source: sequential_stack.intent:1
+  fields:
+    title : text [..8]
+    value : number
+
+rule clamp
+  @intention: "Print bounded numeric readings within a checked stack budget"
+  @source: sequential_stack.intent:2
+  input:
+    reading : Reading
+  output:
+    out : number
+  logic:
+    out = min(max(reading.value, -100), 100)
+  proofs:
+    native_stack: 104
+    purity:
+      reads: [reading.value]
+      calls: []
+    termination:
+      bound: 10
+  hints:
+    overflow: [-100, 100]
+
+rule nonnegative
+  @intention: "Classify each reading and fail the phase if any is negative"
+  @source: sequential_stack.intent:3
+  input:
+    input : Reading
+  output:
+    out : bool
+  logic:
+    out = clamp(input) >= 0
+  proofs:
+    native_stack: 88
+    purity:
+      reads: [input]
+      calls: [clamp]
+    termination:
+      bound: 10
+
+rule label
+  @intention: "Format the original readings after preceding phases succeed"
+  @source: sequential_stack.intent:4
+  input:
+    item : Reading
+  output:
+    out : text [..29]
+  logic:
+    out = concat(item.title, ":", item.value)
+  proofs:
+    native_stack: 192
+    purity:
+      reads: [item.title, item.value]
+      calls: []
+    termination:
+      bound: 10

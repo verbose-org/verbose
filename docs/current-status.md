@@ -35,8 +35,11 @@ frames, placed text buffers and transient storage. `--stack-report` exposes the
 calculation as text or JSON. This does not bound interpreter or total process
 memory; see [native stack budgets](native-stack-budget.md).
 
-The next budget-design question is composition across calls and execution
-phases, including storage retained between phases and work admitted concurrently.
+The first [composition across execution phases](sequential-stack-budgets.md)
+runs checked rules sequentially over the same argv batch. It releases each frame
+before the next phase, combines bounds by maximum and stops after a failed phase.
+Further composition must cover storage retained between phases and work admitted
+concurrently.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.

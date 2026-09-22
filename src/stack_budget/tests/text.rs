@@ -195,7 +195,7 @@ fn text_stack_modes_and_transitive_contexts_refuse_without_overwriting_artifacts
             native::compile_native(&p, name, &path, true, false),
             native::compile_native(&p, name, &path, false, true),
             native::compile_native_stdin_raw(&p, name, &path),
-            native::compile_native_multi(&p, &[name, name], &path, false, false),
+            native::compile_native_multi(&p, &[name, name], &path, true, false),
             native::compile_http_server(&p, name, 18999, &path),
         ] {
             assert!(err.unwrap_err().message.contains("native_stack"));

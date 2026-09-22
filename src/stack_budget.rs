@@ -112,6 +112,63 @@ impl std::fmt::Display for Report {
     }
 }
 
+/// A sequence is an execution selection, not a new source-level budget. Each
+/// declaration still bounds its own argv phase, including expanded callees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SequenceReport {
+    pub phases: Vec<Report>,
+}
+
+impl SequenceReport {
+    pub fn stack_bound_bytes(&self) -> usize {
+        self.phases
+            .iter()
+            .map(Report::stack_bound_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn json(&self) -> String {
+        format!(
+            concat!(
+                "{{\"schema_version\":1,\"target\":\"x86_64-linux\",",
+                "\"entry_mode\":\"argv\",\"scope\":\"additional_entry_stack\",",
+                "\"composition\":\"sequential\",\"on_phase_failure\":\"stop\",",
+                "\"retained_stack_bytes\":0,\"stack_bound_bytes\":{},\"phases\":[{}]}}"
+            ),
+            self.stack_bound_bytes(),
+            self.phases
+                .iter()
+                .map(Report::json)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+impl std::fmt::Display for SequenceReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "native stack: {} sequential argv phases (x86_64-linux)",
+            self.phases.len()
+        )?;
+        writeln!(
+            f,
+            "  additional stack bound: {} bytes (maximum of phases)",
+            self.stack_bound_bytes()
+        )?;
+        writeln!(
+            f,
+            "  retained stack between phases: 0 bytes; stop on phase failure"
+        )?;
+        for (index, phase) in self.phases.iter().enumerate() {
+            writeln!(f, "phase {}:\n{phase}", index + 1)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn has_declarations(p: &Program) -> bool {
     p.items
         .iter()

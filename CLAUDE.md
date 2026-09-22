@@ -157,6 +157,14 @@ and service/reaction contexts; composing budgets across execution scopes remains
 later, with HTTP request handling as one example.
 See [bounded text entry budgets](docs/native-stack-budget.md#bounded-text-entries).
 
+Sequential composition follow-up (2026-09-22): checked numeric/text entries can
+use the existing comma-separated native selection over the same input concept.
+Each phase consumes the whole argv batch and releases its frame before the next;
+the report combines stack bounds by maximum. A nonzero phase status stops later
+phases, preserving standalone boolean/input failure behavior. Source budgets
+keep their standalone meaning; retained state and concurrency are later scopes.
+See [sequential stack budgets](docs/sequential-stack-budgets.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

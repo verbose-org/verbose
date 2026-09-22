@@ -422,13 +422,21 @@ impl Emit<'_> {
 }
 
 pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
-    Ok(compile_with_layout(p, name)?.0)
+    Ok(compile_with_layout(p, name, EntryEnd::Exit)?.0)
 }
 
 pub(super) fn numeric_stack_report(
     p: &Program,
     name: &str,
 ) -> Result<crate::stack_budget::Report, NativeError> {
+    Ok(compile_phase(p, name, EntryEnd::Exit)?.1)
+}
+
+pub(super) fn compile_phase(
+    p: &Program,
+    name: &str,
+    end: EntryEnd,
+) -> Result<(Vec<u8>, crate::stack_budget::Report), NativeError> {
     if !p
         .items
         .iter()
@@ -443,14 +451,17 @@ pub(super) fn numeric_stack_report(
             message: format!("rule '{name}': native stack analysis requires the strict numeric contract (hints.overflow) or the bounded text contract"),
         });
     }
-    compile_with_layout(p, name)?.1.ok_or_else(|| NativeError {
+    let (code, report) = compile_with_layout(p, name, end)?;
+    let report = report.ok_or_else(|| NativeError {
         message: format!("rule '{name}': unknown native stack layout"),
-    })
+    })?;
+    Ok((code, report))
 }
 
 fn compile_with_layout(
     p: &Program,
     name: &str,
+    end: EntryEnd,
 ) -> Result<(Vec<u8>, Option<crate::stack_budget::Report>), NativeError> {
     if let Some(e) = crate::bounds::verify(p).first() {
         return Err(NativeError {
@@ -621,7 +632,7 @@ fn compile_with_layout(
     let back = jump(&mut emit.code, &[0xe9]);
     let d = ctx.loop_top as i32 - back as i32 - 4;
     emit.code[back..back + 4].copy_from_slice(&d.to_le_bytes());
-    emit_record_loop_epilogue(&mut emit.code, &ctx);
+    emit_record_loop_end(&mut emit.code, &ctx, end);
     let report = numeric.then(|| crate::stack_budget::Report {
         text_frame: None,
         rule: name.into(),
