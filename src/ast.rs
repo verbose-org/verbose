@@ -1174,7 +1174,7 @@ pub struct Proofs {
     pub purity: Purity,
     pub termination: Termination,
     /// Optional upper bound, in bytes, on additional native argv entry stack.
-    /// Includes the frame, saved rbp and transient expression/output storage.
+    /// Includes entry/invocation frames, buffers, saved registers and scratch.
     pub native_stack: Option<u32>,
 }
 

@@ -440,7 +440,7 @@ pub(super) fn numeric_stack_report(
     }
     if !crate::numeric_bounds::active_rules(p).contains(name) {
         return Err(NativeError {
-            message: format!("rule '{name}': native stack analysis requires the strict numeric contract (hints.overflow)"),
+            message: format!("rule '{name}': native stack analysis requires the strict numeric contract (hints.overflow) or the bounded text contract"),
         });
     }
     compile_with_layout(p, name)?.1.ok_or_else(|| NativeError {
@@ -623,6 +623,7 @@ fn compile_with_layout(
     emit.code[back..back + 4].copy_from_slice(&d.to_le_bytes());
     emit_record_loop_epilogue(&mut emit.code, &ctx);
     let report = numeric.then(|| crate::stack_budget::Report {
+        text_frame: None,
         rule: name.into(),
         declared_bytes: r.proofs.native_stack,
         input_slot_bytes: concept.fields.len() * 8,

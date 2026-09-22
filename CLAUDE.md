@@ -17,6 +17,14 @@ The identity is: **explicit + verified + optimized**. Declarations should provid
 useful information for verification, optimization, and inspection. Performance
 includes the safeguards chosen for the program.
 
+Scope clarification (2026-09-22): Verbose has a general-purpose language goal
+within explicitly supported, verifiable subsets. Develop reusable contracts for
+computation, memory, resources, effects and concurrency across command-line
+tools, batch processing, compilers and long-running services. HTTP remains a
+concrete example and integration test for those contracts. Future budget work
+should compose calls, execution phases, storage lifetimes and bounded concurrent
+work independently of a particular protocol; current backend limits still apply.
+
 Current direction (2026-09-05): the founding thought experiment was an LLM
 producing a binary directly. The concrete continuation is the already-started
 compiler written in Verbose, developed and used by LLMs under human direction.
@@ -139,6 +147,15 @@ emitter layout drives checking and `--stack-report` (text/JSON); saved rbp and
 transient expression/output storage are included. Unknown layouts refuse;
 WASM/self-hosted output explicitly refuses the contract. Sufficient declarations
 add no native instructions. See [native stack budgets](docs/native-stack-budget.md).
+
+Bounded text follow-up: the same native argv budget now includes the outer
+input frame, the nested invocation's slots and placed buffers, saved rbp/rbx,
+and transient numeric formatting. It uses existing lifetime/branch placement;
+no storage or instructions are added to emitted programs. Schema-1 reports gain
+an optional `text_frame` object. Rules reaching a declaration refuse transport
+and service/reaction contexts; composing budgets across execution scopes remains
+later, with HTTP request handling as one example.
+See [bounded text entry budgets](docs/native-stack-budget.md#bounded-text-entries).
 
 ## Dev workflow (cidx + branch-protected main)
 

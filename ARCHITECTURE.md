@@ -86,12 +86,20 @@ history and [examples](examples/README.md) for concrete declarations.
 
 ### Memory as a language design criterion
 
-Recorded on 2026-09-10: evaluate new service capabilities by whether their storage
+Recorded on 2026-09-10 and clarified on 2026-09-22: evaluate language capabilities
+across tools, data processing, compilers and services by whether their storage
 has an identifiable owner, a capacity, a lifetime, and a defined outcome when
 that capacity is exhausted. Declarations should let the compiler organize and
 check that storage; unknown bounds must remain explicitly unknown. Apache is a
 useful reference for operational capabilities, not a feature-cloning objective
 or a prerequisite for Verbose to make useful design choices.
+
+HTTP is a concrete integration example for the language's general-purpose
+direction within checked subsets. Budget composition should describe calls,
+execution phases, retained storage and bounded concurrent work. Those concepts
+also apply to processing a batch or running a compiler pass; transport-specific
+storage is one contribution to such a composition. This is a design direction,
+with support established separately for each implemented scope and backend.
 
 Memory efficiency is also an objective: minimize live storage, unnecessary
 copies and the working set to support processor-cache locality. Capacity bounds

@@ -2,6 +2,8 @@ use super::*;
 use crate::{interpreter, lexer::Lexer, native, parser::Parser, verifier};
 use std::{collections::HashMap, fs, path::Path, process::Command};
 
+mod text;
+
 fn source(expr: &str, bindings: &str) -> String {
     let reads = if expr.contains("i.y") || bindings.contains("i.y") {
         "i.x, i.y"
@@ -69,32 +71,50 @@ fn native_bytes(p: &Program, name: &str) -> Vec<u8> {
 // Re-entering an instruction must have the same stack depth, including loops.
 // This deliberately does not consume layout metadata or source expressions.
 fn machine_stack_peak(code: &[u8]) -> usize {
-    let mut work = vec![(0usize, 0i64)];
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct State {
+        depth: i64,
+        rbp: Option<i64>,
+        saved_rbp: Vec<(i64, Option<i64>)>,
+    }
+    let mut work = vec![(0usize, State::default())];
     let mut depths = HashMap::new();
     let mut peak = 0;
-    while let Some((pc, mut depth)) = work.pop() {
+    while let Some((pc, mut state)) = work.pop() {
         if pc == code.len() {
             continue;
         }
         assert!(pc < code.len(), "invalid branch target {pc}");
-        if let Some(old) = depths.insert(pc, depth) {
-            assert_eq!(old, depth, "unbalanced stack at {pc}");
+        if let Some(old) = depths.insert(pc, state.clone()) {
+            assert_eq!(old, state, "unbalanced stack at {pc}");
             continue;
         }
         let len = crate::validate_x86::decode_instruction_length(code, pc)
             .unwrap_or_else(|| panic!("cannot decode instruction at {pc}"));
         let ins = &code[pc..pc + len];
         match ins {
-            [0x50..=0x57] => depth += 8,
-            [0x58..=0x5f] => depth -= 8,
-            [0x48, 0x81, 0xec, a, b, c, d] => depth += i32::from_le_bytes([*a, *b, *c, *d]) as i64,
-            [0x48, 0x83, 0xec, n] => depth += *n as i8 as i64,
-            [0x48, 0x83, 0xc4, n] => depth -= *n as i8 as i64,
+            [0x55] => {
+                state.depth += 8;
+                state.saved_rbp.push((state.depth, state.rbp));
+            }
+            [0x5d] => {
+                let (position, rbp) = state.saved_rbp.pop().expect("pop rbp without save");
+                assert_eq!(position, state.depth);
+                state.rbp = rbp;
+                state.depth -= 8;
+            }
+            [0x50..=0x57] | [0x6a, _] => state.depth += 8,
+            [0x58..=0x5f] => state.depth -= 8,
+            [0x48, 0x89, 0xe5] => state.rbp = Some(state.depth),
+            [0x48, 0x89, 0xec] => state.depth = state.rbp.expect("unknown frame pointer"),
+            [0x48, 0x81, 0xec, a, b, c, d] => state.depth += i32::from_le_bytes([*a, *b, *c, *d]) as i64,
+            [0x48, 0x83, 0xec, n] => state.depth += *n as i8 as i64,
+            [0x48, 0x83, 0xc4, n] => state.depth -= *n as i8 as i64,
             [0xe8, ..] | [0xc3] => panic!("unexpected runtime call/return at {pc}"),
             _ => {}
         }
-        assert!(depth >= 0);
-        peak = peak.max(depth as usize);
+        assert!(state.depth >= 0);
+        peak = peak.max(state.depth as usize);
         let next = pc + len;
         let branch = match ins {
             [0xeb, n] | [0x70..=0x7f, n] => Some(*n as i8 as i64),
@@ -104,10 +124,10 @@ fn machine_stack_peak(code: &[u8]) -> usize {
             _ => None,
         };
         if let Some(delta) = branch {
-            work.push(((next as i64 + delta) as usize, depth));
+            work.push(((next as i64 + delta) as usize, state.clone()));
         }
         if !matches!(ins[0], 0xe9 | 0xeb) {
-            work.push((next, depth));
+            work.push((next, state));
         }
     }
     peak
@@ -158,7 +178,7 @@ fn native_stack_bound_matches_emitted_stack_and_exact_limit() {
     ] {
         let mut p = parse(&source(expr, bindings));
         verified(&p);
-        let report = native::numeric_stack_report(&p, "checked").unwrap();
+        let report = native::stack_report(&p, "checked").unwrap();
         let before = native_bytes(&p, "checked");
         assert_eq!(machine_stack_peak(&before[120..]), report.stack_bound_bytes(), "{expr}");
         assert_eq!(report.frame_bytes, report.input_slot_bytes + report.shared_slot_bytes + report.bookkeeping_bytes);
@@ -200,7 +220,7 @@ rule checked
     let mut p = parse(&(helper + caller));
     verified(&p);
     for name in ["helper", "checked"] {
-        let report = native::numeric_stack_report(&p, name).unwrap();
+        let report = native::stack_report(&p, name).unwrap();
         let bytes = native_bytes(&p, name);
         assert_eq!(
             report.stack_bound_bytes(),
@@ -210,7 +230,7 @@ rule checked
     }
     verified(&p);
     assert_eq!(
-        native::numeric_stack_report(&p, "checked")
+        native::stack_report(&p, "checked")
             .unwrap()
             .output_stack_bytes,
         0
@@ -286,7 +306,7 @@ rule checked
 "#;
     let mut p = parse(&(helper + caller));
     verified(&p);
-    let report = native::numeric_stack_report(&p, "checked").unwrap();
+    let report = native::stack_report(&p, "checked").unwrap();
     assert_eq!(report.input_stack_bytes, 8);
     assert_eq!(report.expression_stack_bytes, 0);
     assert_eq!(report.output_stack_bytes, 0);

@@ -1,0 +1,3 @@
+Accept a label of at most eight UTF-8 bytes and a signed i64 reading.
+Format the label and reading with both an output-byte limit and a native argv stack limit.
+Retain the first formatted value through an alias while formatting again, and bound the whole native entry stack.

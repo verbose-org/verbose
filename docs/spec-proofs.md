@@ -17,8 +17,9 @@ The thing to refuse is a declaration that is **neither**: the compiler cannot ve
 ### Native stack budget
 
 `proofs.native_stack: N` is a semantic resource ceiling chosen by the author.
-For supported strict numeric rules, verification checks the actual native argv
-frame layout plus saved-register and transient storage against this byte budget.
+For supported strict numeric and pure bounded text rules, verification checks
+the actual native argv frames, placed buffers, saved registers and transient
+storage against this byte budget.
 Unknown layouts and excessive use fail before artifact emission. It does not
 bound interpreter or whole-process memory. See the
 [contract and support matrix](native-stack-budget.md).

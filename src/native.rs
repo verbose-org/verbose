@@ -32,9 +32,17 @@ impl std::fmt::Display for NativeError {
     }
 }
 
-/// Uses the same lowering and frame placement as the strict numeric emitter.
+/// Uses the same lowering and frame placement as the selected checked emitter.
 /// This returns compiler metadata; it never writes or executes an artifact.
-pub(crate) fn numeric_stack_report(program: &Program, rule: &str) -> Result<crate::stack_budget::Report, NativeError> {
+pub(crate) fn stack_report(program: &Program, rule: &str) -> Result<crate::stack_budget::Report, NativeError> {
+    if crate::text_bounds::active_rules(program).contains(rule) {
+        let entry = program.items.iter().find_map(|i| match i {
+            Item::Rule(r) if r.name == rule => Some(r), _ => None,
+        }).ok_or_else(|| NativeError { message: format!("no rule named '{rule}' for native stack analysis") })?;
+        let concept = iter_all_concepts(&program.items).find(|c| entry.input_ty == Type::Named(c.name.clone()))
+            .ok_or_else(|| NativeError { message: "bounded text stack analysis requires a declared flat input concept for an argv entry".into() })?;
+        return bounded_text::stack_report(program, entry, concept);
+    }
     bounded::numeric_stack_report(program, rule)
 }
 
@@ -58,6 +66,10 @@ pub fn compile_native_multi(
     }
     if rule_names.len() == 1 {
         return compile_native(program, rule_names[0], output_path, stdin, stream);
+    }
+    let budgeted = crate::stack_budget::entry_rules(program);
+    if rule_names.iter().any(|n| budgeted.contains(*n)) {
+        return Err(NativeError { message: "native_stack supports a single native argv entry, not multi-rule entry".into() });
     }
     if rule_names.iter().any(|n| crate::numeric_bounds::active_rules(program).contains(*n)) {
         return Err(NativeError { message: "strict overflow contracts do not support multi-rule native entry".into() });
@@ -144,6 +156,9 @@ fn compile_native_code(
 ) -> Result<Vec<u8>, NativeError> {
     if let Some(error) = crate::stack_budget::verify(program).first() {
         return Err(NativeError { message: error.to_string() });
+    }
+    if (stdin || stream || stdin_raw) && crate::stack_budget::entry_rules(program).contains(rule_name) {
+        return Err(NativeError { message: "native_stack currently supports native argv records only".into() });
     }
     if let Some(error) = crate::text_bounds::verify_mode(program, true).first() {
         return Err(NativeError { message: error.to_string() });
@@ -8891,7 +8906,7 @@ fn emit_itoa_to_buffer(code: &mut Vec<u8>) {
     code[not_neg_patch] = (not_neg_pos - not_neg_patch - 1) as u8;
 
     // sub rsp, 24 — scratch buffer
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x18]);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, ITOA_STACK_BYTES]);
     // lea rsi, [rsp + 23] — rightmost byte
     code.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x17]);
     // mov r8, 10
@@ -8954,7 +8969,7 @@ fn emit_itoa_to_buffer(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x48, 0x89, 0xFB]);
 
     // add rsp, 24 — free scratch
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, ITOA_STACK_BYTES]);
 }
 
 /// Result of `emit_concat_to_buffer` — tells the caller which epilogue to
@@ -10591,7 +10606,7 @@ fn emit_write_static_to_fd(code: &mut Vec<u8>, bytes: &[u8], fd: i32) {
 /// use emit_itoa_inline (which appends \n).
 fn emit_itoa_to_stdout_no_newline(code: &mut Vec<u8>) {
     // sub rsp, 24 — scratch
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x18]);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, ITOA_STACK_BYTES]);
     // lea rsi, [rsp + 23]
     code.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x17]);
     // mov r8, 10
@@ -10681,7 +10696,7 @@ fn emit_itoa_to_stdout_no_newline(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
 
     // add rsp, 24
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, ITOA_STACK_BYTES]);
 }
 
 /// Compute the length of a NUL-terminated C string. Inputs: rsi = pointer
@@ -25136,6 +25151,9 @@ pub fn compile_http_server(
     port: u16,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    if crate::stack_budget::entry_rules(program).contains(rule_name) {
+        return Err(NativeError { message: "native_stack does not support the legacy HTTP shell".into() });
+    }
     if crate::numeric_bounds::active_rules(program).contains(rule_name) {
         return Err(NativeError { message: "strict overflow contracts do not support the legacy HTTP shell".into() });
     }
@@ -56825,7 +56843,8 @@ rule pick
         // guarded_magnitude adds another example refused by the overflow gate.
         // scalar_identities keeps the same explicit strict-numeric refusal.
         // native_stack adds a target-specific stack contract, refused by gen0.
-        const EXPECTED_TOTAL: usize = 181;
+        // text_stack extends that same refusal to bounded text entry budgets.
+        const EXPECTED_TOTAL: usize = 182;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

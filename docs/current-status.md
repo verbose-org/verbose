@@ -14,7 +14,13 @@ inspection, and experimentation also supported. The bundled generators use Claud
 the language and compiler are independent of that choice. Broad model authorability
 remains an evaluation question.
 
-For service evolution, the [memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion)
+Verbose's general-purpose direction covers command-line tools, data processing,
+compilers and long-running services within explicitly supported, verifiable
+subsets. Memory, resource, effect and concurrency contracts should be reusable
+across these applications. HTTP remains a concrete example for exercising their
+composition; these goals do not extend the implementation boundaries listed below.
+
+Across these applications, the [memory design criterion](../ARCHITECTURE.md#memory-as-a-language-design-criterion)
 asks who owns storage, its capacity and lifetime, and what happens at exhaustion.
 The aim is useful, predictable specialization; matching Apache's feature list is
 not the project's identity or a claim of general superiority.
@@ -22,11 +28,18 @@ not the project's identity or a claim of general superiority.
 [Memory management](memory-management.md) distinguishes compile-time slot/buffer
 reuse and scoped arenas from runtime garbage collection, with the current limits.
 
-Strict numeric rules can now declare `proofs.native_stack: N`. The compiler
-checks an upper bound on additional native argv stack storage against this byte
-ceiling, using its actual frame placement plus transient storage. `--stack-report`
-exposes the calculation as text or JSON. This does not bound interpreter or total
-process memory; see [native stack budgets](native-stack-budget.md).
+Strict numeric and supported pure bounded text rules can declare
+`proofs.native_stack: N`. The compiler checks an upper bound on additional native
+argv stack storage against this byte ceiling, using actual entry/invocation
+frames, placed text buffers and transient storage. `--stack-report` exposes the
+calculation as text or JSON. This does not bound interpreter or total process
+memory; see [native stack budgets](native-stack-budget.md).
+
+The next budget-design question is composition across calls and execution
+phases, including storage retained between phases and work admitted concurrently.
+A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
+cases. The contract should describe the execution scope and overlapping storage;
+protocol-specific input/output paths supply their own costs and checks.
 
 ## Concrete continuation
 
