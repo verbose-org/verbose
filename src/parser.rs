@@ -596,6 +596,9 @@ impl Parser {
             } else if self.check_ident("logic") {
                 logic = Some(self.parse_logic_block()?);
             } else if self.check_ident("proofs") {
+                if proofs.is_some() {
+                    return Err(self.error("duplicate proofs block"));
+                }
                 proofs = Some(self.parse_proofs_block()?);
             } else if self.check_ident("hints") {
                 hints = Some(self.parse_hints_block()?);
@@ -1577,15 +1580,28 @@ impl Parser {
 
         let mut purity = None;
         let mut termination = None;
+        let mut native_stack = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if self.check_ident("purity") {
                 purity = Some(self.parse_purity_block()?);
             } else if self.check_ident("termination") {
                 termination = Some(self.parse_termination_block()?);
+            } else if self.check_ident("native_stack") {
+                if native_stack.is_some() {
+                    return Err(self.error("duplicate proofs.native_stack declaration"));
+                }
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let bytes = self.expect_number()?;
+                if !(1..=2_097_152).contains(&bytes) {
+                    return Err(self.error("proofs.native_stack must be in [1, 2097152] bytes"));
+                }
+                native_stack = Some(bytes as u32);
+                self.expect_kind(TokenKind::Newline)?;
             } else {
                 return Err(self.error(
-                    "expected 'purity' or 'termination' in proofs block",
+                    "expected 'purity', 'termination' or 'native_stack' in proofs block",
                 ));
             }
         }
@@ -1597,6 +1613,7 @@ impl Parser {
         Ok(Proofs {
             purity,
             termination,
+            native_stack,
         })
     }
 

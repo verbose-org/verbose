@@ -208,6 +208,9 @@ pub fn compile_wasm(
     rule_name: &str,
     output_path: &str,
 ) -> Result<(), WasmError> {
+    if crate::stack_budget::has_declarations(program) {
+        return Err(WasmError { message: "WASM does not support proofs.native_stack (native x86-64 argv stack contract)".into() });
+    }
     if let Some(error) = crate::numeric_bounds::verify(program).first() {
         return Err(WasmError { message: error.to_string() });
     }

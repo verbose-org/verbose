@@ -15,6 +15,7 @@ for every language/backend combination.
 | Recursive structures and self-hosted compiler intermediates | Arenas allocate nodes within declared capacity. Supported `arena_scope` paths reclaim scoped allocations together after their result is consumed or a scalar survives. | Reclamation depends on declared boundaries and supported result/backend forms; long-lived data can retain substantial storage. |
 
 See [numeric storage](numeric-local-lifetimes.md),
+[source-declared native stack budgets](native-stack-budget.md),
 [bounded text storage](bounded-text-storage.md), and the shipped
 [streaming](self-hosting-arena-scope-design.md) and
 [scalar](self-hosting-scalar-arena-scope-design.md) arena slices. Arena documents

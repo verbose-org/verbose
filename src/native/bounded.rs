@@ -41,6 +41,7 @@ struct Emit<'a> {
     numeric: bool,
     numeric_slots: liveness::Slots,
     temporaries: Vec<usize>,
+    expression_stack_bytes: usize,
 }
 impl Emit<'_> {
     fn numeric_local(&mut self, ty: Type) -> Result<(usize, Local), NativeError> {
@@ -121,6 +122,32 @@ impl Emit<'_> {
         input: &str,
         env: &HashMap<String, Local>,
     ) -> Result<(), NativeError> {
+        if self.numeric {
+            // Children of scalar operators have already been evaluated into
+            // stable slots. Generic binary/min/max emission spills just one
+            // word; nested expressions/calls never run underneath that spill.
+            // Keep this closed: extending numeric analysis must also account
+            // for any newly admitted scalar emitter's transient stack use.
+            let bytes = match expr {
+                Expr::Number(_) | Expr::Ident(_) | Expr::Field(_, _) => 0,
+                Expr::Neg(a) | Expr::Abs(a) | Expr::Not(a)
+                    if matches!(a.as_ref(), Expr::Ident(_)) =>
+                {
+                    0
+                }
+                Expr::Binary(_, a, b) | Expr::Min(a, b) | Expr::Max(a, b)
+                    if matches!((a.as_ref(), b.as_ref()), (Expr::Ident(_), Expr::Ident(_))) =>
+                {
+                    8
+                }
+                _ => {
+                    return Err(NativeError {
+                        message: "unknown native stack analysis for scalar lowering".into(),
+                    })
+                }
+            };
+            self.expression_stack_bytes = self.expression_stack_bytes.max(bytes);
+        }
         let mut offsets = self.fields.clone();
         for (name, l) in env {
             offsets.insert(name.as_str(), l.slot);
@@ -395,6 +422,36 @@ impl Emit<'_> {
 }
 
 pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
+    Ok(compile_with_layout(p, name)?.0)
+}
+
+pub(super) fn numeric_stack_report(
+    p: &Program,
+    name: &str,
+) -> Result<crate::stack_budget::Report, NativeError> {
+    if !p
+        .items
+        .iter()
+        .any(|i| matches!(i, Item::Rule(r) if r.name == name))
+    {
+        return Err(NativeError {
+            message: format!("no rule named '{name}' for native stack analysis"),
+        });
+    }
+    if !crate::numeric_bounds::active_rules(p).contains(name) {
+        return Err(NativeError {
+            message: format!("rule '{name}': native stack analysis requires the strict numeric contract (hints.overflow)"),
+        });
+    }
+    compile_with_layout(p, name)?.1.ok_or_else(|| NativeError {
+        message: format!("rule '{name}': unknown native stack layout"),
+    })
+}
+
+fn compile_with_layout(
+    p: &Program,
+    name: &str,
+) -> Result<(Vec<u8>, Option<crate::stack_budget::Report>), NativeError> {
     if let Some(e) = crate::bounds::verify(p).first() {
         return Err(NativeError {
             message: e.to_string(),
@@ -507,6 +564,7 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
         numeric,
         numeric_slots: liveness::Slots::default(),
         temporaries: Vec::new(),
+        expression_stack_bytes: 0,
     };
     emit.rule(r)?;
     let nslots = if numeric { emit.peak } else { estimated };
@@ -564,5 +622,32 @@ pub(super) fn compile(p: &Program, name: &str) -> Result<Vec<u8>, NativeError> {
     let d = ctx.loop_top as i32 - back as i32 - 4;
     emit.code[back..back + 4].copy_from_slice(&d.to_le_bytes());
     emit_record_loop_epilogue(&mut emit.code, &ctx);
-    Ok(emit.code)
+    let report = numeric.then(|| crate::stack_budget::Report {
+        rule: name.into(),
+        declared_bytes: r.proofs.native_stack,
+        input_slot_bytes: concept.fields.len() * 8,
+        shared_slot_bytes: nslots * 8,
+        bookkeeping_bytes: ctx.frame_bytes - (concept.fields.len() + nslots) * 8,
+        frame_bytes: ctx.frame_bytes,
+        saved_base_pointer_bytes: 8,
+        // emit_text_bound_check saves/restores rdi while scanning each bounded
+        // carried text field. Numeric parsing uses registers only. All guards
+        // finish before body spills or output formatting begin.
+        input_stack_bytes: if concept
+            .fields
+            .iter()
+            .any(|f| text_field_declared_max(f).is_some())
+        {
+            8
+        } else {
+            0
+        },
+        expression_stack_bytes: emit.expression_stack_bytes,
+        output_stack_bytes: if r.output_ty == Type::Number {
+            ITOA_STACK_BYTES as usize
+        } else {
+            0
+        },
+    });
+    Ok((emit.code, report))
 }

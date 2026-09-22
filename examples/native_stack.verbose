@@ -1,0 +1,47 @@
+@verbose 0.1.0
+
+concept Reading
+  @intention: "A signed reading"
+  @source: native_stack.intent:1
+  fields:
+    value : number
+
+rule clamp
+  @intention: "Clamp with a checked native stack ceiling"
+  @source: native_stack.intent:2
+  input:
+    reading : Reading
+  output:
+    out : number
+  logic:
+    out = min(max(reading.value, -100), 100)
+  proofs:
+    native_stack: 96
+    purity:
+      reads: [reading.value]
+      calls: []
+    termination:
+      bound: 10
+  hints:
+    overflow: [-100, 100]
+
+rule magnitude
+  @intention: "Include expanded calls and temporaries in the entry stack budget"
+  @source: native_stack.intent:3
+  input:
+    input : Reading
+  output:
+    out : number
+  logic:
+    let limited = clamp(input)
+    let alias = limited
+    out = if alias < 0 then -alias else alias
+  proofs:
+    native_stack: 112
+    purity:
+      reads: [input]
+      calls: [clamp]
+    termination:
+      bound: 20
+  hints:
+    overflow: [0, 100]

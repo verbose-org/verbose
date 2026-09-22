@@ -518,6 +518,10 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
             Item::Entropy(e) => verify_entropy_stub(e, base_dir, &mut errors),
         }
     }
+    // Layout requires verified source: never lower away an unchecked obligation.
+    if errors.is_empty() {
+        errors.extend(crate::stack_budget::verify(program));
+    }
     errors
 }
 
