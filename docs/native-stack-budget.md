@@ -121,8 +121,15 @@ This analysis adds no instructions, runtime allocation or GC to supported native
 entries. No transport budget is implied: a rule reaching a declaration, even
 through an unannotated caller, refuses stdin/raw/stream, multiple native entries,
 the legacy HTTP shell, and service/reaction uses. Unrelated unannotated entries
-retain their existing support. Composing request, handler, response and log
-storage for a service is a later slice.
+retain their existing support.
+
+Future composition should cover execution scopes across the language: calls,
+successive phases, storage retained between them and bounded concurrent work.
+Command-line processing, batch pipelines and compiler passes are examples along
+with services. HTTP request/handler/response/log storage remains a concrete case
+for validating these reusable contracts. The present `native_stack` declaration
+still describes only the supported standalone argv entry; a whole-program or
+whole-service memory budget requires further analysis and an explicit scope.
 
 ## Inspecting the result
 
