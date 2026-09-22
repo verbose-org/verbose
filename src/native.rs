@@ -1,5 +1,6 @@
 mod bounded;
 mod bounded_text;
+mod sequential;
 mod http_io;
 mod admission;
 mod pool;
@@ -46,6 +47,10 @@ pub(crate) fn stack_report(program: &Program, rule: &str) -> Result<crate::stack
     bounded::numeric_stack_report(program, rule)
 }
 
+pub(crate) fn sequential_stack_report(program: &Program, rules: &[&str]) -> Result<crate::stack_budget::SequenceReport, NativeError> {
+    sequential::report(program, rules)
+}
+
 /// Compile multiple rules into a single native binary. Each rule's code
 /// block is emitted sequentially; intermediate blocks end with stack cleanup
 /// (`mov rsp, rbp; pop rbp`) instead of `sys_exit`, so execution falls
@@ -53,7 +58,8 @@ pub(crate) fn stack_report(program: &Program, rule: &str) -> Result<crate::stack
 ///
 /// Each block re-reads argc/argv from the original stack position (set by
 /// the kernel at `_start`), so every rule independently parses the same
-/// input. This means the binary produces ALL rules' outputs in sequence.
+/// input. Checked phases advance only after a zero exit status; legacy
+/// multi-rule entries retain their existing composition path.
 pub fn compile_native_multi(
     program: &Program,
     rule_names: &[&str],
@@ -67,12 +73,12 @@ pub fn compile_native_multi(
     if rule_names.len() == 1 {
         return compile_native(program, rule_names[0], output_path, stdin, stream);
     }
-    let budgeted = crate::stack_budget::entry_rules(program);
-    if rule_names.iter().any(|n| budgeted.contains(*n)) {
-        return Err(NativeError { message: "native_stack supports a single native argv entry, not multi-rule entry".into() });
-    }
-    if rule_names.iter().any(|n| crate::numeric_bounds::active_rules(program).contains(*n)) {
-        return Err(NativeError { message: "strict overflow contracts do not support multi-rule native entry".into() });
+    if sequential::uses_checked_entry(program, rule_names) {
+        if stdin || stream {
+            return Err(NativeError { message: "native_stack sequential phases currently support argv records only".into() });
+        }
+        let code = sequential::compile(program, rule_names)?;
+        return write_native_elf(&code, output_path);
     }
 
     if stream {
@@ -1040,6 +1046,10 @@ fn compile_native_with_mode(
     stdin_raw: bool,
 ) -> Result<(), NativeError> {
     let code = compile_native_code(program, rule_name, stdin, stream, stdin_raw)?;
+    write_native_elf(&code, output_path)
+}
+
+fn write_native_elf(code: &[u8], output_path: &str) -> Result<(), NativeError> {
 
     // NOTE: there is deliberately NO machine-code peephole pass here. A prior
     // pass eliminated adjacent `push Rx; pop Rx` pairs from the FINISHED byte
@@ -5676,6 +5686,19 @@ fn emit_record_loop_prologue<'a>(
 /// the end of their per-record work before calling this (so control falls
 /// through to `exit` only when r14 >= r12).
 fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
+    emit_record_loop_end(code, ctx, EntryEnd::Exit);
+}
+
+#[derive(Clone, Copy)]
+enum EntryEnd {
+    Exit,
+    NextPhase,
+}
+
+/// Structured exit for checked sequential argv phases. Success restores the
+/// original entry stack before the next prologue rereads argc/argv. Failure
+/// exits with the phase's existing status, including all input abort paths.
+fn emit_record_loop_end(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>, end: EntryEnd) {
     let exit_pos = code.len();
     let exit_offset = exit_pos as i32 - (ctx.exit_patch as i32 + 4);
     code[ctx.exit_patch..ctx.exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
@@ -5688,6 +5711,12 @@ fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
         code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
         code.extend_from_slice(&efl.to_le_bytes());
     }
+    let next_phase = if matches!(end, EntryEnd::NextPhase) {
+        code.extend_from_slice(&[0x48, 0x85, 0xff, 0x0f, 0x84]); // test rdi,rdi; jz cleanup
+        let site = code.len();
+        code.extend_from_slice(&[0; 4]);
+        Some(site)
+    } else { None };
     // mov rax, 60 (sys_exit) ; syscall
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x0F, 0x05]);
@@ -5717,6 +5746,11 @@ fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
         code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
         code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
         code.extend_from_slice(&[0x0F, 0x05]);
+    }
+    if let Some(site) = next_phase {
+        let offset = code.len() as i32 - site as i32 - 4;
+        code[site..site + 4].copy_from_slice(&offset.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0xec, 0x5d]); // mov rsp,rbp; pop rbp
     }
 }
 
@@ -56844,7 +56878,8 @@ rule pick
         // scalar_identities keeps the same explicit strict-numeric refusal.
         // native_stack adds a target-specific stack contract, refused by gen0.
         // text_stack extends that same refusal to bounded text entry budgets.
-        const EXPECTED_TOTAL: usize = 182;
+        // sequential_stack uses the same source contracts, still refused by gen0.
+        const EXPECTED_TOTAL: usize = 183;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

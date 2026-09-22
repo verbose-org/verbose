@@ -3,6 +3,7 @@ use crate::{interpreter, lexer::Lexer, native, parser::Parser, verifier};
 use std::{collections::HashMap, fs, path::Path, process::Command};
 
 mod text;
+mod sequential;
 
 fn source(expr: &str, bindings: &str) -> String {
     let reads = if expr.contains("i.y") || bindings.contains("i.y") {
@@ -253,7 +254,7 @@ fn native_stack_unknown_analysis_and_unsupported_modes_refuse_before_artifacts()
     assert!(native::compile_native(&p, "checked", &path, true, true).is_err());
     assert!(native::compile_native_stdin_raw(&p, "checked", &path).is_err());
     assert!(
-        native::compile_native_multi(&p, &["checked", "checked"], &path, false, false).is_err()
+        native::compile_native_multi(&p, &["checked", "checked"], &path, true, false).is_err()
     );
     assert!(native::compile_http_server(&p, "checked", 9999, &path).is_err());
     assert!(crate::wasm::compile_wasm(&p, "checked", &path)

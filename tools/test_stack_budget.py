@@ -90,7 +90,7 @@ class NativeStackCLI(StackCLIBase):
         self.assertNotEqual(self.run_compiler("--stack-report", "--run", "magnitude").returncode, 0)
 
     def test_unknown_entries_and_unsupported_modes_never_report_success(self):
-        for name in ["missing", "magnitude,clamp"]:
+        for name in ["missing", "magnitude,missing"]:
             out = self.run_compiler("--stack-report", "--run", name, "--json")
             self.assertEqual(out.returncode, 1)
             self.assertEqual(out.stdout, b"")
@@ -195,11 +195,84 @@ class TextStackCLI(StackCLIBase):
         self.source.write_text(self.original.replace("    native_stack: 384\n", ""))
         for args in [["--native", artifact, "--stdin"], ["--native", artifact, "--stream"],
                      ["--native", artifact, "--stdin-raw"],
-                     ["--native", artifact, "--run", "repeat_reading,format_reading"],
+                     ["--native", artifact, "--run", "repeat_reading,format_reading", "--stdin"],
                      ["--wasm", artifact]]:
             out = self.run_compiler(*args)
             self.assertNotEqual(out.returncode, 0, args)
             self.assertIn(b"native_stack", out.stderr)
+            self.assertEqual(artifact.read_bytes(), b"preserve this artifact")
+
+
+class SequentialStackCLI(StackCLIBase):
+    def setUp(self):
+        super().setUp()
+        self.source = self.base / "sequential_stack.verbose"
+        self.original = (ROOT / "examples/sequential_stack.verbose").read_text()
+        self.source.write_text(self.original)
+        (self.base / "sequential_stack.intent").write_bytes(
+            (ROOT / "examples/sequential_stack.intent").read_bytes())
+
+    def test_composed_report_and_ordered_outputs(self):
+        names = "clamp,nonnegative,label"
+        out = self.run_compiler("--stack-report", "--run", names, "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stderr, b"")
+        report = json.loads(out.stdout)
+        self.assertEqual(report["composition"], "sequential")
+        self.assertEqual(report["on_phase_failure"], "stop")
+        self.assertEqual(report["retained_stack_bytes"], 0)
+        self.assertEqual(report["stack_bound_bytes"], 192)
+        self.assertEqual([p["rule"] for p in report["phases"]], names.split(","))
+        self.assertEqual([p["stack_bound_bytes"] for p in report["phases"]], [104, 88, 192])
+        for phase in report["phases"]:
+            single = self.run_compiler("--stack-report", "--run", phase["rule"], "--json")
+            self.assertEqual(phase, json.loads(single.stdout))
+        self.assertEqual(out.stdout, self.run_compiler("--stack-report", "--run", names, "--json").stdout)
+        human = self.run_compiler("--stack-report", "--run", names)
+        self.assertIn(b"192 bytes (maximum of phases)", human.stdout)
+        binary = self.base / "sequence"
+        out = self.run_compiler("--native", binary, "--run", names)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        values = [{"title": "a", "value": 2}, {"title": "éééé", "value": 2**63-1}]
+        data = self.base / "input.json"
+        data.write_text(json.dumps(values, ensure_ascii=False))
+        expected = []
+        for name in names.split(","):
+            result = self.run_compiler("--run", name, "--input", data, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for v in json.loads(result.stdout):
+                value = v["out"]
+                expected.append(str(value).lower() if isinstance(value, bool) else str(value))
+        args = [str(x) for v in values for x in [v["title"], v["value"]]]
+        actual = subprocess.run([str(binary), *args], capture_output=True, timeout=10)
+        self.assertEqual(actual.returncode, 0)
+        self.assertEqual(actual.stderr, b"")
+        self.assertEqual(actual.stdout.decode(), "".join(x + "\n" for x in expected))
+        failed = subprocess.run([str(binary), "x", "2", "y", "-1", "z", "3"], capture_output=True, timeout=10)
+        self.assertEqual((failed.returncode, failed.stdout, failed.stderr), (1, b"2\n-1\n3\ntrue\nfalse\ntrue\n", b""))
+        for n in [104, 88, 192]:
+            self.original = self.original.replace(f"    native_stack: {n}\n", "")
+        self.source.write_text(self.original)
+        control = self.base / "control"
+        self.assertEqual(self.run_compiler("--native", control, "--run", names).returncode, 0)
+        self.assertEqual(binary.read_bytes(), control.read_bytes())
+
+    def test_unknown_phase_and_late_budget_failure_preserve_artifacts(self):
+        artifact = self.base / "existing"
+        artifact.write_bytes(b"preserve this artifact")
+        for names in ["clamp,missing", "clamp,", "label," * 64 + "label"]:
+            for args in [["--stack-report", "--json"], ["--native", artifact]]:
+                out = self.run_compiler(*args, "--run", names)
+                self.assertNotEqual(out.returncode, 0)
+                if "--stack-report" in args:
+                    self.assertEqual(out.stdout, b"")
+                self.assertEqual(artifact.read_bytes(), b"preserve this artifact")
+        self.source.write_text(self.original.replace("native_stack: 192", "native_stack: 191"))
+        for args in [["--stack-report", "--json"], ["--native", artifact]]:
+            out = self.run_compiler(*args, "--run", "clamp,label")
+            self.assertEqual(out.returncode, 1)
+            self.assertEqual(out.stdout, b"")
+            self.assertIn(b"192 bytes exceeds declared 191 bytes", out.stderr)
             self.assertEqual(artifact.read_bytes(), b"preserve this artifact")
 
 
