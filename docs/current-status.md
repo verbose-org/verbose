@@ -150,6 +150,8 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   reused after their last enclosing expression, with no runtime lifetime tracking.
   Expression scratch and expanded callees can reuse those dead slots even below
   still-live locals; caller operands remain protected throughout evaluation.
+  [Direct operand reads](numeric-operands.md) avoid copying immutable numeric
+  fields/locals into scratch when their existing slot remains valid.
   The [numeric benchmark](numeric-benchmark.md) separates elapsed and child CPU
   time and marks inconsistent clock accounting inconclusive. Frame savings are
   established; the recorded timings do not settle small runtime-cost differences.

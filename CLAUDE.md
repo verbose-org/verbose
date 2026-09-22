@@ -128,6 +128,11 @@ in the compiler; complete-expression lifetimes and input/source checks remain.
 See [shared scratch](docs/numeric-local-lifetimes.md#sharing-dead-slots-with-expression-scratch)
 and [memory management versus GC](docs/memory-management.md).
 
+Direct scalar operands now read their stable input/local slots without a scratch
+copy. Complete-expression lifetimes protect them across expanded calls; computed
+operands and constants retain their existing normalization and signed behavior.
+See [numeric operand reads](docs/numeric-operands.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

@@ -961,10 +961,121 @@ fn numeric_native_reuses_scratch_without_clobbering_live_values() {
 }
 
 #[test]
+fn numeric_native_direct_reads_need_no_operand_copy_slots() {
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .chain([(-11, 1), (11, 1), (0, 6)])
+        .collect();
+    let baseline = frame_bytes(&native_bytes(&fixture("i.x", ""), "checked"));
+    for expression in [
+        "i.x + i.y",
+        "i.x - i.y",
+        "i.x * i.y",
+        "i.x / i.y",
+        "i.x % i.y",
+        "-i.x",
+        "abs(i.x)",
+        "min(i.x, i.y)",
+        "max(i.x, i.y)",
+        "if i.x < i.y then i.x else i.y",
+    ] {
+        let p = fixture(expression, "");
+        differential(&p, "checked", &inputs);
+        assert_eq!(
+            frame_bytes(&native_bytes(&p, "checked")),
+            baseline,
+            "{expression} must read the existing input slots"
+        );
+    }
+    // Deferring immutable loads until their operator does not merge lexical
+    // namespaces, including source names that resemble generated operand names.
+    let mut p = fixture(
+        "(__bounds_0 - i.x) + (x - i.y)",
+        "    let __bounds_0 = i.y\n    let x = i.x + i.y\n",
+    );
+    fields(&mut p)[0].name = "__bounds_0".into();
+    fields(&mut p)[1].name = "__bounds_1".into();
+    let replacement = rule(&mut fixture(
+        "(__bounds_0 - i.__bounds_0) + (x - i.__bounds_1)",
+        "    let __bounds_0 = i.__bounds_1\n    let x = i.__bounds_0 + i.__bounds_1\n",
+    ))
+    .logic
+    .clone();
+    rule(&mut p).logic = replacement;
+    differential(&p, "checked", &inputs);
+}
+
+#[test]
+fn numeric_native_borrowed_locals_survive_calls_and_signed_literals_stay_checked() {
+    let inputs: Vec<_> = (-10..=10)
+        .flat_map(|x| (1..=5).map(move |y| (x, y)))
+        .collect();
+    for expression in [
+        "alias - checked(i)",
+        "checked(i) - alias",
+        "keep + (checked(i) + alias)",
+        "if i.x < 0 then checked(i) + keep else alias - checked(i)",
+        "if flag != (checked(i) < 0) then alias else keep",
+    ] {
+        let mut p = fixture(
+            "keep + (i.x + (i.y + alias))",
+            "    let keep = i.x + 1\n    let alias = keep\n    let keep = i.y * 3\n",
+        );
+        let mut caller = rule(&mut fixture(
+            expression,
+            "    let early = i.x + 1\n    let keep = i.y + 2\n    let unused = early + i.x\n    let alias = keep\n    let flag = i.x < 0\n    let keep = checked(i) + alias\n",
+        ))
+        .clone();
+        caller.name = "caller".into();
+        caller.hints = None;
+        caller.input_name = "incoming".into();
+        for (_, value) in &mut caller.logic.bindings {
+            *value =
+                crate::optimizer::substitute_ident(value, "i", &Expr::Ident("incoming".into()));
+        }
+        caller.logic.value = crate::optimizer::substitute_ident(
+            &caller.logic.value,
+            "i",
+            &Expr::Ident("incoming".into()),
+        );
+        p.items.push(Item::Rule(caller));
+        differential(&p, "caller", &inputs);
+    }
+    let edges = [i64::MIN, i64::MIN + 1, -17, -3, -1, 0, 1, 3, 17, i64::MAX].map(|x| (x, 1));
+    for op in ["/", "%"] {
+        for divisor in [2, 4, 16, 1024, 1_i64 << 62, -2, -16] {
+            let mut p = fixture(&format!("i.x {op} {divisor}"), "");
+            fields(&mut p)[0].range = None;
+            full(&mut p);
+            // The generic scalar emitter must still see a frame operand for
+            // the constant divisor, never its legacy unsigned literal path.
+            differential(&p, "checked", &edges);
+        }
+    }
+    for expression in ["min(i.x, i.y)", "max(i.x, i.y)"] {
+        let mut p = fixture(expression, "");
+        for f in fields(&mut p) {
+            f.range = None;
+        }
+        full(&mut p);
+        differential(
+            &p,
+            "checked",
+            &[
+                (i64::MIN, i64::MAX),
+                (i64::MAX, i64::MIN),
+                (i64::MIN, i64::MIN),
+            ],
+        );
+    }
+}
+
+#[test]
 fn numeric_native_scratch_fills_holes_below_live_locals() {
     // The early locals all die in one complete expression. The later local
     // remains live above their holes while a deep expression needs scratch.
-    let deep = (0..63).fold("i.x".to_owned(), |e, _| format!("i.x + ({e})"));
+    // Computed left operands need scratch even when direct reads are borrowed.
+    let deep = (0..63).fold("i.x".to_owned(), |e, _| format!("(i.x + i.y) + ({e})"));
     let inputs: Vec<_> = (-10..=10)
         .flat_map(|x| (1..=5).map(move |y| (x, y)))
         .chain([(-11, 1), (11, 1), (0, 6)])

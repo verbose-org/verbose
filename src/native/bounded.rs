@@ -306,9 +306,12 @@ impl Emit<'_> {
                 patch(&mut self.code, done);
                 Ok(Type::Bool)
             }
-            // Evaluate subterms once, then use the established scalar emitter
-            // solely on frame loads. Synthetic identifiers cannot collide with
-            // source names because this scope contains only the generated ones.
+            // Use the established scalar emitter solely on frame loads. Direct
+            // numeric field/local reads can borrow their existing slots: inputs
+            // are immutable, and lexical locals live through this complete
+            // expression, including its expanded calls. Computed subterms still
+            // evaluate once in source order and receive independent scratch.
+            // Synthetic names isolate operand slots from source namespaces.
             _ => {
                 let mut children = Vec::new();
                 crate::verifier::walk_expr_children(e, &mut |c| children.push(c.clone()));
@@ -318,8 +321,28 @@ impl Emit<'_> {
                     if matches!(e, Expr::ByteAt(_, _)) && i == 0 {
                         continue;
                     }
-                    let ty = self.expr(c, input, env)?;
-                    let local = self.save(ty)?;
+                    let borrowed = if self.numeric {
+                        match c {
+                            Expr::Ident(name) => env.get(name).cloned(),
+                            Expr::Field(_, name) => {
+                                self.fields.get(name.as_str()).map(|&slot| Local {
+                                    slot,
+                                    ty: Type::Number,
+                                })
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let local = if let Some(local) = borrowed {
+                        local
+                    } else {
+                        // Keep literals behind slots too: exposing a constant
+                        // divisor would activate legacy unsigned reductions.
+                        let ty = self.expr(c, input, env)?;
+                        self.save(ty)?
+                    };
                     locals.insert(format!("__bounds_{i}"), local);
                 }
                 let a = Box::new(Expr::Ident("__bounds_0".into()));
