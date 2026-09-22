@@ -26,7 +26,7 @@ two transient requirements combine by maximum, not addition.
 
 ## Verification
 
-This slice requires the existing [strict numeric contract](numeric-overflow.md)
+The numeric path requires the existing [strict numeric contract](numeric-overflow.md)
 on the rule or its connected call graph: pure numeric/boolean scalars, eager
 lets, aliases and shadowing, conditions, and acyclic `callee(input)` calls over
 the same input concept. Different input variable names are allowed. Effects,
@@ -64,6 +64,66 @@ The frame is reused across argv records. Record count changes work performed,
 not the stack reservation. Input guards and malformed/partial-record failures
 retain their existing behavior. No GC or runtime lifetime table is added.
 
+## Bounded text entries
+
+The same proof and report now cover the existing [bounded text storage subset](bounded-text-storage.md)
+in a pure, single native argv entry. Text concatenation, numeric formatting,
+length, comparisons, lets/aliases, shadowing, conditions and acyclic calls are
+supported. Flat constructed inputs and returned records keep their existing
+[checked call rules](bounded-text-inputs.md); record output supports number/text
+fields. This does not add arithmetic, substring, nested records, effects or
+recursion to the bounded text subset. Unknown lowering still refuses.
+
+Text entries keep two frames live during construction: the ordinary input frame
+and an invocation frame containing scalar/pointer/length slots and placed text
+buffers. The report takes both reservations from the emitter. Destination
+capacities use explicit `text[..N]` limits (or inferred limits for unannotated
+participating callees), rounded to eight bytes. Increasing a declared output
+capacity can therefore increase reserved stack, even for a short result.
+Read-only literal bytes embedded in code and pre-existing argv strings are not
+stack buffers. Descriptor slots and every reserved byte still count.
+
+Placement already reuses dead buffers and overlays exclusive branch regions;
+alias uses keep their owners alive through the final consumer. The budget uses
+that actual placement, including holes, rather than adding all capacities or
+assuming an ideal packing. Expanded calls share the invocation frame, with
+simultaneous caller values retained. The existing internal 2 MiB invocation
+ceiling (including its conservative fixed allowance) also remains enforced.
+
+For the [text example](../examples/text_stack.verbose), `repeat_reading` returns
+at most **63 bytes**, but its whole native entry needs **384 bytes**:
+
+| Component | Bytes |
+|---|---:|
+| Outer input/bookkeeping frame | 56 |
+| Saved outer base pointer | 8 |
+| Inner scalar and pointer/length slots | 152 |
+| Placed writable buffers | 128 |
+| Saved inner rbp/rbx | 16 |
+| Numeric-to-text conversion scratch | 24 |
+
+The input length guard temporarily saves 8 bytes before the inner frame opens.
+It does not overlap with construction. Numeric formatting restores its 24-byte
+scratch after each operand; nested concats and successive calls do not accumulate
+that scratch. Text/newline output uses no additional stack. Numeric output and
+numeric fields of a returned record use 24 bytes while the inner frame is live;
+boolean output closes the inner frame first and needs no scratch.
+
+The total is therefore:
+
+```text
+outer frame + saved outer rbp
+  + max(input scratch,
+        inner frame + saved inner registers + max(expression scratch, output scratch))
+```
+
+This analysis adds no instructions, runtime allocation or GC to supported native
+entries. No transport budget is implied: a rule reaching a declaration, even
+through an unannotated caller, refuses stdin/raw/stream, multiple native entries,
+the legacy HTTP shell, and service/reaction uses. Unrelated unannotated entries
+retain their existing support. Composing request, handler, response and log
+storage for a service is a later slice.
+
 ## Inspecting the result
 
 ```sh
@@ -86,15 +146,20 @@ JSON stdout is one object, without verification banners. Schema version 1 report
 | Field | Meaning |
 |---|---|
 | `declared_bytes` | Source limit, or `null` when absent |
-| `stack_bound_bytes` | Saved base pointer + fixed frame + maximum transient use |
-| `frame_bytes` | Actual fixed reservation emitted by the prologue |
+| `stack_bound_bytes` | Additional entry stack, using the numeric or nested-frame formula above |
+| `frame_bytes` | Actual outer frame reservation emitted by the prologue |
 | `input_slot_bytes` | Input words in the fixed frame |
 | `shared_slot_bytes` | Peak shared locals/callee/scratch words in that frame |
 | `bookkeeping_bytes` | Remaining fixed entry storage |
 | `saved_base_pointer_bytes` | Space for the entry's saved base pointer |
 | `input_stack_bytes` | Saved pointer while checking a carried text field's length |
-| `expression_stack_bytes` | Maximum temporary scalar spill below the frame |
-| `output_stack_bytes` | Numeric formatting storage; zero for boolean output |
+| `expression_stack_bytes` | Maximum expression scratch below its frame (inner frame for text) |
+| `output_stack_bytes` | Numeric formatting storage; zero for text/boolean output |
+| `text_frame` | Present only for bounded text lowering: `frame_bytes`, `slot_bytes`, `buffer_bytes`, `saved_register_bytes` |
+
+`text_frame` is an additive schema-1 field; numeric JSON reports are unchanged.
+Its `frame_bytes` equals `slot_bytes + buffer_bytes`. Consumers computing a total
+must include this nested frame as shown above, or use `stack_bound_bytes` directly.
 
 This is a calculated upper bound, not a runtime measurement. Branches are
 conservatively included unless verified lowering removes them. Compiler changes
@@ -108,8 +173,8 @@ inspect the report rather than treating a budget as ABI stability.
 | Rust source verification | Checks every declared native entry budget |
 | Rust interpreter CLI | Verifies the native property, then interprets values; interpreter storage is not bounded by it |
 | Rust native, single argv entry | Supported; the declaration adds no runtime instructions |
-| Native stdin/raw/stream/multiple entries | Refusal through the strict numeric entry gate |
-| HTTP/service/reaction contexts | Unsupported by the participating strict numeric contract |
+| Native stdin/raw/stream/multiple entries | Refused for entries reaching a budget declaration; strict numeric restrictions also remain |
+| HTTP/service/reaction contexts | Refused when they reach a budget declaration, including calls in after mutations or logs |
 | WASM | Refuses programs declaring `native_stack` before writing an artifact |
 | Self-hosted diagnostics, ELF and raw x86 emission | Detect and refuse the proof key; no stack planner yet |
 
@@ -125,9 +190,10 @@ code.
 Rust regressions traverse the emitted instruction control-flow graph and check
 stack depth independently of layout metadata, including both arms and record
 loops. They cover exact/one-byte-too-small limits, numeric and boolean output,
-aliases, shadowing, repeated calls and preservation of existing artifacts on
-refusal. Annotated/unannotated native code must be byte-identical. Interpreter
-and native results are compared with an integer oracle.
+aliases, shadowing, repeated calls, nested frame restoration, text buffer reuse,
+flat record output and preservation of existing artifacts on refusal. Annotated/unannotated native code must be byte-identical. Interpreter
+and native results are compared with numeric/text oracles, including UTF-8 argv
+inputs, embedded NUL output and repeated records.
 
 Self-hosted fixtures omit `hints.overflow`, ensuring its existing refusal cannot
 hide a missing stack-budget gate. Fields, lets, strings and comments spelling

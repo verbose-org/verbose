@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPILER = Path(os.environ.get("VERBOSEC", ROOT / "target/debug/verbosec")).resolve()
 
 
-class NativeStackCLI(unittest.TestCase):
+class StackCLIBase(unittest.TestCase):
     def setUp(self):
         self.assertTrue(COMPILER.is_file(), "run cargo build first")
         self.directory = tempfile.TemporaryDirectory(prefix="verbose-stack-cli-")
@@ -26,6 +26,8 @@ class NativeStackCLI(unittest.TestCase):
         return subprocess.run([str(COMPILER), str(self.source), *map(str, args)],
                               capture_output=True, timeout=30)
 
+
+class NativeStackCLI(StackCLIBase):
     def test_report_json_is_standalone_scoped_and_deterministic(self):
         out = self.run_compiler("--stack-report", "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -106,6 +108,99 @@ class NativeStackCLI(unittest.TestCase):
         self.assertEqual(out.returncode, 1)
         self.assertIn(b"WASM does not support proofs.native_stack", out.stderr)
         self.assertEqual(artifact.read_bytes(), b"old wasm")
+
+
+class TextStackCLI(StackCLIBase):
+    def setUp(self):
+        super().setUp()
+        self.source = self.base / "text_stack.verbose"
+        self.original = (ROOT / "examples/text_stack.verbose").read_text()
+        self.source.write_text(self.original)
+        (self.base / "text_stack.intent").write_bytes(
+            (ROOT / "examples/text_stack.intent").read_bytes())
+
+    def test_report_json_is_standalone_scoped_and_deterministic(self):
+        out = self.run_compiler("--stack-report", "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stderr, b"")
+        report = json.loads(out.stdout)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["scope"], "additional_entry_stack")
+        self.assertEqual(report["rule"], "repeat_reading")
+        self.assertEqual(report["declared_bytes"], 384)
+        self.assertEqual(report["stack_bound_bytes"], 384)
+        self.assertEqual(report["frame_bytes"], 56)
+        self.assertEqual(report["text_frame"], dict(frame_bytes=280, slot_bytes=152,
+                                                  buffer_bytes=128, saved_register_bytes=16))
+        self.assertEqual(report["expression_stack_bytes"], 24)
+        self.assertEqual(report["input_stack_bytes"], 8)
+        self.assertEqual(report["output_stack_bytes"], 0)
+        self.assertEqual(out.stdout, self.run_compiler("--stack-report", "--json").stdout)
+        human = self.run_compiler("--stack-report")
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn(b"nested text frame: 280 bytes", human.stdout)
+        self.assertIn(b"declared limit: 384 bytes (verified)", human.stdout)
+
+    def test_annotation_does_not_change_code_or_extreme_values(self):
+        binary = self.base / "annotated"
+        out = self.run_compiler("--native", binary)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.source.write_text(self.original.replace("    native_stack: 208\n", "")
+                               .replace("    native_stack: 384\n", ""))
+        control = self.base / "control"
+        self.assertEqual(self.run_compiler("--native", control).returncode, 0)
+        self.assertEqual(binary.read_bytes(), control.read_bytes())
+        report = json.loads(self.run_compiler("--stack-report", "--json").stdout)
+        self.assertIsNone(report["declared_bytes"])
+        values = [{"title": title, "code": code} for title in ["", "abcdefgh", "éééé"]
+                  for code in [-2**63, -1, 0, 1, 2**63 - 1]]
+        expected = [f"[{v['title']}]{v['code']} | [{v['title']}]{v['code']}" for v in values]
+        args = [str(x) for v in values for x in [v["title"], v["code"]]]
+        output = subprocess.run([str(binary), *args], capture_output=True, timeout=10)
+        self.assertEqual(output.returncode, 0)
+        self.assertEqual(output.stderr, b"")
+        self.assertEqual(output.stdout.decode(), "".join(f"{s}\n" for s in expected))
+        data = self.base / "input.json"
+        data.write_text(json.dumps(values, ensure_ascii=False))
+        self.source.write_text(self.original)
+        interpreted = self.run_compiler("--run", "repeat_reading", "--input", data, "--json")
+        self.assertEqual(interpreted.returncode, 0, interpreted.stderr)
+        self.assertEqual(json.loads(interpreted.stdout), [{"out": s} for s in expected])
+        for args in [["ééééé", "0"], ["x"], ["ok", "1", "unfinished"]]:
+            a = subprocess.run([str(binary), *args], capture_output=True, timeout=10)
+            b = subprocess.run([str(control), *args], capture_output=True, timeout=10)
+            self.assertEqual((a.returncode, a.stdout, a.stderr), (b.returncode, b.stdout, b.stderr))
+            self.assertNotEqual(a.returncode, 0)
+
+    def test_too_small_budget_fails_verification_report_and_emission(self):
+        self.source.write_text(self.original.replace("native_stack: 384", "native_stack: 383"))
+        artifact = self.base / "existing"
+        artifact.write_bytes(b"preserve this artifact")
+        for args in [[], ["--stack-report", "--json"], ["--native", artifact], ["--wasm", artifact]]:
+            out = self.run_compiler(*args)
+            self.assertEqual(out.returncode, 1)
+            self.assertEqual(out.stdout, b"")
+            self.assertIn(b"384 bytes exceeds declared 383 bytes", out.stderr)
+            self.assertEqual(artifact.read_bytes(), b"preserve this artifact")
+        self.source.write_text(self.original.replace("native_stack: 208", "native_stack: 207"))
+        out = self.run_compiler("--stack-report", "--json")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(b"208 bytes exceeds declared 207 bytes", out.stderr)
+
+    def test_unknown_entries_and_unsupported_modes_never_report_success(self):
+        artifact = self.base / "existing"
+        artifact.write_bytes(b"preserve this artifact")
+        # Only the helper declares a budget; its unannotated caller must still
+        # refuse wrappers whose storage is not covered by that argv contract.
+        self.source.write_text(self.original.replace("    native_stack: 384\n", ""))
+        for args in [["--native", artifact, "--stdin"], ["--native", artifact, "--stream"],
+                     ["--native", artifact, "--stdin-raw"],
+                     ["--native", artifact, "--run", "repeat_reading,format_reading"],
+                     ["--wasm", artifact]]:
+            out = self.run_compiler(*args)
+            self.assertNotEqual(out.returncode, 0, args)
+            self.assertIn(b"native_stack", out.stderr)
+            self.assertEqual(artifact.read_bytes(), b"preserve this artifact")
 
 
 if __name__ == "__main__":

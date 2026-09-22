@@ -94,6 +94,8 @@ pub(super) struct Fragment {
     fields: Vec<(String, Value)>,
     result: Value,
     frame_bytes: usize,
+    slot_bytes: usize,
+    expression_stack_bytes: usize,
     literal_ranges: HashMap<i32, (i64, i64)>,
 }
 struct Emit<'a> {
@@ -102,6 +104,7 @@ struct Emit<'a> {
     concept: &'a Concept,
     fields: Vec<(String, Value)>,
     frame_bytes: usize,
+    expression_stack_bytes: usize,
     nodes: usize,
     literal_bytes: usize,
     // Envelopes of known literal alternatives, solely for HTTP diagnostics.
@@ -384,6 +387,9 @@ impl Emit<'_> {
                         Value::Number(s) => {
                             load(&mut self.code, 0, s);
                             emit_itoa_to_buffer(&mut self.code);
+                            // Operands are evaluated into slots before filling
+                            // the buffer. Each conversion restores its scratch.
+                            self.expression_stack_bytes = ITOA_STACK_BYTES as usize;
                         }
                         Value::Text { ptr, len, .. } => {
                             load(&mut self.code, 6, ptr);
@@ -624,6 +630,7 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
         concept,
         fields: Vec::new(),
         frame_bytes: 0,
+        expression_stack_bytes: 0,
         nodes: 0,
         literal_bytes: 0,
         literal_ranges: HashMap::new(),
@@ -633,12 +640,15 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
     // CLI/HTTP consumers run after the entire fragment. Retain every buffer
     // reachable from the returned text or record through that boundary.
     emit.use_value(&result)?;
-    emit.frame_bytes = emit.storage.layout(&mut emit.code, emit.frame_bytes)?;
+    let slot_bytes = emit.frame_bytes;
+    emit.frame_bytes = emit.storage.layout(&mut emit.code, slot_bytes)?;
     Ok(Fragment {
         code: emit.code,
         fields: emit.fields,
         result,
         frame_bytes: emit.frame_bytes,
+        slot_bytes,
+        expression_stack_bytes: emit.expression_stack_bytes,
         literal_ranges: emit.literal_ranges,
     })
 }
@@ -796,6 +806,22 @@ impl Fragment {
 }
 
 pub(super) fn compile(p: &Program, rule: &Rule, concept: &Concept) -> Result<Vec<u8>, NativeError> {
+    Ok(compile_with_layout(p, rule, concept)?.0)
+}
+
+pub(super) fn stack_report(
+    p: &Program,
+    rule: &Rule,
+    concept: &Concept,
+) -> Result<crate::stack_budget::Report, NativeError> {
+    Ok(compile_with_layout(p, rule, concept)?.1)
+}
+
+fn compile_with_layout(
+    p: &Program,
+    rule: &Rule,
+    concept: &Concept,
+) -> Result<(Vec<u8>, crate::stack_budget::Report), NativeError> {
     let fragment = prepare(p, &rule.name, concept)?;
     let mut input = rule.clone();
     input.logic.bindings.clear();
@@ -815,6 +841,7 @@ pub(super) fn compile(p: &Program, rule: &Rule, concept: &Concept) -> Result<Vec
         false,
     )?;
     fragment.begin(&mut code, &ctx.binding_offsets, &ctx.text_bindings)?;
+    let mut output_stack_bytes = 0;
     match &fragment.result {
         Value::Text { ptr, len, .. } => {
             load(&mut code, 6, *ptr);
@@ -826,6 +853,7 @@ pub(super) fn compile(p: &Program, rule: &Rule, concept: &Concept) -> Result<Vec
         Value::Number(slot) => {
             load(&mut code, 0, *slot);
             emit_itoa_inline(&mut code);
+            output_stack_bytes = ITOA_STACK_BYTES as usize;
         }
         Value::Bool(slot) => {
             // Bool exit status belongs to the outer record loop's frame.
@@ -845,6 +873,9 @@ pub(super) fn compile(p: &Program, rule: &Rule, concept: &Concept) -> Result<Vec
                 match value {
                     Value::Number(s) => {
                         offsets.insert(name.as_str(), *s);
+                        // emit_record_as_json receives only slot identifiers;
+                        // each numeric formatter restores its 24-byte scratch.
+                        output_stack_bytes = ITOA_STACK_BYTES as usize;
                     }
                     Value::Text { ptr, len, .. } => {
                         text.insert(name.as_str(), (*ptr, *len));
@@ -873,5 +904,30 @@ pub(super) fn compile(p: &Program, rule: &Rule, concept: &Concept) -> Result<Vec
     let back = jump(&mut code, &[0xe9]);
     patch(&mut code, back, ctx.loop_top);
     emit_record_loop_epilogue(&mut code, &ctx);
-    Ok(code)
+    let report = crate::stack_budget::Report {
+        rule: rule.name.clone(),
+        declared_bytes: rule.proofs.native_stack,
+        input_slot_bytes: concept.fields.len() * 8,
+        shared_slot_bytes: 0,
+        bookkeeping_bytes: ctx.frame_bytes - concept.fields.len() * 8,
+        frame_bytes: ctx.frame_bytes,
+        saved_base_pointer_bytes: 8,
+        input_stack_bytes: if concept
+            .fields
+            .iter()
+            .any(|f| text_field_declared_max(f).is_some())
+        {
+            8
+        } else {
+            0
+        },
+        expression_stack_bytes: fragment.expression_stack_bytes,
+        output_stack_bytes,
+        text_frame: Some(crate::stack_budget::TextFrame {
+            slot_bytes: fragment.slot_bytes,
+            buffer_bytes: fragment.frame_bytes - fragment.slot_bytes,
+            saved_register_bytes: 16, // Fragment::begin saves rbp and rbx.
+        }),
+    };
+    Ok((code, report))
 }

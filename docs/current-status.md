@@ -22,11 +22,12 @@ not the project's identity or a claim of general superiority.
 [Memory management](memory-management.md) distinguishes compile-time slot/buffer
 reuse and scoped arenas from runtime garbage collection, with the current limits.
 
-Strict numeric rules can now declare `proofs.native_stack: N`. The compiler
-checks an upper bound on additional native argv stack storage against this byte
-ceiling, using its actual frame placement plus transient storage. `--stack-report`
-exposes the calculation as text or JSON. This does not bound interpreter or total
-process memory; see [native stack budgets](native-stack-budget.md).
+Strict numeric and supported pure bounded text rules can declare
+`proofs.native_stack: N`. The compiler checks an upper bound on additional native
+argv stack storage against this byte ceiling, using actual entry/invocation
+frames, placed text buffers and transient storage. `--stack-report` exposes the
+calculation as text or JSON. This does not bound interpreter or total process
+memory; see [native stack budgets](native-stack-budget.md).
 
 ## Concrete continuation
 

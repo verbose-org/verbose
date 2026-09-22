@@ -140,6 +140,14 @@ transient expression/output storage are included. Unknown layouts refuse;
 WASM/self-hosted output explicitly refuses the contract. Sufficient declarations
 add no native instructions. See [native stack budgets](docs/native-stack-budget.md).
 
+Bounded text follow-up: the same native argv budget now includes the outer
+input frame, the nested invocation's slots and placed buffers, saved rbp/rbx,
+and transient numeric formatting. It uses existing lifetime/branch placement;
+no storage or instructions are added to emitted programs. Schema-1 reports gain
+an optional `text_frame` object. Rules reaching a declaration refuse transport
+and service/reaction contexts; composing whole-service budgets remains later.
+See [bounded text entry budgets](docs/native-stack-budget.md#bounded-text-entries).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

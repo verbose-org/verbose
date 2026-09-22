@@ -223,7 +223,7 @@ fn real_main() {
         let name = find_flag(&args, "--run").or_else(|| program.items.iter().rev().find_map(|i| {
             if let ast::Item::Rule(r) = i { Some(r.name.clone()) } else { None }
         })).unwrap_or_default();
-        match native::numeric_stack_report(&program, &name) {
+        match native::stack_report(&program, &name) {
             Ok(report) => {
                 if args.iter().any(|a| a == "--json") {
                     println!("{}", report.json());
