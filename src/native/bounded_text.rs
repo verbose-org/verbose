@@ -97,6 +97,7 @@ pub(super) struct Fragment {
     slot_bytes: usize,
     expression_stack_bytes: usize,
     literal_ranges: HashMap<i32, (i64, i64)>,
+    calls: Vec<crate::stack_budget::CallStorage>,
 }
 struct Emit<'a> {
     code: Vec<u8>,
@@ -360,7 +361,10 @@ impl Emit<'_> {
                     .rules
                     .get(name.as_str())
                     .ok_or_else(|| error("unknown callee"))?;
-                self.rule(rule, input, depth + 1, destination)?
+                let call = self.storage.begin_call(name);
+                let value = self.rule(rule, input, depth + 1, destination)?;
+                self.storage.end_call(call)?;
+                value
             }
             Expr::Concat(args) => {
                 // Evaluate every argument exactly once, in source order, before
@@ -650,6 +654,7 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
         slot_bytes,
         expression_stack_bytes: emit.expression_stack_bytes,
         literal_ranges: emit.literal_ranges,
+        calls: emit.storage.call_report()?,
     })
 }
 
@@ -928,6 +933,7 @@ pub(super) fn compile_phase(
             slot_bytes: fragment.slot_bytes,
             buffer_bytes: fragment.frame_bytes - fragment.slot_bytes,
             saved_register_bytes: 16, // Fragment::begin saves rbp and rbx.
+            calls: fragment.calls,
         }),
     };
     Ok((code, report))

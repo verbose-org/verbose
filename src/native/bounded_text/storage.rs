@@ -8,6 +8,8 @@
 use super::{address, error, NativeError, FIXED_SCRATCH, FRAME_LIMIT};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+mod calls;
+use calls::Call;
 
 #[derive(Default)]
 struct Pointer {
@@ -29,6 +31,8 @@ pub(super) struct Storage {
     clock: usize,
     scopes: Vec<Vec<Member>>,
     current: usize,
+    calls: Vec<Call>,
+    call_stack: Vec<usize>,
 }
 #[derive(Clone, Copy)]
 enum Member {
@@ -49,10 +53,40 @@ impl Default for Storage {
             clock: 0,
             scopes: vec![Vec::new()],
             current: 0,
+            calls: Vec::new(),
+            call_stack: Vec::new(),
         }
     }
 }
 impl Storage {
+    pub(super) fn begin_call(&mut self, callee: &str) -> usize {
+        self.clock += 1;
+        let id = self.calls.len();
+        self.calls.push(Call {
+            callee: callee.into(),
+            parent: self.call_stack.last().map(|n| n + 1),
+            first: self.clock,
+            last: 0,
+        });
+        self.call_stack.push(id);
+        id
+    }
+    pub(super) fn end_call(&mut self, id: usize) -> Result<(), NativeError> {
+        if self.call_stack.pop() != Some(id) {
+            return Err(error("unbalanced storage call"));
+        }
+        self.clock += 1;
+        self.calls[id].last = self.clock;
+        Ok(())
+    }
+
+    pub(super) fn call_report(&self) -> Result<Vec<crate::stack_budget::CallStorage>, NativeError> {
+        if !self.call_stack.is_empty() {
+            return Err(error("unclosed storage call"));
+        }
+        calls::report(&self.calls, &self.buffers)
+    }
+
     // The condition is emitted before entering either arm. Only destinations
     // CREATED in these arms may overlap; existing owners remain in their scope.
     pub(super) fn branch(&mut self) -> Branch {
@@ -387,6 +421,70 @@ mod tests {
     }
     fn overlap(a: (i32, i32), b: (i32, i32)) -> bool {
         a.0 < b.1 && b.0 < a.1
+    }
+
+    #[test]
+    fn call_retention_tracks_aliases_nested_calls_and_last_use_without_recounting_owners() {
+        for keep_after in [false, true] {
+            let mut s = Storage::default();
+            let mut code = Vec::new();
+            reserve(&mut s, &mut code, -8, 64); // caller result destination
+            reserve(&mut s, &mut code, -16, 9); // immutable argument, rounded to 16
+            s.pointer(-24);
+            s.alias(-24, -16).unwrap();
+            s.pointer(-32);
+            s.alias(-32, -24).unwrap();
+            let outer = s.begin_call("outer");
+            reserve(&mut s, &mut code, -40, 24); // callee's own temporary
+            let inner = s.begin_call("inner");
+            s.touch(-24).unwrap();
+            s.end_call(inner).unwrap();
+            s.touch(-40).unwrap();
+            s.end_call(outer).unwrap();
+            if keep_after {
+                s.touch(-32).unwrap();
+            }
+            s.touch(-8).unwrap();
+            s.layout(&mut code, 40).unwrap();
+            let calls = s.call_report().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].parent_call, None);
+            assert_eq!(calls[1].parent_call, Some(1));
+            assert_eq!(calls[0].live_caller_buffer_capacity_bytes, 80);
+            assert_eq!(
+                calls[0].retained_caller_buffer_capacity_bytes,
+                if keep_after { 80 } else { 64 }
+            );
+            assert_eq!(calls[1].live_caller_buffer_capacity_bytes, 104);
+            assert_eq!(
+                calls[1].retained_caller_buffer_capacity_bytes,
+                if keep_after { 104 } else { 88 }
+            );
+        }
+    }
+
+    #[test]
+    fn call_retention_keeps_alternative_capacities_distinct_from_overlaid_frame_bytes() {
+        let mut s = Storage::default();
+        let mut code = Vec::new();
+        s.pointer(-8); // joined pointer
+        let branch = s.branch();
+        reserve(&mut s, &mut code, -16, 64);
+        s.alias(-8, -16).unwrap();
+        s.otherwise(branch).unwrap();
+        reserve(&mut s, &mut code, -24, 64);
+        s.alias(-8, -24).unwrap();
+        s.end_branch(branch).unwrap();
+        let call = s.begin_call("consume");
+        s.touch(-8).unwrap();
+        s.end_call(call).unwrap();
+        s.touch(-8).unwrap();
+        assert_eq!(s.layout(&mut code, 24).unwrap(), 24 + 64);
+        assert_eq!(span(&s, &code, 0), span(&s, &code, 1));
+        let calls = s.call_report().unwrap();
+        // Two possible owners, not 128 bytes added to the 64-byte placement.
+        assert_eq!(calls[0].live_caller_buffer_capacity_bytes, 128);
+        assert_eq!(calls[0].retained_caller_buffer_capacity_bytes, 128);
     }
 
     #[test]

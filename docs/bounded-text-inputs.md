@@ -73,6 +73,12 @@ uses, including aliases. Everything remains inside the enclosing invocation's
 native ceiling. This adds no general calling convention, heap allocator,
 reference counting or ownership beyond the invocation.
 
+With an enclosing `native_stack` declaration, that complete composition also
+has a source-selected native argv ceiling. The [retained-call report](retained-call-storage.md)
+explains the possible caller buffer capacities live at each expanded call and
+retained through its return, including uses through aliases. This makes the
+existing transfer/storage behavior inspectable without adding runtime copies.
+
 ## Services and backends
 
 | Path | Support |

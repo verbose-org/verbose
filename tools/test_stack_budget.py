@@ -131,7 +131,11 @@ class TextStackCLI(StackCLIBase):
         self.assertEqual(report["stack_bound_bytes"], 384)
         self.assertEqual(report["frame_bytes"], 56)
         self.assertEqual(report["text_frame"], dict(frame_bytes=280, slot_bytes=152,
-                                                  buffer_bytes=128, saved_register_bytes=16))
+                                                  buffer_bytes=128, saved_register_bytes=16,
+                                                  calls=[dict(call=n, callee="format_reading", parent_call=None,
+                                                              live_caller_buffer_capacity_bytes=capacity,
+                                                              retained_caller_buffer_capacity_bytes=capacity)
+                                                         for n, capacity in [(1, 64), (2, 96)]]))
         self.assertEqual(report["expression_stack_bytes"], 24)
         self.assertEqual(report["input_stack_bytes"], 8)
         self.assertEqual(report["output_stack_bytes"], 0)
@@ -274,6 +278,75 @@ class SequentialStackCLI(StackCLIBase):
             self.assertEqual(out.stdout, b"")
             self.assertIn(b"192 bytes exceeds declared 191 bytes", out.stderr)
             self.assertEqual(artifact.read_bytes(), b"preserve this artifact")
+
+
+class RetainedStackCLI(StackCLIBase):
+    def setUp(self):
+        super().setUp()
+        self.source = self.base / "retained_stack.verbose"
+        self.original = (ROOT / "examples/retained_stack.verbose").read_text()
+        self.source.write_text(self.original)
+        (self.base / "retained_stack.intent").write_bytes(
+            (ROOT / "examples/retained_stack.intent").read_bytes())
+
+    def test_call_report_and_retained_values_match_the_interpreter(self):
+        out = self.run_compiler("--stack-report", "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, b""))
+        report = json.loads(out.stdout)
+        self.assertEqual(report["stack_bound_bytes"], 408)
+        self.assertEqual(report["declared_bytes"], 408)
+        self.assertEqual(report["text_frame"]["buffer_bytes"], 96)
+        calls = report["text_frame"]["calls"]
+        self.assertEqual([c["call"] for c in calls], [1, 2, 3])
+        self.assertEqual([c["callee"] for c in calls], ["prepare", "forward", "render"])
+        self.assertEqual([c["parent_call"] for c in calls], [None] * 3)
+        self.assertEqual([c["live_caller_buffer_capacity_bytes"] for c in calls], [48, 64, 64])
+        self.assertEqual([c["retained_caller_buffer_capacity_bytes"] for c in calls], [48, 64, 64])
+        self.assertEqual(out.stdout, self.run_compiler("--stack-report", "--json").stdout)
+        human = self.run_compiler("--stack-report")
+        self.assertIn(b"64 bytes live at entry, 64 retained through return", human.stdout)
+        self.assertIn(b"included in the frame, not additive", human.stdout)
+        binary = self.base / "analyze"
+        out = self.run_compiler("--native", binary)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        values = [{"title": title, "code": code} for title in ["", "abcdefgh", "éééé"]
+                  for code in [-2**63, -1, 0, 1, 2**63 - 1]]
+        expected = [f"[{v['title']}]:{1 if v['code'] > 0 else -1} | [{v['title']}]" for v in values]
+        data = self.base / "input.json"
+        data.write_text(json.dumps(values, ensure_ascii=False))
+        interpreted = self.run_compiler("--run", "analyze", "--input", data, "--json")
+        self.assertEqual(interpreted.returncode, 0, interpreted.stderr)
+        self.assertEqual(json.loads(interpreted.stdout), [{"out": v} for v in expected])
+        args = [str(x) for v in values for x in [v["title"], v["code"]]]
+        actual = subprocess.run([str(binary), *args], capture_output=True, timeout=10)
+        self.assertEqual((actual.returncode, actual.stderr), (0, b""))
+        self.assertEqual(actual.stdout.decode(), "".join(v + "\n" for v in expected))
+        self.source.write_text(self.original.replace("    native_stack: 408\n", ""))
+        control = self.base / "control"
+        self.assertEqual(self.run_compiler("--native", control).returncode, 0)
+        self.assertEqual(binary.read_bytes(), control.read_bytes())
+
+    def test_budget_and_transferred_field_bounds_refuse_before_artifact_creation(self):
+        artifact = self.base / "existing"
+        artifact.write_bytes(b"existing")
+        for source, message in [
+            (self.original.replace("native_stack: 408", "native_stack: 407"), b"408 bytes exceeds declared 407"),
+            (self.original.replace("title : text [..10]", "title : text [..9]"), b"call 'forward' input field 'title'"),
+            (self.original.replace("code : number [-1, 1]", "code : number [0, 1]"), b"call 'forward' input field 'code'"),
+        ]:
+            self.source.write_text(source)
+            for args in [[], ["--stack-report", "--json"], ["--native", artifact]]:
+                out = self.run_compiler(*args)
+                self.assertEqual(out.returncode, 1, out.stderr)
+                self.assertEqual(out.stdout, b"")
+                self.assertIn(message, out.stderr)
+                self.assertEqual(artifact.read_bytes(), b"existing")
+        self.source.write_text(self.original)
+        for args in [["--native", artifact, "--stdin"], ["--wasm", artifact]]:
+            out = self.run_compiler(*args)
+            self.assertEqual(out.returncode, 1)
+            self.assertIn(b"native_stack", out.stderr)
+            self.assertEqual(artifact.read_bytes(), b"existing")
 
 
 if __name__ == "__main__":
