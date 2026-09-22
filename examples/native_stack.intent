@@ -1,0 +1,3 @@
+Accept signed readings across the full i64 domain.
+Clamp a reading to [-100, 100] within a 96-byte native entry stack budget.
+Compute a guarded magnitude through that helper within a 112-byte native entry stack budget.

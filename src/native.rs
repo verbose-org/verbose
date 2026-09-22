@@ -4,6 +4,7 @@ mod http_io;
 mod admission;
 mod pool;
 mod transport_asm;
+
 /// Native x86-64 code generation — produces ELF binaries directly.
 ///
 /// General-purpose expression compiler: supports arithmetic (+, -, *, /),
@@ -29,6 +30,12 @@ impl std::fmt::Display for NativeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "native codegen error: {}", self.message)
     }
+}
+
+/// Uses the same lowering and frame placement as the strict numeric emitter.
+/// This returns compiler metadata; it never writes or executes an artifact.
+pub(crate) fn numeric_stack_report(program: &Program, rule: &str) -> Result<crate::stack_budget::Report, NativeError> {
+    bounded::numeric_stack_report(program, rule)
 }
 
 /// Compile multiple rules into a single native binary. Each rule's code
@@ -135,6 +142,9 @@ fn compile_native_code(
     stream: bool,
     stdin_raw: bool,
 ) -> Result<Vec<u8>, NativeError> {
+    if let Some(error) = crate::stack_budget::verify(program).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
     if let Some(error) = crate::text_bounds::verify_mode(program, true).first() {
         return Err(NativeError { message: error.to_string() });
     }
@@ -1071,6 +1081,8 @@ fn field_offsets(concept: &Concept) -> HashMap<&str, i32> {
 /// field names and the rule's let-binding names, both of which live for
 /// the duration of the emitter call.
 struct RecordLoopCtx<'a> {
+    /// Exactly the fixed reservation emitted by `sub rsp, frame_size`.
+    frame_bytes: usize,
     /// Code offset of the loop top — the `cmp r14, r12` that gates iteration.
     loop_top: usize,
     /// Code offset of the rel32 placeholder in the `jge exit` jump.
@@ -5613,6 +5625,7 @@ fn emit_record_loop_prologue<'a>(
     };
 
     Ok(RecordLoopCtx {
+        frame_bytes: frame_size as usize,
         loop_top,
         exit_patch,
         binding_offsets,
@@ -19616,10 +19629,13 @@ fn emit_atoi_inline(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
 }
 
+/// Numeric output's transient reservation, shared with stack accounting.
+const ITOA_STACK_BYTES: u8 = 24;
+
 /// Inline itoa: print rax as decimal string + newline to stdout.
 fn emit_itoa_inline(code: &mut Vec<u8>) {
     // sub rsp, 24 — buffer on stack
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x18]);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, ITOA_STACK_BYTES]);
 
     // lea rsi, [rsp + 22] — point to end of buffer
     code.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x16]);
@@ -19724,7 +19740,7 @@ fn emit_itoa_inline(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x0F, 0x05]);
 
     // add rsp, 24
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, ITOA_STACK_BYTES]);
 }
 
 fn emit_mov_rax_imm(code: &mut Vec<u8>, value: i64) {
@@ -21230,6 +21246,9 @@ pub fn compile_service(
     service_name: &str,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    if let Some(error) = crate::stack_budget::verify(program).first() {
+        return Err(NativeError { message: error.to_string() });
+    }
     if let Some(error) = crate::numeric_bounds::verify(program).first() {
         return Err(NativeError { message: error.to_string() });
     }
@@ -56805,7 +56824,8 @@ rule pick
         // guarded_total keeps that refusal before any native branch simplification.
         // guarded_magnitude adds another example refused by the overflow gate.
         // scalar_identities keeps the same explicit strict-numeric refusal.
-        const EXPECTED_TOTAL: usize = 180;
+        // native_stack adds a target-specific stack contract, refused by gen0.
+        const EXPECTED_TOTAL: usize = 181;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

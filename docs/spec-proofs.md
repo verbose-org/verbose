@@ -14,6 +14,15 @@ The thing to refuse is a declaration that is **neither**: the compiler cannot ve
 
 ## Classification
 
+### Native stack budget
+
+`proofs.native_stack: N` is a semantic resource ceiling chosen by the author.
+For supported strict numeric rules, verification checks the actual native argv
+frame layout plus saved-register and transient storage against this byte budget.
+Unknown layouts and excessive use fail before artifact emission. It does not
+bound interpreter or whole-process memory. See the
+[contract and support matrix](native-stack-budget.md).
+
 ### Text output capacity
 
 `output: out : text [..N]` is a checked semantic claim about the maximum byte

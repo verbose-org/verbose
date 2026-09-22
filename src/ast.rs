@@ -1173,6 +1173,9 @@ pub enum BinOp {
 pub struct Proofs {
     pub purity: Purity,
     pub termination: Termination,
+    /// Optional upper bound, in bytes, on additional native argv entry stack.
+    /// Includes the frame, saved rbp and transient expression/output storage.
+    pub native_stack: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

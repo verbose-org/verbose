@@ -1272,6 +1272,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path {
                         segments: vec!["i".into(), "amount".into()],
@@ -1385,6 +1386,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
@@ -1423,6 +1425,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
@@ -1465,6 +1468,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
@@ -1506,6 +1510,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "s".into()] }],
                     calls: vec![],
@@ -1546,6 +1551,7 @@ mod tests {
                 ))),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
@@ -1590,6 +1596,7 @@ mod tests {
                 ))),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
@@ -1631,6 +1638,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
@@ -1673,6 +1681,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "items".into()] }],
                     calls: vec![],
@@ -1722,6 +1731,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "items".into()] }],
                     calls: vec![],
@@ -1779,6 +1789,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "age".into()] }],
                     calls: vec![],
@@ -1852,6 +1863,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
@@ -1903,6 +1915,7 @@ mod tests {
                 ]),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
@@ -2008,6 +2021,7 @@ mod tests {
                 value: logic_value,
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "s".into()] }],
                     calls: vec![],
@@ -2080,6 +2094,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "id".into()] }],
                     calls: vec![],
@@ -2121,6 +2136,7 @@ mod tests {
                 value: Expr::VariantConstruct("Token".into(), "Eof".into(), vec![]),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![],
                     calls: vec![],
@@ -2219,6 +2235,7 @@ mod tests {
                 ),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![],
                     calls: vec![],
@@ -2361,6 +2378,7 @@ mod tests {
                 value: Expr::MatchVariant(Box::new(Expr::Ident("e".into())), arms),
             },
             proofs: Proofs {
+                native_stack: None,
                 purity: Purity {
                     reads: vec![],
                     calls: vec![],

@@ -102,7 +102,7 @@ pub fn validate_code(code: &[u8]) -> Result<usize, ValidationError> {
 
 /// Decode the length of one x86-64 instruction starting at `code[pos]`.
 /// Returns None if the instruction can't be decoded.
-fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize> {
+pub(crate) fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize> {
     if pos >= code.len() {
         return None;
     }

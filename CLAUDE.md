@@ -133,6 +133,13 @@ copy. Complete-expression lifetimes protect them across expanded calls; computed
 operands and constants retain their existing normalization and signed behavior.
 See [numeric operand reads](docs/numeric-operands.md).
 
+Follow-up (2026-09-22): `proofs.native_stack: N` makes a source-selected native
+argv stack ceiling verifiable for the supported strict numeric subset. The same
+emitter layout drives checking and `--stack-report` (text/JSON); saved rbp and
+transient expression/output storage are included. Unknown layouts refuse;
+WASM/self-hosted output explicitly refuses the contract. Sufficient declarations
+add no native instructions. See [native stack budgets](docs/native-stack-budget.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

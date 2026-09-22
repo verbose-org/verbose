@@ -6,6 +6,7 @@ use std::process;
 mod ast;
 mod bounds;
 mod numeric_bounds;
+mod stack_budget;
 mod text_bounds;
 mod http_framing;
 #[cfg(test)]
@@ -39,6 +40,17 @@ fn main() {
 
 fn real_main() {
     let args: Vec<String> = env::args().collect();
+
+    let stack_report = args.iter().any(|a| a == "--stack-report");
+    if stack_report {
+        for flag in ["--native", "--wasm", "--input", "--stdin", "--stdin-raw", "--stream",
+            "--benchmark", "--stats", "--disasm", "--http-server", "--echo-server", "--demo-http"] {
+            if args.iter().any(|a| a == flag) {
+                eprintln!("--stack-report is a standalone native argv analysis; cannot combine with {flag}");
+                process::exit(2);
+            }
+        }
+    }
 
     // The Rust transpiler backend was removed. A removed flag must be REFUSED,
     // not silently ignored: this project's rule is that unknown attributes are
@@ -161,6 +173,7 @@ fn real_main() {
         eprintln!("                                       entry rule's single text field (large-blob input)");
         eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
+        eprintln!("  --stack-report [--json] --run <rule>  Report checked native argv stack usage, without writing an artifact");
         eprintln!("  --echo-server <port> <output>      TCP echo server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
         eprintln!("  --demo-http <output>               HTTP server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
         eprintln!("  --http-server <port> <.verbose> --run <rule>   HTTP server wrapping a verified rule (plumbing hardcoded; see docs/known-gaps.md)");
@@ -204,6 +217,23 @@ fn real_main() {
         eprintln!();
         eprintln!("verification failed: {} error(s)", errors.len());
         process::exit(1);
+    }
+
+    if stack_report {
+        let name = find_flag(&args, "--run").or_else(|| program.items.iter().rev().find_map(|i| {
+            if let ast::Item::Rule(r) = i { Some(r.name.clone()) } else { None }
+        })).unwrap_or_default();
+        match native::numeric_stack_report(&program, &name) {
+            Ok(report) => {
+                if args.iter().any(|a| a == "--json") {
+                    println!("{}", report.json());
+                } else {
+                    println!("{report}");
+                }
+            }
+            Err(e) => { eprintln!("{e}"); process::exit(1); }
+        }
+        return;
     }
 
     // Optimize AST (platform-independent transformations)
