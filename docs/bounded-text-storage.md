@@ -66,7 +66,8 @@ Placement happens entirely in the compiler. It follows the emitted order,
 propagates last uses backwards through pointer joins, and assigns aligned buffers
 using deterministic best fit with coalescing of adjacent free space. There are
 no runtime allocator calls, reference counts or garbage collection. Pointer,
-length, number and boolean slots remain distinct for the entire invocation.
+length, number and boolean words now also [reuse dead slots](bounded-text-slots.md);
+their logical identities stay distinct from physical addresses and buffer owners.
 Since 2026-09-16, writable buffers created in opposite arms of the same `if`
 can also overlap. The compiler lays out each arm independently, including nested
 choices, then reserves one region sized to the larger arm. That entire region
@@ -89,7 +90,7 @@ Only frame sizes and buffer address offsets change in the emitted code. No
 runtime ownership metadata, allocation, extra branch, or payload copy is added.
 The extra work is in compilation: a tree of structured choices and a second
 placement, without enumerating execution paths or building pairwise buffer
-conflicts. Scalar/pointer/length slots still have invocation-wide storage.
+conflicts. Word-slot reuse is a separate placement within the same invocation.
 
 In the [example](../examples/bounded_text_storage.verbose), `forward_text` passes
 its destination through the selected `reuse_text` or `piece` call. `reuse_text`

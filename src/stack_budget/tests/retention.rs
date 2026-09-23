@@ -8,8 +8,8 @@ fn retained_record_aliases_are_counted_once_and_composition_has_its_own_budget()
     verified(&p);
     let report = native::stack_report(&p, "analyze").unwrap();
     let frame = report.text_frame.as_ref().unwrap();
-    assert_eq!(report.stack_bound_bytes(), 408);
-    assert_eq!((frame.slot_bytes, frame.buffer_bytes), (208, 96));
+    assert_eq!(report.stack_bound_bytes(), 288);
+    assert_eq!((frame.slot_bytes, frame.buffer_bytes), (88, 96));
     let values: Vec<_> = frame
         .calls
         .iter()
@@ -31,7 +31,7 @@ fn retained_record_aliases_are_counted_once_and_composition_has_its_own_budget()
         ]
     );
     let bytes = native_bytes(&p, "analyze");
-    assert_eq!(machine_stack_peak(&bytes[120..]), 408);
+    assert_eq!(machine_stack_peak(&bytes[120..]), 288);
     let aliases = parse(&SOURCE.replace(
         "    let staged = Prepared",
         "    let alias = preserved\n    let preserved = alias\n    let staged = Prepared",
@@ -51,11 +51,11 @@ fn retained_record_aliases_are_counted_once_and_composition_has_its_own_budget()
     assert_eq!(last.retained_caller_buffer_capacity_bytes, 48);
     rule(&mut p, "analyze").proofs.native_stack = None;
     assert_eq!(bytes, native_bytes(&p, "analyze"));
-    rule(&mut p, "analyze").proofs.native_stack = Some(407);
+    rule(&mut p, "analyze").proofs.native_stack = Some(287);
     assert!(verify(&p)
         .iter()
         .any(|e| e.context.contains("analyze")
-            && e.message.contains("408 bytes exceeds declared 407")));
+            && e.message.contains("288 bytes exceeds declared 287")));
     let path = format!("/tmp/verbose-retention-refusal-{}", std::process::id());
     fs::write(&path, b"existing").unwrap();
     assert!(native::compile_native(&p, "analyze", &path, false, false).is_err());
@@ -105,5 +105,5 @@ rule wrapper
     );
     let sequence = native::sequential_stack_report(&p, &["analyze", "analyze"]).unwrap();
     assert_eq!(sequence.phases, vec![report.clone(), report]);
-    assert_eq!(sequence.stack_bound_bytes(), 408);
+    assert_eq!(sequence.stack_bound_bytes(), 288);
 }

@@ -1,0 +1,1400 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-23",
+  "baseline_commit": "dc4dc15dd08e3849cf2530f9bad44d37f4cba0f6",
+  "baseline_compiler_sha256": "04c1b736c92cc835cecc6385e111e4834458202cf1bfabc63a53f23a0273ed22",
+  "scope": "Linux x86-64 native stack and ptrace instruction counts; not elapsed time, RSS or cache performance",
+  "stack_reports": [
+    {
+      "before": {
+        "schema_version": 1,
+        "target": "x86_64-linux",
+        "entry_mode": "argv",
+        "scope": "additional_entry_stack",
+        "rule": "format_reading",
+        "declared_bytes": 208,
+        "stack_bound_bytes": 208,
+        "frame_bytes": 56,
+        "input_slot_bytes": 16,
+        "shared_slot_bytes": 0,
+        "bookkeeping_bytes": 40,
+        "saved_base_pointer_bytes": 8,
+        "input_stack_bytes": 8,
+        "expression_stack_bytes": 24,
+        "output_stack_bytes": 0,
+        "text_frame": {
+          "frame_bytes": 104,
+          "slot_bytes": 72,
+          "buffer_bytes": 32,
+          "saved_register_bytes": 16
+        }
+      },
+      "after": {
+        "schema_version": 1,
+        "target": "x86_64-linux",
+        "entry_mode": "argv",
+        "scope": "additional_entry_stack",
+        "rule": "format_reading",
+        "declared_bytes": 208,
+        "stack_bound_bytes": 208,
+        "frame_bytes": 56,
+        "input_slot_bytes": 16,
+        "shared_slot_bytes": 0,
+        "bookkeeping_bytes": 40,
+        "saved_base_pointer_bytes": 8,
+        "input_stack_bytes": 8,
+        "expression_stack_bytes": 24,
+        "output_stack_bytes": 0,
+        "text_frame": {
+          "frame_bytes": 104,
+          "slot_bytes": 72,
+          "buffer_bytes": 32,
+          "saved_register_bytes": 16
+        }
+      }
+    },
+    {
+      "before": {
+        "schema_version": 1,
+        "target": "x86_64-linux",
+        "entry_mode": "argv",
+        "scope": "additional_entry_stack",
+        "rule": "repeat_reading",
+        "declared_bytes": 384,
+        "stack_bound_bytes": 384,
+        "frame_bytes": 56,
+        "input_slot_bytes": 16,
+        "shared_slot_bytes": 0,
+        "bookkeeping_bytes": 40,
+        "saved_base_pointer_bytes": 8,
+        "input_stack_bytes": 8,
+        "expression_stack_bytes": 24,
+        "output_stack_bytes": 0,
+        "text_frame": {
+          "frame_bytes": 280,
+          "slot_bytes": 152,
+          "buffer_bytes": 128,
+          "saved_register_bytes": 16,
+          "calls": [
+            {
+              "call": 1,
+              "callee": "format_reading",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 64,
+              "retained_caller_buffer_capacity_bytes": 64
+            },
+            {
+              "call": 2,
+              "callee": "format_reading",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 96,
+              "retained_caller_buffer_capacity_bytes": 96
+            }
+          ]
+        }
+      },
+      "after": {
+        "schema_version": 1,
+        "target": "x86_64-linux",
+        "entry_mode": "argv",
+        "scope": "additional_entry_stack",
+        "rule": "repeat_reading",
+        "declared_bytes": 384,
+        "stack_bound_bytes": 336,
+        "frame_bytes": 56,
+        "input_slot_bytes": 16,
+        "shared_slot_bytes": 0,
+        "bookkeeping_bytes": 40,
+        "saved_base_pointer_bytes": 8,
+        "input_stack_bytes": 8,
+        "expression_stack_bytes": 24,
+        "output_stack_bytes": 0,
+        "text_frame": {
+          "frame_bytes": 232,
+          "slot_bytes": 104,
+          "buffer_bytes": 128,
+          "saved_register_bytes": 16,
+          "calls": [
+            {
+              "call": 1,
+              "callee": "format_reading",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 64,
+              "retained_caller_buffer_capacity_bytes": 64
+            },
+            {
+              "call": 2,
+              "callee": "format_reading",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 96,
+              "retained_caller_buffer_capacity_bytes": 96
+            }
+          ]
+        }
+      }
+    },
+    {
+      "before": {
+        "schema_version": 1,
+        "target": "x86_64-linux",
+        "entry_mode": "argv",
+        "scope": "additional_entry_stack",
+        "rule": "label",
+        "declared_bytes": 192,
+        "stack_bound_bytes": 192,
+        "frame_bytes": 56,
+        "input_slot_bytes": 16,
+        "shared_slot_bytes": 0,
+        "bookkeeping_bytes": 40,
+        "saved_base_pointer_bytes": 8,
+        "input_stack_bytes": 8,
+        "expression_stack_bytes": 24,
+        "output_stack_bytes": 0,
+        "text_frame": {
+          "frame_bytes": 88,
+          "slot_bytes": 56,
+          "buffer_bytes": 32,
+          "saved_register_bytes": 16
+        }
+      },
+      "after": {
+        "schema_version": 1,
+        "target": "x86_64-linux",
+        "entry_mode": "argv",
+        "scope": "additional_entry_stack",
+        "rule": "label",
+        "declared_bytes": 192,
+        "stack_bound_bytes": 192,
+        "frame_bytes": 56,
+        "input_slot_bytes": 16,
+        "shared_slot_bytes": 0,
+        "bookkeeping_bytes": 40,
+        "saved_base_pointer_bytes": 8,
+        "input_stack_bytes": 8,
+        "expression_stack_bytes": 24,
+        "output_stack_bytes": 0,
+        "text_frame": {
+          "frame_bytes": 88,
+          "slot_bytes": 56,
+          "buffer_bytes": 32,
+          "saved_register_bytes": 16
+        }
+      }
+    },
+    {
+      "before": {
+        "schema_version": 1,
+        "target": "x86_64-linux",
+        "entry_mode": "argv",
+        "scope": "additional_entry_stack",
+        "rule": "analyze",
+        "declared_bytes": 408,
+        "stack_bound_bytes": 408,
+        "frame_bytes": 56,
+        "input_slot_bytes": 16,
+        "shared_slot_bytes": 0,
+        "bookkeeping_bytes": 40,
+        "saved_base_pointer_bytes": 8,
+        "input_stack_bytes": 8,
+        "expression_stack_bytes": 24,
+        "output_stack_bytes": 0,
+        "text_frame": {
+          "frame_bytes": 304,
+          "slot_bytes": 208,
+          "buffer_bytes": 96,
+          "saved_register_bytes": 16,
+          "calls": [
+            {
+              "call": 1,
+              "callee": "prepare",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 48,
+              "retained_caller_buffer_capacity_bytes": 48
+            },
+            {
+              "call": 2,
+              "callee": "forward",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 64,
+              "retained_caller_buffer_capacity_bytes": 64
+            },
+            {
+              "call": 3,
+              "callee": "render",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 64,
+              "retained_caller_buffer_capacity_bytes": 64
+            }
+          ]
+        }
+      },
+      "after": {
+        "schema_version": 1,
+        "target": "x86_64-linux",
+        "entry_mode": "argv",
+        "scope": "additional_entry_stack",
+        "rule": "analyze",
+        "declared_bytes": 408,
+        "stack_bound_bytes": 288,
+        "frame_bytes": 56,
+        "input_slot_bytes": 16,
+        "shared_slot_bytes": 0,
+        "bookkeeping_bytes": 40,
+        "saved_base_pointer_bytes": 8,
+        "input_stack_bytes": 8,
+        "expression_stack_bytes": 24,
+        "output_stack_bytes": 0,
+        "text_frame": {
+          "frame_bytes": 184,
+          "slot_bytes": 88,
+          "buffer_bytes": 96,
+          "saved_register_bytes": 16,
+          "calls": [
+            {
+              "call": 1,
+              "callee": "prepare",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 48,
+              "retained_caller_buffer_capacity_bytes": 48
+            },
+            {
+              "call": 2,
+              "callee": "forward",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 64,
+              "retained_caller_buffer_capacity_bytes": 64
+            },
+            {
+              "call": 3,
+              "callee": "render",
+              "parent_call": null,
+              "live_caller_buffer_capacity_bytes": 64,
+              "retained_caller_buffer_capacity_bytes": 64
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "instruction_traces": {
+    "default": [
+      {
+        "case": "and-yes",
+        "before": {
+          "frame_bytes": 280,
+          "steps": 421,
+          "copied_bytes": 54,
+          "copy_operations": 5,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 192,
+          "steps": 421,
+          "copied_bytes": 54,
+          "copy_operations": 5,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "and-no",
+        "before": {
+          "frame_bytes": 280,
+          "steps": 385,
+          "copied_bytes": 36,
+          "copy_operations": 4,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 0
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 192,
+          "steps": 385,
+          "copied_bytes": 36,
+          "copy_operations": 4,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 0
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "and-repeat",
+        "before": {
+          "frame_bytes": 280,
+          "steps": 1213,
+          "copied_bytes": 151,
+          "copy_operations": 14,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 2
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "probe",
+            "yes",
+            "eager",
+            "once",
+            "no",
+            "eager",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 192,
+          "steps": 1213,
+          "copied_bytes": 151,
+          "copy_operations": 14,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 2
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "probe",
+            "yes",
+            "eager",
+            "once",
+            "no",
+            "eager",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-yes",
+        "before": {
+          "frame_bytes": 280,
+          "steps": 409,
+          "copied_bytes": 54,
+          "copy_operations": 5,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 0
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 192,
+          "steps": 409,
+          "copied_bytes": 54,
+          "copy_operations": 5,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 0
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-no",
+        "before": {
+          "frame_bytes": 280,
+          "steps": 397,
+          "copied_bytes": 36,
+          "copy_operations": 4,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "probe",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 192,
+          "steps": 397,
+          "copied_bytes": 36,
+          "copy_operations": 4,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "probe",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-repeat",
+        "before": {
+          "frame_bytes": 280,
+          "steps": 1201,
+          "copied_bytes": 151,
+          "copy_operations": 14,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "yes",
+            "eager",
+            "once",
+            "probe",
+            "no",
+            "eager",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 192,
+          "steps": 1201,
+          "copied_bytes": 151,
+          "copy_operations": 14,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "once",
+            "yes",
+            "eager",
+            "once",
+            "probe",
+            "no",
+            "eager",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        }
+      }
+    ],
+    "inputs": [
+      {
+        "case": "and-yes",
+        "before": {
+          "frame_bytes": 376,
+          "steps": 467,
+          "copied_bytes": 56,
+          "copy_operations": 7,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 1,
+            "argument": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 208,
+          "steps": 467,
+          "copied_bytes": 56,
+          "copy_operations": 7,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 1,
+            "argument": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "and-no",
+        "before": {
+          "frame_bytes": 376,
+          "steps": 430,
+          "copied_bytes": 36,
+          "copy_operations": 6,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 0,
+            "argument": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 208,
+          "steps": 430,
+          "copied_bytes": 36,
+          "copy_operations": 6,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 0,
+            "argument": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "and-repeat",
+        "before": {
+          "frame_bytes": 376,
+          "steps": 1353,
+          "copied_bytes": 159,
+          "copy_operations": 20,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 2,
+            "argument": 3
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "yes",
+            "eager",
+            "argument",
+            "once",
+            "no",
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 208,
+          "steps": 1353,
+          "copied_bytes": 159,
+          "copy_operations": 20,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 2,
+            "argument": 3
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "yes",
+            "eager",
+            "argument",
+            "once",
+            "no",
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-yes",
+        "before": {
+          "frame_bytes": 376,
+          "steps": 455,
+          "copied_bytes": 56,
+          "copy_operations": 7,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 0,
+            "argument": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 208,
+          "steps": 455,
+          "copied_bytes": 56,
+          "copy_operations": 7,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 0,
+            "argument": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-no",
+        "before": {
+          "frame_bytes": 376,
+          "steps": 442,
+          "copied_bytes": 36,
+          "copy_operations": 6,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 1,
+            "argument": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 208,
+          "steps": 442,
+          "copied_bytes": 36,
+          "copy_operations": 6,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 1,
+            "argument": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-repeat",
+        "before": {
+          "frame_bytes": 376,
+          "steps": 1341,
+          "copied_bytes": 159,
+          "copy_operations": 20,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 1,
+            "argument": 3
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "yes",
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "no",
+            "eager",
+            "argument",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 208,
+          "steps": 1341,
+          "copied_bytes": 159,
+          "copy_operations": 20,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 1,
+            "argument": 3
+          },
+          "evaluation_order": [
+            "eager",
+            "argument",
+            "once",
+            "yes",
+            "eager",
+            "argument",
+            "once",
+            "probe",
+            "no",
+            "eager",
+            "argument",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        }
+      }
+    ],
+    "branches": [
+      {
+        "case": "and-yes",
+        "before": {
+          "frame_bytes": 440,
+          "steps": 475,
+          "copied_bytes": 56,
+          "copy_operations": 7,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 1,
+            "argument_yes": 1,
+            "argument_no": 0,
+            "decision": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 240,
+          "steps": 475,
+          "copied_bytes": 56,
+          "copy_operations": 7,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 1,
+            "argument_yes": 1,
+            "argument_no": 0,
+            "decision": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "and-no",
+        "before": {
+          "frame_bytes": 440,
+          "steps": 437,
+          "copied_bytes": 36,
+          "copy_operations": 6,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 0,
+            "argument_yes": 0,
+            "argument_no": 1,
+            "decision": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_no",
+            "once",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 240,
+          "steps": 437,
+          "copied_bytes": 36,
+          "copy_operations": 6,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 0,
+            "argument_yes": 0,
+            "argument_no": 1,
+            "decision": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_no",
+            "once",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "and-repeat",
+        "before": {
+          "frame_bytes": 440,
+          "steps": 1376,
+          "copied_bytes": 159,
+          "copy_operations": 20,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 2,
+            "argument_yes": 2,
+            "argument_no": 1,
+            "decision": 3
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "probe",
+            "yes",
+            "eager",
+            "decision",
+            "argument_no",
+            "once",
+            "no",
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 240,
+          "steps": 1376,
+          "copied_bytes": 159,
+          "copy_operations": 20,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 2,
+            "argument_yes": 2,
+            "argument_no": 1,
+            "decision": 3
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "probe",
+            "yes",
+            "eager",
+            "decision",
+            "argument_no",
+            "once",
+            "no",
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "probe",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-yes",
+        "before": {
+          "frame_bytes": 440,
+          "steps": 463,
+          "copied_bytes": 56,
+          "copy_operations": 7,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 0,
+            "argument_yes": 1,
+            "argument_no": 0,
+            "decision": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 240,
+          "steps": 463,
+          "copied_bytes": 56,
+          "copy_operations": 7,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 1,
+            "no": 0,
+            "probe": 0,
+            "argument_yes": 1,
+            "argument_no": 0,
+            "decision": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-no",
+        "before": {
+          "frame_bytes": 440,
+          "steps": 449,
+          "copied_bytes": 36,
+          "copy_operations": 6,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 1,
+            "argument_yes": 0,
+            "argument_no": 1,
+            "decision": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_no",
+            "once",
+            "probe",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 240,
+          "steps": 449,
+          "copied_bytes": 36,
+          "copy_operations": 6,
+          "evaluation_counts": {
+            "eager": 1,
+            "once": 1,
+            "yes": 0,
+            "no": 1,
+            "probe": 1,
+            "argument_yes": 0,
+            "argument_no": 1,
+            "decision": 1
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_no",
+            "once",
+            "probe",
+            "no"
+          ],
+          "syscalls": {
+            "1": 2,
+            "60": 1
+          }
+        }
+      },
+      {
+        "case": "or-repeat",
+        "before": {
+          "frame_bytes": 440,
+          "steps": 1364,
+          "copied_bytes": 159,
+          "copy_operations": 20,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 1,
+            "argument_yes": 2,
+            "argument_no": 1,
+            "decision": 3
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "yes",
+            "eager",
+            "decision",
+            "argument_no",
+            "once",
+            "probe",
+            "no",
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        },
+        "after": {
+          "frame_bytes": 240,
+          "steps": 1364,
+          "copied_bytes": 159,
+          "copy_operations": 20,
+          "evaluation_counts": {
+            "eager": 3,
+            "once": 3,
+            "yes": 2,
+            "no": 1,
+            "probe": 1,
+            "argument_yes": 2,
+            "argument_no": 1,
+            "decision": 3
+          },
+          "evaluation_order": [
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "yes",
+            "eager",
+            "decision",
+            "argument_no",
+            "once",
+            "probe",
+            "no",
+            "eager",
+            "decision",
+            "argument_yes",
+            "once",
+            "yes"
+          ],
+          "syscalls": {
+            "1": 6,
+            "60": 1
+          }
+        }
+      }
+    ]
+  },
+  "existing_examples": {
+    "count": 184,
+    "accepted": 182,
+    "refused": 2,
+    "acceptance_and_diagnostics_equal": true,
+    "binary_lengths_equal": true,
+    "deterministic_compilations_per_example_per_compiler": 2,
+    "unchanged_binaries": 173,
+    "changed_binaries": [
+      {
+        "example": "bounded_text.verbose",
+        "changed_bytes": 31,
+        "unexpected_offsets": []
+      },
+      {
+        "example": "bounded_text_branches.verbose",
+        "changed_bytes": 168,
+        "unexpected_offsets": []
+      },
+      {
+        "example": "bounded_text_inputs.verbose",
+        "changed_bytes": 127,
+        "unexpected_offsets": []
+      },
+      {
+        "example": "bounded_text_state.verbose",
+        "changed_bytes": 46,
+        "unexpected_offsets": []
+      },
+      {
+        "example": "bounded_text_storage.verbose",
+        "changed_bytes": 52,
+        "unexpected_offsets": []
+      },
+      {
+        "example": "http_bounded_log.verbose",
+        "changed_bytes": 77,
+        "unexpected_offsets": []
+      },
+      {
+        "example": "http_bounded_text.verbose",
+        "changed_bytes": 29,
+        "unexpected_offsets": []
+      },
+      {
+        "example": "retained_stack.verbose",
+        "changed_bytes": 59,
+        "unexpected_offsets": []
+      },
+      {
+        "example": "text_stack.verbose",
+        "changed_bytes": 47,
+        "unexpected_offsets": []
+      }
+    ],
+    "diff_classification": "Changed bytes lie only in rbp-relative word/buffer displacements or frame reservation immediates, identified by fixed emitter operand shapes; not an independent machine-code proof."
+  }
+}

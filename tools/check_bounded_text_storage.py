@@ -14,6 +14,9 @@ field; joining that record must not evaluate the other branch or copy its text.
 With --check-overlay and --reference-compiler, compare exclusive 4 KiB result
 buffers: smaller frames, identical executed instruction/copy counts, and the
 same destination for both arms. No cache-hit or throughput claim is made.
+With --check-slots and --reference-compiler, check that word-slot reuse reduces
+frames without changing any executed instruction, copy, evaluation or syscall
+count. It can be combined with --check-inputs or --check-branches.
 """
 import argparse
 import collections
@@ -38,14 +41,18 @@ parser.add_argument('--check-branches', action='store_true',
                     help='trace conditional records and selected-branch evaluation')
 parser.add_argument('--check-overlay', action='store_true',
                     help='compare branch storage with the pre-overlay compiler')
+parser.add_argument('--check-slots', action='store_true',
+                    help='compare descriptor/scalar slot storage with the pre-reuse compiler')
 options = parser.parse_args()
+if options.check_slots and (not options.reference_compiler or options.check_overlay or options.check_reuse):
+    parser.error('--check-slots needs --reference-compiler and excludes overlay/reuse modes')
 if options.check_overlay:
     if not options.reference_compiler or options.check_inputs or options.check_reuse:
         parser.error('--check-overlay needs --reference-compiler and excludes input/reuse modes')
     options.check_branches = True
 if options.check_inputs and options.check_branches:
     parser.error('choose --check-inputs or --check-branches')
-if (options.check_inputs or options.check_branches) and options.reference_compiler and not options.check_overlay:
+if (options.check_inputs or options.check_branches) and options.reference_compiler and not (options.check_overlay or options.check_slots):
     parser.error('input/branch checks run without a reference compiler')
 WORK = Path(tempfile.mkdtemp(prefix='verbose-text-storage-trace-'))
 print(f'Traces: {WORK}', flush=True)
@@ -302,6 +309,15 @@ def trace(binary, records, operator, case, reuse_expected=None):
             if frames:
                 assert registers.rsp >= frames[-1] - frame_bytes - 32, 'unaccounted scratch/stack growth'
             offset = pc - base
+            # Inspect actual rbp-relative word accesses while the invocation
+            # frame is active, including input initialization and result reads.
+            word = blob[offset:offset + 7]
+            if (frames and registers.rbp == frames[-1] and len(word) == 7
+                    and word[0] == 0x48 and word[1] in (0x8b, 0x89)
+                    and word[2] & 0xc7 == 0x85):
+                displacement = struct.unpack_from('<i', word, 3)[0]
+                if displacement < 0:
+                    assert -frame_bytes <= displacement <= -8, 'word access escapes invocation region'
             instruction = blob[offset:offset + 2]
             if instruction == b'\x0f\x05':
                 syscalls[registers.rax] += 1
@@ -417,10 +433,13 @@ for operator in ['and', 'or']:
             before = trace(reference, records, operator, f'{operator}-{case}-reference', False if options.check_reuse else None)
             assert report['frame_bytes'] < before['frame_bytes'], (before, report)
             for metric in ['copied_bytes', 'copy_operations']:
-                if options.check_reuse or options.check_overlay:
+                if options.check_reuse or options.check_overlay or options.check_slots:
                     assert report[metric] == before[metric], (metric, before, report)
                 else:
                     assert report[metric] < before[metric], (metric, before, report)
+            if options.check_slots:
+                for metric in ['steps', 'syscalls', 'evaluation_counts', 'evaluation_order']:
+                    assert report[metric] == before[metric], (metric, before, report)
             if options.check_overlay:
                 assert report['steps'] == before['steps'], ('executed instructions', before, report)
                 assert report['syscalls'] == before['syscalls']

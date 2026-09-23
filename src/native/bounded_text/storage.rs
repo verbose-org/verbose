@@ -1,7 +1,8 @@
 //! Compile-time lifetimes and placement of writable text buffers.
 //!
-//! Pointer/length slots are never reused. A pointer join records both possible
-//! owners; backwards propagation of its last use keeps either buffer alive.
+//! Pointers retain symbolic identities even when physical word slots are reused.
+//! A pointer join records both possible owners; backwards propagation of its
+//! last use keeps either buffer alive.
 //! Intervals follow emitted order. Structured alternatives can share a region;
 //! that region stays live until the last use of either arm's buffers.
 //! There are no runtime allocation/free operations.

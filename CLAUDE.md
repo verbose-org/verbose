@@ -173,6 +173,15 @@ never added to it; exclusive owners can share addresses. The enclosing
 `native_stack` declaration checks the full composition. No emitted instructions
 change. See [retained call storage](docs/retained-call-storage.md).
 
+Bounded text word-slot follow-up (2026-09-23): numbers, booleans, pointers and
+lengths now share dead physical words after their last emitted load/store.
+Inputs remain live from fragment entry and returned values through consumption;
+aliases, joins and HTTP diagnostic facts keep their logical identities. Placement
+rewrites registered operands, with no runtime lifetime tracking or extra copies.
+The retained-record example falls from 408 to 288 bytes of additional entry
+stack; its source budget and buffer ownership report stay unchanged. See
+[bounded text word slots](docs/bounded-text-slots.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

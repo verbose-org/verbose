@@ -89,15 +89,18 @@ that actual placement, including holes, rather than adding all capacities or
 assuming an ideal packing. Expanded calls share the invocation frame, with
 simultaneous caller values retained. The existing internal 2 MiB invocation
 ceiling (including its conservative fixed allowance) also remains enforced.
+Scalar/pointer/length words also [reuse dead slots](bounded-text-slots.md),
+independently of buffer ownership. The report includes their actual placed peak.
 
 For the [text example](../examples/text_stack.verbose), `repeat_reading` returns
-at most **63 bytes**, but its whole native entry needs **384 bytes**:
+at most **63 bytes**, but its whole native entry needs **336 bytes**, within its
+unchanged 384-byte declaration:
 
 | Component | Bytes |
 |---|---:|
 | Outer input/bookkeeping frame | 56 |
 | Saved outer base pointer | 8 |
-| Inner scalar and pointer/length slots | 152 |
+| Inner scalar and pointer/length slots | 104 |
 | Placed writable buffers | 128 |
 | Saved inner rbp/rbx | 16 |
 | Numeric-to-text conversion scratch | 24 |
@@ -179,7 +182,8 @@ possible caller buffer capacities live at entry and retained through return.
 Aliases count one owner; exclusive owners can share placed storage. These
 capacities are already covered by the frame and must not be added to it. See
 [retained call storage](retained-call-storage.md) for the schema and a record
-passed between stages under a checked 408-byte enclosing budget.
+passed between stages with a computed 288-byte bound under its original
+408-byte enclosing budget.
 
 This is a calculated upper bound, not a runtime measurement. Branches are
 conservatively included unless verified lowering removes them. Compiler changes
