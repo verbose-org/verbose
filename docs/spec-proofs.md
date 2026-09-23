@@ -33,6 +33,11 @@ They are not advisory claims about an arbitrary scheduler. See
 Original-AST interpretation supplies a differential reference for their phase
 order, output values and failure policy; it does not extend `native_stack` to
 interpreter allocations or prove compiler correctness.
+`mode: concurrent` instead requires `max_in_flight`, enforced by scoped admission
+waves in the interpreter reference. It refuses a native stack ceiling or report
+until the scheduler/worker layout exists. Ordered publication and full joining
+give the concurrency count an explicit lifetime; it is not a process-memory bound.
+See [concurrent executions](concurrent-executions.md).
 
 ### Text output capacity
 

@@ -201,6 +201,14 @@ input acceptance. Native budgets still gate the source contract; interpreter
 allocations are outside those budgets. Native emission and self-hosted source
 remain unchanged. See [the reference](docs/source-executions.md#interpreter-reference).
 
+Concurrent execution follow-up (2026-09-23): [bounded concurrent phases](docs/concurrent-executions.md)
+implements the previously fixed design: consecutive admission waves, deterministic
+publication, cooperative cancellation and complete joining. The interpreter uses
+scoped host threads and rendezvous channels with checked `max_in_flight`; it bounds
+admission/pending result counts, not host memory. Native output and aggregate stack
+reports explicitly refuse this mode until the complete scheduler/worker layout
+exists. Sequential contracts and emitted bytes remain independent.
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

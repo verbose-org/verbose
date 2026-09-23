@@ -1055,6 +1055,9 @@ fn compile_native_with_mode(
             return Err(NativeError { message: "execution entries support native argv records only".into() });
         }
         crate::execution::gate(program)?;
+        if matches!(e.mode, ExecutionMode::Concurrent { .. }) {
+            return Err(NativeError { message: "native concurrent execution is not supported yet; use the interpreter reference".into() });
+        }
         let names: Vec<_> = e.phases.iter().map(String::as_str).collect();
         let code = sequential::compile(program, &names)?;
         return write_native_elf(&code, output_path);
@@ -56900,7 +56903,8 @@ rule pick
         // sequential_stack uses the same source contracts, still refused by gen0.
         // retained_stack explains existing checked record transfer lifetimes.
         // execution_stack adds a source execution, explicitly refused by gen0.
-        const EXPECTED_TOTAL: usize = 185;
+        // concurrent_execution is also refused by the declaration-scoped gate.
+        const EXPECTED_TOTAL: usize = 186;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

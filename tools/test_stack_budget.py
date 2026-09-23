@@ -226,6 +226,92 @@ class SourceExecutionCLI(unittest.TestCase):
         self.assertIn(b"execution 'inspect_readings' / @source", out.stderr)
 
 
+class ConcurrentExecutionCLI(unittest.TestCase):
+    def setUp(self):
+        SourceExecutionCLI.setUp(self)
+        self.sequential = self.original
+        self.original = self.original.replace("mode: sequential", "mode: concurrent").replace(
+            "native_stack: 192", "max_in_flight: 2")
+        self.source.write_text(self.original)
+
+    run_compiler = SourceExecutionCLI.run_compiler
+    interpret = SourceExecutionCLI.interpret
+
+    def test_concurrent_values_status_and_json_match_sequential_reference(self):
+        binary = self.base / "sequential"
+        self.source.write_text(self.sequential)
+        self.assertEqual(self.run_compiler("--native", binary).returncode, 0)
+        rows = [dict(title="café", value=2), dict(title="x", value=1000)]
+        expected = self.interpret(rows, "--json")
+        for limit in [1, 2, 64]:
+            self.source.write_text(self.original.replace("max_in_flight: 2", f"max_in_flight: {limit}"))
+            for _ in range(3):
+                out = self.interpret(rows, "--json")
+                self.assertEqual((out.returncode, out.stdout, out.stderr),
+                                 (expected.returncode, expected.stdout, expected.stderr))
+            for batch in [rows, [dict(title="éééé", value=-2**63), dict(title="🚀", value=2**63-1)],
+                          [dict(title="x", value=2), dict(title="y", value=-1), dict(title="z", value=3)]]:
+                out = self.interpret(batch)
+                native = subprocess.run([str(binary), *[arg for r in batch for arg in [r["title"], str(r["value"])]]],
+                                        capture_output=True, timeout=5)
+                self.assertEqual((out.returncode, out.stdout, out.stderr),
+                                 (native.returncode, native.stdout, native.stderr))
+        data = json.dumps(rows).encode()
+        out = subprocess.run([str(COMPILER), str(self.source), "--run", "inspect_readings", "--stdin", "--json"],
+                             input=data, capture_output=True, timeout=30)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, expected.stdout, b""))
+
+    def test_concurrent_errors_publish_only_the_ordered_prefix(self):
+        for rows in [[], [dict(title="ok", value=2), dict(title="too long!", value=1), dict(title="later", value=3)],
+                     [dict(title="ok", value=2), dict(title="bad", value=False)]]:
+            self.source.write_text(self.sequential)
+            before = self.interpret(rows, "--json")
+            self.source.write_text(self.original)
+            after = self.interpret(rows, "--json")
+            self.assertEqual((after.returncode, after.stdout, after.stderr),
+                             (before.returncode, before.stdout, before.stderr))
+            self.assertEqual(after.returncode, 1)
+            json.loads(after.stdout)
+
+    def test_concurrent_native_reports_and_artifacts_refuse_explicitly(self):
+        artifact = self.base / "existing"
+        artifact.write_bytes(b"preserve")
+        for flags, expected in [(["--native", artifact], b"native concurrent execution is not supported"),
+                                (["--native", artifact, "--run", "inspect_readings"], b"native concurrent execution is not supported"),
+                                (["--stack-report", "--json"], b"no native stack report"),
+                                (["--wasm", artifact], b"source execution")]:
+            out = self.run_compiler(*flags)
+            self.assertEqual(out.returncode, 1)
+            self.assertIn(expected, out.stderr)
+            self.assertEqual(artifact.read_bytes(), b"preserve")
+            if "--stack-report" in flags:
+                self.assertEqual(out.stdout, b"")
+        out = self.run_compiler()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # Selecting an unrelated native rule still has its own entry semantics.
+        before, after = self.base / "before", self.base / "after"
+        self.source.write_text(self.sequential)
+        self.assertEqual(self.run_compiler("--native", before, "--run", "label").returncode, 0)
+        self.source.write_text(self.original)
+        self.assertEqual(self.run_compiler("--native", after, "--run", "label").returncode, 0)
+        self.assertEqual(before.read_bytes(), after.read_bytes())
+
+    def test_concurrent_unselected_invalid_admission_fails_before_input_or_artifact(self):
+        bad = self.original.split("execution inspect_readings", 1)[1].replace("max_in_flight: 2", "max_in_flight: 0")
+        self.source.write_text(self.original + "\nexecution unused" + bad)
+        artifact = self.base / "existing"
+        artifact.write_bytes(b"preserve")
+        for flags in [["--run", "inspect_readings", "--input", "missing.json", "--json"],
+                      ["--native", artifact, "--run", "label"], ["--stack-report", "--json", "--run", "label"]]:
+            out = self.run_compiler(*flags)
+            self.assertEqual((out.returncode, out.stdout), (1, b""))
+            self.assertIn(b"max_in_flight must be in [1, 64]", out.stderr)
+            self.assertEqual(artifact.read_bytes(), b"preserve")
+
+    def test_concurrent_records_retain_typed_json_values(self):
+        SourceExecutionCLI.test_interpreted_execution_records_keep_typed_values_in_json(self)
+
+
 class NativeStackCLI(StackCLIBase):
     def test_report_json_is_standalone_scoped_and_deterministic(self):
         out = self.run_compiler("--stack-report", "--json")

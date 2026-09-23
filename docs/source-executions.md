@@ -23,8 +23,10 @@ execution inspect_readings
 ```
 
 All seven fields/attributes are required and may occur once. Unknown fields,
-duplicate fields and unsupported mode/policy values refuse. The first slice
-supports only `mode: sequential` and `on_failure: stop`. `@source` must resolve
+duplicate fields and unsupported mode/policy values refuse. This page describes
+`mode: sequential` with `on_failure: stop`. The separate
+[concurrent reference contract](concurrent-executions.md) requires `max_in_flight`
+instead of `native_stack`; sequential mode refuses `max_in_flight`. `@source` must resolve
 to an existing intention line; imported executions have their source references
 rewritten like imported rules. An intention must be nonempty.
 
@@ -180,9 +182,10 @@ Reports for ordinary rules and explicit comma-separated selections are unchanged
 | WASM | Programs declaring executions explicitly refused before artifact creation |
 | Self-hosted diagnostics / raw x86 / ELF | Top-level execution declarations explicitly refused before output; ordinary identifiers, literals and comments remain controls |
 
-This slice establishes a named scope for sequential work. It adds no concurrency,
-cross-phase retained values, new input protocol or whole-service memory budget.
-Those need their own admission, lifetime and failure semantics. Batch processing
+This native slice establishes a named scope for sequential work. The interpreter
+also supports [bounded concurrent waves](concurrent-executions.md), with native
+scheduling and its memory budget still explicitly refused. Cross-phase retained
+values and whole-service memory need further lifetime/transport contracts. Batch processing
 and compiler passes are applications of this source contract; HTTP remains an
 integration case for later transport-aware execution scopes.
 

@@ -10,6 +10,7 @@ impl Parser {
         let mut seen = HashSet::new();
         let (mut intention, mut source, mut input, mut phases, mut limit) =
             (None, None, None, None, None);
+        let (mut mode, mut max_in_flight) = (None, None);
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let attribute = self.peek_attribute_name();
             let key = if let Some(attr) = &attribute {
@@ -27,9 +28,11 @@ impl Parser {
                 "@source" => source = Some(self.parse_source_ref()?),
                 "input" => input = Some(self.expect_ident_any()?),
                 "mode" => {
-                    if self.expect_ident_any()? != "sequential" {
-                        return Err(self.error("execution supports only mode: sequential"));
+                    let value = self.expect_ident_any()?;
+                    if value != "sequential" && value != "concurrent" {
+                        return Err(self.error("execution mode must be sequential or concurrent"));
                     }
+                    mode = Some(value);
                 }
                 "on_failure" => {
                     if self.expect_ident_any()? != "stop" {
@@ -60,6 +63,13 @@ impl Parser {
                     }
                     limit = Some(n as u32);
                 }
+                "max_in_flight" => {
+                    let n = self.expect_number()?;
+                    if !(1..=64).contains(&n) {
+                        return Err(self.error("execution max_in_flight must be in [1, 64]"));
+                    }
+                    max_in_flight = Some(n as u32);
+                }
                 _ => return Err(self.error(&format!("execution '{name}': unknown field '{key}'"))),
             }
             self.expect_kind(TokenKind::Newline)?;
@@ -72,19 +82,35 @@ impl Parser {
             "mode",
             "phases",
             "on_failure",
-            "native_stack",
         ] {
             if !seen.contains(key) {
                 return Err(self.error(&format!("execution '{name}': missing '{key}'")));
             }
         }
+        let mode = if mode.as_deref() == Some("concurrent") {
+            if limit.is_some() {
+                return Err(self.error("concurrent execution refuses native_stack: native scheduler layout is not supported yet"));
+            }
+            ExecutionMode::Concurrent {
+                max_in_flight: max_in_flight
+                    .ok_or_else(|| self.error("concurrent execution requires max_in_flight"))?,
+            }
+        } else {
+            if max_in_flight.is_some() {
+                return Err(self.error("sequential execution does not accept max_in_flight"));
+            }
+            ExecutionMode::Sequential {
+                native_stack: limit
+                    .ok_or_else(|| self.error("sequential execution requires native_stack"))?,
+            }
+        };
         Ok(Execution {
             name,
             intention: intention.unwrap(),
             source: source.unwrap(),
             input: input.unwrap(),
             phases: phases.unwrap(),
-            native_stack: limit.unwrap(),
+            mode,
         })
     }
 }
