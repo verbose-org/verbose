@@ -93,8 +93,121 @@ class SourceExecutionCLI(unittest.TestCase):
         self.assertIn(b"WASM does not support source execution", out.stderr)
         out = self.run_compiler("--run", "inspect_readings", "--input", "missing.json")
         self.assertEqual(out.returncode, 1)
-        self.assertIn(b"interpreter does not support execution entries", out.stderr)
+        self.assertIn(b"cannot read execution input", out.stderr)
         self.assertEqual(artifact.read_bytes(), b"preserve")
+
+    def interpret(self, records, *flags):
+        data = self.base / "input.json"
+        data.write_text(json.dumps(records))
+        return self.run_compiler("--run", "inspect_readings", "--input", data, *flags)
+
+    def test_interpreted_execution_matches_native_output_and_failure_policy(self):
+        binary = self.base / "native"
+        self.assertEqual(self.run_compiler("--native", binary).returncode, 0)
+        for rows in [[("a", 2), ("b", 1000)], [("x", 2), ("y", -1), ("z", 3)],
+                     [("éééé", -2**63), ("🚀", 2**63 - 1)], [("a,{\"}\\\n", 0)], []]:
+            records = [dict(title=s, value=n) for s, n in rows]
+            interpreted = self.interpret(records)
+            native = subprocess.run([str(binary), *[v for s, n in rows for v in [s, str(n)]]],
+                                    capture_output=True, timeout=5)
+            self.assertEqual((interpreted.returncode, interpreted.stdout), (native.returncode, native.stdout))
+            if rows:
+                self.assertEqual(interpreted.stderr, native.stderr)
+            else:
+                self.assertIn(b"at least one input record", interpreted.stderr)
+        # Repeated phases retain separate indices and do not consume prior output.
+        self.source.write_text(self.original.replace("[clamp, nonnegative, label]", "[label, clamp, label]"))
+        out = self.interpret([dict(title="x", value=1000)], "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), [
+            dict(phase=1, rule="label", record=0, value="x:1000"),
+            dict(phase=2, rule="clamp", record=0, value=100),
+            dict(phase=3, rule="label", record=0, value="x:1000"),
+        ])
+
+    def test_interpreted_execution_json_preserves_phase_record_order_and_escapes(self):
+        rows = [dict(title='a,{"}\\\n', value=0), dict(title="🚀", value=2**63 - 1)]
+        out = self.interpret(rows, "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, b""))
+        expected = []
+        for phase, rule, values in [(1, "clamp", [0, 100]), (2, "nonnegative", [True, True]),
+                                    (3, "label", [f'{r["title"]}:{r["value"]}' for r in rows])]:
+            expected.extend(dict(phase=phase, rule=rule, record=i, value=v) for i, v in enumerate(values))
+        self.assertEqual(json.loads(out.stdout), expected)
+        out = self.interpret([dict(title="x", value=-1), dict(title="y", value=2)], "--json")
+        self.assertEqual((out.returncode, out.stderr), (1, b""))
+        self.assertEqual([e["value"] for e in json.loads(out.stdout)], [-1, 2, False, True])
+        self.assertEqual([e["phase"] for e in json.loads(out.stdout)], [1, 1, 2, 2])
+
+    def test_interpreted_execution_input_errors_keep_completed_prefix(self):
+        for bad in [dict(title="ééééé", value=0), dict(title="x", value="0"), dict(title="x")]:
+            rows = [dict(title="ok", value=2), bad, dict(title="later", value=3)]
+            out = self.interpret(rows)
+            self.assertEqual((out.returncode, out.stdout), (1, b"2\n"))
+            self.assertIn(b"phase 1 ('clamp'), record 1", out.stderr)
+            out = self.interpret(rows, "--json")
+            self.assertEqual(out.returncode, 1)
+            self.assertEqual(json.loads(out.stdout), [dict(phase=1, rule="clamp", record=0, value=2)])
+        # Numeric bounds are checked even before a phase that ignores the field.
+        phase_source = self.base / "sequential_stack.verbose"
+        phase_source.write_text(phase_source.read_text().replace("value : number\n", "value : number [-10, 10]\n"))
+        out = self.interpret([dict(title="ok", value=2), dict(title="bad", value=11)])
+        self.assertEqual((out.returncode, out.stdout), (1, b"2\n"))
+        self.assertIn(b"record 1", out.stderr)
+        binary = self.base / "native"
+        self.assertEqual(self.run_compiler("--native", binary).returncode, 0)
+        native = subprocess.run([str(binary), "ok", "2", "bad", "11"], capture_output=True, timeout=5)
+        self.assertEqual((native.returncode, native.stdout), (out.returncode, out.stdout))
+        out = self.interpret([dict(title="ok", value=2), dict(title="ééééé", value=0)])
+        native = subprocess.run([str(binary), "ok", "2", "ééééé", "0"], capture_output=True, timeout=5)
+        self.assertEqual((native.returncode, native.stdout), (out.returncode, out.stdout))
+
+    def test_interpreted_execution_records_keep_typed_values_in_json(self):
+        for name in ["retained_stack.verbose", "retained_stack.intent"]:
+            (self.base / name).write_bytes((ROOT / "examples" / name).read_bytes())
+        self.source.write_text(self.original.replace('"sequential_stack.verbose"', '"retained_stack.verbose"')
+                               .replace("[clamp, nonnegative, label]", "[prepare, analyze]")
+                               .replace("native_stack: 192", "native_stack: 4096"))
+        out = self.interpret([dict(title="café", code=0), dict(title='"\\\n', code=2**63-1)], "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, b""))
+        events = json.loads(out.stdout)
+        self.assertEqual(events[0], dict(phase=1, rule="prepare", record=0, value=dict(title="[café]", code=-1)))
+        self.assertEqual(events[1]["value"], dict(title='["\\\n]', code=1))
+        self.assertEqual(events[2]["value"], "[café]:-1 | [café]")
+        self.assertEqual(events[3]["value"], '["\\\n]:1 | ["\\\n]')
+
+    def test_interpreted_execution_rejects_malformed_json_before_output(self):
+        data = self.base / "input.json"
+        for text in ['[{"title":"x","value":1,}]', '[{"title":"x","value":1,"value":2}]',
+                     '[{"title":"x","value":01}]', '[{"title":"x","value":9223372036854775808}]',
+                     '[{"title":"x","value":1}] garbage', '[{"title":"\\ud800","value":1}]']:
+            data.write_text(text)
+            out = self.run_compiler("--run", "inspect_readings", "--input", data, "--json")
+            self.assertEqual((out.returncode, out.stdout), (1, b""))
+            self.assertIn(b"execution input JSON", out.stderr)
+
+    def test_interpreted_execution_stdin_flags_and_legacy_rule_output(self):
+        data = json.dumps([dict(title="café", value=2)]).encode()
+        out = subprocess.run([str(COMPILER), str(self.source), "--run", "inspect_readings", "--stdin"],
+                             input=data, capture_output=True, timeout=30)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "2\ntrue\ncafé:2\n".encode(), b""))
+        for flags in [[], ["--stdin-raw"], ["--stream"], ["--benchmark"], ["--stats"],
+                      ["--disasm"], ["--input", "missing.json", "--stdin"]]:
+            out = self.run_compiler("--run", "inspect_readings", *flags)
+            self.assertEqual((out.returncode, out.stdout), (2, b""), flags)
+        path = self.base / "legacy.json"
+        path.write_text('[{"title":"x","value":-1}]')
+        out = self.run_compiler("--run", "nonnegative", "--input", path, "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, b""))
+        self.assertEqual(json.loads(out.stdout), [{"out": False}])
+
+    def test_interpreted_execution_rejects_invalid_unselected_budget_before_input(self):
+        bad = self.original.split("execution inspect_readings", 1)[1]
+        self.source.write_text(self.original + "\nexecution unused" + bad.replace("native_stack: 192", "native_stack: 191"))
+        out = self.run_compiler("--run", "inspect_readings", "--input", "missing.json", "--json")
+        self.assertEqual((out.returncode, out.stdout), (1, b""))
+        self.assertIn(b"execution 'unused'", out.stderr)
+        self.assertNotIn(b"cannot read", out.stderr)
 
     def test_imported_execution_source_reference_is_resolved_and_checked(self):
         module = self.base / "module"

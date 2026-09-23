@@ -30,6 +30,9 @@ ceiling. These select the emitted phase sequence and its structured exits;
 the compiler verifies the input agreement and actual maximum stack bound.
 They are not advisory claims about an arbitrary scheduler. See
 [source executions](source-executions.md).
+Original-AST interpretation supplies a differential reference for their phase
+order, output values and failure policy; it does not extend `native_stack` to
+interpreter allocations or prove compiler correctness.
 
 ### Text output capacity
 

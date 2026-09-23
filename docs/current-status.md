@@ -42,6 +42,11 @@ A [source `execution`](source-executions.md) now names this scope and declares
 its input, ordered phases, failure policy and aggregate stack ceiling. Every
 declaration is checked, including unselected entries; native code stays identical
 to the corresponding explicit phase selection.
+The interpreter also executes these declarations against the original verified
+AST on JSON records, with matching phase order and boolean failure policy.
+Results stream as native-style output or typed JSON events; its host memory
+remains outside the native budget. This supplies a reference for optimized
+native execution without extending the declared phase subset.
 Further composition must cover storage retained between phases and work admitted
 concurrently.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
