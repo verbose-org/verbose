@@ -211,6 +211,14 @@ exists. Sequential contracts and emitted bytes remain independent.
 
 ## Dev workflow (cidx + branch-protected main)
 
+Native concurrency design (2026-09-23, before implementation):
+[native concurrent executions](docs/native-concurrent-executions.md) specifies
+fixed reusable worker lanes, raw Linux threads, ordered rendezvous publication,
+complete joining and a checked `native_memory` reservation. The separate memory
+report includes control words, result capacities, worker stacks, page padding and
+guards; it excludes kernel/initial input/code storage and makes no RSS claim.
+The shipped interpreter remains the semantic reference.
+
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.
 
 Install cidx once:
