@@ -7,6 +7,7 @@ mod ast;
 mod bounds;
 mod numeric_bounds;
 mod stack_budget;
+mod execution;
 mod text_bounds;
 mod http_framing;
 #[cfg(test)]
@@ -166,14 +167,14 @@ fn real_main() {
         eprintln!("options:");
         eprintln!("  --run <rule> --input <data.json>   Interpret a rule on JSON data");
         eprintln!("  --native <output>                  Compile to native x86-64 ELF (no dependencies)");
-        eprintln!("                                       Target: --run <name> (rule or service); defaults to the last");
-        eprintln!("                                       declared service, else the last declared rule.");
+        eprintln!("                                       Target: --run <name> (rule, service or execution); defaults to the last");
+        eprintln!("                                       declared service/execution, else the last declared rule.");
         eprintln!("  --native <output> --stdin           Native ELF that reads whitespace tokens from stdin");
         eprintln!("  --native <output> --stdin-raw       Native ELF that reads ALL of stdin verbatim into the");
         eprintln!("                                       entry rule's single text field (large-blob input)");
         eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
-        eprintln!("  --stack-report [--json] --run <rule>  Report checked native argv stack usage, without writing an artifact");
+        eprintln!("  --stack-report [--json] --run <entry> Report checked native argv stack usage, without writing an artifact");
         eprintln!("  --echo-server <port> <output>      TCP echo server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
         eprintln!("  --demo-http <output>               HTTP server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
         eprintln!("  --http-server <port> <.verbose> --run <rule>   HTTP server wrapping a verified rule (plumbing hardcoded; see docs/known-gaps.md)");
@@ -221,8 +222,20 @@ fn real_main() {
 
     if stack_report {
         let name = find_flag(&args, "--run").or_else(|| program.items.iter().rev().find_map(|i| {
+            if let ast::Item::Execution(e) = i { Some(e.name.clone()) } else { None }
+        })).or_else(|| program.items.iter().rev().find_map(|i| {
             if let ast::Item::Rule(r) = i { Some(r.name.clone()) } else { None }
         })).unwrap_or_default();
+        if execution::find(&program, &name).is_some() {
+            match execution::report(&program, &name) {
+                Ok(report) => {
+                    if args.iter().any(|a| a == "--json") { println!("{}", report.json()); }
+                    else { println!("{report}"); }
+                }
+                Err(e) => { eprintln!("{e}"); process::exit(1); }
+            }
+            return;
+        }
         let names: Vec<_> = name.split(',').collect();
         if names.len() > 1 {
             match native::sequential_stack_report(&program, &names) {
@@ -331,20 +344,13 @@ fn real_main() {
         println!("  Checks passed:    declared reads/calls, structural termination checks");
     } else if let Some(output) = native_output {
         let native_rule_str = find_flag(&args, "--run").unwrap_or_else(|| {
-            // No explicit --run target: a service is a program entry point,
-            // so prefer the last declared service when one exists. Fall
+            // No explicit --run target: services and executions are entries,
+            // so prefer the last such declaration when one exists. Fall
             // back to the last rule for non-service files (the historical
             // behaviour, kept so single-rule files still work without
             // --run). Empty programs error out explicitly rather than
             // failing later with an opaque codegen message.
-            program
-                .items
-                .iter()
-                .rev()
-                .find_map(|i| match i {
-                    ast::Item::Service(s) => Some(s.name.clone()),
-                    _ => None,
-                })
+            execution::default_entry(&program)
                 .or_else(|| {
                     program.items.iter().rev().find_map(|i| match i {
                         ast::Item::Rule(r) => Some(r.name.clone()),
@@ -398,7 +404,8 @@ fn real_main() {
             Ok(()) => {
                 let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
                 let mode = if native_stream { "stream" } else if native_stdin_raw { "stdin-raw" } else if native_stdin { "stdin" } else { "argv" };
-                println!("native: {} -> {} ({} bytes, rule '{}', input: {})", path, output, size, native_rule, mode);
+                let entry_kind = if execution::find(&program, native_rule).is_some() { "execution" } else { "rule" };
+                println!("native: {} -> {} ({} bytes, {} '{}', input: {})", path, output, size, entry_kind, native_rule, mode);
                 // Report exploited hints
                 if let Some(rule) = program.items.iter().find_map(|i| match i {
                     ast::Item::Rule(r) if r.name == *native_rule => Some(r),
@@ -494,6 +501,10 @@ fn real_main() {
             }
         }
     } else if let (Some(rule_name), json_path) = (run_rule, input_path) {
+        if execution::find(&program, &rule_name).is_some() {
+            eprintln!("interpreter does not support execution entries yet; use --native or --stack-report");
+            process::exit(1);
+        }
         // Support --stdin as alternative to --input file
         let stdin_mode = args.iter().any(|a| a == "--stdin");
         let json_path = if stdin_mode {
@@ -844,6 +855,7 @@ fn resolve_imports(mut program: ast::Program, base_dir: &Path) -> ast::Program {
                 ast::Item::Rule(r) => rewrite(&mut r.source),
                 ast::Item::Reaction(rx) => rewrite(&mut rx.source),
                 ast::Item::Service(s) => rewrite(&mut s.source),
+                ast::Item::Execution(e) => rewrite(&mut e.source),
                 // Phase 9 slice 1 stub: source-rewriting for imported
                 // resources lands when modules can re-export resources.
                 ast::Item::Resource(_) => {}

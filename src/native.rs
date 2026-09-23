@@ -67,6 +67,10 @@ pub fn compile_native_multi(
     stdin: bool,
     stream: bool,
 ) -> Result<(), NativeError> {
+    crate::execution::gate(program)?;
+    if rule_names.len() > 1 && rule_names.iter().any(|n| crate::execution::find(program, n).is_some()) {
+        return Err(NativeError { message: "an execution must be selected alone; it cannot be a phase in --run a,b".into() });
+    }
     if rule_names.is_empty() {
         return Err(NativeError { message: "no rules specified for multi-rule binary".into() });
     }
@@ -160,6 +164,7 @@ fn compile_native_code(
     stream: bool,
     stdin_raw: bool,
 ) -> Result<Vec<u8>, NativeError> {
+    crate::execution::gate(program)?;
     if let Some(error) = crate::stack_budget::verify(program).first() {
         return Err(NativeError { message: error.to_string() });
     }
@@ -1045,6 +1050,15 @@ fn compile_native_with_mode(
     stream: bool,
     stdin_raw: bool,
 ) -> Result<(), NativeError> {
+    if let Some(e) = crate::execution::find(program, rule_name) {
+        if stdin || stream || stdin_raw {
+            return Err(NativeError { message: "execution entries support native argv records only".into() });
+        }
+        crate::execution::gate(program)?;
+        let names: Vec<_> = e.phases.iter().map(String::as_str).collect();
+        let code = sequential::compile(program, &names)?;
+        return write_native_elf(&code, output_path);
+    }
     let code = compile_native_code(program, rule_name, stdin, stream, stdin_raw)?;
     write_native_elf(&code, output_path)
 }
@@ -21295,6 +21309,7 @@ pub fn compile_service(
     service_name: &str,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    crate::execution::gate(program)?;
     if let Some(error) = crate::stack_budget::verify(program).first() {
         return Err(NativeError { message: error.to_string() });
     }
@@ -25185,6 +25200,10 @@ pub fn compile_http_server(
     port: u16,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    crate::execution::gate(program)?;
+    if crate::execution::find(program, rule_name).is_some() {
+        return Err(NativeError { message: "execution entries do not support the legacy HTTP shell".into() });
+    }
     if crate::stack_budget::entry_rules(program).contains(rule_name) {
         return Err(NativeError { message: "native_stack does not support the legacy HTTP shell".into() });
     }
@@ -56880,7 +56899,8 @@ rule pick
         // text_stack extends that same refusal to bounded text entry budgets.
         // sequential_stack uses the same source contracts, still refused by gen0.
         // retained_stack explains existing checked record transfer lifetimes.
-        const EXPECTED_TOTAL: usize = 184;
+        // execution_stack adds a source execution, explicitly refused by gen0.
+        const EXPECTED_TOTAL: usize = 185;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

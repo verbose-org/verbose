@@ -513,6 +513,11 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                 base_dir,
                 &mut errors,
             ),
+            Item::Execution(e) => {
+                if let Err(message) = verify_source_ref(&e.source, base_dir) {
+                    errors.push(VerifyError { context: format!("execution '{}' / @source", e.name), message });
+                }
+            }
             Item::Resource(r) => verify_resource_stub(r, base_dir, &mut errors),
             Item::Connection(c) => verify_connection_stub(c, base_dir, &mut errors),
             Item::Entropy(e) => verify_entropy_stub(e, base_dir, &mut errors),
@@ -521,6 +526,7 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
     // Layout requires verified source: never lower away an unchecked obligation.
     if errors.is_empty() {
         errors.extend(crate::stack_budget::verify(program));
+        if errors.is_empty() { errors.extend(crate::execution::verify(program)); }
     }
     errors
 }

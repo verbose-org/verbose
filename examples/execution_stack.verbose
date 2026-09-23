@@ -1,0 +1,11 @@
+@verbose 0.1.0
+use "sequential_stack.verbose"
+
+execution inspect_readings
+  @intention: "Run the declared analyses in order within one checked entry budget"
+  @source: execution_stack.intent:1
+  input: Reading
+  mode: sequential
+  phases: [clamp, nonnegative, label]
+  on_failure: stop
+  native_stack: 192

@@ -27,6 +27,92 @@ class StackCLIBase(unittest.TestCase):
                               capture_output=True, timeout=30)
 
 
+class SourceExecutionCLI(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="verbose-execution-cli-")
+        self.addCleanup(self.directory.cleanup)
+        self.base = Path(self.directory.name)
+        self.source = self.base / "execution_stack.verbose"
+        for name in ["execution_stack.verbose", "execution_stack.intent",
+                     "sequential_stack.verbose", "sequential_stack.intent"]:
+            (self.base / name).write_bytes((ROOT / "examples" / name).read_bytes())
+        self.original = self.source.read_text()
+
+    def run_compiler(self, *args):
+        return subprocess.run([str(COMPILER), str(self.source), *map(str, args)],
+                              capture_output=True, timeout=30)
+
+    def test_default_selection_report_and_binary_match_explicit_order(self):
+        out = self.run_compiler("--stack-report", "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, b""))
+        report = json.loads(out.stdout)
+        self.assertEqual(report["execution"], "inspect_readings")
+        self.assertEqual(report["input_concept"], "Reading")
+        self.assertEqual(report["declared_bytes"], 192)
+        self.assertEqual(report["stack_bound_bytes"], 192)
+        self.assertEqual(report["composition"], "sequential")
+        self.assertEqual(report["on_phase_failure"], "stop")
+        self.assertEqual([p["rule"] for p in report["phases"]], ["clamp", "nonnegative", "label"])
+        self.assertEqual(out.stdout, self.run_compiler("--stack-report", "--json", "--run", "inspect_readings").stdout)
+        paths = [self.base / n for n in ["default", "named", "phases"]]
+        for path, selection in zip(paths, [[], ["--run", "inspect_readings"], ["--run", "clamp,nonnegative,label"]]):
+            out = self.run_compiler("--native", path, *selection)
+            self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(paths[0].read_bytes(), paths[1].read_bytes())
+        self.assertEqual(paths[0].read_bytes(), paths[2].read_bytes())
+        for args, status, expected in [
+            (["a", "2", "b", "1000"], 0, b"2\n100\ntrue\ntrue\na:2\nb:1000\n"),
+            (["x", "2", "y", "-1", "z", "3"], 1, b"2\n-1\n3\ntrue\nfalse\ntrue\n"),
+        ]:
+            out = subprocess.run([str(paths[0]), *args], capture_output=True, timeout=5)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (status, expected, b""))
+
+    def test_every_execution_budget_is_checked_before_success_or_artifact(self):
+        bad = self.original.split("execution inspect_readings", 1)[1]
+        self.source.write_text(self.original + "\nexecution unused" + bad.replace("native_stack: 192", "native_stack: 191"))
+        artifact = self.base / "existing"
+        artifact.write_bytes(b"preserve")
+        for args in [[], ["--stack-report", "--json"], ["--native", artifact],
+                     ["--native", artifact, "--run", "clamp"], ["--wasm", artifact]]:
+            out = self.run_compiler(*args)
+            self.assertEqual(out.returncode, 1)
+            self.assertEqual(out.stdout, b"")
+            self.assertIn(b"execution 'unused'", out.stderr)
+            self.assertIn(b"192 bytes exceeds declared 191", out.stderr)
+            self.assertEqual(artifact.read_bytes(), b"preserve")
+
+    def test_unsupported_execution_modes_refuse_and_preserve_artifact(self):
+        artifact = self.base / "existing"
+        artifact.write_bytes(b"preserve")
+        for flag in ["--stdin", "--stdin-raw", "--stream"]:
+            out = self.run_compiler("--native", artifact, flag)
+            self.assertEqual(out.returncode, 1)
+            self.assertIn(b"execution entries support native argv", out.stderr)
+        out = self.run_compiler("--wasm", artifact, "--run", "inspect_readings")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(b"WASM does not support source execution", out.stderr)
+        out = self.run_compiler("--run", "inspect_readings", "--input", "missing.json")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(b"interpreter does not support execution entries", out.stderr)
+        self.assertEqual(artifact.read_bytes(), b"preserve")
+
+    def test_imported_execution_source_reference_is_resolved_and_checked(self):
+        module = self.base / "module"
+        module.mkdir()
+        # Keep imported phases at the root: the existing resolver resolves use
+        # paths from the entry module's base, not the nested module's location.
+        (module / "entry.verbose").write_text(self.original)
+        (module / "execution_stack.intent").write_text("One explicit source execution.\n")
+        self.source.write_text('@verbose 0.1.0\nuse "module/entry.verbose"\n')
+        out = self.run_compiler("--stack-report", "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, b""))
+        self.assertEqual(json.loads(out.stdout)["execution"], "inspect_readings")
+        (module / "execution_stack.intent").unlink()
+        out = self.run_compiler("--stack-report", "--json")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(b"execution 'inspect_readings' / @source", out.stderr)
+
+
 class NativeStackCLI(StackCLIBase):
     def test_report_json_is_standalone_scoped_and_deterministic(self):
         out = self.run_compiler("--stack-report", "--json")

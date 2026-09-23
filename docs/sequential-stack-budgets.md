@@ -67,8 +67,9 @@ already included in its caller's phase. An exceeded declaration refuses the
 whole compilation before opening the output artifact, including when only a
 later phase or an unselected helper exceeds its budget.
 
-The selected sequence has a calculated aggregate bound; this slice adds no
-program-wide source declaration. Declared ceilings need not equal actual use,
+The selected sequence has a calculated aggregate bound. A named
+[source execution](source-executions.md) can now declare its order, input,
+failure policy and aggregate ceiling. Declared ceilings need not equal actual use,
 and their sum is not the sequence's memory requirement. Removing sufficient
 optional declarations changes neither standalone nor composed native bytes.
 

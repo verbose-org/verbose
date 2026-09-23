@@ -182,6 +182,16 @@ The retained-record example falls from 408 to 288 bytes of additional entry
 stack; its source budget and buffer ownership report stay unchanged. See
 [bounded text word slots](docs/bounded-text-slots.md).
 
+Source execution follow-up (2026-09-23): `execution` declares the input concept,
+ordered 2..64 rule phases, sequential mode, stop-on-failure policy and aggregate
+native argv stack ceiling. Every declaration is checked through existing phase
+lowering, including unselected executions. The result is the maximum of released
+phase bounds and emits the same bytes as explicit comma-separated selection.
+WASM/self-hosted output and interpreter execution selection refuse; rule entry
+contracts retain their existing meaning. This is a general execution scope for
+batch tools and compiler passes; retained cross-phase state and bounded concurrent
+admission remain separate steps. See [source executions](docs/source-executions.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

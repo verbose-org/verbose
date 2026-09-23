@@ -139,6 +139,10 @@ using `--run a,b,c`. With no stack values retained between phases, their aggrega
 bound is the maximum of the individual bounds; a failed phase stops the sequence.
 Each source declaration keeps its standalone-entry meaning.
 
+A [source `execution`](source-executions.md) can declare a separate ceiling on
+the whole selected sequence. It fixes the input concept, order and stop policy;
+the compiler checks that ceiling against the maximum of its emitted phase bounds.
+
 ## Inspecting the result
 
 ```sh
