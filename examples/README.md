@@ -2,7 +2,9 @@
 
 [`execution_stack.verbose`](execution_stack.verbose) declares a complete ordered
 batch entry with an input concept, stop-on-failure policy and aggregate stack
-ceiling. It imports the existing numeric/text reading rules; see the
+ceiling. It imports the existing numeric/text reading rules and runs natively
+or through the interpreter with [`execution_stack.json`](execution_stack.json).
+The interpreter can emit typed phase/record events with `--json`; see the
 [source execution contract](../docs/source-executions.md).
 
 [`bounded_text.verbose`](bounded_text.verbose) declares and composes checked text

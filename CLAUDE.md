@@ -187,10 +187,19 @@ ordered 2..64 rule phases, sequential mode, stop-on-failure policy and aggregate
 native argv stack ceiling. Every declaration is checked through existing phase
 lowering, including unselected executions. The result is the maximum of released
 phase bounds and emits the same bytes as explicit comma-separated selection.
-WASM/self-hosted output and interpreter execution selection refuse; rule entry
+WASM/self-hosted output refuses; rule entry
 contracts retain their existing meaning. This is a general execution scope for
 batch tools and compiler passes; retained cross-phase state and bounded concurrent
 admission remain separate steps. See [source executions](docs/source-executions.md).
+
+Interpreter follow-up (2026-09-23): source executions now run on the original
+verified AST, before optimization, using the same ordered whole-batch and
+stop-after-failed-phase semantics. Results stream directly or as typed JSON
+phase/record events, preserving completed prefixes on runtime failure. A scoped
+strict flat-JSON reader handles strings/Unicode without changing legacy rule
+input acceptance. Native budgets still gate the source contract; interpreter
+allocations are outside those budgets. Native emission and self-hosted source
+remain unchanged. See [the reference](docs/source-executions.md#interpreter-reference).
 
 ## Dev workflow (cidx + branch-protected main)
 

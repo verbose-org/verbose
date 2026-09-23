@@ -165,7 +165,8 @@ fn real_main() {
         eprintln!("usage: verbosec <file.verbose> [options]");
         eprintln!();
         eprintln!("options:");
-        eprintln!("  --run <rule> --input <data.json>   Interpret a rule on JSON data");
+        eprintln!("  --run <name> --input <data.json>   Interpret a rule or execution on JSON data (--stdin also accepted)");
+        eprintln!("                                       Executions print native-style results; --json adds phase/record metadata.");
         eprintln!("  --native <output>                  Compile to native x86-64 ELF (no dependencies)");
         eprintln!("                                       Target: --run <name> (rule, service or execution); defaults to the last");
         eprintln!("                                       declared service/execution, else the last declared rule.");
@@ -258,6 +259,29 @@ fn real_main() {
             Err(e) => { eprintln!("{e}"); process::exit(1); }
         }
         return;
+    }
+
+    // Source executions use the original verified AST as the native backend's
+    // behavioral reference. Dispatch before optimization and stdout banners.
+    if find_flag(&args, "--native").is_none() && find_flag(&args, "--wasm").is_none() {
+        if let Some(name) = find_flag(&args, "--run") {
+            if execution::find(&program, &name).is_some() {
+                for flag in ["--stdin-raw", "--stream", "--stats", "--benchmark", "--disasm"] {
+                    if args.iter().any(|a| a == flag) {
+                        eprintln!("interpreter execution cannot combine with {flag}");
+                        process::exit(2);
+                    }
+                }
+                let input = find_flag(&args, "--input");
+                let stdin = args.iter().any(|a| a == "--stdin");
+                if stdin && input.is_some() {
+                    eprintln!("interpreter execution requires either --input or --stdin, not both");
+                    process::exit(2);
+                }
+                process::exit(interpreter::execution::cli(&program, &name, input.as_deref(), stdin,
+                    args.iter().any(|a| a == "--json")));
+            }
+        }
     }
 
     // Optimize AST (platform-independent transformations)
@@ -501,10 +525,6 @@ fn real_main() {
             }
         }
     } else if let (Some(rule_name), json_path) = (run_rule, input_path) {
-        if execution::find(&program, &rule_name).is_some() {
-            eprintln!("interpreter does not support execution entries yet; use --native or --stack-report");
-            process::exit(1);
-        }
         // Support --stdin as alternative to --input file
         let stdin_mode = args.iter().any(|a| a == "--stdin");
         let json_path = if stdin_mode {
