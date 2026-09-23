@@ -128,9 +128,9 @@ class TextStackCLI(StackCLIBase):
         self.assertEqual(report["scope"], "additional_entry_stack")
         self.assertEqual(report["rule"], "repeat_reading")
         self.assertEqual(report["declared_bytes"], 384)
-        self.assertEqual(report["stack_bound_bytes"], 384)
+        self.assertEqual(report["stack_bound_bytes"], 336)
         self.assertEqual(report["frame_bytes"], 56)
-        self.assertEqual(report["text_frame"], dict(frame_bytes=280, slot_bytes=152,
+        self.assertEqual(report["text_frame"], dict(frame_bytes=232, slot_bytes=104,
                                                   buffer_bytes=128, saved_register_bytes=16,
                                                   calls=[dict(call=n, callee="format_reading", parent_call=None,
                                                               live_caller_buffer_capacity_bytes=capacity,
@@ -142,7 +142,7 @@ class TextStackCLI(StackCLIBase):
         self.assertEqual(out.stdout, self.run_compiler("--stack-report", "--json").stdout)
         human = self.run_compiler("--stack-report")
         self.assertEqual(human.returncode, 0, human.stderr)
-        self.assertIn(b"nested text frame: 280 bytes", human.stdout)
+        self.assertIn(b"nested text frame: 232 bytes", human.stdout)
         self.assertIn(b"declared limit: 384 bytes (verified)", human.stdout)
 
     def test_annotation_does_not_change_code_or_extreme_values(self):
@@ -177,14 +177,14 @@ class TextStackCLI(StackCLIBase):
             self.assertNotEqual(a.returncode, 0)
 
     def test_too_small_budget_fails_verification_report_and_emission(self):
-        self.source.write_text(self.original.replace("native_stack: 384", "native_stack: 383"))
+        self.source.write_text(self.original.replace("native_stack: 384", "native_stack: 335"))
         artifact = self.base / "existing"
         artifact.write_bytes(b"preserve this artifact")
         for args in [[], ["--stack-report", "--json"], ["--native", artifact], ["--wasm", artifact]]:
             out = self.run_compiler(*args)
             self.assertEqual(out.returncode, 1)
             self.assertEqual(out.stdout, b"")
-            self.assertIn(b"384 bytes exceeds declared 383 bytes", out.stderr)
+            self.assertIn(b"336 bytes exceeds declared 335 bytes", out.stderr)
             self.assertEqual(artifact.read_bytes(), b"preserve this artifact")
         self.source.write_text(self.original.replace("native_stack: 208", "native_stack: 207"))
         out = self.run_compiler("--stack-report", "--json")
@@ -293,7 +293,7 @@ class RetainedStackCLI(StackCLIBase):
         out = self.run_compiler("--stack-report", "--json")
         self.assertEqual((out.returncode, out.stderr), (0, b""))
         report = json.loads(out.stdout)
-        self.assertEqual(report["stack_bound_bytes"], 408)
+        self.assertEqual(report["stack_bound_bytes"], 288)
         self.assertEqual(report["declared_bytes"], 408)
         self.assertEqual(report["text_frame"]["buffer_bytes"], 96)
         calls = report["text_frame"]["calls"]
@@ -330,7 +330,7 @@ class RetainedStackCLI(StackCLIBase):
         artifact = self.base / "existing"
         artifact.write_bytes(b"existing")
         for source, message in [
-            (self.original.replace("native_stack: 408", "native_stack: 407"), b"408 bytes exceeds declared 407"),
+            (self.original.replace("native_stack: 408", "native_stack: 287"), b"288 bytes exceeds declared 287"),
             (self.original.replace("title : text [..10]", "title : text [..9]"), b"call 'forward' input field 'title'"),
             (self.original.replace("code : number [-1, 1]", "code : number [0, 1]"), b"call 'forward' input field 'code'"),
         ]:

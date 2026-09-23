@@ -4,6 +4,7 @@
 //! never a substituted expression. Calls expand once per call site. Text result
 //! destinations pass through tail calls and conditionals to the final producer.
 //! Buffer placement follows proved last uses, including aliased branch results.
+mod slots;
 mod storage;
 use super::*;
 
@@ -38,6 +39,34 @@ impl TextDestination {
     }
 }
 impl Value {
+    fn slots(&self, out: &mut Vec<i32>) {
+        match self {
+            Self::Number(s) | Self::Bool(s) => out.push(*s),
+            Self::Text { ptr, len, .. } => out.extend([*ptr, *len]),
+            Self::Record(_, fields) => {
+                for (_, value) in fields {
+                    value.slots(out);
+                }
+            }
+            Self::Input => {}
+        }
+    }
+    fn relocate(&mut self, layout: &slots::Layout) -> Result<(), NativeError> {
+        match self {
+            Self::Number(s) | Self::Bool(s) => *s = layout.offset(*s)?,
+            Self::Text { ptr, len, .. } => {
+                *ptr = layout.offset(*ptr)?;
+                *len = layout.offset(*len)?;
+            }
+            Self::Record(_, fields) => {
+                for (_, value) in fields {
+                    value.relocate(layout)?;
+                }
+            }
+            Self::Input => return Err(error("unmaterialized input during slot placement")),
+        }
+        Ok(())
+    }
     fn scalar(&self) -> Result<i32, NativeError> {
         match self {
             Self::Number(s) | Self::Bool(s) => Ok(*s),
@@ -67,13 +96,19 @@ fn patch(code: &mut [u8], site: usize, target: usize) {
     code[site..site + 4].copy_from_slice(&((target as i32) - (site as i32) - 4).to_le_bytes());
 }
 // Only low registers are used here; all accesses use disp32 for one encoding.
-fn load(code: &mut Vec<u8>, reg: u8, slot: i32) {
-    code.extend_from_slice(&[0x48, 0x8b, 0x85 | (reg << 3)]);
-    code.extend_from_slice(&slot.to_le_bytes());
+fn load(code: &mut impl slots::Buffer, reg: u8, slot: i32) {
+    let bytes = code.bytes();
+    bytes.extend_from_slice(&[0x48, 0x8b, 0x85 | (reg << 3)]);
+    let site = bytes.len();
+    bytes.extend_from_slice(&slot.to_le_bytes());
+    code.operand(slot, site);
 }
-fn store(code: &mut Vec<u8>, reg: u8, slot: i32) {
-    code.extend_from_slice(&[0x48, 0x89, 0x85 | (reg << 3)]);
-    code.extend_from_slice(&slot.to_le_bytes());
+fn store(code: &mut impl slots::Buffer, reg: u8, slot: i32) {
+    let bytes = code.bytes();
+    bytes.extend_from_slice(&[0x48, 0x89, 0x85 | (reg << 3)]);
+    let site = bytes.len();
+    bytes.extend_from_slice(&slot.to_le_bytes());
+    code.operand(slot, site);
 }
 fn address(code: &mut Vec<u8>, reg: u8, slot: i32) {
     code.extend_from_slice(&[0x48, 0x8d, 0x85 | (reg << 3)]);
@@ -96,15 +131,14 @@ pub(super) struct Fragment {
     frame_bytes: usize,
     slot_bytes: usize,
     expression_stack_bytes: usize,
-    literal_ranges: HashMap<i32, (i64, i64)>,
+    http_status_range: Option<(i64, i64)>,
     calls: Vec<crate::stack_budget::CallStorage>,
 }
 struct Emit<'a> {
-    code: Vec<u8>,
+    code: slots::Code,
     rules: HashMap<&'a str, &'a Rule>,
     concept: &'a Concept,
     fields: Vec<(String, Value)>,
-    frame_bytes: usize,
     expression_stack_bytes: usize,
     nodes: usize,
     literal_bytes: usize,
@@ -114,22 +148,8 @@ struct Emit<'a> {
     storage: storage::Storage,
 }
 impl Emit<'_> {
-    fn allocate(&mut self, bytes: usize) -> Result<i32, NativeError> {
-        let bytes = bytes
-            .checked_add(7)
-            .map(|n| n & !7)
-            .ok_or_else(|| error("frame size overflow"))?;
-        self.frame_bytes = self
-            .frame_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| error("frame size overflow"))?;
-        if self.frame_bytes + FIXED_SCRATCH > FRAME_LIMIT {
-            return Err(error(format!("invocation frame exceeds {FRAME_LIMIT} bytes (needs {} including slots, buffers and fixed scratch)", self.frame_bytes + FIXED_SCRATCH)));
-        }
-        Ok(-(self.frame_bytes as i32))
-    }
     fn scalar(&mut self, boolean: bool) -> Result<Value, NativeError> {
-        let slot = self.allocate(8)?;
+        let slot = self.code.slot()?;
         store(&mut self.code, 0, slot);
         Ok(if boolean {
             Value::Bool(slot)
@@ -138,11 +158,11 @@ impl Emit<'_> {
         })
     }
     fn text(&mut self, cap: usize) -> Result<Value, NativeError> {
-        let ptr = self.allocate(8)?;
+        let ptr = self.code.slot()?;
         self.storage.pointer(ptr);
         Ok(Value::Text {
             ptr,
-            len: self.allocate(8)?,
+            len: self.code.slot()?,
             cap,
         })
     }
@@ -191,7 +211,7 @@ impl Emit<'_> {
             .find(|f| f.name == name)
             .ok_or_else(|| error("unknown input field"))?;
         let value = match f.ty {
-            Type::Number => Value::Number(self.allocate(8)?),
+            Type::Number => Value::Number(self.code.slot()?),
             Type::Text => self.text(
                 f.range
                     .and_then(|(_, n)| usize::try_from(n).ok())
@@ -538,9 +558,9 @@ impl Emit<'_> {
     fn join_slots(&mut self, value: &Value) -> Result<Value, NativeError> {
         Ok(match value {
             Value::Text { cap, .. } => self.text(*cap)?,
-            Value::Bool(_) => Value::Bool(self.allocate(8)?),
+            Value::Bool(_) => Value::Bool(self.code.slot()?),
             Value::Number(source) => {
-                let slot = self.allocate(8)?;
+                let slot = self.code.slot()?;
                 self.join_literals(*source, slot);
                 Value::Number(slot)
             }
@@ -629,31 +649,52 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
         .collect();
     let rule = *rules.get(name).ok_or_else(|| error("entry rule missing"))?;
     let mut emit = Emit {
-        code: Vec::new(),
+        code: slots::Code::default(),
         rules,
         concept,
         fields: Vec::new(),
-        frame_bytes: 0,
         expression_stack_bytes: 0,
         nodes: 0,
         literal_bytes: 0,
         literal_ranges: HashMap::new(),
         storage: storage::Storage::default(),
     };
-    let result = emit.rule(rule, Value::Input, 0, None)?;
+    let mut result = emit.rule(rule, Value::Input, 0, None)?;
     // CLI/HTTP consumers run after the entire fragment. Retain every buffer
     // reachable from the returned text or record through that boundary.
     emit.use_value(&result)?;
-    let slot_bytes = emit.frame_bytes;
-    emit.frame_bytes = emit.storage.layout(&mut emit.code, slot_bytes)?;
+    // Preserve diagnostics by logical identity, before unrelated words can
+    // share an address. A dead literal must never become a result's range.
+    let http_status_range = if let Value::Record(name, fields) = &result {
+        fields
+            .iter()
+            .find(|(field, _)| name == "HttpResponse" && field == "status")
+            .and_then(|(_, v)| v.scalar().ok())
+            .and_then(|slot| emit.literal_ranges.get(&slot).copied())
+    } else {
+        None
+    };
+    let mut inputs = Vec::new();
+    for (_, value) in &emit.fields {
+        value.slots(&mut inputs);
+    }
+    let mut outputs = Vec::new();
+    result.slots(&mut outputs);
+    let layout = emit.code.layout(&inputs, &outputs)?;
+    let slot_bytes = layout.bytes;
+    let frame_bytes = emit.storage.layout(&mut emit.code, slot_bytes)?;
+    for (_, value) in &mut emit.fields {
+        value.relocate(&layout)?;
+    }
+    result.relocate(&layout)?;
     Ok(Fragment {
-        code: emit.code,
+        code: emit.code.into_bytes(),
         fields: emit.fields,
         result,
-        frame_bytes: emit.frame_bytes,
+        frame_bytes,
         slot_bytes,
         expression_stack_bytes: emit.expression_stack_bytes,
-        literal_ranges: emit.literal_ranges,
+        http_status_range,
         calls: emit.storage.call_report()?,
     })
 }
@@ -777,9 +818,9 @@ impl Fragment {
             .ok_or_else(|| error("missing response status"))?
             .1
             .scalar()?;
-        if let Some((lo, hi)) = self.literal_ranges.get(&status) {
-            if *lo < 100 || *hi > 599 {
-                let n = if *lo < 100 { lo } else { hi };
+        if let Some((lo, hi)) = self.http_status_range {
+            if lo < 100 || hi > 599 {
+                let n = if lo < 100 { lo } else { hi };
                 return Err(error(format!(
                     "status {n} outside HTTP valid range [100, 599]"
                 )));

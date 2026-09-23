@@ -46,20 +46,22 @@ Output:
 [sample]:-1 | [sample]
 ```
 
-The source declares `native_stack: 408` on `analyze`. Its emitted layout is:
+The source retains its `native_stack: 408` declaration on `analyze`. With
+[word-slot reuse](bounded-text-slots.md), its emitted layout now needs 288 bytes:
 
 | Storage | Bytes |
 |---|---:|
 | Outer input/bookkeeping frame and saved base pointer | 64 |
-| Inner scalar/pointer/length slots | 208 |
+| Inner scalar/pointer/length slots | 88 |
 | Placed writable buffers | 96 |
 | Saved inner registers | 16 |
 | Peak numeric-formatting scratch | 24 |
-| **Additional entry stack bound** | **408** |
+| **Additional entry stack bound** | **288** |
 
 The buffers are the final destination (44 bytes rounded to 48), prepared title
 (10 rounded to 16) and rendered text (31 rounded to 32). Passing or renaming the
-record adds no second title buffer. A 408-byte declaration passes; 407 refuses
+record adds no second title buffer. The original 408-byte declaration still
+passes; an exact 288-byte declaration passes and 287 refuses
 before artifact creation. Removing a sufficient declaration changes no native
 bytes. Standalone helper entry budgets are not added to the caller's budget:
 expanded helpers use the shared invocation layout.
@@ -97,7 +99,7 @@ These numbers include reserved destinations that have not yet been filled: the
 that call's retained capacity to 48, while its live-at-entry capacity stays 64.
 The callee's own newly created buffers are not pre-existing caller owners; they
 remain included in the complete frame. Descriptor and numeric slots are also
-included there and still reserved for the invocation's whole lifetime.
+included there, with physical word slots reused after their last emitted use.
 
 These are **possible owner capacities, not additional allocations or measured
 live bytes**. Aliases of one owner count once. Owners from exclusive branches
