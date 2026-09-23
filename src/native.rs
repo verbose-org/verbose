@@ -1,6 +1,7 @@
 mod bounded;
 mod bounded_text;
 mod sequential;
+mod concurrent;
 mod http_io;
 mod admission;
 mod pool;
@@ -49,6 +50,10 @@ pub(crate) fn stack_report(program: &Program, rule: &str) -> Result<crate::stack
 
 pub(crate) fn sequential_stack_report(program: &Program, rules: &[&str]) -> Result<crate::stack_budget::SequenceReport, NativeError> {
     sequential::report(program, rules)
+}
+
+pub(crate) fn concurrent_memory_report(program: &Program, e: &Execution) -> Result<concurrent::Report, NativeError> {
+    concurrent::report(program, e)
 }
 
 /// Compile multiple rules into a single native binary. Each rule's code
@@ -1056,7 +1061,8 @@ fn compile_native_with_mode(
         }
         crate::execution::gate(program)?;
         if matches!(e.mode, ExecutionMode::Concurrent { .. }) {
-            return Err(NativeError { message: "native concurrent execution is not supported yet; use the interpreter reference".into() });
+            let code = concurrent::compile(program, e)?;
+            return write_native_elf_image(&code, output_path);
         }
         let names: Vec<_> = e.phases.iter().map(String::as_str).collect();
         let code = sequential::compile(program, &names)?;
@@ -1083,6 +1089,11 @@ fn write_native_elf(code: &[u8], output_path: &str) -> Result<(), NativeError> {
         eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
     }
 
+    write_native_elf_image(code, output_path)
+}
+
+// Callers either use the legacy linear decoder or the concurrent CFG decoder.
+fn write_native_elf_image(code: &[u8], output_path: &str) -> Result<(), NativeError> {
     let elf = build_elf(&code);
 
     let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {
@@ -56904,7 +56915,8 @@ rule pick
         // retained_stack explains existing checked record transfer lifetimes.
         // execution_stack adds a source execution, explicitly refused by gen0.
         // concurrent_execution is also refused by the declaration-scoped gate.
-        const EXPECTED_TOTAL: usize = 186;
+        // native_concurrent_execution keeps the same self-hosted execution refusal.
+        const EXPECTED_TOTAL: usize = 187;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

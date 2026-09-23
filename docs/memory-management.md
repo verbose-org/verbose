@@ -6,15 +6,17 @@ their supported contracts; authors do not manually free individual numeric or
 bounded text values. This is not a claim of universal ownership or memory safety
 for every language/backend combination.
 
-## Three concrete mechanisms
+## Concrete mechanisms
 
 | Storage | How it is managed | Present limit |
 |---|---|---|
 | Strict native numeric values | The compiler assigns one-word stack slots from checked lexical lifetimes. Locals, expression scratch and expanded calls reuse dead slots. | Pure acyclic numeric argv subset; a separate 2 MiB frame ceiling. |
 | Bounded native text | Each invocation owns a fixed region. Checked capacities, alias lifetimes and exclusive branches allow buffers to share space; scalar/pointer/length words reuse dead slots. Output can be written directly into its destination. | Supported bounded text rules/handlers; transport, input and persistent state have separate storage. |
 | Recursive structures and self-hosted compiler intermediates | Arenas allocate nodes within declared capacity. Supported `arena_scope` paths reclaim scoped allocations together after their result is consumed or a scalar survives. | Reclamation depends on declared boundaries and supported result/backend forms; long-lived data can retain substantial storage. |
+| Concurrent native executions | One checked mapping owns control words, fixed output buffers, worker stacks and guard pages. Lanes are reused only after kernel-confirmed worker termination. | Pure acyclic argv phases; `native_memory` measures reserved address bytes, excluding initial input/code/kernel storage. |
 
-See [numeric storage](numeric-local-lifetimes.md),
+See [native concurrent reservations](native-concurrent-executions.md),
+[numeric storage](numeric-local-lifetimes.md),
 [source-declared native stack budgets](native-stack-budget.md),
 [bounded text buffers](bounded-text-storage.md), [word slots](bounded-text-slots.md),
 and the shipped

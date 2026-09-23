@@ -42,7 +42,7 @@ fn concurrent_execution_parser_closes_mode_specific_resource_fields() {
         assert!(verifier::verify_program(&p, Path::new("examples")).is_empty());
         assert!(
             matches!(&p.items.last().unwrap(), Item::Execution(Execution {
-            mode: ExecutionMode::Concurrent { max_in_flight }, .. }) if *max_in_flight == limit)
+            mode: ExecutionMode::Concurrent { max_in_flight, .. }, .. }) if *max_in_flight == limit)
         );
     }
     // These remain ordinary field/local/rule identifiers outside the attribute.
@@ -58,9 +58,7 @@ fn concurrent_contract_gates_unknown_phases_and_all_backend_artifacts() {
     fs::write(&path, b"existing").unwrap();
     let path_str = path.to_str().unwrap();
     let e = native::compile_native(&p, "inspect_together", path_str, false, false).unwrap_err();
-    assert!(e
-        .message
-        .contains("native concurrent execution is not supported"));
+    assert!(e.message.contains("native_memory is required"));
     assert!(report(&p, "inspect_together")
         .unwrap_err()
         .message
@@ -134,7 +132,10 @@ fn concurrent_contract_gates_unknown_phases_and_all_backend_artifacts() {
         .contains("concurrent phase analysis unavailable"));
     let mut p = p;
     if let Item::Execution(e) = p.items.last_mut().unwrap() {
-        e.mode = ExecutionMode::Concurrent { max_in_flight: 0 };
+        e.mode = ExecutionMode::Concurrent {
+            max_in_flight: 0,
+            native_memory: None,
+        };
     }
     assert!(verify(&p)[0].message.contains("max_in_flight"));
 }

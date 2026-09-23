@@ -458,11 +458,13 @@ pub(super) fn compile_phase(
     Ok((code, report))
 }
 
-fn compile_with_layout(
-    p: &Program,
-    name: &str,
-    end: EntryEnd,
-) -> Result<(Vec<u8>, Option<crate::stack_budget::Report>), NativeError> {
+struct Body {
+    code: Vec<u8>,
+    nslots: usize,
+    numeric: bool,
+    expression_stack_bytes: usize,
+}
+fn prepare_body(p: &Program, name: &str) -> Result<Body, NativeError> {
     if let Some(e) = crate::bounds::verify(p).first() {
         return Err(NativeError {
             message: e.to_string(),
@@ -482,7 +484,9 @@ fn compile_with_layout(
             _ => None,
         })
         .collect();
-    let r = rules[name];
+    let r = *rules.get(name).ok_or_else(|| NativeError {
+        message: format!("unknown rule {name}"),
+    })?;
     let concept = p
         .items
         .iter()
@@ -584,6 +588,74 @@ fn compile_with_layout(
             message: "strict overflow frame exceeds 2 MiB".into(),
         });
     }
+    Ok(Body {
+        code: emit.code,
+        nslots,
+        numeric,
+        expression_stack_bytes: emit.expression_stack_bytes,
+    })
+}
+
+pub(super) fn worker_body(
+    p: &Program,
+    rule: &Rule,
+    concept: &Concept,
+) -> Result<super::concurrent::Body, NativeError> {
+    let body = prepare_body(p, &rule.name)?;
+    if !body.numeric || !matches!(rule.output_ty, Type::Number | Type::Bool) {
+        return Err(NativeError {
+            message: "concurrent numeric phase requires checked scalar output".into(),
+        });
+    }
+    let frame_bytes = (concept.fields.len() + body.nslots + 1) * 8;
+    let mut code = body.code;
+    super::concurrent::scalar_output(&mut code, &rule.output_ty, -(frame_bytes as i32));
+    Ok(super::concurrent::Body {
+        code,
+        frame_bytes,
+        stack_bytes: frame_bytes
+            + body
+                .expression_stack_bytes
+                .max(if rule.output_ty == Type::Number {
+                    24
+                } else {
+                    0
+                })
+                .max(
+                    if concept
+                        .fields
+                        .iter()
+                        .any(|f| text_field_declared_max(f).is_some())
+                    {
+                        8
+                    } else {
+                        0
+                    },
+                ),
+        output_bytes: if rule.output_ty == Type::Bool { 6 } else { 21 },
+    })
+}
+
+fn compile_with_layout(
+    p: &Program,
+    name: &str,
+    end: EntryEnd,
+) -> Result<(Vec<u8>, Option<crate::stack_budget::Report>), NativeError> {
+    let body = prepare_body(p, name)?;
+    let r = p
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Rule(r) if r.name == name => Some(r),
+            _ => None,
+        })
+        .unwrap();
+    let concept = iter_all_concepts(&p.items)
+        .find(|c| r.input_ty == Type::Named(c.name.clone()))
+        .unwrap();
+    let nslots = body.nslots;
+    let numeric = body.numeric;
+    let mut emit = body;
     let mut frame = r.clone();
     frame.output_ty = Type::Number;
     frame.logic.value = Expr::Number(0);
@@ -609,7 +681,8 @@ fn compile_with_layout(
         .bindings
         .iter()
         .enumerate()
-        .all(|(i, (name, _))| ctx.binding_offsets[name.as_str()] == emit.slots[i]));
+        .all(|(i, (name, _))| ctx.binding_offsets[name.as_str()]
+            == -(((concept.fields.len() + i) as i32 + 1) * 8)));
     code.append(&mut emit.code);
     emit.code = code;
     if r.output_ty == crate::bounds::result_type() {

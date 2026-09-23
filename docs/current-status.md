@@ -51,9 +51,12 @@ An interpreter reference now supports [bounded concurrent waves](concurrent-exec
 `mode: concurrent` requires `max_in_flight`, orders publication and joins all
 admitted workers before a new wave or return. Rendezvous channels prevent queues
 of completed batches. This bounds admission/pending result counts, not host memory.
-Native output and aggregate stack reporting explicitly refuse this mode until
-their scheduler/worker layout exists. Further native composition must cover
-storage retained between phases and work admitted concurrently.
+The [native implementation](native-concurrent-executions.md) now uses Linux
+threads with a fixed `native_memory` reservation and `--memory-report`. The
+calculation covers reusable worker stacks, control/results, padding and guard
+pages, with ordered publication and full joins. Initial argv/code/kernel storage
+are excluded; this is not RSS or total process memory. Native stdin/stream,
+service scopes and retained state between phases remain separate work.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.

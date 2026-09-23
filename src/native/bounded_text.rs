@@ -979,3 +979,101 @@ pub(super) fn compile_phase(
     };
     Ok((code, report))
 }
+
+// Reuse the checked fragment and its placed lifetimes for a concurrent lane.
+// Only the final consumer changes: serialization into a fixed owned buffer.
+pub(super) fn worker_body(
+    p: &Program,
+    rule: &Rule,
+    concept: &Concept,
+) -> Result<super::concurrent::Body, NativeError> {
+    use super::concurrent::{literal, output_end, output_start, scalar_output};
+    let fragment = prepare(p, &rule.name, concept)?;
+    let frame_bytes = (concept.fields.len() + 1) * 8;
+    let sticky = -(frame_bytes as i32);
+    let offsets = concept
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), -((i as i32 + 1) * 8)))
+        .collect();
+    let mut code = Vec::new();
+    fragment.begin(&mut code, &offsets, &HashMap::new())?;
+    let mut scratch = 0;
+    fn value(code: &mut Vec<u8>, v: &Value, scratch: &mut usize) -> Result<usize, NativeError> {
+        match v {
+            Value::Number(slot) => {
+                load(code, 0, *slot);
+                emit_itoa_to_buffer(code);
+                *scratch = 24;
+                Ok(20)
+            }
+            Value::Text { ptr, len, cap } => {
+                load(code, 6, *ptr);
+                load(code, 1, *len);
+                code.extend_from_slice(&[0x48, 0x89, 0xdf, 0xfc, 0xf3, 0xa4, 0x48, 0x89, 0xfb]);
+                Ok(*cap)
+            }
+            _ => Err(error(
+                "concurrent record output supports number/text fields",
+            )),
+        }
+    }
+    let output_bytes = if let Value::Bool(slot) = fragment.result {
+        load(&mut code, 0, slot);
+        Fragment::end(&mut code);
+        scalar_output(&mut code, &Type::Bool, sticky);
+        6
+    } else {
+        output_start(&mut code);
+        let capacity = if let Value::Record(name, fields) = &fragment.result {
+            let output = iter_all_concepts(&p.items)
+                .find(|c| c.name == *name)
+                .ok_or_else(|| error("missing output concept"))?;
+            let mut capacity: usize = 2; // closing brace and newline
+            for (index, field) in output.fields.iter().enumerate() {
+                let v = &fields
+                    .iter()
+                    .find(|(n, _)| *n == field.name)
+                    .ok_or_else(|| error("missing output field"))?
+                    .1;
+                let prefix = format!(
+                    "{}\"{}\":{}",
+                    if index == 0 { "{" } else { "," },
+                    field.name,
+                    if field.ty == Type::Text { "\"" } else { "" }
+                );
+                literal(&mut code, prefix.as_bytes());
+                let n = value(&mut code, v, &mut scratch)?;
+                capacity = capacity
+                    .checked_add(prefix.len())
+                    .and_then(|v| v.checked_add(n))
+                    .ok_or_else(|| error("output capacity overflow"))?;
+                if field.ty == Type::Text {
+                    literal(&mut code, b"\"");
+                    capacity = capacity
+                        .checked_add(1)
+                        .ok_or_else(|| error("output capacity overflow"))?;
+                }
+            }
+            literal(&mut code, b"}\n");
+            capacity
+        } else {
+            let capacity = value(&mut code, &fragment.result, &mut scratch)?
+                .checked_add(1)
+                .ok_or_else(|| error("output capacity overflow"))?;
+            literal(&mut code, b"\n");
+            capacity
+        };
+        output_end(&mut code);
+        Fragment::end(&mut code);
+        capacity
+    };
+    Ok(super::concurrent::Body {
+        code,
+        frame_bytes,
+        output_bytes,
+        stack_bytes: frame_bytes
+            + 8usize.max(16 + fragment.frame_bytes + fragment.expression_stack_bytes.max(scratch)),
+    })
+}

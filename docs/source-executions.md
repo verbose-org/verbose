@@ -26,7 +26,9 @@ All seven fields/attributes are required and may occur once. Unknown fields,
 duplicate fields and unsupported mode/policy values refuse. This page describes
 `mode: sequential` with `on_failure: stop`. The separate
 [concurrent reference contract](concurrent-executions.md) requires `max_in_flight`
-instead of `native_stack`; sequential mode refuses `max_in_flight`. `@source` must resolve
+instead of `native_stack`, plus an optional `native_memory` ceiling required for
+[native concurrency](native-concurrent-executions.md). Sequential mode refuses
+both concurrent resource fields. `@source` must resolve
 to an existing intention line; imported executions have their source references
 rewritten like imported rules. An intention must be nonempty.
 
@@ -182,10 +184,11 @@ Reports for ordinary rules and explicit comma-separated selections are unchanged
 | WASM | Programs declaring executions explicitly refused before artifact creation |
 | Self-hosted diagnostics / raw x86 / ELF | Top-level execution declarations explicitly refused before output; ordinary identifiers, literals and comments remain controls |
 
-This native slice establishes a named scope for sequential work. The interpreter
-also supports [bounded concurrent waves](concurrent-executions.md), with native
-scheduling and its memory budget still explicitly refused. Cross-phase retained
-values and whole-service memory need further lifetime/transport contracts. Batch processing
+This page establishes a named scope for sequential work. The separate
+[concurrent contract](concurrent-executions.md) now runs in the interpreter and
+[native threads with a checked reservation](native-concurrent-executions.md).
+Cross-phase retained values and whole-service memory need further
+lifetime/transport contracts. Batch processing
 and compiler passes are applications of this source contract; HTTP remains an
 integration case for later transport-aware execution scopes.
 

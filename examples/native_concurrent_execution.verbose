@@ -1,0 +1,12 @@
+@verbose 0.1.0
+use "sequential_stack.verbose"
+
+execution inspect_native
+  @intention: "Evaluate independent analyses with bounded admission and ordered output"
+  @source: native_concurrent_execution.intent:1
+  input: Reading
+  mode: concurrent
+  phases: [clamp, nonnegative, label]
+  on_failure: stop
+  max_in_flight: 2
+  native_memory: 20480

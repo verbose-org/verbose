@@ -34,10 +34,13 @@ Original-AST interpretation supplies a differential reference for their phase
 order, output values and failure policy; it does not extend `native_stack` to
 interpreter allocations or prove compiler correctness.
 `mode: concurrent` instead requires `max_in_flight`, enforced by scoped admission
-waves in the interpreter reference. It refuses a native stack ceiling or report
-until the scheduler/worker layout exists. Ordered publication and full joining
-give the concurrency count an explicit lifetime; it is not a process-memory bound.
-See [concurrent executions](concurrent-executions.md).
+waves in the interpreter and native runtime. Ordered publication and full joining
+give the concurrency count an explicit lifetime. Optional `native_memory` is a
+checked ceiling on the native fixed reservation; it is required for native
+emission and inspected through `--memory-report`. Worker stacks, output/control,
+padding and guards are included; argv/code/kernel storage and interpreter memory
+are excluded. See [concurrent executions](concurrent-executions.md) and
+[the native budget](native-concurrent-executions.md).
 
 ### Text output capacity
 

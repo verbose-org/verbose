@@ -3,8 +3,9 @@
 Design fixed on 2026-09-23, before implementation; the interpreter reference is
 now implemented. This slice gives pure source
 executions an admission/lifetime contract and an executable interpreter reference.
-Native scheduling and its memory layout are a separate slice: no aggregate native
-budget may be accepted or reported for this mode until that layout exists.
+The [native follow-up](native-concurrent-executions.md) implements Linux x86-64
+threads and a fixed checked reservation. This page defines the shared semantics
+and interpreter storage; native memory has its own scope and report.
 
 ## Source contract
 
@@ -21,7 +22,10 @@ execution inspect_together
 
 The existing six common execution fields/attributes remain mandatory and unique.
 Concurrent mode requires `max_in_flight` in 1..64 and refuses `native_stack`.
-Sequential mode keeps its required `native_stack` and refuses `max_in_flight`.
+Its optional `native_memory` ceiling enables native emission; without it the
+interpreter remains usable and `--memory-report` can calculate the reservation.
+Sequential mode keeps its required `native_stack` and refuses `max_in_flight`
+and `native_memory`.
 Names, source references, input concepts, 2..64 phases, repeated names and pure
 acyclic numeric/bounded-text restrictions retain their checks. Effects, services,
 recursion, nested executions and unknown phase analysis refuse. Every declaration
@@ -102,12 +106,12 @@ release their owners early. No detached task or user-visible pointer is exposed.
 
 ## Backend boundary and validation
 
-| Path | First-slice contract |
+| Path | Current support |
 |---|---|
 | Rust parser/verifier | Closed modes, admission count, phase types/purity/bounds and all declarations checked |
 | Interpreter | Concurrent waves, ordered native-style/JSON events, bounded pending results, cancellation and join |
-| Native execution entry | Explicit refusal before writing an artifact |
-| `--stack-report` on concurrent execution | Explicit refusal; no invented aggregate stack estimate |
+| Native execution entry | Linux x86-64 argv threads; requires checked `native_memory` |
+| `--stack-report` on concurrent execution | Explicit refusal; use `--memory-report` for the fixed reservation |
 | Explicit standalone rule or sequential execution | Existing behavior and budgets, even with an unselected valid concurrent declaration |
 | WASM and self-hosted diagnostics/raw/ELF | Existing source-execution refusal |
 
@@ -123,6 +127,6 @@ Existing native corpus bytes must remain unchanged. Run serialized tests, CLI
 checks, bootstrap and CIDX checks before delivery.
 
 This is a reusable execution contract for batch analyses or compiler checks.
-HTTP remains an integration case for a later transport-aware scope. Native work
-must account for scheduler storage, worker stacks, retained results, publication
-buffers, admission failure and cleanup before offering a complete memory budget.
+HTTP remains an integration case for a later transport-aware scope. The native
+reservation includes scheduler storage, worker stacks, pending output and guards;
+it excludes initial input/code/kernel storage and is not a whole-process bound.

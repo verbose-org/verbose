@@ -1,6 +1,6 @@
 # Native bounded concurrent executions
 
-Design fixed before implementation, 2026-09-23. This extends the shipped
+Design fixed before implementation, 2026-09-23; now implemented. This extends the shipped
 [interpreter reference](concurrent-executions.md) to Linux x86-64 argv entries.
 The reference's consecutive waves, ordered publication, sticky boolean failure,
 partial-admission failure and complete joining remain the observable contract.
@@ -35,6 +35,30 @@ unknown layouts refuse. Keep existing independent rule budgets checked against
 their original standalone argv layouts. The report exposes both logical storage
 and page reservation, including per-phase and per-lane calculations.
 
+## Running the example
+
+[`native_concurrent_execution.verbose`](../examples/native_concurrent_execution.verbose)
+adds `native_memory: 20480` to the reading analyses:
+
+```sh
+target/release/verbosec examples/native_concurrent_execution.verbose --memory-report --json
+target/release/verbosec examples/native_concurrent_execution.verbose --native /tmp/readings
+/tmp/readings a 2 b 1000
+```
+
+It prints `2`, `100`, `true`, `true`, `a:2`, `b:1000` on separate lines,
+with status 0. The reservation is 4096 bytes for control/results plus two lanes
+of 4096 stack bytes and 4096 inaccessible guard bytes: 20480 bytes. The report
+also exposes the smaller actual stack bounds and output capacities; reserved
+pages and logical live storage are distinct. A 20479-byte declaration refuses;
+a larger sufficient ceiling changes no native bytes.
+
+The CLI report and native concurrent emission use the same original-source
+lowering. Numeric simplification remains inside the checked numeric emitter.
+Standalone/sequential optimization paths are unchanged. New code is checked by
+following both branch arms and skipping embedded literals through their jumps;
+this is an instruction-boundary check, not a formal proof of the native runtime.
+
 ## Threads, ownership and registers
 
 The emitted binary uses raw Linux `clone` with shared VM, file descriptors and
@@ -64,12 +88,14 @@ capacity plus newline; flat record capacities include names, punctuation and eac
 number/text field. NUL in result text is data. Native argv cannot carry NUL input.
 The new worker parser checks complete decimal i64s and incomplete records for
 all phase types; older standalone/sequential text argv parsing is unchanged.
+Empty input and input/kernel failures return status 1 without native contextual
+stderr diagnostics; the interpreter retains its explanatory error messages.
 
 ## Rendezvous and cleanup
 
 Each lane has an aligned 32-bit state word: EMPTY, READY, DONE, ERROR or CANCEL.
-Only the worker fills its buffer. Publishing READY uses an atomic exchange after
-the bytes and length are stored. The coordinator reads that buffer only after
+Only the worker fills its buffer. Publishing READY uses an atomic compare-and-exchange from EMPTY after
+the bytes and length are stored; a prior CANCEL wins. The coordinator reads that buffer only after
 observing READY, writes it completely (retrying EINTR and advancing short writes),
 then exchanges EMPTY and wakes the worker. The worker waits for EMPTY before
 evaluating its next record. This deliberately tighter backpressure still satisfies

@@ -205,19 +205,19 @@ Concurrent execution follow-up (2026-09-23): [bounded concurrent phases](docs/co
 implements the previously fixed design: consecutive admission waves, deterministic
 publication, cooperative cancellation and complete joining. The interpreter uses
 scoped host threads and rendezvous channels with checked `max_in_flight`; it bounds
-admission/pending result counts, not host memory. Native output and aggregate stack
-reports explicitly refuse this mode until the complete scheduler/worker layout
-exists. Sequential contracts and emitted bytes remain independent.
+admission/pending result counts, not host memory. The native follow-up below now
+supplies its separate fixed reservation. Sequential contracts and emitted bytes
+remain independent.
 
-## Dev workflow (cidx + branch-protected main)
-
-Native concurrency design (2026-09-23, before implementation):
-[native concurrent executions](docs/native-concurrent-executions.md) specifies
+Native concurrency follow-up (2026-09-23, design committed before implementation):
+[native concurrent executions](docs/native-concurrent-executions.md) implements
 fixed reusable worker lanes, raw Linux threads, ordered rendezvous publication,
 complete joining and a checked `native_memory` reservation. The separate memory
 report includes control words, result capacities, worker stacks, page padding and
 guards; it excludes kernel/initial input/code storage and makes no RSS claim.
 The shipped interpreter remains the semantic reference.
+
+## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.
 

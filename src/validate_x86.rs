@@ -173,8 +173,8 @@ pub(crate) fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize
                 i += modrm_length(code, i)?;
                 return Some(i - pos);
             }
-            // IMUL r, r/m
-            0xAF => {
+            // IMUL and CMPXCHG r/m, r (including LOCK for publication).
+            0xAF | 0xB1 => {
                 i += modrm_length(code, i)?;
                 return Some(i - pos);
             }
@@ -292,8 +292,8 @@ pub(crate) fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize
             i += modrm_length(code, i)?;
             Some(i - pos)
         }
-        // MOV r/m, r (89)
-        0x89 => {
+        // MOV r/m, r (89); XCHG r/m, r (87, implicitly locked in memory).
+        0x89 | 0x87 => {
             i += modrm_length(code, i)?;
             Some(i - pos)
         }

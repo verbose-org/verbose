@@ -276,8 +276,8 @@ class ConcurrentExecutionCLI(unittest.TestCase):
     def test_concurrent_native_reports_and_artifacts_refuse_explicitly(self):
         artifact = self.base / "existing"
         artifact.write_bytes(b"preserve")
-        for flags, expected in [(["--native", artifact], b"native concurrent execution is not supported"),
-                                (["--native", artifact, "--run", "inspect_readings"], b"native concurrent execution is not supported"),
+        for flags, expected in [(["--native", artifact], b"native_memory is required"),
+                                (["--native", artifact, "--run", "inspect_readings"], b"native_memory is required"),
                                 (["--stack-report", "--json"], b"no native stack report"),
                                 (["--wasm", artifact], b"source execution")]:
             out = self.run_compiler(*flags)
@@ -310,6 +310,83 @@ class ConcurrentExecutionCLI(unittest.TestCase):
 
     def test_concurrent_records_retain_typed_json_values(self):
         SourceExecutionCLI.test_interpreted_execution_records_keep_typed_values_in_json(self)
+
+
+class NativeConcurrentExecutionCLI(unittest.TestCase):
+    setUp = ConcurrentExecutionCLI.setUp
+    run_compiler = SourceExecutionCLI.run_compiler
+    interpret = SourceExecutionCLI.interpret
+
+    def test_memory_report_exact_budget_and_unchanged_generous_budget(self):
+        out = self.run_compiler("--memory-report", "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, b""))
+        report = json.loads(out.stdout)
+        self.assertEqual(report["scope"], "concurrent_execution_reservation")
+        self.assertEqual(report["reserved_bytes"], 20480)
+        self.assertIsNone(report["declared_bytes"])
+        self.assertEqual(report["coordinator_stack_bytes"], 0)
+        self.assertEqual(len(report["lanes"]), 2)
+        self.assertEqual(report["lanes"][0]["stack_bound_bytes"], report["phases"][2]["stack_bound_bytes"])
+        paths = [self.base / "exact", self.base / "generous"]
+        for budget, path in zip([20480, 20481], paths):
+            self.source.write_text(self.original + f"  native_memory: {budget}\n")
+            out = self.run_compiler("--native", path)
+            self.assertEqual((out.returncode, out.stderr), (0, b""))
+            text = self.run_compiler("--memory-report")
+            self.assertIn(b"reserved virtual address bytes", text.stdout)
+        self.assertEqual(paths[0].read_bytes(), paths[1].read_bytes())
+        artifact = self.base / "preserve"
+        artifact.write_bytes(b"preserve")
+        invalid = self.original.split("execution inspect_readings", 1)[1] + "  native_memory: 20479\n"
+        self.source.write_text(self.original + "\nexecution unused" + invalid)
+        for flags in [["--native", artifact, "--run", "clamp"], ["--memory-report", "--json"],
+                      ["--run", "inspect_readings", "--input", "missing.json"]]:
+            out = self.run_compiler(*flags)
+            self.assertEqual((out.returncode, out.stdout), (1, b""))
+            self.assertIn(b"20480 bytes exceeds declared 20479", out.stderr)
+            self.assertNotIn(b"cannot read", out.stderr)
+            self.assertEqual(artifact.read_bytes(), b"preserve")
+
+    def test_native_concurrent_matches_original_interpretation(self):
+        path = self.base / "native"
+        for limit in [1, 2, 64]:
+            self.source.write_text(self.original.replace("max_in_flight: 2", f"max_in_flight: {limit}") + "  native_memory: 1000000\n")
+            out = self.run_compiler("--native", path)
+            self.assertEqual((out.returncode, out.stderr), (0, b""))
+            for rows in [[dict(title="café", value=2), dict(title="x", value=1000)],
+                         [dict(title="", value=-2**63), dict(title="🚀", value=2**63-1)],
+                         [dict(title="x", value=2), dict(title="y", value=-1), dict(title="z", value=3)]]:
+                interpreted = self.interpret(rows)
+                native = subprocess.run([str(path), *[v for r in rows for v in [r["title"], str(r["value"])]]],
+                                        capture_output=True, timeout=5)
+                self.assertEqual((native.returncode, native.stdout, native.stderr),
+                                 (interpreted.returncode, interpreted.stdout, interpreted.stderr))
+        self.source.write_text(self.original + "  native_memory: 20480\n")
+        for flag in ["--stdin", "--stdin-raw", "--stream"]:
+            before = path.read_bytes()
+            out = self.run_compiler("--native", path, flag)
+            self.assertEqual(out.returncode, 1)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_memory_field_and_analysis_flags_are_closed(self):
+        for line in ["native_memory: 0", "native_memory: -1", "native_memory: 268435457",
+                     "native_memory: 20480\n  native_memory: 20480"]:
+            self.source.write_text(self.original + f"  {line}\n")
+            out = self.run_compiler("--memory-report", "--json")
+            self.assertNotEqual(out.returncode, 0)
+            self.assertEqual(out.stdout, b"")
+        self.source.write_text(self.sequential + "  native_memory: 20480\n")
+        out = self.run_compiler()
+        self.assertIn(b"sequential execution does not accept native_memory", out.stderr)
+        self.source.write_text(self.original)
+        for flags in [["--stack-report"], ["--input", "missing.json"], ["--native", self.base / "absent"],
+                      ["--wasm", self.base / "absent"], ["--stdin"], ["--stream"], ["--benchmark"]]:
+            out = self.run_compiler("--memory-report", *flags)
+            self.assertEqual((out.returncode, out.stdout), (2, b""))
+        self.assertFalse((self.base / "absent").exists())
+        self.source.write_text(self.sequential)
+        out = self.run_compiler("--memory-report", "--json")
+        self.assertIn(b"requires a concurrent execution", out.stderr)
 
 
 class NativeStackCLI(StackCLIBase):
