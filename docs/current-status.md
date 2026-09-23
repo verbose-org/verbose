@@ -47,8 +47,13 @@ AST on JSON records, with matching phase order and boolean failure policy.
 Results stream as native-style output or typed JSON events; its host memory
 remains outside the native budget. This supplies a reference for optimized
 native execution without extending the declared phase subset.
-Further composition must cover storage retained between phases and work admitted
-concurrently.
+An interpreter reference now supports [bounded concurrent waves](concurrent-executions.md):
+`mode: concurrent` requires `max_in_flight`, orders publication and joins all
+admitted workers before a new wave or return. Rendezvous channels prevent queues
+of completed batches. This bounds admission/pending result counts, not host memory.
+Native output and aggregate stack reporting explicitly refuse this mode until
+their scheduler/worker layout exists. Further native composition must cover
+storage retained between phases and work admitted concurrently.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.

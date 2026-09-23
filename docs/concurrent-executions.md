@@ -1,6 +1,7 @@
 # Bounded concurrent execution phases
 
-Design fixed on 2026-09-23, before implementation. This slice gives pure source
+Design fixed on 2026-09-23, before implementation; the interpreter reference is
+now implemented. This slice gives pure source
 executions an admission/lifetime contract and an executable interpreter reference.
 Native scheduling and its memory layout are a separate slice: no aggregate native
 budget may be accepted or reported for this mode until that layout exists.
@@ -26,6 +27,17 @@ acyclic numeric/bounded-text restrictions retain their checks. Effects, services
 recursion, nested executions and unknown phase analysis refuse. Every declaration
 is checked, including unselected ones. Existing independent rule stack contracts
 keep their native argv meaning.
+
+Run the [complete example](../examples/concurrent_execution.verbose) with the
+existing [reading batch](../examples/execution_stack.json):
+
+```sh
+target/release/verbosec examples/concurrent_execution.verbose \
+  --run inspect_together --input examples/execution_stack.json --json
+```
+
+Plain and JSON output use the existing [execution output formats](source-executions.md#interpreter-reference).
+JSON phase indices retain declaration order, including repeated rule names.
 
 ## Admission and observable order
 
@@ -99,12 +111,13 @@ release their owners early. No detached task or user-visible pointer is exposed.
 | Explicit standalone rule or sequential execution | Existing behavior and budgets, even with an unselected valid concurrent declaration |
 | WASM and self-hosted diagnostics/raw/ELF | Existing source-execution refusal |
 
-Validation must force out-of-order completion and check ordered publication;
-prove admission and wave barriers with synchronization, not timing benchmarks;
-exercise false results, input/evaluation/output errors, worker failure, blocked
-sender cancellation and complete joining. Compare the concurrent reference with
-sequential interpretation and the corresponding native sequential selection.
-Cover counts 1/2/64, repeated phases, i64/UTF-8/text and flat records, parser/type
+Tests force out-of-order completion and check ordered publication, and prove
+admission/wave barriers with synchronization rather than timing benchmarks.
+They exercise false results, input/evaluation/output errors, worker failure,
+partial admission failure, blocked sender cancellation and complete joining.
+Differentials compare the concurrent reference with sequential interpretation
+and the corresponding native sequential selection. They cover counts 1/2/64,
+repeated phases, i64/UTF-8/text and flat records, parser/type
 refusals, unselected invalid declarations, and zero-artifact backend refusals.
 Existing native corpus bytes must remain unchanged. Run serialized tests, CLI
 checks, bootstrap and CIDX checks before delivery.

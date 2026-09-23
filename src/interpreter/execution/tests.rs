@@ -212,7 +212,7 @@ fn execution_interpreter_runtime_and_writer_failures_preserve_only_completed_pre
     // Invalid unselected declarations cannot be bypassed through the reference.
     let mut p = p;
     if let Item::Execution(e) = p.items.last_mut().unwrap() {
-        e.native_stack = 1;
+        e.mode = ExecutionMode::Sequential { native_stack: 1 };
     }
     assert!(run(
         &p,
@@ -284,4 +284,92 @@ fn execution_json_output_escapes_all_controls_and_orders_record_fields() {
     );
     let decoded = input::parse(&format!("[{}]", String::from_utf8(out).unwrap())).unwrap();
     assert_eq!(Value::Record(decoded[0].clone()), value);
+}
+
+#[test]
+fn concurrent_reference_matches_sequential_and_native_across_admission_limits() {
+    let dir = std::env::temp_dir().join(format!(
+        "verbose-concurrent-reference-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("run");
+    for phases in [
+        "clamp, nonnegative, label".to_string(),
+        "label, clamp, label".into(),
+        vec!["label"; 64].join(", "),
+    ] {
+        let sequential = program(RULES, &phases);
+        native::compile_native(
+            &optimizer::optimize_program(&sequential).0,
+            "inspect_readings",
+            binary.to_str().unwrap(),
+            false,
+            false,
+        )
+        .unwrap();
+        for limit in [1, 2, 64] {
+            let mut concurrent = sequential.clone();
+            if let Item::Execution(e) = concurrent.items.last_mut().unwrap() {
+                e.mode = ExecutionMode::Concurrent {
+                    max_in_flight: limit,
+                };
+            }
+            for rows in [
+                vec![("café", 2), ("b", 1000)],
+                vec![("", i64::MIN), ("🚀", i64::MAX)],
+                vec![("a,{\"}\\\n", -1), ("next", 1)],
+            ] {
+                let data = records(&rows, "value");
+                let out = Command::new(&binary)
+                    .args(
+                        rows.iter()
+                            .flat_map(|(s, n)| [s.to_string(), n.to_string()]),
+                    )
+                    .output()
+                    .unwrap();
+                let mut raw = Vec::new();
+                let status =
+                    write(&concurrent, "inspect_readings", &data, false, &mut raw).unwrap();
+                assert_eq!(
+                    (out.status.code(), out.stdout, out.stderr),
+                    (Some(status), raw, vec![])
+                );
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                assert_eq!(
+                    write(&sequential, "inspect_readings", &data, true, &mut a).unwrap(),
+                    write(&concurrent, "inspect_readings", &data, true, &mut b).unwrap()
+                );
+                assert_eq!(a, b);
+            }
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_records_and_runtime_errors_keep_the_sequential_prefix() {
+    let sequential = program(
+        include_str!("../../../examples/retained_stack.verbose"),
+        "prepare, analyze, prepare",
+    );
+    let mut concurrent = sequential.clone();
+    if let Item::Execution(e) = concurrent.items.last_mut().unwrap() {
+        e.mode = ExecutionMode::Concurrent { max_in_flight: 2 };
+    }
+    for data in [
+        records(&[("café", i64::MIN), ("a\"\n\\", i64::MAX)], "code"),
+        records(&[("ok", 0), ("too long!", 1), ("later", 2)], "code"),
+        vec![],
+    ] {
+        for json in [false, true] {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let ra =
+                write(&sequential, "inspect_readings", &data, json, &mut a).map_err(|e| e.message);
+            let rb =
+                write(&concurrent, "inspect_readings", &data, json, &mut b).map_err(|e| e.message);
+            assert_eq!(ra, rb);
+            assert_eq!(a, b);
+        }
+    }
 }

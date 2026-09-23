@@ -280,6 +280,8 @@ rule calculate
     let cases = [
         (control.to_string(), false),
         (format!("{control}{declaration}"), true),
+        (format!("{control}{}", declaration.replace("mode: sequential", "mode: concurrent")
+            .replace("native_stack: 192", "max_in_flight: 2")), true),
         (
             format!(
                 "@verbose 0.1.0\n{declaration}{}",

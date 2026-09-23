@@ -1,5 +1,11 @@
 # Verbose examples
 
+[`concurrent_execution.verbose`](concurrent_execution.verbose) declares pure
+analyses in bounded concurrent waves with ordered output. Run it through the
+interpreter with [`execution_stack.json`](execution_stack.json); native output
+and aggregate stack reporting explicitly refuse this first reference slice.
+See [concurrent execution contracts](../docs/concurrent-executions.md).
+
 [`execution_stack.verbose`](execution_stack.verbose) declares a complete ordered
 batch entry with an input concept, stop-on-failure policy and aggregate stack
 ceiling. It imports the existing numeric/text reading rules and runs natively

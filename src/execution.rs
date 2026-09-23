@@ -1,5 +1,5 @@
-//! Source-owned execution order and a checked aggregate native argv budget.
-//! Uses the existing sequential lowering; declarations add no native code.
+//! Source-owned execution order and resource contracts for pure phases.
+//! Only sequential executions have an implemented native layout and budget.
 use crate::ast::*;
 use crate::native::{self, NativeError};
 use crate::stack_budget::SequenceReport;
@@ -71,8 +71,16 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
         if !(2..=64).contains(&e.phases.len()) {
             errors.push(error(e, "expected 2..=64 phases"));
         }
-        if !(1..=2_097_152).contains(&e.native_stack) {
-            errors.push(error(e, "native_stack must be in [1, 2097152] bytes"));
+        match e.mode {
+            ExecutionMode::Sequential { native_stack }
+                if !(1..=2_097_152).contains(&native_stack) =>
+            {
+                errors.push(error(e, "native_stack must be in [1, 2097152] bytes"))
+            }
+            ExecutionMode::Concurrent { max_in_flight } if !(1..=64).contains(&max_in_flight) => {
+                errors.push(error(e, "max_in_flight must be in [1, 64]"))
+            }
+            _ => {}
         }
         if !iter_all_concepts(&p.items).any(|c| c.name == e.input) {
             errors.push(error(e, format!("unknown input concept '{}'", e.input)));
@@ -94,17 +102,20 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
 }
 
 fn report_one(p: &Program, e: &Execution) -> Result<Report, VerifyError> {
+    let ExecutionMode::Sequential { native_stack } = e.mode else {
+        return Err(error(e, "concurrent execution has no native stack report: scheduler and worker layout are not supported yet"));
+    };
     let names: Vec<_> = e.phases.iter().map(String::as_str).collect();
     let sequence = native::sequential_stack_report(p, &names)
         .map_err(|cause| error(e, format!("stack analysis unavailable: {}", cause.message)))?;
-    if sequence.stack_bound_bytes() > e.native_stack as usize {
+    if sequence.stack_bound_bytes() > native_stack as usize {
         return Err(error(e, format!("native argv stack bound {} bytes exceeds declared {} bytes (maximum of sequential phases)",
-            sequence.stack_bound_bytes(), e.native_stack)));
+            sequence.stack_bound_bytes(), native_stack)));
     }
     Ok(Report {
         name: e.name.clone(),
         input: e.input.clone(),
-        declared_bytes: e.native_stack,
+        declared_bytes: native_stack,
         sequence,
     })
 }
@@ -120,7 +131,23 @@ pub fn verify(p: &Program) -> Vec<VerifyError> {
     p.items
         .iter()
         .filter_map(|i| match i {
-            Item::Execution(e) => report_one(p, e).err(),
+            Item::Execution(e) => match e.mode {
+                ExecutionMode::Sequential { .. } => report_one(p, e).err(),
+                ExecutionMode::Concurrent { .. } => {
+                    // Reuse the existing closed pure phase analysis, including
+                    // source rule budgets and the code/expansion limits. The
+                    // sequential layout is NOT a concurrent memory estimate.
+                    let names: Vec<_> = e.phases.iter().map(String::as_str).collect();
+                    native::sequential_stack_report(p, &names)
+                        .err()
+                        .map(|cause| {
+                            error(
+                                e,
+                                format!("concurrent phase analysis unavailable: {}", cause.message),
+                            )
+                        })
+                }
+            },
             _ => None,
         })
         .collect()
@@ -175,5 +202,7 @@ impl std::fmt::Display for Report {
     }
 }
 
+#[cfg(test)]
+mod concurrent_tests;
 #[cfg(test)]
 mod tests;

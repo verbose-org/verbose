@@ -18,7 +18,7 @@ pub enum Item {
     Rule(Rule),
     Reaction(Reaction),
     Service(Service),
-    /// Source-selected sequential argv phases and their aggregate stack ceiling.
+    /// Source-selected execution phases and their checked resource contract.
     Execution(Execution),
     /// Phase 9 slice 1: a top-level read-only file resource. The path is a
     /// compile-time literal; the file contents are read at runtime by any
@@ -67,8 +67,8 @@ pub enum Item {
     ConceptGroup(ConceptGroup),
 }
 
-/// Closed first slice: sequential phases over the original input batch, stopping
-/// on the first nonzero phase status. No values survive between phases.
+/// Pure phases over the original input batch with ordered publication and stop
+/// on failure. Concurrent reference execution has a separate admission contract.
 #[derive(Debug, Clone)]
 pub struct Execution {
     pub name: String,
@@ -76,7 +76,13 @@ pub struct Execution {
     pub source: SourceRef,
     pub input: String,
     pub phases: Vec<String>,
-    pub native_stack: u32,
+    pub mode: ExecutionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Sequential { native_stack: u32 },
+    Concurrent { max_in_flight: u32 },
 }
 
 /// Phase B slice 1: a mutually-recursive concept group.

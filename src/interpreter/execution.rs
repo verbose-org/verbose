@@ -1,5 +1,6 @@
 //! Reference semantics for source executions, using the original verified AST.
 //! Input records remain available to every phase; completed results are streamed.
+mod concurrent;
 mod input;
 #[cfg(test)]
 mod tests;
@@ -24,10 +25,11 @@ pub(super) fn run(
     records: &[HashMap<String, Value>],
     mut emit: impl FnMut(usize, &Rule, usize, Value) -> Result<(), RuntimeError>,
 ) -> Result<i32, RuntimeError> {
-    // This is the same closed contract as native execution, not a second,
-    // more permissive interpretation of source budgets or unsupported phases.
-    crate::execution::report(program, name).map_err(|e| error(e.message))?;
-    let execution = crate::execution::find(program, name).unwrap();
+    // Check every source contract. Concurrent admission retains the same closed
+    // pure phase subset; only sequential mode has an aggregate native budget.
+    crate::execution::gate(program).map_err(|e| error(e.message))?;
+    let execution = crate::execution::find(program, name)
+        .ok_or_else(|| error(format!("no execution named '{name}'")))?;
     if records.is_empty() {
         return Err(error(format!(
             "execution '{name}': expected at least one input record"
@@ -42,6 +44,21 @@ pub(super) fn run(
         })
         .collect();
     let concepts: Vec<_> = iter_all_concepts(&program.items).collect();
+    if let ExecutionMode::Concurrent { max_in_flight } = execution.mode {
+        let phases: Vec<_> = execution
+            .phases
+            .iter()
+            .map(|name| *rules.iter().find(|r| r.name == *name).unwrap())
+            .collect();
+        return concurrent::run(
+            name,
+            &phases,
+            records,
+            max_in_flight as usize,
+            &|rule, record| eval_rule(rule, &rules, &concepts, &[], record),
+            &mut emit,
+        );
+    }
     for (phase, rule_name) in execution.phases.iter().enumerate() {
         let rule = rules.iter().find(|r| r.name == *rule_name).unwrap();
         let mut failed = false;
