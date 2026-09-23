@@ -208,6 +208,9 @@ pub fn compile_wasm(
     rule_name: &str,
     output_path: &str,
 ) -> Result<(), WasmError> {
+    if crate::execution::has_declarations(program) {
+        return Err(WasmError { message: "WASM does not support source execution contracts".into() });
+    }
     if crate::stack_budget::has_declarations(program) {
         return Err(WasmError { message: "WASM does not support proofs.native_stack (native x86-64 argv stack contract)".into() });
     }

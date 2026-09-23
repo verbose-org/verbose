@@ -38,6 +38,10 @@ memory; see [native stack budgets](native-stack-budget.md).
 The first [composition across execution phases](sequential-stack-budgets.md)
 runs checked rules sequentially over the same argv batch. It releases each frame
 before the next phase, combines bounds by maximum and stops after a failed phase.
+A [source `execution`](source-executions.md) now names this scope and declares
+its input, ordered phases, failure policy and aggregate stack ceiling. Every
+declaration is checked, including unselected entries; native code stays identical
+to the corresponding explicit phase selection.
 Further composition must cover storage retained between phases and work admitted
 concurrently.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete

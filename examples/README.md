@@ -1,5 +1,10 @@
 # Verbose examples
 
+[`execution_stack.verbose`](execution_stack.verbose) declares a complete ordered
+batch entry with an input concept, stop-on-failure policy and aggregate stack
+ceiling. It imports the existing numeric/text reading rules; see the
+[source execution contract](../docs/source-executions.md).
+
 [`bounded_text.verbose`](bounded_text.verbose) declares and composes checked text
 result capacities across pure rules. [`http_bounded_text.verbose`](http_bounded_text.verbose)
 uses the same contract in an HTTP formatter.

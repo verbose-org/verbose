@@ -1770,3 +1770,4 @@ tab-indented line or a raw-newline string each contribute >= 1. A harness runs
 this BEFORE trusting count_rules: nonzero means the stream carries error
 tokens and downstream structural counts describe a damaged stream. NATIVE-ONLY
 for newline-bearing sources, same as count_rules.
+Refuse top-level execution contracts in diagnostics and raw/ELF output until source phase composition is implemented.

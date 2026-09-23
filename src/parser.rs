@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::ast::*;
 use crate::lexer::{Token, TokenKind};
+mod execution;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -109,6 +110,8 @@ impl Parser {
                 items.push(Item::Reaction(self.parse_reaction()?));
             } else if self.check_ident("service") {
                 items.push(Item::Service(self.parse_service()?));
+            } else if self.check_ident("execution") {
+                items.push(Item::Execution(self.parse_execution()?));
             } else if self.check_ident("resource") {
                 items.push(Item::Resource(self.parse_resource()?));
             } else if self.check_ident("connection") {
@@ -116,7 +119,7 @@ impl Parser {
             } else if self.check_ident("entropy") {
                 items.push(Item::Entropy(self.parse_entropy()?));
             } else {
-                return Err(self.error("expected 'concept', 'concept_group', 'rule', 'reaction', 'service', 'resource', 'connection', or 'entropy' at top level"));
+                return Err(self.error("expected 'concept', 'concept_group', 'rule', 'reaction', 'service', 'execution', 'resource', 'connection', or 'entropy' at top level"));
             }
         }
         Ok(Program { version, uses, items })

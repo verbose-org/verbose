@@ -70,6 +70,7 @@ independent of external state.
 | `connection` | Declared outbound connection and response bound |
 | `entropy` | Declared random-byte source |
 | `service` | Protocol, listener, handler, and optional logging/concurrency/state |
+| `execution` | Ordered native argv phases over one input concept, stop policy and checked aggregate stack ceiling |
 
 The native backend implements the machinery behind these constructs: parsing,
 buffers, syscalls, and calling conventions. Those implementation details are part

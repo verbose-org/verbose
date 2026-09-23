@@ -155,6 +155,7 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
                 Item::Reaction(rx) => Item::Reaction(rx.clone()),
                 // Services carry no logic expression to optimise; pass through.
                 Item::Service(s) => Item::Service(s.clone()),
+                Item::Execution(e) => Item::Execution(e.clone()),
                 // Phase 9 slice 1 stub: resources are declarative (no logic
                 // expression to optimise); pass through unchanged.
                 Item::Resource(r) => Item::Resource(r.clone()),

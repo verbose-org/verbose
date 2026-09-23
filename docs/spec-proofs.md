@@ -24,6 +24,13 @@ Unknown layouts and excessive use fail before artifact emission. It does not
 bound interpreter or whole-process memory. See the
 [contract and support matrix](native-stack-budget.md).
 
+An `execution` supplies a semantic entry specification: input concept, ordered
+phases, sequential mode, stop policy and a separate aggregate `native_stack`
+ceiling. These select the emitted phase sequence and its structured exits;
+the compiler verifies the input agreement and actual maximum stack bound.
+They are not advisory claims about an arbitrary scheduler. See
+[source executions](source-executions.md).
+
 ### Text output capacity
 
 `output: out : text [..N]` is a checked semantic claim about the maximum byte
