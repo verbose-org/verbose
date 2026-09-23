@@ -165,6 +165,14 @@ phases, preserving standalone boolean/input failure behavior. Source budgets
 keep their standalone meaning; retained state and concurrency are later scopes.
 See [sequential stack budgets](docs/sequential-stack-budgets.md).
 
+Source-level retained-value composition: ordinary lets and checked flat records
+already transfer values within one invocation. `--stack-report` now exposes
+possible pre-existing buffer capacities at each expanded call's entry and return,
+after alias/branch last-use propagation. These are included in the placed frame,
+never added to it; exclusive owners can share addresses. The enclosing
+`native_stack` declaration checks the full composition. No emitted instructions
+change. See [retained call storage](docs/retained-call-storage.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

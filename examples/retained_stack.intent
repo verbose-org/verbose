@@ -1,0 +1,6 @@
+Receive a named signed reading for a staged analysis.
+Carry a bounded title and a normalized code between stages.
+Produce the checked record consumed by subsequent stages.
+Forward the record without copying its immutable title buffer.
+Consume the prepared record inside the enclosing checked budget.
+Retain the prepared title through rendering and use it again afterward.

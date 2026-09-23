@@ -102,6 +102,12 @@ concurrent execution and passing results between phases need separate compositio
 rules. WASM and self-hosted emission keep their current capability refusals.
 Existing unchecked multi-rule emission retains its own behavior and restrictions.
 
+To pass a prepared value to its consumer within one entry, use ordinary lets,
+records and calls. The enclosing rule's budget covers their overlapping storage;
+the [retained-call report](retained-call-storage.md) explains which caller buffer
+capacities survive each expanded call. These details also appear inside each
+selected phase's report. Independent batch execution keeps its existing meaning.
+
 Rust tests compare reports with independent instruction-level stack tracking
 through nested frame restoration, branches and record loops. They cover repeated
 phases, exact/minus-one budgets, the 64-phase limit, record/text/numeric consumers,

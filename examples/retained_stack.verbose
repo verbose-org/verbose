@@ -1,0 +1,84 @@
+@verbose 0.1.0
+
+concept Reading
+  @intention: "Receive a named signed reading for a staged analysis"
+  @source: retained_stack.intent:1
+  fields:
+    title : text [..8]
+    code : number
+
+concept Prepared
+  @intention: "Carry a bounded title and a normalized code between stages"
+  @source: retained_stack.intent:2
+  fields:
+    title : text [..10]
+    code : number [-1, 1]
+
+rule prepare
+  @intention: "Produce the checked record consumed by subsequent stages"
+  @source: retained_stack.intent:3
+  input:
+    reading : Reading
+  output:
+    out : Prepared
+  logic:
+    out = Prepared { title: concat("[", reading.title, "]"), code: if reading.code > 0 then 1 else -1 }
+  proofs:
+    purity:
+      reads: [reading.title, reading.code]
+      calls: []
+    termination:
+      bound: 20
+
+rule forward
+  @intention: "Forward the record without copying its immutable title buffer"
+  @source: retained_stack.intent:4
+  input:
+    item : Prepared
+  output:
+    out : Prepared
+  logic:
+    out = item
+  proofs:
+    purity:
+      reads: [item]
+      calls: []
+    termination:
+      bound: 1
+
+rule render
+  @intention: "Consume the prepared record inside the enclosing checked budget"
+  @source: retained_stack.intent:5
+  input:
+    record : Prepared
+  output:
+    out : text [..31]
+  logic:
+    out = concat(record.title, ":", record.code)
+  proofs:
+    purity:
+      reads: [record.title, record.code]
+      calls: []
+    termination:
+      bound: 10
+
+rule analyze
+  @intention: "Retain the prepared title through rendering and use it again afterward"
+  @source: retained_stack.intent:6
+  input:
+    input : Reading
+  output:
+    out : text [..44]
+  logic:
+    let staged = prepare(input)
+    let preserved = forward(staged)
+    let staged = Prepared { title: "shadow", code: 0 }
+    let rendered = render(preserved)
+    out = concat(rendered, " | ", preserved.title)
+  proofs:
+    native_stack: 408
+    purity:
+      reads: [input]
+      calls: [prepare, forward, render]
+    termination:
+      bound: 40

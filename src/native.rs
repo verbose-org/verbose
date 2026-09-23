@@ -56879,7 +56879,8 @@ rule pick
         // native_stack adds a target-specific stack contract, refused by gen0.
         // text_stack extends that same refusal to bounded text entry budgets.
         // sequential_stack uses the same source contracts, still refused by gen0.
-        const EXPECTED_TOTAL: usize = 183;
+        // retained_stack explains existing checked record transfer lifetimes.
+        const EXPECTED_TOTAL: usize = 184;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

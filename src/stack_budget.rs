@@ -4,11 +4,22 @@ use crate::ast::*;
 use crate::verifier::VerifyError;
 use std::collections::BTreeSet;
 
+/// Possible pre-existing owners, counted once each, not extra frame storage.
+/// Exclusive alternatives can share addresses while both contribute capacity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallStorage {
+    pub callee: String,
+    pub parent_call: Option<usize>,
+    pub live_caller_buffer_capacity_bytes: usize,
+    pub retained_caller_buffer_capacity_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextFrame {
     pub slot_bytes: usize,
     pub buffer_bytes: usize,
     pub saved_register_bytes: usize,
+    pub calls: Vec<CallStorage>,
 }
 
 impl TextFrame {
@@ -52,8 +63,15 @@ impl Report {
     pub fn json(&self) -> String {
         // Additive schema-1 extension. Numeric reports remain byte-identical.
         let text_frame = self.text_frame.as_ref().map_or(String::new(), |t| {
-            format!(",\"text_frame\":{{\"frame_bytes\":{},\"slot_bytes\":{},\"buffer_bytes\":{},\"saved_register_bytes\":{}}}",
-                t.frame_bytes(), t.slot_bytes, t.buffer_bytes, t.saved_register_bytes)
+            let calls = if t.calls.is_empty() { String::new() } else {
+                format!(",\"calls\":[{}]", t.calls.iter().enumerate().map(|(index, c)| format!(
+                    "{{\"call\":{},\"callee\":\"{}\",\"parent_call\":{},\"live_caller_buffer_capacity_bytes\":{},\"retained_caller_buffer_capacity_bytes\":{}}}",
+                    index + 1, c.callee, c.parent_call.map_or("null".into(), |n| n.to_string()),
+                    c.live_caller_buffer_capacity_bytes, c.retained_caller_buffer_capacity_bytes
+                )).collect::<Vec<_>>().join(","))
+            };
+            format!(",\"text_frame\":{{\"frame_bytes\":{},\"slot_bytes\":{},\"buffer_bytes\":{},\"saved_register_bytes\":{}{}}}",
+                t.frame_bytes(), t.slot_bytes, t.buffer_bytes, t.saved_register_bytes, calls)
         });
         // Rule names are lexer identifiers, never arbitrary source strings.
         format!(
@@ -104,6 +122,14 @@ impl std::fmt::Display for Report {
             writeln!(f, "  nested text frame: {} bytes (slots {}, placed buffers {}), saved registers {} bytes",
                 t.frame_bytes(), t.slot_bytes, t.buffer_bytes, t.saved_register_bytes)?;
             writeln!(f, "  peak = entry frame + saved base pointer + max(input, nested frame + saved registers + max(expression, output))")?;
+            if !t.calls.is_empty() {
+                writeln!(f, "  expanded calls: possible caller buffer capacities (included in the frame, not additive)")?;
+                for (index, call) in t.calls.iter().enumerate() {
+                    writeln!(f, "    call {} '{}', parent {}: {} bytes live at entry, {} retained through return",
+                        index + 1, call.callee, call.parent_call.map_or("entry".into(), |n| n.to_string()),
+                        call.live_caller_buffer_capacity_bytes, call.retained_caller_buffer_capacity_bytes)?;
+                }
+            }
         }
         write!(
             f,

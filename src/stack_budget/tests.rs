@@ -4,6 +4,7 @@ use std::{collections::HashMap, fs, path::Path, process::Command};
 
 mod text;
 mod sequential;
+mod retention;
 
 fn source(expr: &str, bindings: &str) -> String {
     let reads = if expr.contains("i.y") || bindings.contains("i.y") {

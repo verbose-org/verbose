@@ -44,6 +44,13 @@ A batch-processing pipeline, a compiler pass and an HTTP request provide concret
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.
 
+Within one entry, ordinary lets and checked flat-record calls already pass
+values between stages. The [retained-call report](retained-call-storage.md) now
+details possible caller buffer capacities live at each call and retained through
+return. The enclosing `native_stack` ceiling covers the complete shared frame;
+alias names do not duplicate buffers. This exposes existing lifetimes without
+changing emitted code or the separate argv selections' independent batch meaning.
+
 ## Concrete continuation
 
 The original thought experiment was an LLM producing a binary directly. The

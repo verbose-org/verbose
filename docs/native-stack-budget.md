@@ -174,6 +174,13 @@ JSON stdout is one object, without verification banners. Schema version 1 report
 Its `frame_bytes` equals `slot_bytes + buffer_bytes`. Consumers computing a total
 must include this nested frame as shown above, or use `stack_bound_bytes` directly.
 
+When a bounded text entry expands calls, `text_frame.calls` also explains the
+possible caller buffer capacities live at entry and retained through return.
+Aliases count one owner; exclusive owners can share placed storage. These
+capacities are already covered by the frame and must not be added to it. See
+[retained call storage](retained-call-storage.md) for the schema and a record
+passed between stages under a checked 408-byte enclosing budget.
+
 This is a calculated upper bound, not a runtime measurement. Branches are
 conservatively included unless verified lowering removes them. Compiler changes
 may alter placement and make a formerly sufficient declaration fail; rebuild and
