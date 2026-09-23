@@ -203,6 +203,13 @@ remain unchanged. See [the reference](docs/source-executions.md#interpreter-refe
 
 ## Dev workflow (cidx + branch-protected main)
 
+Next execution design (2026-09-23): [bounded concurrent phases](docs/concurrent-executions.md)
+fixes consecutive admission waves, deterministic result publication, cooperative
+cancellation and complete joining before native scheduling. The first slice is
+an interpreter reference with rendezvous channels and a checked `max_in_flight`;
+native output/reports must refuse this mode until its complete layout exists.
+Sequential contracts and emitted bytes remain independent.
+
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.
 
 Install cidx once:
