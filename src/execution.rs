@@ -5,6 +5,7 @@ use crate::native::{self, NativeError};
 use crate::stack_budget::SequenceReport;
 use crate::verifier::VerifyError;
 use std::collections::HashSet;
+pub mod workload;
 
 pub fn find<'a>(p: &'a Program, name: &str) -> Option<&'a Execution> {
     p.items.iter().find_map(|item| match item {
@@ -67,6 +68,9 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
         }
         if e.intention.trim().is_empty() {
             errors.push(error(e, "@intention must not be empty"));
+        }
+        if let Some(message) = e.workload.as_ref().and_then(workload::shape_error) {
+            errors.push(error(e, message));
         }
         if !(2..=64).contains(&e.phases.len()) {
             errors.push(error(e, "expected 2..=64 phases"));

@@ -12,6 +12,7 @@ impl Parser {
             (None, None, None, None, None);
         let (mut mode, mut max_in_flight, mut native_memory) = (None, None, None);
         let mut result_batch = None;
+        let mut workload = None;
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let attribute = self.peek_attribute_name();
             let key = if let Some(attr) = &attribute {
@@ -25,6 +26,10 @@ impl Parser {
             }
             self.expect_kind(TokenKind::Colon)?;
             match key.as_str() {
+                "workload" => {
+                    workload = Some(self.parse_workload()?);
+                    continue; // The nested block consumes its final newline/dedent.
+                }
                 "@intention" => intention = Some(self.expect_string()?),
                 "@source" => source = Some(self.parse_source_ref()?),
                 "input" => input = Some(self.expect_ident_any()?),
@@ -138,6 +143,7 @@ impl Parser {
             input: input.unwrap(),
             phases: phases.unwrap(),
             mode,
+            workload,
         })
     }
 }

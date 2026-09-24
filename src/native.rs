@@ -56925,7 +56925,9 @@ rule pick
         // execution_stack adds a source execution, explicitly refused by gen0.
         // concurrent_execution is also refused by the declaration-scoped gate.
         // native_concurrent_execution keeps the same self-hosted execution refusal.
-        const EXPECTED_TOTAL: usize = 187;
+        // workload_profile adds predicted cases to that same refused scope.
+        // gen0 returns 1 with zero output; EXPECTED_ACCEPTED stays 93.
+        const EXPECTED_TOTAL: usize = 188;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

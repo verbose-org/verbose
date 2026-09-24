@@ -3,6 +3,7 @@ use std::fmt;
 use crate::ast::*;
 use crate::lexer::{Token, TokenKind};
 mod execution;
+mod workload;
 
 #[derive(Debug)]
 pub struct ParseError {

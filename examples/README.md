@@ -1,5 +1,11 @@
 # Verbose examples
 
+[`workload_profile.verbose`](workload_profile.verbose) declares predicted small
+and bulk reading batches, relative frequencies and desired elapsed times.
+Use `--workload-report` (optionally `--json`) to inspect weighted counts and its
+20 KiB native reservation. The profile changes no emitted instructions and
+accepts the same runtime inputs; see [workload profiles](../docs/workload-profiles.md).
+
 [`concurrent_execution.verbose`](concurrent_execution.verbose) declares pure
 analyses in bounded concurrent waves with ordered output. Run it through the
 interpreter with [`execution_stack.json`](execution_stack.json).

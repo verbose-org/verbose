@@ -33,6 +33,12 @@ Sequential mode refuses all three concurrent resource fields. `@source` must res
 to an existing intention line; imported executions have their source references
 rewritten like imported rules. An intention must be nonempty.
 
+Either mode may additionally declare an optional
+[predicted `workload` block](workload-profiles.md) for experiment planning.
+It is checked in every declaration and reported with `--workload-report`;
+its expected batch sizes and desired latencies do not restrict runtime inputs
+or change the execution's native resource budget.
+
 An execution name cannot collide with another declaration or primitive. Its
 phases are 2 through 64 rule names, all with the declared input concept.
 Repeated names are allowed and preserve their positions. Executions are entry
