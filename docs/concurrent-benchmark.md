@@ -4,6 +4,9 @@ This compares sequential and concurrent execution of the same pure phases in
 the Linux x86-64 native backend. It measures the implementation added in PR #248,
 not HTTP throughput, a general thread pool, or a comparison with C/Apache.
 The compiler and emitted runtime are unchanged by this measurement work.
+The subsequent [bounded result-batch comparison](concurrent-result-batches.md#recorded-result-2026-09-24)
+measures the follow-up implementation against fresh sequential/default controls;
+the historical observations below remain unchanged.
 
 ## Recorded result, 2026-09-23
 

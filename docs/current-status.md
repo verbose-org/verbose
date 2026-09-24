@@ -59,8 +59,11 @@ pages, with ordered publication and full joins. Initial argv/code/kernel storage
 are excluded; this is not RSS or total process memory. Native stdin/stream,
 service scopes and retained state between phases remain separate work.
 The [initial measurements](concurrent-benchmark.md) show substantial per-result
-synchronization costs; declared result batches amortize exchanges within the
-same ordered publication contract. Bounded memory is not a speedup guarantee.
+synchronization costs. The [batch comparison](concurrent-result-batches.md#recorded-result-2026-09-24)
+measures reduced exchanges within the same ordered publication contract: on the
+recorded machine, batches of 32 retain the same reserved pages in the fixtures;
+batches of 128 beat sequential elapsed time on the long synthetic compute case.
+Cheap phases remain faster sequentially. Bounded memory is not a speedup guarantee.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.

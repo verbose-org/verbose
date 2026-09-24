@@ -1,0 +1,245 @@
+{
+  "revision": "04af394b3b6ce7db04a77fe9f5d26f3d3cf5b907",
+  "strace": "strace -- version 6.8",
+  "scope": "Separate traced executions, not timing samples; syscall summary stdout is /dev/null, fault injection stdout is captured",
+  "runs": [
+    {
+      "mode": "sequential",
+      "records": 256,
+      "binary_sha256": "630f146308e9e1e4dc0d2f150c0bd313e2742e7e8071573c3ef136d0a3818b42",
+      "calls": {
+        "write": {
+          "calls": 1024,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "total": {
+          "calls": 1025,
+          "errors": 0
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.013246          12      1024           write\n  0.00    0.000000           0         1           execve\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.013246          12      1025           total\n"
+    },
+    {
+      "mode": "batch_1",
+      "records": 256,
+      "binary_sha256": "ef6299956b0cf4f92f38eaec8a1bdb47f6579eeada0ee703cdfc0acbd6f0a682",
+      "calls": {
+        "futex": {
+          "calls": 3614,
+          "errors": 994
+        },
+        "write": {
+          "calls": 1024,
+          "errors": 0
+        },
+        "munmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mprotect": {
+          "calls": 5,
+          "errors": 0
+        },
+        "rt_sigprocmask": {
+          "calls": 1,
+          "errors": 0
+        },
+        "clone": {
+          "calls": 4,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "total": {
+          "calls": 4651,
+          "errors": 994
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n 95.04    0.181659          50      3614       994 futex\n  4.93    0.009423           9      1024           write\n  0.03    0.000057          57         1           munmap\n  0.00    0.000000           0         1           mmap\n  0.00    0.000000           0         5           mprotect\n  0.00    0.000000           0         1           rt_sigprocmask\n  0.00    0.000000           0         4           clone\n  0.00    0.000000           0         1           execve\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.191139          41      4651       994 total\n"
+    },
+    {
+      "mode": "batch_8",
+      "records": 256,
+      "binary_sha256": "15993137da03eea8a364fad1dece96c179c06e890bef479c1f5e2fbfe54870e2",
+      "calls": {
+        "futex": {
+          "calls": 487,
+          "errors": 126
+        },
+        "write": {
+          "calls": 128,
+          "errors": 0
+        },
+        "munmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mprotect": {
+          "calls": 5,
+          "errors": 0
+        },
+        "rt_sigprocmask": {
+          "calls": 1,
+          "errors": 0
+        },
+        "clone": {
+          "calls": 4,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "total": {
+          "calls": 628,
+          "errors": 126
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n 95.54    0.021194          43       487       126 futex\n  4.23    0.000938           7       128           write\n  0.23    0.000051          51         1           munmap\n  0.00    0.000000           0         1           mmap\n  0.00    0.000000           0         5           mprotect\n  0.00    0.000000           0         1           rt_sigprocmask\n  0.00    0.000000           0         4           clone\n  0.00    0.000000           0         1           execve\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.022183          35       628       126 total\n"
+    },
+    {
+      "mode": "batch_32",
+      "records": 256,
+      "binary_sha256": "e53a030ecee070239983615e879c22b5c82cbb295d1e41f298b12c10d4d29ed9",
+      "calls": {
+        "write": {
+          "calls": 32,
+          "errors": 0
+        },
+        "mmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mprotect": {
+          "calls": 5,
+          "errors": 0
+        },
+        "munmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "rt_sigprocmask": {
+          "calls": 1,
+          "errors": 0
+        },
+        "clone": {
+          "calls": 4,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "futex": {
+          "calls": 129,
+          "errors": 31
+        },
+        "total": {
+          "calls": 174,
+          "errors": 31
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n  0.00    0.000000           0        32           write\n  0.00    0.000000           0         1           mmap\n  0.00    0.000000           0         5           mprotect\n  0.00    0.000000           0         1           munmap\n  0.00    0.000000           0         1           rt_sigprocmask\n  0.00    0.000000           0         4           clone\n  0.00    0.000000           0         1           execve\n  0.00    0.000000           0       129        31 futex\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.000000           0       174        31 total\n"
+    },
+    {
+      "mode": "batch_128",
+      "records": 256,
+      "binary_sha256": "1900bde4d09b7f6cea009dbf5254cc8edc6771e0cb615520daa0fe77037c6285",
+      "calls": {
+        "write": {
+          "calls": 8,
+          "errors": 0
+        },
+        "mmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mprotect": {
+          "calls": 5,
+          "errors": 0
+        },
+        "munmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "rt_sigprocmask": {
+          "calls": 1,
+          "errors": 0
+        },
+        "clone": {
+          "calls": 4,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "futex": {
+          "calls": 36,
+          "errors": 8
+        },
+        "total": {
+          "calls": 57,
+          "errors": 8
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n  0.00    0.000000           0         8           write\n  0.00    0.000000           0         1           mmap\n  0.00    0.000000           0         5           mprotect\n  0.00    0.000000           0         1           munmap\n  0.00    0.000000           0         1           rt_sigprocmask\n  0.00    0.000000           0         4           clone\n  0.00    0.000000           0         1           execve\n  0.00    0.000000           0        36         8 futex\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.000000           0        57         8 total\n"
+    }
+  ],
+  "fault_injections": [
+    {
+      "specification": "write:error=EINTR:when=1",
+      "mode": "batch_32",
+      "records": 33,
+      "status": 0,
+      "stdout_bytes": 529,
+      "stdout_sha256": "a0be4be0cef29b4175b49cc195a2d6beec6cc6287a2b46d851e97f482536a93c",
+      "stderr_bytes": 0,
+      "passed": true
+    },
+    {
+      "specification": "write:retval=1:when=1",
+      "mode": "batch_32",
+      "records": 33,
+      "status": 0,
+      "stdout_bytes": 528,
+      "stdout_sha256": "817913c642de8f323dcadcfe4a4ea09eda85734ffed6feb1595f99554903245a",
+      "stderr_bytes": 0,
+      "passed": true
+    },
+    {
+      "specification": "write:error=EIO:when=2",
+      "mode": "batch_32",
+      "records": 33,
+      "status": 1,
+      "stdout_bytes": 129,
+      "stdout_sha256": "c19de2fe5b56b1ceedb536f60e72a8bc60ddac2fcc19f7f5ee7c9c049b658f1b",
+      "stderr_bytes": 0,
+      "passed": true
+    },
+    {
+      "specification": "write:retval=0:when=1",
+      "mode": "batch_32",
+      "records": 33,
+      "status": 1,
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_bytes": 0,
+      "passed": true
+    }
+  ]
+}

@@ -131,3 +131,108 @@ No sample is discarded. Batching also reduces the number of stdout writes;
 these measurements compare complete implementations, not isolated futex costs.
 The new benchmark and its helper hashes are recorded; the historical report
 and original benchmark remain available.
+
+## Recorded result, 2026-09-24
+
+[Raw timing/memory report](measurements/concurrent-result-batches-2026-09-24.json),
+[separate syscall and fault-injection observations](measurements/result-batch-syscalls-2026-09-24.json).
+Measured release compiler/source revision:
+`04af394b3b6ce7db04a77fe9f5d26f3d3cf5b907`, with a clean tree.
+The Ryzen 7 5800X was exposed through WSL2, kernel
+`5.15.153.1-microsoft-standard-WSL2`, with affinity to guest CPUs 2, 4, 6, 8
+(reported distinct cores). The user reported no significant host load; no
+build, test suite or other benchmark overlapped timing. Guest affinity does
+not control the Windows scheduler.
+
+Median elapsed milliseconds, 30 samples per cell. Concurrent limit is 4;
+the three-phase readings workload admits three workers.
+
+| Workload | Records | Sequential | Batch 1 | Batch 8 | Batch 32 | Batch 128 |
+|---|---:|---:|---:|---:|---:|---:|
+| Light arithmetic | 1 | 0.252 | 0.625 | 0.619 | 0.616 | 0.608 |
+| Light arithmetic | 4096 | 3.502 | 796.025 | 94.502 | 25.166 | 7.596 |
+| Compute | 1 | 1.848 | 1.556 | 1.680 | 1.617 | 1.579 |
+| Compute | 256 | 63.099 | 112.013 | 68.609 | 59.261 | 41.180 |
+| Mixed readings | 4096 | 4.810 | 593.977 | 72.693 | 20.900 | 7.330 |
+
+Batch 32 reduces elapsed time relative to batch 1 by about 31 times for the
+long light workload and 29 times for readings (reciprocals of paired median
+ratios 0.03187 and 0.03485). Both remain slower than sequential execution,
+including at batch 128. Compute/256 at batch 128 has a paired median ratio
+of 0.6463 to sequential, about 35% less elapsed time on this synthetic workload.
+Ordering still constrains overlap: a worker fills one batch, then waits until
+earlier phases have published their complete input lot.
+
+For the three long workloads in table order, elapsed MADs for sequential /
+batch 1 / batch 32 / batch 128 are respectively 0.165 / 7.677 / 0.865 / 0.311 ms,
+1.415 / 0.857 / 0.734 / 1.048 ms, and 0.144 / 6.800 / 0.606 / 0.228 ms.
+The one-record compute case is much more dispersed: sequential spans
+0.894–3.111 ms with MAD 0.400 ms, and batch 128 spans 0.948–3.721 ms with
+MAD 0.260 ms. It does not establish a reliable small-job speedup. Timings
+include launch, parsing, serialization and output, not only arithmetic.
+
+Median aggregate CPU time on compute/256 is 65.175 ms sequentially and
+69.017 ms with batch 128: the wall-time improvement is not a reduction in
+CPU consumption. For light/4096, CPU time falls from 662.651 ms at batch 1
+to 20.688 ms at batch 32 (sequential: 3.278 ms); voluntary context switches
+fall from 32637.5 to 1022.5 (sequential: 1). CPU capacity/probe checks flag
+no inconsistency but do not calibrate WSL accounting. No energy claim is made.
+
+### Memory and syscall observations
+
+Three separate snapshots per workload/mode confirm the compiler's reservation:
+
+| Workload / admitted workers | Batches | Reserved mapping | Resident within mapping | Guards, all nonresident |
+|---|---|---:|---:|---:|
+| Numeric / 4 | 1, 8, 32 | 36 KiB | 20 KiB | 16 KiB |
+| Numeric / 4 | 128 | 44 KiB | 28 KiB | 16 KiB |
+| Mixed readings / 3 | 1, 8, 32 | 28 KiB | 16 KiB | 12 KiB |
+| Mixed readings / 3 | 128 | 32 KiB | 20 KiB | 12 KiB |
+
+Batch 32 uses capacity within already reserved pages in these examples;
+this is not guaranteed for other result types or lane counts. The shipped
+two-worker example also retains its 20 KiB reservation at batch 32.
+Light/4096 whole-process snapshot RSS is 60–68 KiB sequentially, 84–88 KiB
+at batch 32 and 92–96 KiB at batch 128. These are blocked-output snapshots,
+not peak RSS. The compute fixture expands to roughly 3 MB of code; its
+828 KiB sequential versus roughly 3060 KiB concurrent snapshot largely
+reflects which phases' instruction pages have already been touched. Code,
+initial input and kernel storage remain outside `native_memory`. Neither
+cache residency nor cache hits were measured.
+
+Separate traced light/256 executions produce 1024 results:
+
+| Mode | Writes | Futex calls |
+|---|---:|---:|
+| Sequential | 1024 | 0 |
+| Batch 1 | 1024 | 3614 |
+| Batch 8 | 128 | 487 |
+| Batch 32 | 32 | 129 |
+| Batch 128 | 8 | 36 |
+
+Every concurrent trace has one `mmap`, five `mprotect`, one `munmap` and four
+`clone` calls. Batching changes neither per-record allocation nor admission
+count. Futex counts depend on scheduling, which tracing itself changes;
+traced elapsed times are not performance samples. Reported futex errors include
+normal races. Separate batch-32 write injections verify EINTR retry, cursor
+advancement after a simulated short write, failure after a complete batch,
+and zero-write failure with cancellation. A simulated short write reports a
+byte accepted without actually writing it; its expected captured output omits
+that byte. This is a control-flow check, not an actual partial-write delivery.
+
+Validation retains 750 timed runs, 50 warmups, two clock probes and 45 memory
+snapshots, with `status: ok`, no discarded samples and no flagged CPU
+inconsistency. All 15 builds pass independent 201-record output oracles and
+seven-record original-interpreter comparisons; all 25 full timed-input checks
+pass. Six sequential/default-concurrent controls are byte-identical to the
+reference compiler. The normal serialized suite passes 835 tests, bootstrap
+26, CLI checks 33 and benchmark unit checks 6; 24 focused concurrent tests
+also pass in release mode. The archived 187-example corpus keeps identical
+acceptance/diagnostics, with all 184 accepted binaries byte-identical across
+the old and new compilers and repeated builds.
+
+These measurements support explicit bounded batching for sufficiently costly
+work. They do not select a universal batch size: larger batches increase
+storage and can delay the first visible result. Cheap phases still favor
+sequential execution here. HTTP throughput, general thread-pool behavior and
+other hardware remain separate measurements.

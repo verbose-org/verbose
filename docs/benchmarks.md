@@ -3,7 +3,8 @@
 For native HTTP services, see the separate
 [forked/pool throughput and memory baseline](http-worker-benchmarks.md).
 For pure native execution phases, see the separate
-[bounded concurrency measurements](concurrent-benchmark.md).
+[bounded concurrency measurements](concurrent-benchmark.md) and the follow-up
+[bounded result-batch comparison](concurrent-result-batches.md#recorded-result-2026-09-24).
 The separate [bounded text HTTP comparison](bounded-text-http-benchmark.md)
 measures branch-buffer reuse, distinguishing reserved frame size, sampled
 residency and observed latency/throughput.
