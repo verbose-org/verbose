@@ -1,0 +1,5 @@
+Accept order lines with explicit title, quantity and unit price limits.
+Carry a total whose range fits the next stage's public input contract.
+Compute the quantity times the unit price without i64 overflow.
+Render the title and computed total within a checked output capacity.
+Publish each final total in input order within one shared native stack budget.

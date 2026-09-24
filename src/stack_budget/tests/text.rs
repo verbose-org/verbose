@@ -15,6 +15,24 @@ fn pipeline_shared_frame_bound_matches_emitted_stack_depth() {
     }
 }
 
+#[test]
+fn record_arithmetic_stack_bound_matches_placed_operands_and_signed_instructions() {
+    for expr in [
+        "concat(i.code + 1, i.code - 1, i.code * 3)",
+        "concat(i.code / (-3), i.code % (-3))",
+        "concat(abs(i.code), min(i.code, 2), max(-i.code, -2))",
+        "concat((i.code + 1) * (i.code - 2) / 3)",
+    ] {
+        let source = text_source(expr, "").replace("code : number\n", "code : number [-100, 100]\n");
+        check_layout(parse(&source), "checked");
+    }
+    let p = parse(include_str!("../../../examples/pipeline_totals.verbose"));
+    verified(&p);
+    let crate::execution::Report::Pipeline(report) = crate::execution::report(&p, "totals").unwrap()
+        else { panic!("expected pipeline") };
+    assert_eq!(machine_stack_peak(&native_bytes(&p, "totals")[120..]), report.invocation.stack_bound_bytes());
+}
+
 fn text_source(expr: &str, bindings: &str) -> String {
     let reads = ["i.title", "i.code"]
         .into_iter()

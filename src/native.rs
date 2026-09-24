@@ -56945,8 +56945,9 @@ rule pick
         // native_concurrent_execution keeps the same self-hosted execution refusal.
         // workload_profile adds predicted cases to that same refused scope.
         // pipeline_stack adds per-record transfer, refused by the execution gate.
+        // pipeline_totals keeps that refusal for computed numeric record fields.
         // gen0 returns 1 with zero output; EXPECTED_ACCEPTED stays 93.
-        const EXPECTED_TOTAL: usize = 189;
+        const EXPECTED_TOTAL: usize = 190;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

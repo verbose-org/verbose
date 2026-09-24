@@ -446,6 +446,49 @@ impl Emit<'_> {
                 self.finish_jump(done);
                 dest
             }
+            Expr::Binary(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod), a, b) => {
+                let a = self.expr(a, env, depth + 1)?;
+                let b = self.expr(b, env, depth + 1)?;
+                // Both values stay live across RHS evaluation and until their
+                // register loads. Their proved domain excludes overflow/traps.
+                load(&mut self.code, 0, a.scalar()?);
+                load(&mut self.code, 1, b.scalar()?);
+                match op {
+                    BinOp::Add => self.code.extend_from_slice(&[0x48, 0x01, 0xc8]),
+                    BinOp::Sub => self.code.extend_from_slice(&[0x48, 0x29, 0xc8]),
+                    BinOp::Mul => self.code.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]),
+                    BinOp::Div | BinOp::Mod => {
+                        self.code.extend_from_slice(&[0x48, 0x99, 0x48, 0xf7, 0xf9]); // cqo; idiv rcx
+                        if *op == BinOp::Mod {
+                            self.code.extend_from_slice(&[0x48, 0x89, 0xd0]); // mov rax,rdx
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                self.scalar(false)?
+            }
+            Expr::Abs(e) => {
+                let value = self.expr(e, env, depth + 1)?;
+                load(&mut self.code, 0, value.scalar()?);
+                self.code.extend_from_slice(&[
+                    0x48, 0x89, 0xc1, // mov rcx,rax
+                    0x48, 0xf7, 0xd9, // neg rcx (MIN excluded by verification)
+                    0x48, 0x85, 0xc0, // test rax,rax
+                    0x48, 0x0f, 0x48, 0xc1, // cmovs rax,rcx
+                ]);
+                self.scalar(false)?
+            }
+            Expr::Min(a, b) | Expr::Max(a, b) => {
+                let a = self.expr(a, env, depth + 1)?;
+                let b = self.expr(b, env, depth + 1)?;
+                load(&mut self.code, 0, a.scalar()?);
+                load(&mut self.code, 1, b.scalar()?);
+                self.code.extend_from_slice(&[0x48, 0x39, 0xc8]); // cmp rax,rcx
+                self.code.extend_from_slice(&[
+                    0x48, 0x0f, if matches!(e, Expr::Min(..)) { 0x4f } else { 0x4c }, 0xc1,
+                ]); // signed cmovg / cmovl rax,rcx
+                self.scalar(false)?
+            }
             Expr::Binary(op, a, b) => {
                 let a = self.expr(a, env, depth + 1)?;
                 let b = self.expr(b, env, depth + 1)?;

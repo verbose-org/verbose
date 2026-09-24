@@ -67,6 +67,12 @@ Numeric local aliases and rebinding are supported. Record construction, collecti
 Results, effects, context inputs, services and reactions are refused in this slice.
 Rules disconnected from the contract retain their existing acceptance rules.
 
+The separate [bounded text/record composition subset](bounded-record-arithmetic.md)
+now supports the same numeric operators without an `overflow` annotation. It
+checks intermediate safety and field transfers using one interval per fact,
+without this scalar contract's branch narrowing or repeated-value identities.
+It still refuses optimization hints; the two analyses are not combined.
+
 Analysis is limited to 100000 expression visits, 256 expression levels and 128
 nested calls. Native call expansion is separately limited to 100000 nodes on the
 original source, before simplification, and a conservative 2 MiB frame ceiling

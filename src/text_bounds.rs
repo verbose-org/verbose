@@ -97,6 +97,11 @@ impl Value {
             Err(format!("expected {ty:?}, got {:?}", self.ty()))
         }
     }
+    fn number(&self) -> Result<(i64, i64), String> {
+        self.require(&Type::Number)?;
+        let Self::Number(lo, hi) = self else { unreachable!() };
+        Ok((*lo, *hi))
+    }
     fn capacity(&self) -> Result<Option<u64>, String> {
         match self {
             Self::Text(n) => Ok(*n),
@@ -172,6 +177,9 @@ impl Check<'_> {
         match f.ty {
             Type::Number => {
                 let (min, max) = f.range.unwrap_or((i64::MIN, i64::MAX));
+                if min > max {
+                    return Err(format!("input field '{}': invalid numeric interval [{min}, {max}]", f.name));
+                }
                 Ok(Value::Number(min, max))
             }
             Type::Text => Ok(Value::Text(
@@ -384,11 +392,28 @@ impl Check<'_> {
         let value = match e {
             Expr::Text(s) => Value::Text(Some(s.len() as u64)),
             Expr::Number(n) => Value::Number(*n, *n),
-            Expr::Neg(n) if matches!(n.as_ref(), Expr::Number(0..)) => {
-                let Expr::Number(n) = n.as_ref() else {
-                    unreachable!()
-                };
-                Value::Number(-*n, -*n)
+            Expr::Neg(n) | Expr::Abs(n) => {
+                let (lo, hi) = sub(n)?.number()?;
+                if lo == i64::MIN {
+                    return Err("numeric arithmetic: negation/abs may overflow i64 at MIN".into());
+                }
+                if matches!(e, Expr::Neg(_)) {
+                    Value::Number(-hi, -lo)
+                } else {
+                    Value::Number(
+                        if lo <= 0 && hi >= 0 { 0 } else { lo.abs().min(hi.abs()) },
+                        lo.abs().max(hi.abs()),
+                    )
+                }
+            }
+            Expr::Min(a, b) | Expr::Max(a, b) => {
+                let (lo, hi) = sub(a)?.number()?;
+                let (other_lo, other_hi) = sub(b)?.number()?;
+                if matches!(e, Expr::Min(..)) {
+                    Value::Number(lo.min(other_lo), hi.min(other_hi))
+                } else {
+                    Value::Number(lo.max(other_lo), hi.max(other_hi))
+                }
             }
             Expr::Ident(n) => env
                 .get(n)
@@ -446,7 +471,11 @@ impl Check<'_> {
                     BinOp::Gt | BinOp::Lt | BinOp::GtEq | BinOp::LtEq => {
                         a.require(&Type::Number)?; b.require(&Type::Number)?; Value::Bool
                     }
-                    _ => return Err("numeric arithmetic is outside this bounded text slice; pass or format a number directly".into()),
+                    _ => {
+                        let (lo, hi) = crate::numeric_bounds::interval_arithmetic(*op, a.number()?, b.number()?)
+                            .map_err(|e| format!("numeric arithmetic: {e}"))?;
+                        Value::Number(lo, hi)
+                    }
                 }
             }
             Expr::Not(e) => {

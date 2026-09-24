@@ -1,6 +1,7 @@
 # Proved arithmetic in bounded record composition
 
-Design recorded before implementation. The bounded text/flat-record subset and
+Design recorded before implementation; implemented as described below.
+The bounded text/flat-record subset and
 source pipelines can already carry numeric fields, compare them and format them.
 This slice lets those same compositions calculate numeric values, with every
 intermediate checked before native emission. An invoice total, normalized reading
@@ -76,10 +77,19 @@ failed obligation in an unused let or untaken branch.
 This is reusable bounded composition: ordinary checked rules, source pipelines,
 and existing bounded HTTP handler fragments use the same arithmetic analysis
 and emitter. It adds no HTTP protocol/lifecycle or whole-service memory contract.
-Existing log-expression restrictions, context/effect/recursion restrictions,
-pipeline transport refusals and workload restrictions remain in force. WASM and
+Existing HTTP response-shape and log-expression restrictions, context/effect/
+recursion restrictions, pipeline transport refusals and workload restrictions
+remain in force. WASM and
 self-hosted output continue to refuse bounded-text/pipeline declarations. The
 self-hosted compiler source need not change.
+
+| Path | Support |
+|---|---|
+| Verifier / original-AST interpreter | Checked numeric intervals within bounded composition |
+| Linux x86-64 native argv / pipeline | Signed arithmetic in the existing placed frame |
+| Existing pure bounded HTTP handler | Same checked arithmetic; existing service limits remain |
+| WASM / self-hosted compiler | Existing bounded-text/pipeline gates refuse emission |
+| Scalar `hints.overflow` | Separate richer analysis, unchanged |
 
 Validate before delivery with original-AST/native differentials over signed
 operands, i64 boundaries, division/remainder signs, min/max/abs, nested calls,
@@ -94,3 +104,30 @@ bootstrap; compare all pre-existing examples against the reference compiler.
 
 Performance measurements and clock calibration remain deferred. Static storage
 and arithmetic safety checks are the claims of this slice, not a measured gain.
+
+## Worked composition
+
+[`pipeline_totals.verbose`](../examples/pipeline_totals.verbose) multiplies a
+bounded quantity and unit price, transfers the product and borrowed title in a
+`TotalLine`, then formats only the final value. The consumer's declared total
+range is checked against the product's inferred range.
+
+```sh
+target/release/verbosec examples/pipeline_totals.verbose --native /tmp/totals
+/tmp/totals café 3 250 maximum 1000 1000000
+target/release/verbosec examples/pipeline_totals.verbose \
+  --run totals --input examples/pipeline_totals_input.json --json
+target/release/verbosec examples/pipeline_totals.verbose --stack-report --json
+```
+
+The native output is `café:750` and `maximum:1000000000`, each on its own line.
+The interpreter publishes the same two values as phase-2 `render_total` events.
+The `_input.json` fixture targets the execution's first phase; it is not input
+for the standalone `render_total` rule, which consumes an already computed total.
+The additional native entry stack bound is **208 bytes**: 64 for the outer
+input/bookkeeping frame, 8 for its saved base pointer, and 136 for the peak
+nested invocation (96 placed bytes, 16 saved register bytes and 24 numeric
+formatting scratch bytes). The placed frame contains 56 word-slot bytes and
+40 aligned text-buffer bytes. An exact 208-byte declaration passes; 207 refuses.
+Initial argv/environment, kernel storage and interpreter allocations are not
+included, and this figure makes no cache-residency or total-process-memory claim.

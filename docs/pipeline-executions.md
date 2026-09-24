@@ -34,10 +34,12 @@ results can be numbers, booleans, bounded text or supported flat records.
 
 Every phase and its transitive callees must fit the existing pure, acyclic
 bounded-text composition subset: literals, fields, aliases, conditionals,
-comparisons, length, concat, flat records and checked calls. This execution
+comparisons, length, concat, flat records and checked calls, now including
+[proved arithmetic](bounded-record-arithmetic.md). This execution
 declaration opts its composition into that strict analysis, including when no
-phase returns text. It does not admit arithmetic merely because a legacy rule
-previously accepted it. Unknown capacities, unsupported expressions, effects,
+phase returns text. Every numeric intermediate must be safe over its checked
+interval; this subset does not narrow intervals from branch conditions.
+Unknown capacities, unsupported expressions, effects,
 recursion, context inputs, hints, collections, nested records and Result values
 refuse explicitly. Original source proof checks still apply to every rule.
 

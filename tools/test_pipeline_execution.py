@@ -189,13 +189,154 @@ class PipelineCLI(unittest.TestCase):
         self.assertEqual(self.binary.read_bytes(), b"preserve")
 
     def test_unknown_analysis_is_a_source_error_before_optimization(self):
-        # Dead arithmetic would be foldable; the source contract must refuse it.
-        self.final_rule("number", "1 + 2", "")
+        # A constant overflowing intermediate must refuse before any folding.
+        self.final_rule("number", "9223372036854775807 + 1", "")
         self.binary.write_bytes(b"preserve")
         out = self.compiler("--native", self.binary)
         self.assertEqual((out.returncode, out.stdout), (1, b""))
-        self.assertIn(b"numeric arithmetic is outside", out.stderr)
+        self.assertIn(b"may overflow i64", out.stderr)
         self.assertEqual(self.binary.read_bytes(), b"preserve")
+
+
+class ArithmeticPipelineCLI(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="verbose-arithmetic-cli-")
+        self.addCleanup(self.directory.cleanup)
+        self.base = Path(self.directory.name)
+        for suffix in ["verbose", "intent"]:
+            (self.base / f"pipeline_totals.{suffix}").write_bytes(
+                (ROOT / "examples" / f"pipeline_totals.{suffix}").read_bytes())
+        self.source = self.base / "pipeline_totals.verbose"
+        self.original = self.source.read_text()
+        self.binary = self.base / "native"
+
+    def compiler(self, *args, input=None):
+        return subprocess.run([str(COMPILER), str(self.source), *map(str, args)],
+                              input=input, capture_output=True, timeout=30)
+
+    def compare(self, rows, expected, status=0):
+        compiled = self.compiler("--native", self.binary)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        interpreted = self.compiler("--run", "totals", "--stdin", input=json.dumps(rows).encode())
+        argv = [v for row in rows for v in [row["title"], str(row["quantity"]), str(row["unit_price"])]]
+        native = subprocess.run([str(self.binary), *argv], capture_output=True, timeout=5)
+        self.assertEqual((interpreted.returncode, interpreted.stdout, interpreted.stderr), (status, expected, b""))
+        self.assertEqual((native.returncode, native.stdout, native.stderr), (status, expected, b""))
+
+    def test_computed_records_publish_final_values_and_keep_exact_stack_budget(self):
+        rows = json.loads((ROOT / "examples/pipeline_totals_input.json").read_text())
+        rows.append(dict(title="é" * 8, quantity=0, unit_price=1000000))
+        self.compare(rows, "café:750\nmaximum:1000000000\néééééééé:0\n".encode())
+        events = self.compiler("--run", "totals", "--stdin", "--json", input=json.dumps(rows).encode())
+        self.assertEqual(json.loads(events.stdout), [dict(phase=2, rule="render_total", record=i,
+            value=f'{r["title"]}:{r["quantity"] * r["unit_price"]}') for i, r in enumerate(rows)])
+        original = self.binary.read_bytes()
+        report = self.compiler("--stack-report", "--json")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        bound = json.loads(report.stdout)["stack_bound_bytes"]
+        self.source.write_text(self.original.replace("native_stack: 512", f"native_stack: {bound}"))
+        self.assertEqual(self.compiler("--native", self.binary).returncode, 0)
+        self.assertEqual(original, self.binary.read_bytes())
+        self.source.write_text(self.original.replace("native_stack: 512", f"native_stack: {bound - 1}"))
+        out = self.compiler("--native", self.binary)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(b"exceeds declared", out.stderr)
+        self.assertEqual(original, self.binary.read_bytes())
+
+    def test_numeric_and_boolean_computations_need_no_text_output_annotation(self):
+        rows = [dict(title="x", quantity=n, unit_price=1) for n in [1, 0, 3]]
+        for ty, expr, expected, status in [
+            ("number", "value.total * 2 - 1", b"1\n-1\n5\n", 0),
+            ("bool", "value.total * 2 - 1 > 0", b"true\nfalse\ntrue\n", 1),
+        ]:
+            self.source.write_text(self.original.replace("text [..37]", ty)
+                .replace('concat(value.title, ":", value.total)', expr)
+                .replace("reads: [value.title, value.total]", "reads: [value.total]"))
+            self.compare(rows, expected, status)
+
+    def test_nested_call_operands_survive_expansion_and_record_transfer(self):
+        source = self.original.replace("item.quantity * item.unit_price", "quantity(item) * (price(item) + quantity(item))")
+        source = source.replace("reads: [item.quantity, item.unit_price, item.title]", "reads: [item, item.title]")
+        source = source.replace("calls: []", "calls: [quantity, price]", 1).replace("bound: 8", "bound: 100")
+        source = source.replace("total : number [0, 1000000000]", "total : number [0, 1001000000]")
+        for name, field in [("quantity", "quantity"), ("price", "unit_price")]:
+            source += f'''\nrule {name}
+  @intention: "Read a declared numeric input for composition"
+  @source: pipeline_totals.intent:3
+  input:
+    other : OrderLine
+  output:
+    out : number
+  logic:
+    out = other.{field}
+  proofs:
+    purity:
+      reads: [other.{field}]
+      calls: []
+    termination:
+      bound: 1
+'''
+        self.source.write_text(source)
+        self.compare([dict(title="nested", quantity=3, unit_price=250),
+                      dict(title="max", quantity=1000, unit_price=1000000)], b"nested:759\nmax:1001000000\n")
+
+    def test_public_callee_domain_is_checked_independently_of_constant_argument(self):
+        source = self.original.replace('concat(value.title, ":", value.total)',
+            'concat(value.title, ":", increment(TotalLine { title: value.title, total: 0 }))')
+        source = source.replace("reads: [value.title, value.total]\n      calls: []",
+            "reads: [value.title]\n      calls: [increment]")
+        source += '''
+rule increment
+  @intention: "Check an increment against the public input domain"
+  @source: pipeline_totals.intent:3
+  input:
+    another : TotalLine
+  output:
+    out : number
+  logic:
+    out = another.total + 1
+  proofs:
+    purity:
+      reads: [another.total]
+      calls: []
+    termination:
+      bound: 4
+'''
+        self.source.write_text(source)
+        self.compare([dict(title="callee", quantity=3, unit_price=250)], b"callee:1\n")
+        original = self.binary.read_bytes()
+        self.source.write_text(source.replace("total : number [0, 1000000000]",
+                                              "total : number [0, 9223372036854775807]"))
+        out = self.compiler("--native", self.binary)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(b"may overflow i64", out.stderr)
+        self.assertEqual(original, self.binary.read_bytes())
+
+    def test_input_domains_guard_arithmetic_before_later_publication(self):
+        good = dict(title="ok", quantity=3, unit_price=250)
+        self.compare([good], b"ok:750\n")
+        for field, value in [("quantity", -1), ("quantity", 1001), ("unit_price", -1),
+                             ("unit_price", 1000001), ("quantity", -2**63), ("unit_price", 2**63 - 1)]:
+            bad = dict(good, **{field: value})
+            rows = [good, bad, good]
+            a = self.compiler("--run", "totals", "--stdin", input=json.dumps(rows).encode())
+            argv = [v for r in rows for v in [r["title"], str(r["quantity"]), str(r["unit_price"])]]
+            b = subprocess.run([str(self.binary), *argv], capture_output=True, timeout=5)
+            self.assertEqual((a.returncode, a.stdout), (1, b"ok:750\n"))
+            self.assertEqual((b.returncode, b.stdout), (1, b"ok:750\n"))
+            self.assertIn(field.encode(), a.stderr)
+
+    def test_unselected_unsafe_transfer_refuses_before_input_or_artifact(self):
+        self.source.write_text(self.original.replace("total : number [0, 1000000000]",
+                                                     "total : number [0, 999999999]"))
+        self.binary.write_bytes(b"preserve")
+        for args in [["--native", self.binary, "--run", "render_total"],
+                     ["--run", "totals", "--input", "missing.json"], ["--stack-report", "--json"]]:
+            out = self.compiler(*args)
+            self.assertEqual((out.returncode, out.stdout), (1, b""))
+            self.assertIn(b"cannot prove argument range", out.stderr)
+            self.assertNotIn(b"cannot read execution input", out.stderr)
+            self.assertEqual(self.binary.read_bytes(), b"preserve")
 
 
 if __name__ == "__main__":
