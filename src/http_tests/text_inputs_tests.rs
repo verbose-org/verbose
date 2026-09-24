@@ -3,6 +3,25 @@ use super::*;
 const BODY_CONCEPT: &str = "concept BodyInput\n  @intention: \"Bound the reusable formatter input\"\n  @source: bounded_text_state.intent:2\n  fields:\n    body : text [..4096]\n\n";
 
 #[test]
+fn record_arithmetic_http_handler_formats_proved_work_with_borrowed_text() {
+    let source = include_str!("../../examples/http_bounded_text.verbose")
+        .replace("port: 18964", "port: 18960")
+        .replace("service bounded_text_http", "service bounded_http")
+        .replace("262-byte", "283-byte")
+        .replace("text [..262]", "text [..283]")
+        .replace("concat(prefix, request.path)",
+            "concat(prefix, request.path, \":\", length(request.path) * 2 - 1)");
+    for concurrency in ["", "  concurrency: forked\n", "  concurrency: pooled\n  workers: 2\n"] {
+        let server = Server::start(&format!("{source}{concurrency}"));
+        for path in ["/".to_string(), "/sample".into(), format!("/{}", "x".repeat(255))] {
+            let request = format!("GET {path} HTTP/1.0\r\n\r\n");
+            assert_eq!(server.request(request.as_bytes()), wire(format!("path: {path}:{}", path.len() * 2 - 1).as_bytes()));
+        }
+        assert!(server.request(b"invalid\r\n\r\n").is_empty());
+    }
+}
+
+#[test]
 fn text_inputs_http_state_formatter_projects_to_a_different_concept() {
     let source = include_str!("../../examples/bounded_text_state.verbose")
         .replace("port: 18965", "port: 18960")

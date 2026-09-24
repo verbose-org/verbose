@@ -65,6 +65,13 @@ shared invocation frame, including retained values. Native argv uses strict i64
 and complete-record guards; the original-AST interpreter provides the reference.
 This pure, acyclic flat-record subset adds no allocator or GC. Concurrent
 pipelines, persistent cross-record state and service integration remain separate.
+Those compositions now admit [proved numeric arithmetic](bounded-record-arithmetic.md):
+every intermediate must fit i64, division/remainder exclude exceptional inputs,
+and computed field intervals must fit each consumer's public domain. The same
+operations work in ordinary bounded text rules and existing pure HTTP fragments.
+They reuse the placed word slots and stack accounting without runtime interval
+checks or allocation. This subset uses single intervals without branch narrowing;
+the richer scalar `hints.overflow` contract remains separate.
 The [initial measurements](concurrent-benchmark.md) show substantial per-result
 synchronization costs. The [batch comparison](concurrent-result-batches.md#recorded-result-2026-09-24)
 measures reduced exchanges within the same ordered publication contract: on the

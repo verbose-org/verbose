@@ -27,8 +27,10 @@ collections, Results, effects and context inputs receive explicit diagnostics.
 Unknown bounds are never accepted as evidence of the annotation.
 
 Supported scalar expressions are number literals/fields, `length(text)`, scalar
-comparisons, boolean operations and conditionals. Arithmetic, `substring`,
-`json_escape` and other checked primitives are outside this slice. Flat record
+comparisons, boolean operations and conditionals. [Proved numeric arithmetic](bounded-record-arithmetic.md)
+now includes `+`, `-`, `*`, `/`, `%`, unary minus, `abs`, `min` and `max`, with
+every intermediate checked against i64 and division's exceptional inputs.
+`substring`, `json_escape` and other checked primitives remain outside this slice. Flat record
 construction supports a wrapper such as `HttpResponse`;
 [conditional records](bounded-text-branches.md) join fields of the same concept.
 Nested record fields are refused. An annotation applies to a rule's text output only,

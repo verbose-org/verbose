@@ -285,6 +285,12 @@ impl<'a> Check<'a> {
     }
 }
 
+/// The same checked endpoint calculation also serves flat record/text values.
+/// It neither invents field bounds nor enables the richer scalar guard domain.
+pub(crate) fn interval_arithmetic(op: BinOp, a: (i64, i64), b: (i64, i64)) -> Result<(i64, i64), String> {
+    arithmetic(op, a, b)?.number().map(Ranges::hull)
+}
+
 fn arithmetic(op: BinOp, (a, b): (i64, i64), (c, d): (i64, i64)) -> Result<Value, String> {
     if matches!(op, BinOp::Div | BinOp::Mod) {
         if c <= 0 && d >= 0 {

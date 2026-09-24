@@ -1,0 +1,58 @@
+@verbose 0.1.0
+
+concept OrderLine
+  @intention: "Supply a bounded title, quantity and integer unit price"
+  @source: pipeline_totals.intent:1
+  fields:
+    title : text [..16]
+    quantity : number [0, 1000]
+    unit_price : number [0, 1000000]
+
+concept TotalLine
+  @intention: "Transfer a computed total with the title used to identify it"
+  @source: pipeline_totals.intent:2
+  fields:
+    title : text [..16]
+    total : number [0, 1000000000]
+
+rule total_line
+  @intention: "Compute the product once within the declared numeric domains"
+  @source: pipeline_totals.intent:3
+  input:
+    item : OrderLine
+  output:
+    out : TotalLine
+  logic:
+    let product = item.quantity * item.unit_price
+    out = TotalLine { title: item.title, total: product }
+  proofs:
+    purity:
+      reads: [item.quantity, item.unit_price, item.title]
+      calls: []
+    termination:
+      bound: 8
+
+rule render_total
+  @intention: "Render the checked record within an explicit byte capacity"
+  @source: pipeline_totals.intent:4
+  input:
+    value : TotalLine
+  output:
+    out : text [..37]
+  logic:
+    out = concat(value.title, ":", value.total)
+  proofs:
+    purity:
+      reads: [value.title, value.total]
+      calls: []
+    termination:
+      bound: 8
+
+execution totals
+  @intention: "Compute and render one total per input under a shared stack ceiling"
+  @source: pipeline_totals.intent:5
+  input: OrderLine
+  mode: pipeline
+  phases: [total_line, render_total]
+  on_failure: stop
+  native_stack: 512

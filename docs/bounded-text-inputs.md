@@ -38,7 +38,10 @@ the intervals of both branches. `length(text)` conservatively carries
 These facts survive lets,
 record fields and rule returns. A supplied interval must fit a constrained
 numeric input field; the compiler does not infer correlations between conditions.
-Arithmetic remains outside this text subset.
+[Proved arithmetic](bounded-record-arithmetic.md) now carries computed intervals
+through these same transfers. Every intermediate must fit i64; divisors must
+exclude zero and the MIN/-1 exception. This subset uses one interval per numeric
+fact and does not narrow it from conditions.
 
 Rule bodies are checked against their declared inputs, independently of the
 arguments at a particular call site. A shorter actual title does not justify

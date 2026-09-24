@@ -168,8 +168,8 @@ fn pipeline_refuses_unknown_effectful_recursive_and_contextual_shapes() {
         Expr::Call("missing".into(), vec![Expr::Ident("reading".into())]),
         Expr::Binary(
             BinOp::Add,
+            Box::new(Expr::Number(i64::MAX)),
             Box::new(Expr::Number(1)),
-            Box::new(Expr::Number(2)),
         ),
     ] {
         let mut p = fixture("prepare, render");

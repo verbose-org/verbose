@@ -10,6 +10,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      - name: Reserve disk space for native compiler tests
+        # The suite builds many native compiler/probe binaries. Hosted runners
+        # exhausted their disk twice; this unused SDK is outside the toolchain.
+        run: |
+          df -h /
+          sudo rm -rf -- /usr/local/lib/android
+          df -h /
+
       - uses: actions/checkout@v4
 
       - name: Install Rust
@@ -68,6 +76,10 @@ jobs:
 
       - name: Benchmark
         run: cargo run -- examples/invoices.verbose --benchmark --run important_invoice
+
+      - name: Report remaining disk space
+        if: always()
+        run: df -h /
 
   # The self-hosting crown jewel: the compiler emitted by the compiler reproduces
   # its entire self byte-for-byte (R0 fixed point), emits the whole real source

@@ -4,6 +4,7 @@ use std::{fs, path::Path, process::Command};
 
 mod branches;
 mod inputs;
+mod arithmetic;
 
 const SOURCE: &str = include_str!("../../examples/bounded_text.verbose");
 fn parse(s: &str) -> Program {

@@ -144,11 +144,16 @@ space after their proved last use, including through aliases and branch joins.
 Buffers created in opposite `if` arms can overlap while their region remains
 protected through all subsequent alias uses. The compiler keeps that placement
 only when it reduces the reserved frame compared with ordinary last-use reuse.
-Placement happens at compilation; scalar/pointer/length slots are not reused.
+Placement happens at compilation; [scalar/pointer/length words](docs/bounded-text-slots.md)
+also reuse slots after their last emitted use.
 Rules can [construct checked record inputs](docs/bounded-text-inputs.md) for
 callees with different concepts. The compiler proves field capacities and numeric
 intervals at that boundary, evaluates fields once, and retains their storage
 through callee and caller uses.
+[Numeric arithmetic](docs/bounded-record-arithmetic.md) computes safe intermediate
+intervals within these compositions and emits signed instructions into the same
+placed frame. Division's exceptional inputs must be excluded statically; no
+runtime interval table or allocator is introduced.
 [Conditional records](docs/bounded-text-branches.md) join capacities and numeric
 intervals field by field. Native selection moves text descriptors while keeping
 their possible owners alive through subsequent uses.
