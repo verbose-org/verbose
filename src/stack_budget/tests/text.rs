@@ -1,5 +1,20 @@
 use super::*;
 
+#[test]
+fn pipeline_shared_frame_bound_matches_emitted_stack_depth() {
+    let source = include_str!("../../../examples/pipeline_stack.verbose");
+    let declaration = &source[source.find("execution ").unwrap()..];
+    for phases in ["prepare, render", "prepare, forward, render", "prepare, forward, forward"] {
+        let p = parse(&format!("{}\n{}", include_str!("../../../examples/retained_stack.verbose"),
+            declaration.replace("prepare, forward, render", phases)));
+        verified(&p);
+        let crate::execution::Report::Pipeline(report) = crate::execution::report(&p, "prepare_readings").unwrap()
+            else { panic!("expected pipeline") };
+        let bytes = native_bytes(&p, "prepare_readings");
+        assert_eq!(machine_stack_peak(&bytes[120..]), report.invocation.stack_bound_bytes());
+    }
+}
+
 fn text_source(expr: &str, bindings: &str) -> String {
     let reads = ["i.title", "i.code"]
         .into_iter()

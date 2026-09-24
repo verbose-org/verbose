@@ -117,6 +117,7 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
     let mut bounded_rules = crate::bounds::active_rules(program);
     bounded_rules.extend(crate::text_bounds::active_rules(program));
     bounded_rules.extend(crate::numeric_bounds::active_rules(program));
+    bounded_rules.extend(crate::execution::pipeline::participating(program));
     // Count nodes before optimization
     let nodes_before: usize = program
         .items

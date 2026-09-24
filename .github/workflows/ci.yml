@@ -60,6 +60,9 @@ jobs:
       - name: Validate predicted workload profiles
         run: python3 tools/test_workload_profile.py -v
 
+      - name: Validate bounded pipeline execution
+        run: python3 tools/test_pipeline_execution.py -v
+
       - name: Validate measured workload proposals
         run: python3 tools/test_workload_experiment.py -v
 

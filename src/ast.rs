@@ -67,8 +67,8 @@ pub enum Item {
     ConceptGroup(ConceptGroup),
 }
 
-/// Pure phases over the original input batch with ordered publication and stop
-/// on failure. Concurrent reference execution has a separate admission contract.
+/// Pure phases with ordered publication and stop on failure. Sequential and
+/// concurrent modes reuse original records; a pipeline passes values per record.
 #[derive(Debug, Clone)]
 pub struct Execution {
     pub name: String,
@@ -104,6 +104,8 @@ pub struct WorkloadCase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
     Sequential { native_stack: u32 },
+    /// Each record passes through the phases; only its final value is published.
+    Pipeline { native_stack: u32 },
     Concurrent { max_in_flight: u32, native_memory: Option<u32>, result_batch: u32 },
 }
 

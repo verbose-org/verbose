@@ -1,6 +1,7 @@
 //! Reference semantics for source executions, using the original verified AST.
 //! Input records remain available to every phase; completed results are streamed.
 mod concurrent;
+mod pipeline;
 mod input;
 #[cfg(test)]
 mod tests;
@@ -44,6 +45,9 @@ pub(super) fn run(
         })
         .collect();
     let concepts: Vec<_> = iter_all_concepts(&program.items).collect();
+    if matches!(execution.mode, ExecutionMode::Pipeline { .. }) {
+        return pipeline::run(execution, &rules, &concepts, records, &mut emit);
+    }
     if let ExecutionMode::Concurrent {
         max_in_flight,
         result_batch,

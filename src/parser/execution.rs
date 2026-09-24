@@ -35,8 +35,8 @@ impl Parser {
                 "input" => input = Some(self.expect_ident_any()?),
                 "mode" => {
                     let value = self.expect_ident_any()?;
-                    if value != "sequential" && value != "concurrent" {
-                        return Err(self.error("execution mode must be sequential or concurrent"));
+                    if !matches!(value.as_str(), "sequential" | "concurrent" | "pipeline") {
+                        return Err(self.error("execution mode must be sequential, concurrent or pipeline"));
                     }
                     mode = Some(value);
                 }
@@ -122,18 +122,25 @@ impl Parser {
                     .ok_or_else(|| self.error("concurrent execution requires max_in_flight"))?,
             }
         } else {
+            let kind = mode.as_deref().unwrap();
             if result_batch.is_some() {
-                return Err(self.error("sequential execution does not accept result_batch"));
+                return Err(self.error(&format!("{kind} execution does not accept result_batch")));
             }
             if native_memory.is_some() {
-                return Err(self.error("sequential execution does not accept native_memory"));
+                return Err(self.error(&format!("{kind} execution does not accept native_memory")));
             }
             if max_in_flight.is_some() {
-                return Err(self.error("sequential execution does not accept max_in_flight"));
+                return Err(self.error(&format!("{kind} execution does not accept max_in_flight")));
             }
-            ExecutionMode::Sequential {
-                native_stack: limit
-                    .ok_or_else(|| self.error("sequential execution requires native_stack"))?,
+            let native_stack = limit
+                .ok_or_else(|| self.error(&format!("{kind} execution requires native_stack")))?;
+            if kind == "pipeline" {
+                if workload.is_some() {
+                    return Err(self.error("pipeline execution does not accept workload in this slice"));
+                }
+                ExecutionMode::Pipeline { native_stack }
+            } else {
+                ExecutionMode::Sequential { native_stack }
             }
         };
         Ok(Execution {

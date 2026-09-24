@@ -869,6 +869,24 @@ pub(super) fn compile_phase(
     concept: &Concept,
     end: EntryEnd,
 ) -> Result<(Vec<u8>, crate::stack_budget::Report), NativeError> {
+    compile_entry(p, rule, concept, end, false)
+}
+
+pub(super) fn compile_pipeline(
+    p: &Program,
+    rule: &Rule,
+    concept: &Concept,
+) -> Result<(Vec<u8>, crate::stack_budget::Report), NativeError> {
+    compile_entry(p, rule, concept, EntryEnd::Exit, true)
+}
+
+fn compile_entry(
+    p: &Program,
+    rule: &Rule,
+    concept: &Concept,
+    end: EntryEnd,
+    checked_input: bool,
+) -> Result<(Vec<u8>, crate::stack_budget::Report), NativeError> {
     let fragment = prepare(p, &rule.name, concept)?;
     let mut input = rule.clone();
     input.logic.bindings.clear();
@@ -885,7 +903,10 @@ pub(super) fn compile_phase(
         &HashMap::new(),
         None,
         false,
-        false,
+        // This synthetic input rule has no lets. The numeric-scratch entry
+        // option therefore only enables strict i64 and complete-record guards;
+        // there are no scratch bindings to reserve or skip.
+        checked_input,
     )?;
     fragment.begin(&mut code, &ctx.binding_offsets, &ctx.text_bindings)?;
     let mut output_stack_bytes = 0;

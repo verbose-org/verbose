@@ -156,9 +156,10 @@ fn execution_uses_the_same_bytes_and_budget_as_the_explicit_phase_selection() {
         let p = parse(&format!("{PHASES}{declaration}"));
         verified(&p);
         let r = report(&p, "inspect_readings").unwrap();
-        assert_eq!(r.sequence.stack_bound_bytes(), 192);
+        let Report::Sequential(sequential) = &r else { panic!("expected sequential report") };
+        assert_eq!(sequential.sequence.stack_bound_bytes(), 192);
         assert_eq!(
-            r.sequence,
+            sequential.sequence,
             native::sequential_stack_report(&parse(PHASES), &names).unwrap()
         );
         assert!(r.json().contains("\"declared_bytes\":192"));
@@ -280,6 +281,9 @@ rule calculate
     let cases = [
         (control.to_string(), false),
         (format!("{control}{declaration}"), true),
+        (format!("{}{}", control.replace("out : number", "out : Input")
+            .replace("out = i.x", "out = i").replace("reads: [i.x]", "reads: [i]"),
+            declaration.replace("mode: sequential", "mode: pipeline")), true),
         (format!("{control}{declaration}  workload:\n    objective: elapsed\n    case common:\n      weight: 99\n      records: 1\n"), true),
         (format!("{control}{}", declaration.replace("mode: sequential", "mode: concurrent")
             .replace("native_stack: 192", "max_in_flight: 2")), true),
