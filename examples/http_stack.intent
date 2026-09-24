@@ -1,0 +1,4 @@
+Receive a bounded request path and byte count for reusable formatting.
+Compute and format the count within a checked text capacity.
+Prepare a record and retain its formatted body until the HTTP response is sent.
+Serve requests with two reusable processes under an explicit per-process stack ceiling.

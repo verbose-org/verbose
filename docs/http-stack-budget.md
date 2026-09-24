@@ -1,7 +1,7 @@
 # Native stack budgets for bounded HTTP services
 
-Design recorded before implementation. Extend source-selected storage ceilings
-from argv compositions to a closed HTTP service path. The contract measures the
+Implemented after the separately committed design. Source-selected storage ceilings
+now extend from argv compositions to a closed HTTP service path. The contract measures the
 emitted service frame and the complete lifetime of its bounded handler result,
 including response serialization. HTTP is the first transport consumer of the
 existing invocation layout; this does not replace its reusable language contract.
@@ -82,6 +82,35 @@ or claim their native storage. WASM and the self-hosted compiler explicitly
 refuse service ceilings before any artifact. Extend the self-hosted token gate
 at immediate service depth, retaining ordinary `native_stack` identifiers in
 fields, locals, strings and comments.
+
+| Path | Support |
+|---|---|
+| Rust verifier | Checks every declared service ceiling, including unselected services |
+| Linux x86-64 native | Sequential, forked, capped forked and pooled HTTP within the closed subset |
+| Interpreter | Pure handler values only; no service execution or host-memory guarantee |
+| WASM | Explicit refusal before artifact creation |
+| Self-hosted verification/ELF/raw x86 | Detects and refuses the service attribute before emission |
+
+## Worked example
+
+[`http_stack.verbose`](../examples/http_stack.verbose) builds a bounded request
+record, computes twice the body byte count and returns a formatted path. The
+service declares `native_stack: 8192` and two pooled workers. Inspect or compile:
+
+```sh
+cargo build --release
+target/release/verbosec examples/http_stack.verbose --stack-report --json
+target/release/verbosec examples/http_stack.verbose --native /tmp/http-stack
+```
+
+The current report gives **4,720 bytes per process**: 4,328 fixed bytes (4,096
+request bytes, 64 metadata, 128 socket-I/O and 40 dispatch), eight saved base-pointer
+bytes, a 344-byte placed handler frame, 16 saved handler registers and a 24-byte
+scratch peak. A ceiling of 4,720 passes and 4,719 refuses. Removing a sufficient
+declaration leaves the binary identical. Future placement changes may change
+the required ceiling; the report, not this fixture's number, defines the result.
+
+## Validation
 
 Validation must cover parser ranges/duplicates, exact and one-byte-small ceilings,
 all declarations including unselected services, direct backend gates, deterministic

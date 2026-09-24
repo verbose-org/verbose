@@ -183,7 +183,7 @@ fn real_main() {
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
         eprintln!("  --memory-report [--json] --run <execution> Report a concurrent native memory reservation");
         eprintln!("  --workload-report [--json] --run <execution> Report predicted cases and checked native storage");
-        eprintln!("  --stack-report [--json] --run <entry> Report checked native argv stack usage, without writing an artifact");
+        eprintln!("  --stack-report [--json] --run <entry> Report checked native argv or HTTP service stack usage");
         eprintln!("  --echo-server <port> <output>      TCP echo server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
         eprintln!("  --demo-http <output>               HTTP server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
         eprintln!("  --http-server <port> <.verbose> --run <rule>   HTTP server wrapping a verified rule (plumbing hardcoded; see docs/known-gaps.md)");
@@ -233,6 +233,9 @@ fn real_main() {
         let name = find_flag(&args, "--run").or_else(|| program.items.iter().rev().find_map(|i| {
             if let ast::Item::Execution(e) = i { Some(e.name.clone()) } else { None }
         })).or_else(|| program.items.iter().rev().find_map(|i| {
+            if stack_report { if let ast::Item::Service(s) = i { return Some(s.name.clone()); } }
+            None
+        })).or_else(|| program.items.iter().rev().find_map(|i| {
             if let ast::Item::Rule(r) = i { Some(r.name.clone()) } else { None }
         })).unwrap_or_default();
         if workload_report {
@@ -260,6 +263,16 @@ fn real_main() {
         }
         if execution::find(&program, &name).is_some() {
             match execution::report(&program, &name) {
+                Ok(report) => {
+                    if args.iter().any(|a| a == "--json") { println!("{}", report.json()); }
+                    else { println!("{report}"); }
+                }
+                Err(e) => { eprintln!("{e}"); process::exit(1); }
+            }
+            return;
+        }
+        if program.items.iter().any(|i| matches!(i, ast::Item::Service(s) if s.name == name)) {
+            match native::service_stack_report(&program, &name) {
                 Ok(report) => {
                     if args.iter().any(|a| a == "--json") { println!("{}", report.json()); }
                     else { println!("{report}"); }

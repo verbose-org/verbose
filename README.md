@@ -403,6 +403,14 @@ workers to terminate when the grace period expires. See the
 [contract and example](docs/http-pool-shutdown.md), including exit statuses,
 partial effects, and the limits of the deadline.
 
+**Checked service stack (2026-09-24):** a service-level `native_stack: N` now
+checks additional explicit stack storage per process for pure bounded handlers,
+including reception, dispatch and sending. It supports sequential, forked and
+pooled HTTP with socket deadlines; logs, state and graceful shutdown are excluded
+from this first scope. See the [contract and support matrix](docs/http-stack-budget.md)
+and [source example](examples/http_stack.verbose). The ceiling adds no emitted
+instructions and does not claim total process memory or cache residency.
+
 The native backend emits complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and a per-request `log:` block. As of 2026-04-30, the surface includes: HTTP/1.0 services with prefix routing and computed status; cached + per-request file reads with `on_read_error: abort`; outbound `fetch()` to declared connections; multiple `log:` blocks per service (strict + best-effort sinks); fork-per-accept concurrency; `req.body` parsing; and a family of runtime primitives (`read`, `parse_int`, `now_unix`, `length`, `starts_with`, `contains`, `abs`, `field == read(...)`, `json_escape`).
 
 | Example | Binary | What it does |

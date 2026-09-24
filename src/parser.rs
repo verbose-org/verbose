@@ -1867,6 +1867,7 @@ impl Parser {
         let mut max_connections = None;
         let mut workers = None;
         let mut shutdown_timeout = None;
+        let mut native_stack = None;
         let mut saw_concurrency = false;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
@@ -2184,6 +2185,18 @@ impl Parser {
                 if slot.is_some() { return Err(self.error(&format!("duplicate service attribute '{}'", key))); }
                 *slot = Some(n as u32);
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("native_stack") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if !(1..=2_097_152).contains(&n) {
+                    return Err(self.error("service native_stack must be in [1, 2097152] bytes"));
+                }
+                if native_stack.is_some() {
+                    return Err(self.error("duplicate service attribute 'native_stack'"));
+                }
+                native_stack = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
             } else if self.check_ident("shutdown_timeout") {
                 self.advance();
                 self.expect_kind(TokenKind::Colon)?;
@@ -2224,7 +2237,7 @@ impl Parser {
                     name
                 )));
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', 'response_timeout:', 'max_connections:', 'workers:', or 'shutdown_timeout:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', 'after:', 'max_steps:', 'read_timeout:', 'request_timeout:', 'response_timeout:', 'max_connections:', 'workers:', 'native_stack:', or 'shutdown_timeout:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -2253,6 +2266,7 @@ impl Parser {
             max_connections,
             workers,
             shutdown_timeout,
+            native_stack,
         })
     }
 

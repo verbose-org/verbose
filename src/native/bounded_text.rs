@@ -743,6 +743,14 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
 }
 
 impl Fragment {
+    pub(super) fn stack_layout(&self) -> (crate::stack_budget::TextFrame, usize) {
+        (crate::stack_budget::TextFrame {
+            slot_bytes: self.slot_bytes,
+            buffer_bytes: self.frame_bytes - self.slot_bytes,
+            saved_register_bytes: 16,
+            calls: self.calls.clone(),
+        }, self.expression_stack_bytes)
+    }
     pub(super) fn uses_field(&self, name: &str) -> bool {
         self.fields.iter().any(|(n, _)| n == name)
     }

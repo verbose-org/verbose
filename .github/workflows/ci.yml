@@ -65,6 +65,9 @@ jobs:
       - name: Validate native stack contract CLI
         run: python3 tools/test_stack_budget.py -v
 
+      - name: Validate HTTP service stack contract CLI
+        run: python3 tools/test_http_stack_budget.py -v
+
       - name: Validate predicted workload profiles
         run: python3 tools/test_workload_profile.py -v
 
