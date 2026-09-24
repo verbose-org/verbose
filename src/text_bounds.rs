@@ -56,6 +56,23 @@ pub fn active_rules(p: &Program) -> BTreeSet<String> {
     )
 }
 
+/// A pipeline explicitly opts its whole composition into this closed subset,
+/// even when its final value is numeric or a record and has no text annotation.
+/// This does not change the participating set or acceptance of ordinary rules.
+pub(crate) fn verify_entry(p: &Program, name: &str) -> Result<(), String> {
+    let mut check = Check {
+        rules: p.items.iter().filter_map(|i| match i {
+            Item::Rule(r) => Some((r.name.as_str(), r)), _ => None,
+        }).collect(),
+        concepts: iter_all_concepts(&p.items).map(|c| (c.name.as_str(), c)).collect(),
+        visiting: BTreeSet::new(),
+        cache: HashMap::new(),
+        steps: 0,
+        native: true,
+    };
+    check.rule(name).map(|_| ())
+}
+
 #[derive(Clone, Debug)]
 enum Value {
     Number(i64, i64),

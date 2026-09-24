@@ -57,7 +57,14 @@ threads with a fixed `native_memory` reservation and `--memory-report`. The
 calculation covers reusable worker stacks, control/result batches, padding and guard
 pages, with ordered publication and full joins. Initial argv/code/kernel storage
 are excluded; this is not RSS or total process memory. Native stdin/stream,
-service scopes and retained state between phases remain separate work.
+service scopes and persistent state between records remain separate work.
+For sequential value transfer, a [bounded pipeline](pipeline-executions.md) now
+passes each record through declared phases and publishes only its final result.
+The compiler checks concept links, transferred capacities/ranges and the whole
+shared invocation frame, including retained values. Native argv uses strict i64
+and complete-record guards; the original-AST interpreter provides the reference.
+This pure, acyclic flat-record subset adds no allocator or GC. Concurrent
+pipelines, persistent cross-record state and service integration remain separate.
 The [initial measurements](concurrent-benchmark.md) show substantial per-result
 synchronization costs. The [batch comparison](concurrent-result-batches.md#recorded-result-2026-09-24)
 measures reduced exchanges within the same ordered publication contract: on the
@@ -74,6 +81,8 @@ selection/validation data and proposes a reviewable source diff. It preserves
 source ceilings and excludes functional differences; a mandatory empty-argv
 probe currently excludes mode switches because their stderr differs. Concurrent
 lane/batch comparisons are supported, with no automatic source application.
+Further clock calibration and performance comparisons are deferred as of
+2026-09-24; the recorded workload experiment remains inconclusive.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.

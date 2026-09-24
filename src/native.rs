@@ -56,6 +56,20 @@ pub(crate) fn concurrent_memory_report(program: &Program, e: &Execution) -> Resu
     concurrent::report(program, e)
 }
 
+/// The pipeline caller has checked its generated composition against the closed
+/// bounded-text subset even if no source rule carries a text-output annotation.
+pub(crate) fn pipeline_layout(program: &Program, name: &str) -> Result<(Vec<u8>, crate::stack_budget::Report), NativeError> {
+    let rule = program.items.iter().find_map(|i| match i {
+        Item::Rule(r) if r.name == name => Some(r), _ => None,
+    }).ok_or_else(|| NativeError { message: "pipeline entry missing".into() })?;
+    let concept = iter_all_concepts(&program.items).find(|c| rule.input_ty == Type::Named(c.name.clone()))
+        .ok_or_else(|| NativeError { message: "pipeline input concept missing".into() })?;
+    if concept.fields.is_empty() {
+        return Err(NativeError { message: "pipeline argv input requires at least one field".into() });
+    }
+    bounded_text::compile_pipeline(program, rule, concept)
+}
+
 /// Compile multiple rules into a single native binary. Each rule's code
 /// block is emitted sequentially; intermediate blocks end with stack cleanup
 /// (`mov rsp, rbp; pop rbp`) instead of `sys_exit`, so execution falls
@@ -1063,6 +1077,10 @@ fn compile_native_with_mode(
         if matches!(e.mode, ExecutionMode::Concurrent { .. }) {
             let code = concurrent::compile(program, e)?;
             return write_native_elf_image(&code, output_path);
+        }
+        if matches!(e.mode, ExecutionMode::Pipeline { .. }) {
+            let (code, _) = crate::execution::pipeline::prepare(program, e)?;
+            return write_native_elf(&code, output_path);
         }
         let names: Vec<_> = e.phases.iter().map(String::as_str).collect();
         let code = sequential::compile(program, &names)?;
@@ -56926,8 +56944,9 @@ rule pick
         // concurrent_execution is also refused by the declaration-scoped gate.
         // native_concurrent_execution keeps the same self-hosted execution refusal.
         // workload_profile adds predicted cases to that same refused scope.
+        // pipeline_stack adds per-record transfer, refused by the execution gate.
         // gen0 returns 1 with zero output; EXPECTED_ACCEPTED stays 93.
-        const EXPECTED_TOTAL: usize = 188;
+        const EXPECTED_TOTAL: usize = 189;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

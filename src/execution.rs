@@ -6,6 +6,7 @@ use crate::stack_budget::SequenceReport;
 use crate::verifier::VerifyError;
 use std::collections::HashSet;
 pub mod workload;
+pub(crate) mod pipeline;
 
 pub fn find<'a>(p: &'a Program, name: &str) -> Option<&'a Execution> {
     p.items.iter().find_map(|item| match item {
@@ -72,11 +73,14 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
         if let Some(message) = e.workload.as_ref().and_then(workload::shape_error) {
             errors.push(error(e, message));
         }
+        if matches!(e.mode, ExecutionMode::Pipeline { .. }) && e.workload.is_some() {
+            errors.push(error(e, "pipeline execution does not accept workload in this slice"));
+        }
         if !(2..=64).contains(&e.phases.len()) {
             errors.push(error(e, "expected 2..=64 phases"));
         }
         match e.mode {
-            ExecutionMode::Sequential { native_stack }
+            ExecutionMode::Sequential { native_stack } | ExecutionMode::Pipeline { native_stack }
                 if !(1..=2_097_152).contains(&native_stack) =>
             {
                 errors.push(error(e, "native_stack must be in [1, 2097152] bytes"))
@@ -96,6 +100,7 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
         if !iter_all_concepts(&p.items).any(|c| c.name == e.input) {
             errors.push(error(e, format!("unknown input concept '{}'", e.input)));
         }
+        let mut expected_input = Type::Named(e.input.clone());
         for (index, name) in e.phases.iter().enumerate() {
             let rule = p.items.iter().find_map(|item| match item {
                 Item::Rule(r) if r.name == *name => Some(r),
@@ -103,16 +108,28 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
             });
             match rule {
                 None => errors.push(error(e, format!("phase {}: no rule named '{name}'; nested executions and services are not phases", index + 1))),
-                Some(r) if r.input_ty != Type::Named(e.input.clone()) => errors.push(error(e,
-                    format!("phase {} ('{name}'): input must be concept '{}'", index + 1, e.input))),
+                Some(r) if r.input_ty != expected_input => errors.push(error(e,
+                    if matches!(e.mode, ExecutionMode::Pipeline { .. }) {
+                        format!("phase {} ('{name}'): input {:?} must match pipeline value {:?}", index + 1, r.input_ty, expected_input)
+                    } else {
+                        format!("phase {} ('{name}'): input must be concept '{}'", index + 1, e.input)
+                    })),
                 _ => {}
+            }
+            if matches!(e.mode, ExecutionMode::Pipeline { .. }) {
+                if let Some(r) = rule {
+                    if index + 1 < e.phases.len() && !matches!(r.output_ty, Type::Named(_)) {
+                        errors.push(error(e, format!("phase {} ('{name}'): intermediate pipeline result must be a flat record", index + 1)));
+                    }
+                    expected_input = r.output_ty.clone();
+                }
             }
         }
     }
     errors
 }
 
-fn report_one(p: &Program, e: &Execution) -> Result<Report, VerifyError> {
+fn report_one(p: &Program, e: &Execution) -> Result<SequentialReport, VerifyError> {
     let ExecutionMode::Sequential { native_stack } = e.mode else {
         return Err(error(e, "concurrent execution has no native stack report: use --memory-report for its fixed reservation"));
     };
@@ -123,7 +140,7 @@ fn report_one(p: &Program, e: &Execution) -> Result<Report, VerifyError> {
         return Err(error(e, format!("native argv stack bound {} bytes exceeds declared {} bytes (maximum of sequential phases)",
             sequence.stack_bound_bytes(), native_stack)));
     }
-    Ok(Report {
+    Ok(SequentialReport {
         name: e.name.clone(),
         input: e.input.clone(),
         declared_bytes: native_stack,
@@ -144,6 +161,8 @@ pub fn verify(p: &Program) -> Vec<VerifyError> {
         .filter_map(|i| match i {
             Item::Execution(e) => match e.mode {
                 ExecutionMode::Sequential { .. } => report_one(p, e).err(),
+                ExecutionMode::Pipeline { .. } => pipeline::prepare(p, e).err()
+                    .map(|cause| error(e, cause.message)),
                 ExecutionMode::Concurrent {
                     native_memory: Some(_),
                     ..
@@ -186,19 +205,22 @@ pub fn report(p: &Program, name: &str) -> Result<Report, NativeError> {
     let e = find(p, name).ok_or_else(|| NativeError {
         message: format!("no execution named '{name}'"),
     })?;
-    report_one(p, e).map_err(|e| NativeError {
+    if matches!(e.mode, ExecutionMode::Pipeline { .. }) {
+        return pipeline::prepare(p, e).map(|(_, r)| Report::Pipeline(r));
+    }
+    report_one(p, e).map(Report::Sequential).map_err(|e| NativeError {
         message: e.to_string(),
     })
 }
 
 #[derive(Debug)]
-pub struct Report {
+pub struct SequentialReport {
     pub name: String,
     pub input: String,
     pub declared_bytes: u32,
     pub sequence: SequenceReport,
 }
-impl Report {
+impl SequentialReport {
     pub fn json(&self) -> String {
         let mut base = self.sequence.json();
         base.pop();
@@ -208,7 +230,7 @@ impl Report {
         )
     }
 }
-impl std::fmt::Display for Report {
+impl std::fmt::Display for SequentialReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(
             f,
@@ -216,6 +238,28 @@ impl std::fmt::Display for Report {
             self.name, self.input, self.declared_bytes
         )?;
         self.sequence.fmt(f)
+    }
+}
+
+#[derive(Debug)]
+pub enum Report {
+    Sequential(SequentialReport),
+    Pipeline(pipeline::Report),
+}
+impl Report {
+    pub fn json(&self) -> String {
+        match self {
+            Self::Sequential(r) => r.json(),
+            Self::Pipeline(r) => r.json(),
+        }
+    }
+}
+impl std::fmt::Display for Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sequential(r) => r.fmt(f),
+            Self::Pipeline(r) => r.fmt(f),
+        }
     }
 }
 

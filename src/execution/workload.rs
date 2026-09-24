@@ -78,6 +78,9 @@ pub fn report(p: &Program, name: &str) -> Result<Report, NativeError> {
         message: format!("execution '{name}': --workload-report requires a declared workload"),
     })?;
     let (batch, native_budget_present, native_json, native_text) = match e.mode {
+        ExecutionMode::Pipeline { .. } => return Err(NativeError {
+            message: "pipeline execution does not support workload reports in this slice".into(),
+        }),
         ExecutionMode::Sequential { .. } => {
             let r = super::report_one(p, e).map_err(|e| NativeError {
                 message: e.to_string(),

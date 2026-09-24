@@ -1,17 +1,21 @@
 # Bounded record pipelines
 
-Design recorded before implementation. A source execution can compose pure
-rules into one per-record pipeline, instead of running independent phases over
+Design recorded before implementation; implemented and checked as described
+below. A source execution can compose pure rules into one per-record pipeline,
+instead of running independent phases over
 the original batch. This is useful for preparing, normalizing and rendering data
 in command-line tools, compiler passes and eventually service handlers. It does
 not introduce a transport or a general concurrent dataflow runtime.
 
 ## Source contract
 
+The [complete example](../examples/pipeline_stack.verbose) imports the prepared
+reading rules used by the retained-call example:
+
 ```verbose
 execution prepare_readings
   @intention: "Prepare and render each reading within one checked frame"
-  @source: pipeline.intent:1
+  @source: pipeline_stack.intent:1
   input: Reading
   mode: pipeline
   phases: [prepare, forward, render]
@@ -44,8 +48,16 @@ records have been processed, then status 1 is returned, as for an ordinary
 boolean rule. Fatal input/evaluation errors stop immediately, preserving
 the completed output prefix. Interpreter writer errors also stop further work;
 native output retains the existing ordinary-rule syscall behavior.
-`on_failure: stop` does not imply recovery or
-rollback. Intermediate booleans refuse because they cannot feed a record input.
+`on_failure: stop` does not imply recovery or rollback. Intermediate booleans
+refuse because they cannot feed a record input.
+
+Native numeric argv fields accept `[-]digits` representable as i64. Empty
+strings, sign-only strings, other characters and overflow refuse. Each record
+must supply all its fields, including the final record of a batch. The pipeline
+uses the existing checked numeric entry guards; ordinary bounded-text entries
+retain their legacy lexical conversion. Differential parity uses equivalent
+decoded records, not malformed JSON versus arbitrary argv strings. An argv
+pipeline requires a nonempty input concept.
 
 `native_stack` is required with the existing 1..2,097,152 byte limits. Concurrent
 resource fields refuse. Predicted workload blocks and the experiment tool refuse
@@ -109,16 +121,39 @@ storage remain excluded; this is not a total-process or cache-residency claim.
 | Concurrent pipeline, workload experiments | Refuse in this slice |
 | WASM and self-hosted compiler | Existing execution-declaration gates refuse |
 
-Validation will compare direct phase interpretation, explicit ordinary-call
-composition and native pipeline output/status. Cover UTF-8 byte boundaries,
+Validation compares direct phase interpretation, explicit ordinary-call
+composition and native pipeline output/status. Tests cover UTF-8 byte boundaries,
 empty strings, i64 extremes, aliases, shadowing, conditional records, repeated
 stages, final scalar/record forms, final boolean failure and invalid later input.
 Refusals cover mismatched concepts, unsafe field transfer, unknown/effectful/
 recursive forms, resource fields, unselected insufficient budgets and unsupported
-backends without overwriting artifacts. Check exact/one-byte-small budgets,
-deterministic emission and unchanged pre-existing example binaries. Run the
-serialized Rust suite, relevant CLI tests and CIDX controls before delivery.
+backends without overwriting artifacts. Tests check exact/one-byte-small budgets,
+deterministic emission and instruction-level stack depth independently of layout
+metadata. The corpus comparison checks unchanged pre-existing example binaries.
+Run `cargo test -- --test-threads=1`, `python3 tools/test_pipeline_execution.py -v`,
+the existing CLI suites and CIDX controls before delivery. The existing bootstrap
+job covers the self-hosted compiler; its source does not change for this slice.
+
+```sh
+target/release/verbosec examples/pipeline_stack.verbose --stack-report --json
+target/release/verbosec examples/pipeline_stack.verbose --native /tmp/pipeline
+/tmp/pipeline café 42 sample -42
+target/release/verbosec examples/pipeline_stack.verbose \
+  --run prepare_readings --input examples/pipeline_stack.json --json
+```
+
+Native output is `[café]:1` followed by `[sample]:-1`, each on its own line.
+The JSON interpreter output has two events, both from phase 3 (`render`), with
+record indices 0 and 1. `prepare` and `forward` publish no intermediate output.
+
+The current example's additional stack bound is **240 bytes**: 56 for the outer
+input/bookkeeping frame, 8 for its saved base pointer, and a peak transient of
+176 (136 for placed invocation words/buffers, 16 saved register bytes and 24
+formatting scratch bytes). Of those 136 invocation bytes, 88 are reusable word
+slots and 48 are placed text buffers. The declared 512 bytes is a ceiling; an
+exact declaration of 240 passes and 239 refuses. This is a conservative emitted
+layout bound, not a runtime timing or total-memory measurement.
 
 Further clock calibration and performance comparisons are deferred as of
 2026-09-24. The previous workload experiment remains inconclusive; this slice
-will claim checked behavior and storage only, without a measured speedup.
+claims checked behavior and storage only, without a measured speedup.

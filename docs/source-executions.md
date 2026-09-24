@@ -25,6 +25,8 @@ execution inspect_readings
 All seven fields/attributes are required and may occur once. Unknown fields,
 duplicate fields and unsupported mode/policy values refuse. This page describes
 `mode: sequential` with `on_failure: stop`. The separate
+[pipeline contract](pipeline-executions.md) uses `mode: pipeline` for per-record
+value transfer with a shared stack ceiling and final-only publication. The
 [concurrent reference contract](concurrent-executions.md) requires `max_in_flight`
 instead of `native_stack`, plus an optional `native_memory` ceiling required for
 [native concurrency](native-concurrent-executions.md). Optional
@@ -194,8 +196,9 @@ Reports for ordinary rules and explicit comma-separated selections are unchanged
 This page establishes a named scope for sequential work. The separate
 [concurrent contract](concurrent-executions.md) now runs in the interpreter and
 [native threads with a checked reservation](native-concurrent-executions.md).
-Cross-phase retained values and whole-service memory need further
-lifetime/transport contracts. Batch processing
+The [pipeline contract](pipeline-executions.md) now supports values retained
+between sequential stages within one record. Persistent state, concurrent
+transfer and whole-service memory need further lifetime/transport contracts. Batch processing
 and compiler passes are applications of this source contract; HTTP remains an
 integration case for later transport-aware execution scopes.
 

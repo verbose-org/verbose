@@ -1,0 +1,11 @@
+@verbose 0.1.0
+use "retained_stack.verbose"
+
+execution prepare_readings
+  @intention: "Prepare, forward and render each reading within one checked invocation"
+  @source: pipeline_stack.intent:1
+  input: Reading
+  mode: pipeline
+  phases: [prepare, forward, render]
+  on_failure: stop
+  native_stack: 512

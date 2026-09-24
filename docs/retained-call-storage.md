@@ -129,8 +129,10 @@ outside the native budget.
 [Sequential argv selections](sequential-stack-budgets.md) still run complete,
 independent batches and retain no values between selected entries. An entry may
 itself use the source-level composition above; its call details appear in that
-phase's report. Cross-entry transfer, persistent state across invocations and
-bounded concurrent work need separately defined execution scopes. HTTP handlers
+phase's report. A [pipeline execution](pipeline-executions.md) now declares an
+ordered composition of these calls, passing each result to the next stage and
+publishing only the final value under one shared invocation ceiling. Persistent
+state across invocations and concurrent transfer need separate contracts. HTTP handlers
 and compiler/data-processing stages remain examples for those future contracts.
 
 Tests compare the call summary with an independent owner scan, exercise nested
