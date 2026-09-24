@@ -51,6 +51,65 @@ fn concurrent_execution_parser_closes_mode_specific_resource_fields() {
 }
 
 #[test]
+fn result_batch_is_closed_defaulted_and_checked_in_unselected_asts() {
+    let original = source();
+    let p = parse(&original);
+    let Item::Execution(e) = p.items.last().unwrap() else {
+        unreachable!()
+    };
+    assert!(matches!(
+        e.mode,
+        ExecutionMode::Concurrent {
+            result_batch: 1,
+            ..
+        }
+    ));
+    for capacity in [1, 8, 1024] {
+        let p = parse(&format!("{original}  result_batch: {capacity}\n"));
+        assert!(verifier::verify_program(&p, Path::new("examples")).is_empty());
+        let Item::Execution(e) = p.items.last().unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            matches!(e.mode, ExecutionMode::Concurrent { result_batch, .. } if result_batch == capacity)
+        );
+    }
+    for tail in [
+        "result_batch: 0",
+        "result_batch: -1",
+        "result_batch: 1025",
+        "result_batch: 2\n  result_batch: 2",
+    ] {
+        assert!(Parser::new(
+            Lexer::new(&format!("{original}  {tail}\n"))
+                .tokenize()
+                .unwrap()
+        )
+        .parse_program()
+        .is_err());
+    }
+    let sequential = original
+        .replace("mode: concurrent", "mode: sequential")
+        .replace("max_in_flight: 2", "native_stack: 192\n  result_batch: 1");
+    assert!(Parser::new(Lexer::new(&sequential).tokenize().unwrap())
+        .parse_program()
+        .unwrap_err()
+        .to_string()
+        .contains("sequential execution does not accept result_batch"));
+    for capacity in [0, 1025] {
+        let mut p = p.clone();
+        let Item::Execution(e) = p.items.last_mut().unwrap() else {
+            unreachable!()
+        };
+        let ExecutionMode::Concurrent { result_batch, .. } = &mut e.mode else {
+            unreachable!()
+        };
+        *result_batch = capacity;
+        assert!(verify(&p)[0].message.contains("result_batch"));
+    }
+}
+
+#[test]
 fn concurrent_contract_gates_unknown_phases_and_all_backend_artifacts() {
     let p = parse(&source());
     let path =
@@ -133,6 +192,7 @@ fn concurrent_contract_gates_unknown_phases_and_all_backend_artifacts() {
     let mut p = p;
     if let Item::Execution(e) = p.items.last_mut().unwrap() {
         e.mode = ExecutionMode::Concurrent {
+            result_batch: 1,
             max_in_flight: 0,
             native_memory: None,
         };

@@ -82,6 +82,11 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
             {
                 errors.push(error(e, "max_in_flight must be in [1, 64]"))
             }
+            ExecutionMode::Concurrent { result_batch, .. }
+                if !(1..=1024).contains(&result_batch) =>
+            {
+                errors.push(error(e, "result_batch must be in [1, 1024]"))
+            }
             _ => {}
         }
         if !iter_all_concepts(&p.items).any(|c| c.name == e.input) {

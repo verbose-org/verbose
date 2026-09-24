@@ -87,6 +87,7 @@ fn concurrent_waves_overlap_but_publish_in_order_and_join_before_readmission() {
         &refs,
         &batch(1),
         2,
+        1,
         &|r, _| {
             let p = phase(r);
             assert!(
@@ -138,6 +139,7 @@ fn rendezvous_bounds_unpublished_results_instead_of_buffering_whole_batches() {
             &refs,
             &batch(100),
             3,
+            1,
             &|r, record| {
                 let p = phase(r);
                 if evaluated[p].fetch_add(1, Ordering::SeqCst) == 0 {
@@ -181,6 +183,7 @@ fn concurrent_failure_cancels_blocked_senders_and_prevents_later_waves() {
             &refs,
             &batch(5),
             2,
+            1,
             &|r, record| {
                 let p = phase(r);
                 let call = evaluated[p].fetch_add(1, Ordering::SeqCst);
@@ -242,6 +245,7 @@ fn concurrent_partial_start_failure_joins_admitted_workers_without_wave_output()
             &refs,
             &batch(1),
             2,
+            1,
             &|_, _| {
                 evaluated.fetch_add(1, Ordering::SeqCst);
                 Ok(Value::Number(1))
@@ -276,6 +280,7 @@ fn concurrent_later_error_waits_for_prior_publication_and_limits_are_closed() {
         &refs,
         &batch(2),
         3,
+        1,
         &|r, record| {
             if phase(r) == 1 {
                 return Err(error("later error"));
@@ -296,6 +301,114 @@ fn concurrent_later_error_waits_for_prior_publication_and_limits_are_closed() {
             &refs,
             &batch(1),
             limit,
+            1,
+            &|_, _| panic!(),
+            &mut |_, _, _, _| panic!()
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn result_batch_bounds_speculation_and_cancels_full_queues_before_joining() {
+    for capacity in [2, 8, 32] {
+        let rules = rules(4);
+        let refs: Vec<_> = rules.iter().collect();
+        let full = Arrival::new();
+        let evaluated: Vec<_> = (0..4).map(|_| AtomicUsize::new(0)).collect();
+        let result = run(
+            "batched",
+            &refs,
+            &batch(100),
+            3,
+            capacity,
+            &|r, record| {
+                let p = phase(r);
+                let n = evaluated[p].fetch_add(1, Ordering::SeqCst) + 1;
+                if p == 0 && n == 1 {
+                    full.until(2);
+                } else if p != 0 && n == capacity {
+                    full.arrive();
+                }
+                Ok(record["index"].clone())
+            },
+            &mut |p, _, i, _| {
+                assert_eq!((p, i), (1, 0));
+                assert_eq!(evaluated[1].load(Ordering::SeqCst), capacity);
+                assert_eq!(evaluated[2].load(Ordering::SeqCst), capacity);
+                Err(error("stop publication"))
+            },
+        );
+        assert!(result.unwrap_err().message.contains("stop publication"));
+        assert!(evaluated[0].load(Ordering::SeqCst) <= capacity + 1);
+        assert_eq!(evaluated[1].load(Ordering::SeqCst), capacity);
+        assert_eq!(evaluated[2].load(Ordering::SeqCst), capacity);
+        assert_eq!(evaluated[3].load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn result_batch_preserves_error_and_boolean_prefixes_at_batch_boundaries() {
+    let rules = rules(4);
+    let refs: Vec<_> = rules.iter().collect();
+    for capacity in [1, 2, 8, 1024] {
+        for at in [0, 1, 7, 8, 16] {
+            for failure in ["false", "evaluation", "output", "later"] {
+                let mut output = Vec::new();
+                let result = run(
+                    "batched",
+                    &refs,
+                    &batch(17),
+                    2,
+                    capacity,
+                    &|r, record| {
+                        let Value::Number(index) = record["index"] else {
+                            unreachable!()
+                        };
+                        let target = phase(r) == usize::from(failure == "later") && index == at;
+                        if target && matches!(failure, "evaluation" | "later") {
+                            return Err(error("record failed"));
+                        }
+                        Ok(if target && failure == "false" {
+                            Value::Bool(false)
+                        } else {
+                            record["index"].clone()
+                        })
+                    },
+                    &mut |p, _, i, _| {
+                        if failure == "output" && p == 1 && i == at as usize {
+                            return Err(error("output failed"));
+                        }
+                        output.push((p, i));
+                        Ok(())
+                    },
+                );
+                let expected = if failure == "false" {
+                    assert_eq!(result.unwrap(), 1);
+                    (0..17).map(|i| (1, i)).collect::<Vec<_>>()
+                } else {
+                    assert!(result.is_err());
+                    let mut values = if failure == "later" {
+                        (0..17).map(|i| (1, i)).collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    values.extend(
+                        (0..at as usize).map(|i| (if failure == "later" { 2 } else { 1 }, i)),
+                    );
+                    values
+                };
+                assert_eq!(output, expected, "{capacity}/{at}/{failure}");
+            }
+        }
+    }
+    for capacity in [0, 1025] {
+        assert!(run(
+            "bad",
+            &refs,
+            &batch(1),
+            2,
+            capacity,
             &|_, _| panic!(),
             &mut |_, _, _, _| panic!()
         )

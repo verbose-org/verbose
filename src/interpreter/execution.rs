@@ -44,7 +44,12 @@ pub(super) fn run(
         })
         .collect();
     let concepts: Vec<_> = iter_all_concepts(&program.items).collect();
-    if let ExecutionMode::Concurrent { max_in_flight, .. } = execution.mode {
+    if let ExecutionMode::Concurrent {
+        max_in_flight,
+        result_batch,
+        ..
+    } = execution.mode
+    {
         let phases: Vec<_> = execution
             .phases
             .iter()
@@ -55,6 +60,7 @@ pub(super) fn run(
             &phases,
             records,
             max_in_flight as usize,
+            result_batch as usize,
             &|rule, record| eval_rule(rule, &rules, &concepts, &[], record),
             &mut emit,
         );

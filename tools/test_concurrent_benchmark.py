@@ -7,9 +7,25 @@ import unittest
 from unittest.mock import patch
 
 from benchmark_concurrent import batch, measured, parse_smaps, summarize, MODES
+import benchmark_result_batches as batches
 
 
 class ConcurrentBenchmark(unittest.TestCase):
+    def test_batch_comparison_retains_original_controls_and_paired_ratios(self):
+        from benchmark_concurrent import source
+        for kind in ['light', 'compute', 'readings']:
+            self.assertEqual(batches.fixture(kind, 'sequential'), source(kind, 'sequential'))
+            self.assertEqual(batches.fixture(kind, 'batch_1'), source(kind, 'concurrent_4'))
+        metrics = ['wall_ms', 'cpu_ms', 'user_ms', 'system_ms', 'voluntary_switches',
+                   'involuntary_switches', 'minor_faults', 'major_faults']
+        runs = []
+        for value in [1, 10]:
+            runs.append({'samples': {m: {k: value * (i + 1) for k in metrics}
+                                     for i, m in enumerate(batches.MODES)}})
+        summary = batches.summary(runs)
+        self.assertEqual(summary['batch_128']['paired_wall_ratio_to_batch_1']['median'], 2.5)
+        self.assertEqual(summary['batch_128']['paired_wall_ratio_to_sequential']['median'], 5)
+
     def test_oracle_retains_phase_order_and_signed_truncation(self):
         _, argv, output = batch('light', 201)
         values = list(map(int, output.splitlines()))

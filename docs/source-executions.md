@@ -27,8 +27,9 @@ duplicate fields and unsupported mode/policy values refuse. This page describes
 `mode: sequential` with `on_failure: stop`. The separate
 [concurrent reference contract](concurrent-executions.md) requires `max_in_flight`
 instead of `native_stack`, plus an optional `native_memory` ceiling required for
-[native concurrency](native-concurrent-executions.md). Sequential mode refuses
-both concurrent resource fields. `@source` must resolve
+[native concurrency](native-concurrent-executions.md). Optional
+[`result_batch`](concurrent-result-batches.md) bounds pending results per worker.
+Sequential mode refuses all three concurrent resource fields. `@source` must resolve
 to an existing intention line; imported executions have their source references
 rewritten like imported rules. An intention must be nonempty.
 

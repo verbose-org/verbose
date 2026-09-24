@@ -1,5 +1,5 @@
 //! Ordered publication of pure phases admitted in bounded consecutive waves.
-//! Rendezvous sends apply backpressure; cancellation drops every receiver before
+//! Bounded sends apply backpressure; cancellation drops every receiver before
 //! joining, so an unpublished worker cannot remain blocked on its result.
 use super::{error, RuntimeError, Value};
 use crate::ast::Rule;
@@ -56,10 +56,20 @@ pub(super) fn run(
     phases: &[&Rule],
     records: &[HashMap<String, Value>],
     limit: usize,
+    result_batch: usize,
     evaluate: &(impl Fn(&Rule, &HashMap<String, Value>) -> Result<Value, RuntimeError> + Sync),
     emit: &mut impl FnMut(usize, &Rule, usize, Value) -> Result<(), RuntimeError>,
 ) -> Result<i32, RuntimeError> {
-    run_with_start(name, phases, records, limit, evaluate, emit, &|_| Ok(()))
+    run_with_start(
+        name,
+        phases,
+        records,
+        limit,
+        result_batch,
+        evaluate,
+        emit,
+        &|_| Ok(()),
+    )
 }
 
 // The start hook makes partial admission failure testable without exhausting
@@ -69,6 +79,7 @@ fn run_with_start(
     phases: &[&Rule],
     records: &[HashMap<String, Value>],
     limit: usize,
+    result_batch: usize,
     evaluate: &(impl Fn(&Rule, &HashMap<String, Value>) -> Result<Value, RuntimeError> + Sync),
     emit: &mut impl FnMut(usize, &Rule, usize, Value) -> Result<(), RuntimeError>,
     before_start: &impl Fn(usize) -> std::io::Result<()>,
@@ -78,6 +89,11 @@ fn run_with_start(
             "concurrent execution max_in_flight must be in [1, 64]",
         ));
     }
+    if !(1..=1024).contains(&result_batch) {
+        return Err(error(
+            "concurrent execution result_batch must be in [1, 1024]",
+        ));
+    }
     for (wave_index, wave) in phases.chunks(limit).enumerate() {
         let cancel = AtomicBool::new(false);
         let result = thread::scope(|scope| {
@@ -85,7 +101,9 @@ fn run_with_start(
             let mut outcome = Ok(0);
             for (offset, &rule) in wave.iter().enumerate() {
                 let phase = wave_index * limit + offset + 1;
-                let (sender, receiver) = sync_channel(0);
+                // B-1 queued values plus one blocked send, in addition to the
+                // single value currently being published by the coordinator.
+                let (sender, receiver) = sync_channel(result_batch - 1);
                 let flag = &cancel;
                 let worker = before_start(phase).and_then(|()| {
                     thread::Builder::new()

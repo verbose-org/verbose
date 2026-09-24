@@ -1,6 +1,6 @@
 # Bounded result batches
 
-Design fixed before implementation, 2026-09-24. The first
+Design fixed before implementation, 2026-09-24; now implemented. The first
 [native concurrency measurements](concurrent-benchmark.md) identify per-result
 rendezvous as a substantial cost. This slice bounds and amortizes those exchanges;
 it does not change the pure phase subset or promise parallel throughput.
@@ -19,6 +19,9 @@ B-1 queued slots and at most one value in a blocked send. Native workers share
 one fixed serialized batch with the coordinator and wait for its consumption
 before starting the next batch. They may publish fewer than B results at end of
 input or before a recoverable input/evaluation failure.
+Native batching can delay the first visible result while the worker fills its
+buffer. B=1 retains per-record publication; a larger capacity is an explicit
+storage/latency tradeoff, not an automatic choice inferred from idle memory.
 
 Admission remains in consecutive waves. Publication retains phase order then
 record order. Boolean false remains sticky until its complete phase is
@@ -59,8 +62,10 @@ are read by the coordinator only after READY publication.
 On a full batch: copy committed length to offset 8, publish READY with the
 existing locked transition, wake, then wait for EMPTY or CANCEL. After EMPTY,
 reset destination to base and committed bytes/count to zero. At end or input
-failure, save terminal status, flush any committed partial batch, then publish
-DONE. Cancellation wins every publication transition. The coordinator reads
+failure, save terminal status (1 for an input error), flush any committed partial
+batch, then publish DONE. Native argv failures retain status 1 with no contextual
+stderr; interpreter errors retain their phase/record diagnostic. Cancellation
+wins every publication transition. The coordinator reads
 the immutable base, writes the entire published length, and acknowledges once
 per batch. Native scalar and bounded-text bodies and worker stack bounds stay
 unchanged. The B=1 emitter path retains its existing instruction bytes.
@@ -90,3 +95,39 @@ with balanced repeated order, independent output oracles and separate memory/
 syscall observations. No build/test overlaps timing. Record current host load
 and retain all observations. Phase-order backpressure still limits useful compute
 overlap on long lots even if larger batches reduce synchronization costs.
+
+## Reproduce the comparison
+
+Build both compilers before timing. The reference is the implementation before
+result batching (`eee1124`, also present at merge `29d8f3c`). The harness refuses
+to measure if any of its three sequential or three default-concurrent controls
+differs in native bytes from that reference. Explicit `result_batch: 1` is also
+checked against the omitted field by the CLI tests.
+
+```sh
+python3 tools/test_concurrent_benchmark.py -v
+python3 tools/benchmark_result_batches.py \
+  --compiler target/release/verbosec \
+  --reference-compiler /path/to/pre-batch/verbosec \
+  --reference-revision eee1124605344846a2cbc0861d43bacfd9ff569a \
+  --cpus 2 4 6 8 --repeats 30 \
+  --host-note "Describe current host load" \
+  --output /tmp/result-batches.json
+```
+
+The five modes are sequential and concurrent limit 4 with batches 1/8/32/128.
+Five workloads retain the [initial benchmark's](concurrent-benchmark.md)
+input/oracle and timing/memory definitions. Thirty rotated rounds balance every
+mode's position; two warmups per mode precede timing. Each ratio is paired
+within the same round against a freshly measured sequential or batch-1 control,
+not against yesterday's readings. Raw observations and median/range/MAD remain
+available. Native output is checked on every timed input before measurement;
+independent arithmetic and original-interpreter checks precede all timing.
+
+Three separate memory snapshots per workload/mode retain the same blocked-output
+conditions and guards/reservation checks. CPU-accounting anomalies produce
+`status: inconclusive` and exit 2; functional or execution failures exit 1.
+No sample is discarded. Batching also reduces the number of stdout writes;
+these measurements compare complete implementations, not isolated futex costs.
+The new benchmark and its helper hashes are recorded; the historical report
+and original benchmark remain available.

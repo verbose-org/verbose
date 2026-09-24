@@ -9,4 +9,5 @@ execution inspect_native
   phases: [clamp, nonnegative, label]
   on_failure: stop
   max_in_flight: 2
+  result_batch: 32
   native_memory: 20480
