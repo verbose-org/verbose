@@ -35,6 +35,7 @@ class WorkloadCLI(unittest.TestCase):
         self.assertEqual(report['profile_kind'], 'prediction')
         self.assertFalse(report['measurements_available'])
         self.assertEqual(report['measurement_metric'], 'wall_us')
+        self.assertEqual(report['input_fields'], [dict(name='title', type='text'), dict(name='value', type='number')])
         self.assertEqual(report['aggregation'], 'weighted_arithmetic_mean_per_invocation')
         self.assertEqual(report['target_kind'], 'unverified_elapsed_goal')
         self.assertEqual(report['expected_records_per_invocation'], dict(numerator=4195, denominator=100))

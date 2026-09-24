@@ -1,6 +1,6 @@
 # Measured execution proposals
 
-Design fixed before implementation, 2026-09-24. This is the next slice after
+Design fixed before implementation, 2026-09-24; now implemented. This is the next slice after
 [predicted workloads](workload-profiles.md): an offline, standard-library Python
 tool compares existing native execution organizations and emits a reviewable
 source proposal. The compiler remains the authority for syntax, proofs and
@@ -38,7 +38,8 @@ batches with exactly its predicted record count. Identical batches under
 different filenames or JSON formatting refuse. Authors remain responsible for
 representative independent data; different bytes alone cannot establish that.
 Explicit additional JSON batches and raw argv checks cover rare and invalid
-inputs without contributing to performance scores.
+inputs without contributing to performance scores. An empty native argv check
+is mandatory even when the manifest supplies no additional checks.
 
 Before timing, run the original interpreter and every candidate on both sets
 and additional checks. Compare exit status, stdout and stderr within each
@@ -48,6 +49,14 @@ specific. Time only successful, stderr-free cases in this slice. Check the
 native signatures again after timing. Test agreement supplements the narrow
 structural change restriction; it is not a proof of arbitrary algorithm
 equivalence.
+
+An observed difference excludes that candidate before timing and keeps both
+transcripts. In particular, today's sequential entry writes
+`error: not enough arguments` on empty argv, while the concurrent entry exits
+with empty stderr; both exit 1. The mandatory probe therefore excludes current
+mode switches. This is an explicit backend compatibility limit, not a difference
+the experiment may ignore for speed. Concurrent lane/batch changes remain useful
+candidates. Byte-identical binaries are retained but not scored as improvements.
 
 ## Measurement and decision
 
@@ -83,7 +92,7 @@ There is no automatic commit, deployment or general algorithm rewrite.
 
 The JSON manifest has closed keys. Paths are relative to the manifest; the
 source's directory is the root of the dependency snapshot. Candidate names are
-unique identifiers (`baseline` is reserved), with at most eight candidates.
+unique identifiers (`baseline` and `proposal` are reserved), with at most eight candidates.
 The optional `budgets` object supplies only a missing mode's ceiling; it cannot
 override a ceiling in the original source. `checks` and `argv_checks` are
 required arrays, possibly empty (empty arrays mean no additional coverage).
@@ -96,6 +105,7 @@ required arrays, possibly empty (empty arrays mean no additional coverage).
   "budgets": {"native_stack": 192},
   "variants": [
     {"name": "sequential", "mode": "sequential"},
+    {"name": "batch64", "mode": "concurrent", "max_in_flight": 2, "result_batch": 64},
     {"name": "batch128", "mode": "concurrent", "max_in_flight": 2, "result_batch": 128}
   ],
   "cases": {
@@ -118,8 +128,42 @@ binaries, compiler transcripts, functional signatures and a JSON report.
 `--repeats` defaults to 32, rounded up to complete balanced cycles in each half;
 `--min-gain-pct` defaults to 5. No proposed change is a normal measured outcome
 (exit 0), accounting/identity instability is inconclusive (exit 2), and invalid
-configuration or functional/build inconsistency fails (exit 1). A rejected
-candidate alone does not fail the experiment; a rejected baseline does.
+configuration, baseline inconsistency or a post-measurement functional/build
+inconsistency fails (exit 1). A candidate's pre-measurement compiler/functional
+refusal alone does not fail the experiment; a rejected baseline does.
+
+For a complete reproducible example, first run:
+
+```sh
+python3 tools/workload_experiment_example.py /tmp/reading-workload
+python3 tools/experiment_workload.py /tmp/reading-workload/experiment.json \
+  --compiler target/release/verbosec --cpus 2 4 6 8 \
+  --host-note 'Describe current host load' --output /tmp/reading-experiment
+```
+
+Choose CPUs allowed on your machine. The generator makes an explicitly
+**unbatched** version of the reading example, preserving its 20 KiB source
+ceiling and 99:1 invocation profile. It supplies two separate batches per case,
+empty/negative/i64-extreme/overlong/invalid argument checks, four result-batch
+sizes and a sequential candidate. A batch of 128 exceeds this ceiling and is
+recorded as refused; the sequential candidate fails the diagnostic comparison.
+This does not claim an improvement over the already-batched repository example.
+
+Supported measurement inputs are flat `number`/`text` records, with exact i64
+JSON integers and NUL-free UTF-8 argv strings. Input bounds are still checked by
+the compiler-generated entry and interpreter. Host argument-size limits can
+refuse large cases; this slice does not substitute a different input channel.
+The sequential stack and concurrent reservation reports are kept separately;
+no RSS, cache residency, tail-latency, sustained-service or TLS claim follows.
+
+| Path | Support |
+|---|---|
+| Rust compiler workload report | Additive ordered `input_fields` schema; native code unchanged |
+| Offline native experiment | Linux x86-64, explicit candidates and data, existing strict pure executions |
+| Interpreter | Untimed functional reference and candidate comparisons |
+| Proposal | Reviewed source patch plus verified binary identity; original source unchanged |
+| WASM / self-hosted compiler | Existing execution refusal; no experiment target |
+| Algorithm rewriting / automatic application / service tuning | Not implemented |
 
 ## Validation
 

@@ -108,6 +108,7 @@ fn workload_reports_exact_invocation_and_volume_shares_without_pricing_work() {
     ));
     assert!(r.json().contains("\"scope\":\"additional_entry_stack\""));
     assert!(r.json().contains("\"measurements_available\":false"));
+    assert!(r.json().contains("\"input_fields\":[{\"name\":\"title\",\"type\":\"text\"},{\"name\":\"value\",\"type\":\"number\"}]"));
     assert_eq!(r.json(), report(&p, "inspect").unwrap().json());
     assert!(r.to_string().contains("99/4195 record volume"));
     for b in [1, 32, 1024] {

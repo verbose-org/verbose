@@ -60,6 +60,9 @@ jobs:
       - name: Validate predicted workload profiles
         run: python3 tools/test_workload_profile.py -v
 
+      - name: Validate measured workload proposals
+        run: python3 tools/test_workload_experiment.py -v
+
       - name: Benchmark
         run: cargo run -- examples/invoices.verbose --benchmark --run important_invoice
 
