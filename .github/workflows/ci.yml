@@ -51,6 +51,9 @@ jobs:
       - name: Validate numeric benchmark harness
         run: python3 tools/test_numeric_benchmark.py -v
 
+      - name: Validate concurrent benchmark accounting
+        run: python3 tools/test_concurrent_benchmark.py -v
+
       - name: Validate native stack contract CLI
         run: python3 tools/test_stack_budget.py -v
 

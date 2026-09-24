@@ -4,7 +4,8 @@
 analyses in bounded concurrent waves with ordered output. Run it through the
 interpreter with [`execution_stack.json`](execution_stack.json).
 [`native_concurrent_execution.verbose`](native_concurrent_execution.verbose)
-adds the checked 20480-byte `native_memory` reservation for Linux native threads;
+adds the checked 20480-byte `native_memory` reservation for Linux native threads
+and `result_batch: 32`, which still fits that reservation;
 inspect it with `--memory-report`. See [concurrent execution contracts](../docs/concurrent-executions.md)
 and [native reservations](../docs/native-concurrent-executions.md).
 

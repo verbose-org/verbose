@@ -49,14 +49,21 @@ remains outside the native budget. This supplies a reference for optimized
 native execution without extending the declared phase subset.
 An interpreter reference now supports [bounded concurrent waves](concurrent-executions.md):
 `mode: concurrent` requires `max_in_flight`, orders publication and joins all
-admitted workers before a new wave or return. Rendezvous channels prevent queues
-of completed batches. This bounds admission/pending result counts, not host memory.
+admitted workers before a new wave or return. The optional
+[`result_batch`](concurrent-result-batches.md), default 1, bounds pending results
+per worker. This bounds admission/pending result counts, not host memory.
 The [native implementation](native-concurrent-executions.md) now uses Linux
 threads with a fixed `native_memory` reservation and `--memory-report`. The
-calculation covers reusable worker stacks, control/results, padding and guard
+calculation covers reusable worker stacks, control/result batches, padding and guard
 pages, with ordered publication and full joins. Initial argv/code/kernel storage
 are excluded; this is not RSS or total process memory. Native stdin/stream,
 service scopes and retained state between phases remain separate work.
+The [initial measurements](concurrent-benchmark.md) show substantial per-result
+synchronization costs. The [batch comparison](concurrent-result-batches.md#recorded-result-2026-09-24)
+measures reduced exchanges within the same ordered publication contract: on the
+recorded machine, batches of 32 retain the same reserved pages in the fixtures;
+batches of 128 beat sequential elapsed time on the long synthetic compute case.
+Cheap phases remain faster sequentially. Bounded memory is not a speedup guarantee.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.

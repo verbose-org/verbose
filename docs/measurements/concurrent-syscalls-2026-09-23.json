@@ -1,0 +1,283 @@
+{
+  "measurement_revision": "eee1124605344846a2cbc0861d43bacfd9ff569a",
+  "strace": "strace -- version 6.8",
+  "scope": "Separate traced executions; syscall counts only, traced timings are not benchmark results",
+  "runs": [
+    {
+      "mode": "sequential",
+      "records": 1,
+      "binary_sha256": "630f146308e9e1e4dc0d2f150c0bd313e2742e7e8071573c3ef136d0a3818b42",
+      "arguments": [
+        "strace",
+        "-f",
+        "-qq",
+        "-c",
+        "-o",
+        "<trace>",
+        "/tmp/verbose-concurrent-bench-boysigko/light-sequential",
+        "*batch(light, records).argv"
+      ],
+      "calls": {
+        "write": {
+          "calls": 4,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "total": {
+          "calls": 5,
+          "errors": 0
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n  0.00    0.000000           0         4           write\n  0.00    0.000000           0         1           execve\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.000000           0         5           total\n"
+    },
+    {
+      "mode": "sequential",
+      "records": 256,
+      "binary_sha256": "630f146308e9e1e4dc0d2f150c0bd313e2742e7e8071573c3ef136d0a3818b42",
+      "arguments": [
+        "strace",
+        "-f",
+        "-qq",
+        "-c",
+        "-o",
+        "<trace>",
+        "/tmp/verbose-concurrent-bench-boysigko/light-sequential",
+        "*batch(light, records).argv"
+      ],
+      "calls": {
+        "write": {
+          "calls": 1024,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "total": {
+          "calls": 1025,
+          "errors": 0
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.016668          16      1024           write\n  0.00    0.000000           0         1           execve\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.016668          16      1025           total\n"
+    },
+    {
+      "mode": "concurrent_1",
+      "records": 1,
+      "binary_sha256": "49dba4e111960d3d6b6e50ac53e7d4a0ee5be513e537a1a924305ee4baa9afd4",
+      "arguments": [
+        "strace",
+        "-f",
+        "-qq",
+        "-c",
+        "-o",
+        "<trace>",
+        "/tmp/verbose-concurrent-bench-boysigko/light-concurrent_1",
+        "*batch(light, records).argv"
+      ],
+      "calls": {
+        "write": {
+          "calls": 4,
+          "errors": 0
+        },
+        "mmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mprotect": {
+          "calls": 2,
+          "errors": 0
+        },
+        "munmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "rt_sigprocmask": {
+          "calls": 1,
+          "errors": 0
+        },
+        "clone": {
+          "calls": 4,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "futex": {
+          "calls": 20,
+          "errors": 4
+        },
+        "total": {
+          "calls": 34,
+          "errors": 4
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n  0.00    0.000000           0         4           write\n  0.00    0.000000           0         1           mmap\n  0.00    0.000000           0         2           mprotect\n  0.00    0.000000           0         1           munmap\n  0.00    0.000000           0         1           rt_sigprocmask\n  0.00    0.000000           0         4           clone\n  0.00    0.000000           0         1           execve\n  0.00    0.000000           0        20         4 futex\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.000000           0        34         4 total\n"
+    },
+    {
+      "mode": "concurrent_1",
+      "records": 256,
+      "binary_sha256": "49dba4e111960d3d6b6e50ac53e7d4a0ee5be513e537a1a924305ee4baa9afd4",
+      "arguments": [
+        "strace",
+        "-f",
+        "-qq",
+        "-c",
+        "-o",
+        "<trace>",
+        "/tmp/verbose-concurrent-bench-boysigko/light-concurrent_1",
+        "*batch(light, records).argv"
+      ],
+      "calls": {
+        "futex": {
+          "calls": 3790,
+          "errors": 1023
+        },
+        "write": {
+          "calls": 1024,
+          "errors": 0
+        },
+        "clone": {
+          "calls": 4,
+          "errors": 0
+        },
+        "munmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mprotect": {
+          "calls": 2,
+          "errors": 0
+        },
+        "rt_sigprocmask": {
+          "calls": 1,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "total": {
+          "calls": 4824,
+          "errors": 1023
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n 91.45    0.093077          24      3790      1023 futex\n  8.19    0.008338           8      1024           write\n  0.32    0.000323          80         4           clone\n  0.04    0.000038          38         1           munmap\n  0.00    0.000000           0         1           mmap\n  0.00    0.000000           0         2           mprotect\n  0.00    0.000000           0         1           rt_sigprocmask\n  0.00    0.000000           0         1           execve\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.101776          21      4824      1023 total\n"
+    },
+    {
+      "mode": "concurrent_4",
+      "records": 1,
+      "binary_sha256": "ef6299956b0cf4f92f38eaec8a1bdb47f6579eeada0ee703cdfc0acbd6f0a682",
+      "arguments": [
+        "strace",
+        "-f",
+        "-qq",
+        "-c",
+        "-o",
+        "<trace>",
+        "/tmp/verbose-concurrent-bench-boysigko/light-concurrent_4",
+        "*batch(light, records).argv"
+      ],
+      "calls": {
+        "write": {
+          "calls": 4,
+          "errors": 0
+        },
+        "mmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mprotect": {
+          "calls": 5,
+          "errors": 0
+        },
+        "munmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "rt_sigprocmask": {
+          "calls": 1,
+          "errors": 0
+        },
+        "clone": {
+          "calls": 4,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "futex": {
+          "calls": 21,
+          "errors": 4
+        },
+        "total": {
+          "calls": 38,
+          "errors": 4
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n  0.00    0.000000           0         4           write\n  0.00    0.000000           0         1           mmap\n  0.00    0.000000           0         5           mprotect\n  0.00    0.000000           0         1           munmap\n  0.00    0.000000           0         1           rt_sigprocmask\n  0.00    0.000000           0         4           clone\n  0.00    0.000000           0         1           execve\n  0.00    0.000000           0        21         4 futex\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.000000           0        38         4 total\n"
+    },
+    {
+      "mode": "concurrent_4",
+      "records": 256,
+      "binary_sha256": "ef6299956b0cf4f92f38eaec8a1bdb47f6579eeada0ee703cdfc0acbd6f0a682",
+      "arguments": [
+        "strace",
+        "-f",
+        "-qq",
+        "-c",
+        "-o",
+        "<trace>",
+        "/tmp/verbose-concurrent-bench-boysigko/light-concurrent_4",
+        "*batch(light, records).argv"
+      ],
+      "calls": {
+        "futex": {
+          "calls": 3748,
+          "errors": 1008
+        },
+        "write": {
+          "calls": 1024,
+          "errors": 0
+        },
+        "munmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mmap": {
+          "calls": 1,
+          "errors": 0
+        },
+        "mprotect": {
+          "calls": 5,
+          "errors": 0
+        },
+        "rt_sigprocmask": {
+          "calls": 1,
+          "errors": 0
+        },
+        "clone": {
+          "calls": 4,
+          "errors": 0
+        },
+        "execve": {
+          "calls": 1,
+          "errors": 0
+        },
+        "total": {
+          "calls": 4785,
+          "errors": 1008
+        }
+      },
+      "raw_summary": "% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n 95.66    0.195375          52      3748      1008 futex\n  4.32    0.008827           8      1024           write\n  0.02    0.000044          44         1           munmap\n  0.00    0.000000           0         1           mmap\n  0.00    0.000000           0         5           mprotect\n  0.00    0.000000           0         1           rt_sigprocmask\n  0.00    0.000000           0         4           clone\n  0.00    0.000000           0         1           execve\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.204246          42      4785      1008 total\n"
+    }
+  ]
+}

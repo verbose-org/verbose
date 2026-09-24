@@ -1,4 +1,5 @@
 use super::*;
+mod batches;
 use crate::{lexer::Lexer, parser::Parser, verifier};
 use std::{
     fs,
@@ -180,7 +181,15 @@ fn native_concurrent_layout_budget_and_artifact_gates() {
 
 #[test]
 fn native_concurrent_syscall_failures_cancel_and_join_admitted_workers() {
-    let p = program(RULES, "clamp, nonnegative, label", 2, Some(20480));
+    for capacity in [1, 8] {
+        syscall_failures(capacity);
+    }
+}
+fn syscall_failures(capacity: u32) {
+    let p = batches::batched(
+        program(RULES, "clamp, nonnegative, label", 2, Some(20480)),
+        capacity,
+    );
     let prepared = prepare(&p, entry(&p)).unwrap();
     let emission = emit::compile(&prepared).unwrap();
     for nr in [9, 10, 14, 56, 1, 202] {
@@ -218,7 +227,15 @@ fn native_concurrent_syscall_failures_cancel_and_join_admitted_workers() {
 
 #[test]
 fn native_concurrent_backpressure_keeps_threads_bounded_and_joins_on_broken_pipe() {
-    let p = program(RULES, "label, label, label, label", 2, Some(20480));
+    for capacity in [1, 32] {
+        backpressure(capacity);
+    }
+}
+fn backpressure(capacity: u32) {
+    let p = batches::batched(
+        program(RULES, "label, label, label, label", 2, Some(20480)),
+        capacity,
+    );
     let path = binary(&compile(&p, entry(&p)).unwrap(), "backpressure");
     let input: Vec<_> = (0..5000)
         .flat_map(|_| ["12345678".to_string(), "9223372036854775807".to_string()])

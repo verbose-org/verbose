@@ -45616,7 +45616,16 @@ service shadow
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let mut bound = false;
         for _ in 0..100 {
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+            if let Ok(mut probe) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                // Wait for the readiness connection to be closed before taking
+                // the fd baseline. Merely dropping our socket can leave its
+                // accepted peer temporarily counted (5 baseline -> 4 final).
+                // EOF after half-close confirms the server released that peer;
+                // this does not weaken the later exact leak assertion.
+                probe.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                probe.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut reply = Vec::new();
+                probe.read_to_end(&mut reply).expect("readiness connection must close");
                 bound = true;
                 break;
             }

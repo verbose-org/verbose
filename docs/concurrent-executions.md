@@ -24,8 +24,11 @@ The existing six common execution fields/attributes remain mandatory and unique.
 Concurrent mode requires `max_in_flight` in 1..64 and refuses `native_stack`.
 Its optional `native_memory` ceiling enables native emission; without it the
 interpreter remains usable and `--memory-report` can calculate the reservation.
+The optional [`result_batch: B`](concurrent-result-batches.md) bounds pending
+results per worker in 1..1024, defaulting to 1. Native emission groups serialized
+results into a fixed buffer whose complete capacity counts towards `native_memory`.
 Sequential mode keeps its required `native_stack` and refuses `max_in_flight`
-and `native_memory`.
+and `native_memory`, as well as `result_batch`.
 Names, source references, input concepts, 2..64 phases, repeated names and pure
 acyclic numeric/bounded-text restrictions retain their checks. Effects, services,
 recursion, nested executions and unknown phase analysis refuse. Every declaration
@@ -76,12 +79,13 @@ waves remain published. These host failures need not have a sequential analogue.
 ## Reference storage and control flow
 
 The interpreter uses scoped host threads with immutable borrowed program/input
-data. Each worker has a rendezvous channel: sending a result waits until the
-coordinator consumes it. There is no queue of completed batches. A worker can
-hold at most one result awaiting publication; while the coordinator publishes a
-received value that worker may compute the next. Thus at most N worker-owned
-pending results plus one coordinator-owned result can be retained, for N admitted
-phases. This is a count of result values, not a bound on their bytes, temporary
+data. Each worker has a channel with B-1 queued slots for `result_batch: B`:
+including a value in a blocked send, it can retain at most B values awaiting
+publication. Default B=1 retains the original rendezvous channel. While the
+coordinator publishes a received value, that worker may compute the next.
+Thus at most N×B worker/channel-owned pending results plus one coordinator-owned
+result can be retained, for N admitted phases. This is a count of result values,
+not a bound on their bytes, temporary
 evaluation values, input storage or the Rust process's memory.
 
 The host uses its existing 64 MiB interpreter stack size per worker, subject to
@@ -92,7 +96,7 @@ native thread/process ABI.
 
 Control flow per wave:
 
-1. Create a cancellation flag, at most N rendezvous channels and scoped workers.
+1. Create a cancellation flag, at most N bounded channels and scoped workers.
 2. Each worker evaluates one record, checks cancellation, sends its value, and
    repeats. It sends an ordinary error immediately or a final sticky-bool status.
 3. The coordinator drains each phase in declaration order, publishing each value

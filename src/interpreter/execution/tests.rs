@@ -309,10 +309,11 @@ fn concurrent_reference_matches_sequential_and_native_across_admission_limits() 
             false,
         )
         .unwrap();
-        for limit in [1, 2, 64] {
+        for (limit, result_batch) in [(1, 1), (2, 1), (64, 1), (1, 8), (2, 8), (64, 8), (2, 32)] {
             let mut concurrent = sequential.clone();
             if let Item::Execution(e) = concurrent.items.last_mut().unwrap() {
                 e.mode = ExecutionMode::Concurrent {
+                    result_batch,
                     native_memory: Some(1_000_000),
                     max_in_flight: limit,
                 };
@@ -386,6 +387,7 @@ fn concurrent_records_and_runtime_errors_keep_the_sequential_prefix() {
     let mut concurrent = sequential.clone();
     if let Item::Execution(e) = concurrent.items.last_mut().unwrap() {
         e.mode = ExecutionMode::Concurrent {
+            result_batch: 8,
             max_in_flight: 2,
             native_memory: None,
         };

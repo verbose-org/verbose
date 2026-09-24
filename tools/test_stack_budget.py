@@ -317,6 +317,67 @@ class NativeConcurrentExecutionCLI(unittest.TestCase):
     run_compiler = SourceExecutionCLI.run_compiler
     interpret = SourceExecutionCLI.interpret
 
+    def test_result_batch_capacity_defaults_budgets_and_unchanged_single_result(self):
+        paths = [self.base / "default", self.base / "one"]
+        for suffix, path in zip(["", "  result_batch: 1\n"], paths):
+            self.source.write_text(self.original + "  native_memory: 20480\n" + suffix)
+            out = self.run_compiler("--native", path)
+            self.assertEqual((out.returncode, out.stderr), (0, b""))
+        self.assertEqual(paths[0].read_bytes(), paths[1].read_bytes())
+        for capacity, reserved in [(8, 20480), (32, 20480), (128, 24576)]:
+            self.source.write_text(self.original + f"  result_batch: {capacity}\n  native_memory: {reserved}\n")
+            out = self.run_compiler("--memory-report", "--json")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            report = json.loads(out.stdout)
+            self.assertEqual(report["result_batch"], capacity)
+            self.assertEqual(report["reserved_bytes"], reserved)
+            self.assertEqual([l["result_capacity_bytes"] for l in report["lanes"]], [30, 6])
+            self.assertEqual([l["output_capacity_bytes"] for l in report["lanes"]], [30 * capacity, 6 * capacity])
+            out = self.run_compiler("--native", paths[1])
+            self.assertEqual((out.returncode, out.stderr), (0, b""))
+            rows = [dict(title="é", value=i) for i in range(33)]
+            interpreted = self.interpret(rows)
+            native = subprocess.run([str(paths[1]), *[v for r in rows for v in [r["title"], str(r["value"])]]],
+                                    capture_output=True, timeout=5)
+            self.assertEqual((native.returncode, native.stdout, native.stderr),
+                             (interpreted.returncode, interpreted.stdout, interpreted.stderr))
+            for at in sorted({0, capacity - 1, capacity, 32}):
+                if at >= len(rows):
+                    continue
+                failing = [dict(r) for r in rows]
+                failing[at]["value"] = -1
+                interpreted = self.interpret(failing)
+                native = subprocess.run([str(paths[1]), *[v for r in failing for v in [r["title"], str(r["value"])]]],
+                                        capture_output=True, timeout=5)
+                self.assertEqual((native.returncode, native.stdout, native.stderr),
+                                 (1, interpreted.stdout, interpreted.stderr))
+            before = paths[1].read_bytes()
+            refused = self.run_compiler("--wasm", paths[1])
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn(b"source execution", refused.stderr)
+            self.assertEqual(paths[1].read_bytes(), before)
+            self.source.write_text(self.source.read_text().replace(f"native_memory: {reserved}", f"native_memory: {reserved - 1}"))
+            out = self.run_compiler("--native", paths[1])
+            self.assertEqual((out.returncode, out.stdout), (1, b""))
+            self.assertEqual(paths[1].read_bytes(), before)
+
+    def test_result_batch_refusals_precede_input_and_artifact_access(self):
+        path = self.base / "untouched"
+        path.write_bytes(b"preserve")
+        for tail in ["result_batch: 0", "result_batch: -1", "result_batch: 1025",
+                     "result_batch: 1\n  result_batch: 2"]:
+            unused = self.original.split("execution inspect_readings", 1)[1] + f"  {tail}\n"
+            self.source.write_text(self.original + "\nexecution unused" + unused)
+            for flags in [["--native", path, "--run", "clamp"],
+                          ["--run", "inspect_readings", "--input", "missing.json"]]:
+                out = self.run_compiler(*flags)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn(b"result_batch", out.stderr)
+                self.assertNotIn(b"cannot read", out.stderr)
+                self.assertEqual(path.read_bytes(), b"preserve")
+        self.source.write_text(self.sequential + "  result_batch: 1\n")
+        self.assertIn(b"sequential execution does not accept result_batch", self.run_compiler().stderr)
+
     def test_memory_report_exact_budget_and_unchanged_generous_budget(self):
         out = self.run_compiler("--memory-report", "--json")
         self.assertEqual((out.returncode, out.stderr), (0, b""))

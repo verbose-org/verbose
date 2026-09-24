@@ -11,6 +11,10 @@ Concurrent executions may additionally declare `native_memory: N`, a byte ceilin
 in 1..268435456. Existing declarations without it still run in the interpreter;
 native emission requires it. Sequential executions refuse this field.
 `native_stack` remains reserved for sequential entries and independent rules.
+An optional [`result_batch: B`](concurrent-result-batches.md), in 1..1024 and
+defaulting to 1, groups results into each lane's fixed output buffer. It is checked
+by both the interpreter and native paths. The default/explicit-1 native path
+retains the original emitted bytes.
 
 `--memory-report [--json] --run <execution>` computes the concurrent layout even
 without a ceiling, without creating an artifact. A declared insufficient ceiling
@@ -18,7 +22,7 @@ refuses every entry path, including unselected executions. The existing
 `--stack-report` does not describe this off-stack allocation.
 
 The ceiling covers one fixed, page-rounded userspace mapping: scheduler words,
-per-worker synchronization/termination words, one serialized result buffer per
+per-worker synchronization/termination words, one serialized result-batch buffer per
 worker, worker stacks with their transient scratch, padding and inaccessible
 guard pages. It is a bound on reserved virtual address bytes for this execution,
 not RSS, touched bytes or whole-process memory. Code/ELF, kernel-provided initial
@@ -29,7 +33,9 @@ collector or unbounded result queue is introduced.
 
 There are min(max_in_flight, phase count) reusable lanes. A lane's stack and result
 capacities are the maxima of phases assigned to that lane across consecutive
-waves. Sum those lane reservations, not independent source budget declarations.
+waves, with output capacity multiplied by B using checked arithmetic. The report
+exposes per-record and per-batch lane capacities. Sum those lane reservations,
+not independent source budget declarations.
 Every phase's actual lowering supplies its stack and serialized result capacities;
 unknown layouts refuse. Keep existing independent rule budgets checked against
 their original standalone argv layouts. The report exposes both logical storage
@@ -38,7 +44,7 @@ and page reservation, including per-phase and per-lane calculations.
 ## Running the example
 
 [`native_concurrent_execution.verbose`](../examples/native_concurrent_execution.verbose)
-adds `native_memory: 20480` to the reading analyses:
+adds `native_memory: 20480` and `result_batch: 32` to the reading analyses:
 
 ```sh
 target/release/verbosec examples/native_concurrent_execution.verbose --memory-report --json
@@ -49,6 +55,8 @@ target/release/verbosec examples/native_concurrent_execution.verbose --native /t
 It prints `2`, `100`, `true`, `true`, `a:2`, `b:1000` on separate lines,
 with status 0. The reservation is 4096 bytes for control/results plus two lanes
 of 4096 stack bytes and 4096 inaccessible guard bytes: 20480 bytes. The report
+shows per-lane result capacities 30 and 6 bytes, giving batch capacities 960 and
+192 bytes. Both still fit in the original control/results page. It
 also exposes the smaller actual stack bounds and output capacities; reserved
 pages and logical live storage are distinct. A 20479-byte declaration refuses;
 a larger sufficient ceiling changes no native bytes.
@@ -98,8 +106,10 @@ Only the worker fills its buffer. Publishing READY uses an atomic compare-and-ex
 the bytes and length are stored; a prior CANCEL wins. The coordinator reads that buffer only after
 observing READY, writes it completely (retrying EINTR and advancing short writes),
 then exchanges EMPTY and wakes the worker. The worker waits for EMPTY before
-evaluating its next record. This deliberately tighter backpressure still satisfies
-the reference's pending-value maximum and avoids a coordinator copy.
+evaluating its next batch. B=1 retains a rendezvous per record. B>1 fills at most B
+complete results and flushes a partial batch at EOF or before an input error.
+The tighter native backpressure satisfies the reference's pending-value maximum
+and avoids a coordinator copy. A batch is not an atomic output transaction.
 
 Waits use futex compare-and-block loops, rechecking after wake, EINTR or EAGAIN;
 there is no busy-spin loop. State transitions wake waiters. Native x86-64 ordering
@@ -108,7 +118,8 @@ admits the complete wave before receiving any of its results. It consumes lanes
 in declared order, then joins the whole wave before the next admission.
 
 A boolean false remains sticky until all valid records of that phase have been
-published. An input/evaluation failure publishes only its prior complete records.
+published. An input/evaluation failure publishes only its prior complete records,
+including completed records still held in a partial batch.
 A clone failure publishes none of its partially admitted wave. On any ordinary
 failure, exchange CANCEL into every admitted lane and wake it before joining
 any worker. Cancellation is checked between records and before publication;
@@ -140,6 +151,10 @@ services and unknown pure phase layouts. Only argv native execution is added;
 stdin/stream, HTTP execution scopes, WASM and self-hosted execution stay refused.
 Existing standalone/sequential bytes must remain identical to the reference.
 Run serialized Rust tests, CLI checks, CIDX and bootstrap before delivery.
+
+The separate [concurrency benchmark](concurrent-benchmark.md) compares elapsed
+time, CPU accounting and memory snapshots with sequential phases. Bounded
+admission and storage do not by themselves establish a throughput improvement.
 
 Kernel ABI references: [clone](https://man7.org/linux/man-pages/man2/clone.2.html),
 [futex](https://man7.org/linux/man-pages/man2/futex.2.html). The generated runtime

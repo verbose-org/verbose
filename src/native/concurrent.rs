@@ -27,12 +27,16 @@ fn prepare<'a>(p: &'a Program, e: &Execution) -> Result<Prepared<'a>, NativeErro
     let ExecutionMode::Concurrent {
         max_in_flight,
         native_memory,
+        result_batch,
     } = e.mode
     else {
         return Err(error("--memory-report requires a concurrent execution"));
     };
     if !(1..=64).contains(&max_in_flight) {
         return Err(error("max_in_flight must be in [1, 64]"));
+    }
+    if !(1..=1024).contains(&result_batch) {
+        return Err(error("result_batch must be in [1, 1024]"));
     }
     if native_memory.is_some_and(|n| !(1..=268_435_456).contains(&n)) {
         return Err(error("native_memory must be in [1, 268435456] bytes"));

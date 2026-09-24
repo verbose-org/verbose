@@ -148,6 +148,9 @@ pub(super) fn compile(p: &Prepared<'_>) -> Result<Emission, NativeError> {
         );
         addr(&mut a, AX, BP, l.output);
         put(&mut a, BP, l.control + 24, AX);
+        if p.report.result_batch > 1 {
+            put(&mut a, BP, l.control + 40, AX);
+        }
         addr(&mut a, AX, BP, l.stack + l.stack_reserved);
         put(&mut a, BP, l.control + 32, AX);
     }
@@ -197,7 +200,12 @@ pub(super) fn compile(p: &Prepared<'_>) -> Result<Emission, NativeError> {
             get(&mut a, BX, 15, 8);
             a.cmp(BX, l.output_bytes as i32);
             a.jump(Some(0x87), cancel);
-            get(&mut a, 14, 15, 24);
+            get(
+                &mut a,
+                14,
+                15,
+                if p.report.result_batch > 1 { 40 } else { 24 },
+            );
             let write = a.label();
             let consumed = a.label();
             a.mark(write);
@@ -272,7 +280,7 @@ pub(super) fn compile(p: &Prepared<'_>) -> Result<Emission, NativeError> {
     for (index, body) in p.bodies.iter().enumerate() {
         a.mark(worker_labels[index]);
         let start = a.code.len();
-        worker(&mut a, &mut sites, body, p.concept);
+        worker(&mut a, &mut sites, body, p.concept, p.report.result_batch);
         worker_ranges.push((start, a.code.len()));
     }
     assert!(a.finish().is_empty());
@@ -288,7 +296,13 @@ pub(super) fn compile(p: &Prepared<'_>) -> Result<Emission, NativeError> {
         workers: worker_ranges,
     })
 }
-fn worker(a: &mut Asm<'_>, sites: &mut Vec<(usize, i32)>, body: &Body, concept: &Concept) {
+fn worker(
+    a: &mut Asm<'_>,
+    sites: &mut Vec<(usize, i32)>,
+    body: &Body,
+    concept: &Concept,
+    batch: usize,
+) {
     let exit = a.label();
     let fail = a.label();
     let done = a.label();
@@ -303,6 +317,9 @@ fn worker(a: &mut Asm<'_>, sites: &mut Vec<(usize, i32)>, body: &Body, concept: 
     a.imm(14, 1);
     a.imm(AX, 0);
     a.store(-(body.frame_bytes as i32), AX);
+    if batch > 1 {
+        reset_batch(a);
+    }
     a.cmp(12, (concept.fields.len() + 1) as i32);
     a.jump(Some(0x8c), fail);
     a.mark(next);
@@ -337,31 +354,92 @@ fn worker(a: &mut Asm<'_>, sites: &mut Vec<(usize, i32)>, body: &Body, concept: 
         a.op(0, 14, 1);
     }
     a.bytes(&body.code);
+    if batch > 1 {
+        // Commit only a complete serialized record. The input/parser guards
+        // above cannot expose any bytes from the failing record.
+        get(a, AX, 15, 8);
+        get(a, BX, 15, 48);
+        a.rr(0x01, BX, AX);
+        put(a, 15, 48, BX);
+        get(a, BX, 15, 24);
+        a.rr(0x01, BX, AX);
+        put(a, 15, 24, BX);
+        get(a, AX, 15, 56);
+        a.op(0, AX, 1);
+        put(a, 15, 56, AX);
+        a.cmp(AX, batch as i32);
+        a.jump(Some(0x82), next);
+        let consumed = a.label();
+        flush_batch(a, sites, exit, consumed);
+        a.mark(consumed);
+        reset_batch(a);
+        a.jump(None, next);
+    } else {
+        publish(a, sites, READY, exit);
+        await_consumption(a, sites, exit, next);
+    }
+    let terminal = if batch > 1 { Some(a.label()) } else { None };
+    a.mark(done);
+    a.load(AX, -(body.frame_bytes as i32));
+    put(a, 15, 16, AX);
+    if let Some(terminal) = terminal {
+        a.jump(None, terminal);
+    } else {
+        publish(a, sites, DONE, exit);
+        a.jump(None, exit);
+    }
+    a.mark(fail);
+    for at in aborts {
+        let delta = a.code.len() as i32 - at as i32 - 4;
+        a.code[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    if let Some(terminal) = terminal {
+        a.imm(AX, 1);
+        put(a, 15, 16, AX);
+        a.mark(terminal);
+        let complete = a.label();
+        get(a, AX, 15, 48);
+        a.cmp(AX, 0);
+        a.jump(Some(0x84), complete);
+        // An input error must not discard already completed records in a
+        // partial batch. Only the terminal status differs from normal EOF.
+        flush_batch(a, sites, exit, complete);
+        a.mark(complete);
+        publish(a, sites, DONE, exit);
+    } else {
+        publish(a, sites, ERROR, exit);
+    }
+    a.mark(exit);
+    a.imm(DI, 0);
+    syscall(a, 60, sites);
+}
+
+fn reset_batch(a: &mut Asm<'_>) {
+    get(a, AX, 15, 40);
+    put(a, 15, 24, AX);
+    a.imm(AX, 0);
+    put(a, 15, 48, AX);
+    put(a, 15, 56, AX);
+}
+
+fn flush_batch(a: &mut Asm<'_>, sites: &mut Vec<(usize, i32)>, exit: usize, consumed: usize) {
+    get(a, AX, 15, 48);
+    put(a, 15, 8, AX);
     publish(a, sites, READY, exit);
+    await_consumption(a, sites, exit, consumed);
+}
+
+fn await_consumption(a: &mut Asm<'_>, sites: &mut Vec<(usize, i32)>, exit: usize, consumed: usize) {
     let pending = a.label();
     a.mark(pending);
     state(a);
     a.cmp(AX, CANCEL);
     a.jump(Some(0x84), exit);
     a.cmp(AX, EMPTY);
-    a.jump(Some(0x84), next);
+    a.jump(Some(0x84), consumed);
     a.cmp(AX, READY);
     a.jump(Some(0x85), 0);
     wait(a, sites, 0, READY, true, pending);
-    a.mark(done);
-    a.load(AX, -(body.frame_bytes as i32));
-    put(a, 15, 16, AX);
-    publish(a, sites, DONE, exit);
-    a.jump(None, exit);
-    a.mark(fail);
-    for at in aborts {
-        let delta = a.code.len() as i32 - at as i32 - 4;
-        a.code[at..at + 4].copy_from_slice(&delta.to_le_bytes());
-    }
-    publish(a, sites, ERROR, exit);
-    a.mark(exit);
-    a.imm(DI, 0);
-    syscall(a, 60, sites);
 }
 
 // Follow both branch arms, skipping embedded literal data by control flow.

@@ -11,6 +11,7 @@ impl Parser {
         let (mut intention, mut source, mut input, mut phases, mut limit) =
             (None, None, None, None, None);
         let (mut mode, mut max_in_flight, mut native_memory) = (None, None, None);
+        let mut result_batch = None;
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let attribute = self.peek_attribute_name();
             let key = if let Some(attr) = &attribute {
@@ -79,6 +80,15 @@ impl Parser {
                     }
                     max_in_flight = Some(n as u32);
                 }
+                "result_batch" => {
+                    let n = self.expect_number().map_err(|_| {
+                        self.error("execution result_batch must be an integer in [1, 1024]")
+                    })?;
+                    if !(1..=1024).contains(&n) {
+                        return Err(self.error("execution result_batch must be in [1, 1024]"));
+                    }
+                    result_batch = Some(n as u32);
+                }
                 _ => return Err(self.error(&format!("execution '{name}': unknown field '{key}'"))),
             }
             self.expect_kind(TokenKind::Newline)?;
@@ -102,10 +112,14 @@ impl Parser {
             }
             ExecutionMode::Concurrent {
                 native_memory,
+                result_batch: result_batch.unwrap_or(1),
                 max_in_flight: max_in_flight
                     .ok_or_else(|| self.error("concurrent execution requires max_in_flight"))?,
             }
         } else {
+            if result_batch.is_some() {
+                return Err(self.error("sequential execution does not accept result_batch"));
+            }
             if native_memory.is_some() {
                 return Err(self.error("sequential execution does not accept native_memory"));
             }
