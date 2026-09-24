@@ -165,6 +165,37 @@ no RSS, cache residency, tail-latency, sustained-service or TLS claim follows.
 | WASM / self-hosted compiler | Existing execution refusal; no experiment target |
 | Algorithm rewriting / automatic application / service tuning | Not implemented |
 
+## Recorded integration run, 2026-09-24
+
+**Inconclusive: no source proposal was emitted.** The
+[complete report](measurements/workload-experiment-2026-09-24.json) retains all
+samples, refusals, identities and functional signatures. This is evidence that
+the experiment runs and refuses an invalid measurement, not a validated speedup.
+
+The release compiler (`rustc 1.90.0`) and tool were built from `70bca65` (clean working tree), on
+the Ryzen 7 5800X / Linux WSL2 environment recorded in the report, with guest CPU
+affinity 2, 4, 6, 8. Current external host load was not reconfirmed; earlier user
+reports said no significant load. This session ran no overlapping builds, tests
+or benchmarks during the experiment. The generator above supplied the explicit
+unbatched reading fixture and separate selection/validation batches.
+
+The compiler admitted batches 1, 8, 32 and 64 under the unchanged 20,480-byte
+concurrent reservation ceiling. Batch 128 required 24,576 bytes and was refused.
+The sequential candidate passed its separate 192-byte stack contract but was
+excluded for its empty-argv stderr difference. Selection used 32 balanced rounds
+for each admitted candidate/case, then froze batch 64 for 32 validation rounds
+against the baseline. Functional comparisons passed on the admitted candidates.
+
+The raw weighted elapsed means were 9.680 / 1.763 ms (baseline / batch 64) on
+selection, and 8.934 / 1.345 ms on validation. These are **unvalidated diagnostic
+measurements**: the independent single-thread clock probe before timing recorded
+369.786 ms aggregate child CPU over 347.880 ms accounting wall time, exceeding
+the predeclared 20 ms tolerance. The later probe stayed within that tolerance;
+the earlier anomaly still invalidates the experiment. All identities remained
+unchanged. The tool returned exit 2, kept `proposal: null` and wrote no patch.
+No retry or tolerance change was used to obtain a favorable conclusion. The
+cause of this accounting/clock discrepancy remains to be established separately.
+
 ## Validation
 
 Tests must cover weighted arithmetic scoring, CPU versus elapsed objectives,
@@ -175,3 +206,10 @@ reproducible emission, ordered numeric/text input and failure prefixes. Include
 an end-to-end experiment whose decision is not asserted from noisy real timings;
 test decision branches separately with deterministic synthetic samples. Run the
 normal Rust suite serially, relevant Python suites and CIDX before delivery.
+
+For this implementation: 839 normal Rust tests pass (27 ignored), all 17
+experiment tests pass with debug and release compilers, and the existing 6
+profile, 33 stack/CLI, 5 numeric benchmark and 6 concurrent benchmark tests pass.
+Across 188 examples, repeated reference/new compilations preserve all native
+bytes, sizes, diagnostics and acceptance (185 accepted). No self-hosted source
+or native emitter was changed; the ordinary CI bootstrap remains required.
