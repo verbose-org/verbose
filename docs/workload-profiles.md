@@ -68,7 +68,8 @@ target/release/verbosec examples/workload_profile.verbose --native /tmp/readings
 The last command processes three records, although neither predicted case has
 that size. Prediction does not narrow the supported runtime input domain.
 
-Schema 1 exposes the predicted objective, measurement metric, targets, original
+Schema 1 exposes ordered `input_fields` (name and type) for native argv tooling,
+the predicted objective, measurement metric, targets, original
 case order and exact rational shares. For weights w and record counts r:
 
 - Invocation share is w / sum(w).
@@ -114,7 +115,7 @@ retain their explicit source-execution refusal before output.
 | Workload report, text/JSON | Original-source predictions, exact rational counts, existing native layout |
 | Native argv / interpreter | Profile accepted, execution behavior unchanged |
 | WASM / self-hosted diagnostics, raw x86, ELF | Existing execution refusal before output |
-| Automatic measurement, source rewrite or organization selection | Later stages; not implemented by this profile |
+| Measurement and organization proposals | Separate [offline experiment tool](workload-experiments.md); never automatic profile-driven runtime changes |
 
 Test closed syntax at every nesting level, range limits, duplicate names,
 programmatic AST checks, unselected invalid profiles, rational weighting,
@@ -126,8 +127,8 @@ example corpus and the existing self-hosted bootstrap before delivery.
 The dedicated CLI suite is `python3 tools/test_workload_profile.py -v` after
 `cargo build`; `VERBOSEC` can select another compiler build. CI runs it too.
 
-Next stages should bind generated variants and measurements to exact sources,
-compiler/binary identities and a workload profile; separate selection data from
-validation data; preserve all samples and refused candidates; and produce an
-auditable source diff. Hardware/host load and target failures remain explicit.
-No winner should be inferred from these static counts alone.
+The [experiment tool](workload-experiments.md) now binds constrained variants and
+measurements to sources, compiler/binary identities and this profile, separates
+selection from validation and emits a source diff only after measured checks.
+Hardware/host load, refusals and target failures remain explicit. No winner is
+inferred from these static counts alone.

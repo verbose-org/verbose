@@ -58,6 +58,7 @@ impl WorkloadObjective {
 pub struct Report {
     execution: String,
     input: String,
+    input_fields: Vec<(String, &'static str)>,
     workload: Workload,
     phases: Vec<String>,
     batch: Option<u32>,
@@ -100,6 +101,24 @@ pub fn report(p: &Program, name: &str) -> Result<Report, NativeError> {
     Ok(Report {
         execution: e.name.clone(),
         input: e.input.clone(),
+        input_fields: iter_all_concepts(&p.items)
+            .find(|c| c.name == e.input)
+            .expect("gate validated the input concept")
+            .fields
+            .iter()
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    match f.ty {
+                        Type::Number => "number",
+                        Type::Text => "text",
+                        Type::Bool => "bool",
+                        Type::Bytes => "bytes",
+                        _ => "unsupported",
+                    },
+                )
+            })
+            .collect(),
         workload,
         phases: e.phases.clone(),
         batch,
@@ -170,12 +189,15 @@ impl Report {
         };
         format!(concat!(
             "{{\"schema_version\":1,\"profile_kind\":\"prediction\",\"execution\":\"{}\",\"input_concept\":\"{}\",",
+            "\"input_fields\":[{}],",
             "\"objective\":\"{}\",\"measurement_metric\":\"{}\",\"aggregation\":\"weighted_arithmetic_mean_per_invocation\",",
             "\"target_kind\":\"unverified_elapsed_goal\",\"phase_count\":{},\"total_weight\":{},\"cases\":[{}],",
             "\"expected_records_per_invocation\":{},\"expected_full_success_phase_evaluations\":{},",
             "\"expected_full_success_native_result_batches\":{},\"native_emission_budget_present\":{},",
             "\"native_resource\":{},\"measurements_available\":false}}"),
-            self.execution, self.input, self.workload.objective.name(), self.workload.objective.metric(),
+            self.execution, self.input,
+            self.input_fields.iter().map(|(name, ty)| format!("{{\"name\":\"{name}\",\"type\":\"{ty}\"}}")).collect::<Vec<_>>().join(","),
+            self.workload.objective.name(), self.workload.objective.metric(),
             phase_count, weight, cases, ratio(records, weight), ratio(records * phase_count, weight),
             batches, self.native_budget_present, self.native_json)
     }

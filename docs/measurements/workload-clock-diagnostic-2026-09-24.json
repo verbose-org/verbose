@@ -1,0 +1,740 @@
+{
+  "schema_version": 1,
+  "purpose": "independent single-thread clock/accounting diagnostic",
+  "started_utc": "2026-09-24T12:52:46Z",
+  "host_note": "User confirms no significant external load. No other builds, tests or benchmarks launched by this session.",
+  "platform": "Linux-5.15.153.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python": "3.14.5 (main, May 10 2026, 10:21:34) [GCC 12.3.0]",
+  "clocksource": "tsc",
+  "available_clocksources": "tsc hyperv_clocksource_tsc_page",
+  "source_sha256": "c7e807d6a6abc2c0eefa6a209ed5c832ef9b36754377680ee450cf2ada3ebd44",
+  "child_code": "\nimport json, os, resource, sys, time\nfrom pathlib import Path\nmode, duration = sys.argv[1], float(sys.argv[2])\ndef snapshot():\n    r = resource.getrusage(resource.RUSAGE_SELF)\n    return dict(monotonic_ns=time.monotonic_ns(), raw_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),\n                process_ns=time.process_time_ns(), thread_ns=time.thread_time_ns(),\n                self_ns=round((r.ru_utime + r.ru_stime) * 1e9))\nbefore = snapshot()\nif mode == 'busy':\n    deadline = before['raw_ns'] + int(duration * 1e9)\n    while time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) < deadline:\n        pass\nelse:\n    time.sleep(duration)\nafter = snapshot()\nprint(json.dumps(dict(milliseconds={k[:-3]: (after[k]-v)/1e6 for k,v in before.items()},\n                      task_count=len(list(Path('/proc/self/task').iterdir())), affinity=sorted(os.sched_getaffinity(0)))))\n",
+  "clock_info": {
+    "monotonic": {
+      "implementation": "clock_gettime(CLOCK_MONOTONIC)",
+      "monotonic": true,
+      "adjustable": false,
+      "resolution": 1e-09
+    },
+    "perf_counter": {
+      "implementation": "clock_gettime(CLOCK_MONOTONIC)",
+      "monotonic": true,
+      "adjustable": false,
+      "resolution": 1e-09
+    },
+    "process_time": {
+      "implementation": "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)",
+      "monotonic": true,
+      "adjustable": false,
+      "resolution": 1e-09
+    },
+    "thread_time": {
+      "implementation": "clock_gettime(CLOCK_THREAD_CPUTIME_ID)",
+      "monotonic": true,
+      "adjustable": false,
+      "resolution": 1e-09
+    }
+  },
+  "samples": [
+    {
+      "repeat": 0,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 311.939191,
+      "parent_child_cpu_ms": 328.941,
+      "child": {
+        "milliseconds": {
+          "monotonic": 283.003077,
+          "raw": 300.022484,
+          "process": 300.0224,
+          "thread": 300.0226,
+          "self": 300.018
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 0,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 1,
+      "parent_wall_ms": 969.883975,
+      "parent_child_cpu_ms": 1025.2320000000002,
+      "child": {
+        "milliseconds": {
+          "monotonic": 943.294721,
+          "raw": 1000.025786,
+          "process": 998.6963,
+          "thread": 998.6975,
+          "self": 998.689
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 0,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 3,
+      "parent_wall_ms": 2854.824694,
+      "parent_child_cpu_ms": 3024.7479999999996,
+      "child": {
+        "milliseconds": {
+          "monotonic": 2829.840443,
+          "raw": 3000.032701,
+          "process": 2999.904,
+          "thread": 2999.9043,
+          "self": 2999.894
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 0,
+      "cpus": [
+        2
+      ],
+      "mode": "sleep",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 324.935086,
+      "parent_child_cpu_ms": 24.790000000000315,
+      "child": {
+        "milliseconds": {
+          "monotonic": 300.135065,
+          "raw": 318.18667,
+          "process": 0.0794,
+          "thread": 0.079,
+          "self": 0.069
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 0,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 308.491882,
+      "parent_child_cpu_ms": 326.6170000000003,
+      "child": {
+        "milliseconds": {
+          "monotonic": 282.999609,
+          "raw": 300.019005,
+          "process": 299.9739,
+          "thread": 299.9741,
+          "self": 299.969
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 0,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 1,
+      "parent_wall_ms": 967.349804,
+      "parent_child_cpu_ms": 1025.1619999999998,
+      "child": {
+        "milliseconds": {
+          "monotonic": 943.289258,
+          "raw": 1000.019863,
+          "process": 999.9779,
+          "thread": 999.978,
+          "self": 999.974
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 0,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 3,
+      "parent_wall_ms": 2783.597611,
+      "parent_child_cpu_ms": 3023.7729999999992,
+      "child": {
+        "milliseconds": {
+          "monotonic": 2761.046251,
+          "raw": 3000.024847,
+          "process": 3000.0255,
+          "thread": 3000.0257,
+          "self": 3000.015
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 0,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "sleep",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 321.50543,
+      "parent_child_cpu_ms": 23.075000000000482,
+      "child": {
+        "milliseconds": {
+          "monotonic": 300.093982,
+          "raw": 327.062276,
+          "process": 0.0806,
+          "thread": 0.0809,
+          "self": 0.07
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 1,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 298.608921,
+      "parent_child_cpu_ms": 323.6080000000001,
+      "child": {
+        "milliseconds": {
+          "monotonic": 275.287893,
+          "raw": 300.025282,
+          "process": 299.8965,
+          "thread": 299.8977,
+          "self": 299.889
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 1,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 1,
+      "parent_wall_ms": 943.710288,
+      "parent_child_cpu_ms": 1026.7540000000006,
+      "child": {
+        "milliseconds": {
+          "monotonic": 917.567085,
+          "raw": 1000.021776,
+          "process": 999.9897,
+          "thread": 999.9896,
+          "self": 999.984
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 1,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 3,
+      "parent_wall_ms": 2813.90255,
+      "parent_child_cpu_ms": 3029.617,
+      "child": {
+        "milliseconds": {
+          "monotonic": 2784.831567,
+          "raw": 3000.02284,
+          "process": 2999.8749,
+          "thread": 2999.8744,
+          "self": 2999.871
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 1,
+      "cpus": [
+        2
+      ],
+      "mode": "sleep",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 324.139973,
+      "parent_child_cpu_ms": 23.80999999999885,
+      "child": {
+        "milliseconds": {
+          "monotonic": 300.103449,
+          "raw": 315.175544,
+          "process": 0.0715,
+          "thread": 0.0723,
+          "self": 0.062
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 1,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 309.615279,
+      "parent_child_cpu_ms": 324.90299999999996,
+      "child": {
+        "milliseconds": {
+          "monotonic": 285.676731,
+          "raw": 300.022384,
+          "process": 300.0117,
+          "thread": 300.0117,
+          "self": 300.005
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 1,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 1,
+      "parent_wall_ms": 973.834254,
+      "parent_child_cpu_ms": 1027.3850000000007,
+      "child": {
+        "milliseconds": {
+          "monotonic": 947.469391,
+          "raw": 1000.023912,
+          "process": 999.9662,
+          "thread": 999.9655,
+          "self": 999.967
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 1,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 3,
+      "parent_wall_ms": 2848.670775,
+      "parent_child_cpu_ms": 3023.971999999999,
+      "child": {
+        "milliseconds": {
+          "monotonic": 2825.747725,
+          "raw": 3000.021419,
+          "process": 2999.9486,
+          "thread": 2999.9478,
+          "self": 2999.944
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 1,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "sleep",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 323.456853,
+      "parent_child_cpu_ms": 24.537000000002266,
+      "child": {
+        "milliseconds": {
+          "monotonic": 300.119402,
+          "raw": 318.629971,
+          "process": 0.0738,
+          "thread": 0.0746,
+          "self": 0.064
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 2,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 306.665818,
+      "parent_child_cpu_ms": 323.96399999999926,
+      "child": {
+        "milliseconds": {
+          "monotonic": 282.591642,
+          "raw": 300.018649,
+          "process": 299.9988,
+          "thread": 299.9989,
+          "self": 299.996
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 2,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 1,
+      "parent_wall_ms": 966.427255,
+      "parent_child_cpu_ms": 1024.437999999999,
+      "child": {
+        "milliseconds": {
+          "monotonic": 941.92868,
+          "raw": 1000.020447,
+          "process": 999.9979,
+          "thread": 999.998,
+          "self": 999.994
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 2,
+      "cpus": [
+        2
+      ],
+      "mode": "busy",
+      "requested_seconds": 3,
+      "parent_wall_ms": 2851.089989,
+      "parent_child_cpu_ms": 3025.2390000000014,
+      "child": {
+        "milliseconds": {
+          "monotonic": 2825.750029,
+          "raw": 3000.024484,
+          "process": 2999.8659,
+          "thread": 2999.866,
+          "self": 2999.858
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 2,
+      "cpus": [
+        2
+      ],
+      "mode": "sleep",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 323.525726,
+      "parent_child_cpu_ms": 23.325999999997293,
+      "child": {
+        "milliseconds": {
+          "monotonic": 300.134846,
+          "raw": 318.338798,
+          "process": 0.0776,
+          "thread": 0.0779,
+          "self": 0.066
+        },
+        "task_count": 1,
+        "affinity": [
+          2
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 2,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 307.792568,
+      "parent_child_cpu_ms": 324.5330000000024,
+      "child": {
+        "milliseconds": {
+          "monotonic": 284.264409,
+          "raw": 300.020733,
+          "process": 299.975,
+          "thread": 299.9748,
+          "self": 299.975
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    },
+    {
+      "repeat": 2,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 1,
+      "parent_wall_ms": 970.881319,
+      "parent_child_cpu_ms": 1024.3269999999998,
+      "child": {
+        "milliseconds": {
+          "monotonic": 947.500662,
+          "raw": 1000.022549,
+          "process": 999.9778,
+          "thread": 999.9782,
+          "self": 999.972
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 2,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "busy",
+      "requested_seconds": 3,
+      "parent_wall_ms": 2866.905105,
+      "parent_child_cpu_ms": 3025.4459999999985,
+      "child": {
+        "milliseconds": {
+          "monotonic": 2842.465491,
+          "raw": 3000.032019,
+          "process": 2999.9724,
+          "thread": 2999.9742,
+          "self": 2999.958
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": true,
+      "outer_flag": true
+    },
+    {
+      "repeat": 2,
+      "cpus": [
+        2,
+        4,
+        6,
+        8
+      ],
+      "mode": "sleep",
+      "requested_seconds": 0.3,
+      "parent_wall_ms": 323.428924,
+      "parent_child_cpu_ms": 24.392999999999887,
+      "child": {
+        "milliseconds": {
+          "monotonic": 300.128074,
+          "raw": 316.765677,
+          "process": 0.0789,
+          "thread": 0.0791,
+          "self": 0.069
+        },
+        "task_count": 1,
+        "affinity": [
+          2,
+          4,
+          6,
+          8
+        ]
+      },
+      "inner_flag": false,
+      "outer_flag": false
+    }
+  ],
+  "finished_utc": "2026-09-24T12:53:14Z",
+  "parent_probe_source": "\"\"\"Bounded, serial clock diagnostic, independent of Verbose and its compiler.\"\"\"\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport platform\nimport resource\nimport subprocess\nimport sys\nimport time\n\nCHILD = r'''\nimport json, os, resource, sys, time\nfrom pathlib import Path\nmode, duration = sys.argv[1], float(sys.argv[2])\ndef snapshot():\n    r = resource.getrusage(resource.RUSAGE_SELF)\n    return dict(monotonic_ns=time.monotonic_ns(), raw_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),\n                process_ns=time.process_time_ns(), thread_ns=time.thread_time_ns(),\n                self_ns=round((r.ru_utime + r.ru_stime) * 1e9))\nbefore = snapshot()\nif mode == 'busy':\n    deadline = before['raw_ns'] + int(duration * 1e9)\n    while time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) < deadline:\n        pass\nelse:\n    time.sleep(duration)\nafter = snapshot()\nprint(json.dumps(dict(milliseconds={k[:-3]: (after[k]-v)/1e6 for k,v in before.items()},\n                      task_count=len(list(Path('/proc/self/task').iterdir())), affinity=sorted(os.sched_getaffinity(0)))))\n'''\n\ndef text(path):\n    p = Path(path)\n    return p.read_text().strip() if p.exists() else None\n\nreport = dict(schema_version=1, purpose='independent single-thread clock/accounting diagnostic',\n              started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),\n              host_note='User confirms no significant external load. No other builds, tests or benchmarks launched by this session.',\n              platform=platform.platform(), python=sys.version, clocksource=text('/sys/devices/system/clocksource/clocksource0/current_clocksource'),\n              available_clocksources=text('/sys/devices/system/clocksource/clocksource0/available_clocksource'),\n              source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), child_code=CHILD,\n              clock_info={name:vars(time.get_clock_info(name)) for name in ['monotonic','perf_counter','process_time','thread_time']},\n              samples=[])\noutput = Path(sys.argv[1])\nif output.exists():\n    raise SystemExit('output already exists')\nfor repeat in range(3):\n    for cpus in ([2], [2,4,6,8]):\n        os.sched_setaffinity(0, cpus)\n        for mode, duration in [('busy', .3), ('busy', 1), ('busy', 3), ('sleep', .3)]:\n            before = resource.getrusage(resource.RUSAGE_CHILDREN)\n            start = time.monotonic_ns()\n            out = subprocess.run([sys.executable, '-I', '-S', '-c', CHILD, mode, str(duration)],\n                                 capture_output=True, check=True, timeout=15)\n            end = time.monotonic_ns()\n            after = resource.getrusage(resource.RUSAGE_CHILDREN)\n            if out.stderr:\n                raise RuntimeError(out.stderr)\n            r = dict(repeat=repeat, cpus=cpus, mode=mode, requested_seconds=duration,\n                     parent_wall_ms=(end-start)/1e6,\n                     parent_child_cpu_ms=(after.ru_utime-before.ru_utime+after.ru_stime-before.ru_stime)*1000,\n                     child=json.loads(out.stdout))\n            m = r['child']['milliseconds']\n            r['inner_flag'] = m['process'] > m['monotonic'] + max(20, .05*m['monotonic'])\n            r['outer_flag'] = r['parent_child_cpu_ms'] > r['parent_wall_ms'] + max(20, .05*r['parent_wall_ms'])\n            report['samples'].append(r)\n            output.write_text(json.dumps(report, indent=2) + '\\n')\nreport['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())\noutput.write_text(json.dumps(report, indent=2) + '\\n')\nprint(json.dumps(dict(samples=len(report['samples']), flagged=sum(r['inner_flag'] or r['outer_flag'] for r in report['samples']))))\n",
+  "native_probe": {
+    "result": {
+      "raw_ms": 3000.00004,
+      "monotonic_ms": 2723.670877,
+      "process_ms": 2999.0202,
+      "adjtimex_query": {
+        "state": 0,
+        "status": 8192,
+        "tick_us": 9521,
+        "freq_scaled_ppm": 2362390,
+        "offset": 0
+      }
+    },
+    "source": "#define _GNU_SOURCE\n#include <stdio.h>\n#include <sys/timex.h>\n#include <time.h>\n\nstatic long long ns(clockid_t id) {\n    struct timespec t;\n    if (clock_gettime(id, &t)) return -1;\n    return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;\n}\nint main(void) {\n    struct timex t = {0}; /* modes=0 queries only; never changes kernel time. */\n    int state = adjtimex(&t);\n    long long raw = ns(CLOCK_MONOTONIC_RAW);\n    long long mono = ns(CLOCK_MONOTONIC);\n    long long cpu = ns(CLOCK_PROCESS_CPUTIME_ID);\n    while (ns(CLOCK_MONOTONIC_RAW) - raw < 3000000000LL) {}\n    long long raw_end = ns(CLOCK_MONOTONIC_RAW);\n    long long mono_end = ns(CLOCK_MONOTONIC);\n    long long cpu_end = ns(CLOCK_PROCESS_CPUTIME_ID);\n    printf(\"{\\\"raw_ms\\\":%.6f,\\\"monotonic_ms\\\":%.6f,\\\"process_ms\\\":%.6f,\"\n           \"\\\"adjtimex_query\\\":{\\\"state\\\":%d,\\\"status\\\":%d,\\\"tick_us\\\":%ld,\\\"freq_scaled_ppm\\\":%ld,\\\"offset\\\":%ld}}\\n\",\n           (raw_end-raw)/1e6,(mono_end-mono)/1e6,(cpu_end-cpu)/1e6,state,t.status,t.tick,t.freq,t.offset);\n    return 0;\n}\n",
+    "source_sha256": "5a3c09a2ab93e5a29c67d60a4cc158e03902f4ba7c624ed40b136b79a65c21e4",
+    "binary_sha256": "18a0ab424df62246f59e3d8fbe70761772c720bef1c3fc4fd13f6c00566338cc",
+    "build_command": "cc -O2 -Wall -Wextra -Werror native.c -o native",
+    "run_command": "taskset -c 2 ./native",
+    "kernel_time_modified": false
+  },
+  "summary": {
+    "flagged_samples": 13,
+    "busy_samples": 18,
+    "sleep_controls": 6,
+    "interpretation": "CPU counters track raw time while CLOCK_MONOTONIC diverges, including on one pinned CPU; this reproduces independently of Verbose. No workload rerun, clock switch, threshold change or kernel time adjustment was performed. The underlying cause and an independent real-time calibration remain unresolved."
+  }
+}

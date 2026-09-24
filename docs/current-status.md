@@ -68,8 +68,12 @@ An optional [predicted workload](workload-profiles.md) now describes weighted
 batch sizes, an elapsed/CPU objective and desired per-case elapsed times within
 an execution. `--workload-report` distinguishes invocation frequency from record
 volume and embeds the checked native layout. Predictions neither narrow input
-acceptance nor change emitted code; automatic measurement/selection and source
-revision remain subsequent steps.
+acceptance nor change emitted code. A separate [offline experiment tool](workload-experiments.md)
+now checks explicit execution variants, measures the weighted objective on
+selection/validation data and proposes a reviewable source diff. It preserves
+source ceilings and excludes functional differences; a mandatory empty-argv
+probe currently excludes mode switches because their stderr differs. Concurrent
+lane/batch comparisons are supported, with no automatic source application.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.

@@ -39,9 +39,11 @@ Product-specific optimization can start from [predicted workloads](docs/workload
 source executions describe expected batch sizes, relative frequencies and time
 objectives. The compiler checks their shape and reports exact weighted counts
 alongside the existing verified storage layout. Prediction and measurement do
-not replace safety contracts. Comparing variants, validating on separate data
-and proposing a source revision form the next stages of this offline loop;
-the current profile/report changes no runtime code.
+not replace safety contracts. The [offline experiment tool](docs/workload-experiments.md)
+compares explicitly bounded execution variants, validates one selected candidate
+on separate data and can propose a source revision. It retains refusals and
+requires unchanged observable behavior; it never applies the patch automatically.
+The profile/report itself changes no runtime code.
 
 ## Compiler stages
 
