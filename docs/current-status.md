@@ -64,6 +64,12 @@ measures reduced exchanges within the same ordered publication contract: on the
 recorded machine, batches of 32 retain the same reserved pages in the fixtures;
 batches of 128 beat sequential elapsed time on the long synthetic compute case.
 Cheap phases remain faster sequentially. Bounded memory is not a speedup guarantee.
+An optional [predicted workload](workload-profiles.md) now describes weighted
+batch sizes, an elapsed/CPU objective and desired per-case elapsed times within
+an execution. `--workload-report` distinguishes invocation frequency from record
+volume and embeds the checked native layout. Predictions neither narrow input
+acceptance nor change emitted code; automatic measurement/selection and source
+revision remain subsequent steps.
 A batch-processing pipeline, a compiler pass and an HTTP request provide concrete
 cases. The contract should describe the execution scope and overlapping storage;
 protocol-specific input/output paths supply their own costs and checks.

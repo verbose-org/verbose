@@ -280,6 +280,7 @@ rule calculate
     let cases = [
         (control.to_string(), false),
         (format!("{control}{declaration}"), true),
+        (format!("{control}{declaration}  workload:\n    objective: elapsed\n    case common:\n      weight: 99\n      records: 1\n"), true),
         (format!("{control}{}", declaration.replace("mode: sequential", "mode: concurrent")
             .replace("native_stack: 192", "max_in_flight: 2")), true),
         (format!("{control}{}", declaration.replace("mode: sequential", "mode: concurrent")

@@ -44,11 +44,12 @@ fn real_main() {
 
     let stack_report = args.iter().any(|a| a == "--stack-report");
     let memory_report = args.iter().any(|a| a == "--memory-report");
-    if stack_report && memory_report {
-        eprintln!("--stack-report and --memory-report are separate analyses"); process::exit(2);
+    let workload_report = args.iter().any(|a| a == "--workload-report");
+    if [stack_report, memory_report, workload_report].iter().filter(|v| **v).count() > 1 {
+        eprintln!("--stack-report, --memory-report and --workload-report are separate analyses"); process::exit(2);
     }
-    if stack_report || memory_report {
-        let report_flag = if memory_report { "--memory-report" } else { "--stack-report" };
+    if stack_report || memory_report || workload_report {
+        let report_flag = if workload_report { "--workload-report" } else if memory_report { "--memory-report" } else { "--stack-report" };
         for flag in ["--native", "--wasm", "--input", "--stdin", "--stdin-raw", "--stream",
             "--benchmark", "--stats", "--disasm", "--http-server", "--echo-server", "--demo-http"] {
             if args.iter().any(|a| a == flag) {
@@ -181,6 +182,7 @@ fn real_main() {
         eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
         eprintln!("  --memory-report [--json] --run <execution> Report a concurrent native memory reservation");
+        eprintln!("  --workload-report [--json] --run <execution> Report predicted cases and checked native storage");
         eprintln!("  --stack-report [--json] --run <entry> Report checked native argv stack usage, without writing an artifact");
         eprintln!("  --echo-server <port> <output>      TCP echo server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
         eprintln!("  --demo-http <output>               HTTP server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
@@ -227,12 +229,22 @@ fn real_main() {
         process::exit(1);
     }
 
-    if stack_report || memory_report {
+    if stack_report || memory_report || workload_report {
         let name = find_flag(&args, "--run").or_else(|| program.items.iter().rev().find_map(|i| {
             if let ast::Item::Execution(e) = i { Some(e.name.clone()) } else { None }
         })).or_else(|| program.items.iter().rev().find_map(|i| {
             if let ast::Item::Rule(r) = i { Some(r.name.clone()) } else { None }
         })).unwrap_or_default();
+        if workload_report {
+            match execution::workload::report(&program, &name) {
+                Ok(report) => {
+                    if args.iter().any(|a| a == "--json") { println!("{}", report.json()); }
+                    else { println!("{report}"); }
+                }
+                Err(e) => { eprintln!("{e}"); process::exit(1); }
+            }
+            return;
+        }
         if memory_report {
             let result = execution::find(&program, &name).ok_or_else(|| native::NativeError {
                 message: "--memory-report requires a concurrent execution".into()

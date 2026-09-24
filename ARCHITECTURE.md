@@ -35,6 +35,14 @@ The compiler checks referenced source lines exist; it does not decide whether th
 program faithfully expresses their prose. That comparison belongs to the author
 and auditor.
 
+Product-specific optimization can start from [predicted workloads](docs/workload-profiles.md):
+source executions describe expected batch sizes, relative frequencies and time
+objectives. The compiler checks their shape and reports exact weighted counts
+alongside the existing verified storage layout. Prediction and measurement do
+not replace safety contracts. Comparing variants, validating on separate data
+and proposing a source revision form the next stages of this offline loop;
+the current profile/report changes no runtime code.
+
 ## Compiler stages
 
 | Stage | Implementation | Responsibility |

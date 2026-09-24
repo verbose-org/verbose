@@ -1,6 +1,6 @@
 # Predicted execution workloads
 
-Design fixed before implementation, 2026-09-24. This first slice describes
+Design fixed before implementation, 2026-09-24; now implemented. This first slice describes
 expected use in the source and derives a reproducible experiment plan. It does
 not select an organization, run a benchmark or rewrite source automatically.
 
@@ -13,7 +13,8 @@ argument; test agreement alone does not prove general equivalence.
 
 ## Source and meaning
 
-An execution may contain one optional block:
+An execution may contain one optional block, as in the complete
+[reading example](../examples/workload_profile.verbose):
 
 ```verbose
   workload:
@@ -57,6 +58,16 @@ every execution before returning a report. It defaults to the last execution,
 requires an explicitly declared workload, and cannot combine with artifact,
 runtime or other report modes. It produces no program output or artifact.
 
+```sh
+target/release/verbosec examples/workload_profile.verbose --workload-report
+target/release/verbosec examples/workload_profile.verbose --workload-report --json
+target/release/verbosec examples/workload_profile.verbose --native /tmp/readings
+/tmp/readings a 1 b 2 c 3
+```
+
+The last command processes three records, although neither predicted case has
+that size. Prediction does not narrow the supported runtime input domain.
+
 Schema 1 exposes the predicted objective, measurement metric, targets, original
 case order and exact rational shares. For weights w and record counts r:
 
@@ -97,6 +108,14 @@ including inputs outside its predicted cases and failure prefixes. Existing
 stack/memory report formats remain unchanged. WASM and the self-hosted compiler
 retain their explicit source-execution refusal before output.
 
+| Path | Support |
+|---|---|
+| Rust parser/verifier | Closed profiles checked in every execution |
+| Workload report, text/JSON | Original-source predictions, exact rational counts, existing native layout |
+| Native argv / interpreter | Profile accepted, execution behavior unchanged |
+| WASM / self-hosted diagnostics, raw x86, ELF | Existing execution refusal before output |
+| Automatic measurement, source rewrite or organization selection | Later stages; not implemented by this profile |
+
 Test closed syntax at every nesting level, range limits, duplicate names,
 programmatic AST checks, unselected invalid profiles, rational weighting,
 partial batches, repeated phases, maximum arithmetic and resource scopes.
@@ -104,6 +123,8 @@ CLI checks cover imports, selection, incompatible modes, JSON validity,
 no-artifact failures, byte-identical compilation and input counts outside the
 prediction. Run serialized normal tests, CLI tests, CIDX checks, the reference
 example corpus and the existing self-hosted bootstrap before delivery.
+The dedicated CLI suite is `python3 tools/test_workload_profile.py -v` after
+`cargo build`; `VERBOSEC` can select another compiler build. CI runs it too.
 
 Next stages should bind generated variants and measurements to exact sources,
 compiler/binary identities and a workload profile; separate selection data from

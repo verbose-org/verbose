@@ -77,6 +77,28 @@ pub struct Execution {
     pub input: String,
     pub phases: Vec<String>,
     pub mode: ExecutionMode,
+    pub workload: Option<Workload>,
+}
+
+/// Predicted use for experiment planning; never an input or runtime guarantee.
+#[derive(Debug, Clone)]
+pub struct Workload {
+    pub objective: WorkloadObjective,
+    pub cases: Vec<WorkloadCase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadObjective {
+    Elapsed,
+    Cpu,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkloadCase {
+    pub name: String,
+    pub weight: u32,
+    pub records: u32,
+    pub target_us: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

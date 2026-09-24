@@ -6,13 +6,25 @@ Every declaration in a `.verbose` file falls into one of two categories: **mecha
 
 **Mechanical** — the value is derivable from the AST alone. The compiler walks the code and produces the same value independently; the declaration exists so a human auditor reads the conclusion without running the walker in their head. The verifier checks **consistency** (declaration ↔ AST-derived fact) and rejects drift.
 
-**Semantic** — the declaration carries information the AST cannot produce. Either a claim the verifier then checks by a stronger method (interval arithmetic, layer discipline, external file existence), or an input that drives codegen and dispatch.
+**Semantic** — the declaration carries information the AST cannot produce. Either a claim the verifier then checks by a stronger method (interval arithmetic, layer discipline, external file existence), or an input that drives compiler analysis, codegen and dispatch.
 
 Both categories carry weight. Mechanical declarations are audit scaffolding: they fail loudly when code drifts away from their stated reads/calls, which is the whole point. Semantic declarations are where the compiler gains information the AST didn't already have — optimization, safety claims, architectural discipline.
 
 The thing to refuse is a declaration that is **neither**: the compiler cannot verify it *and* it carries no information the AST lacks. That is false explicitation, and Phase A removed about 845 lines of it.
 
 ## Classification
+
+### Predicted workloads
+
+An execution's optional [`workload`](workload-profiles.md) is a semantic input
+to experiment planning, not a proof. The compiler checks the closed shape,
+positive weights/counts, names and ranges, then derives exact weighted record
+shares and full-success phase/batch counts in `--workload-report`. Its elapsed
+or CPU objective defines which measured quantity a later comparison should
+minimize; optional elapsed targets identify per-case measurement goals.
+Actual frequencies, runtimes and satisfaction of those goals are unverified.
+They cannot justify removing guards, changing input acceptance or relaxing the
+separately checked native resource ceiling. No runtime code changes today.
 
 ### Native stack budget
 
