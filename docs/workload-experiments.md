@@ -196,6 +196,37 @@ unchanged. The tool returned exit 2, kept `proposal: null` and wrote no patch.
 No retry or tolerance change was used to obtain a favorable conclusion. The
 cause of this accounting/clock discrepancy remains to be established separately.
 
+### Follow-up with host load confirmed
+
+The user subsequently confirmed no significant external load. A bounded,
+independent [clock diagnostic](measurements/workload-clock-diagnostic-2026-09-24.json)
+then ran 24 serial Python probes: three repetitions, affinity either CPU 2 alone
+or CPUs 2/4/6/8, busy intervals of 0.3/1/3 raw seconds and a 0.3-second sleep
+control. Every child had exactly one thread. The report retains the complete
+probe sources, measurements, platform and clock identities. No compiler build,
+test suite or workload benchmark overlapped those measurements.
+
+Thirteen probes triggered the existing CPU/wall tolerance. CPU process/thread
+counters and self accounting tracked `CLOCK_MONOTONIC_RAW`; the benchmark's
+`CLOCK_MONOTONIC` measured about 91.75–95.22% of the corresponding raw intervals.
+The drift also appeared in sleep controls, with negligible CPU consumption, and
+with a single pinned CPU. Thus the observation does not require Verbose code,
+worker concurrency or CPU migration.
+
+A separate compiled C probe reproduced it: 3,000.000 ms raw, 2,999.020 ms process
+CPU, but 2,723.671 ms monotonic. A read-only `adjtimex` query (`modes=0`) returned
+`tick=9521`, `freq=2362390`, `status=8192`; the active clocksource was `tsc`.
+These are observations, not a diagnosis of the component setting the clock rate.
+
+Linux documents that [raw time excludes NTP rate adjustments](https://docs.kernel.org/core-api/timekeeping.html),
+and Python's [`perf_counter` uses the monotonic clock](https://docs.python.org/3/library/time.html#time.perf_counter).
+The clocks therefore have different semantics. Agreement between CPU and raw
+time alone does not independently establish real-time accuracy or validate
+latency goals; simply selecting the clock that makes the check pass would be
+insufficient. The underlying cause and an independent calibration remain open.
+No clocksource, kernel time setting, benchmark clock or tolerance was changed,
+and the workload was not rerun. The earlier result remains inconclusive.
+
 ## Validation
 
 Tests must cover weighted arithmetic scoring, CPU versus elapsed objectives,
