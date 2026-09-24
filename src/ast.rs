@@ -82,7 +82,7 @@ pub struct Execution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
     Sequential { native_stack: u32 },
-    Concurrent { max_in_flight: u32 },
+    Concurrent { max_in_flight: u32, native_memory: Option<u32> },
 }
 
 /// Phase B slice 1: a mutually-recursive concept group.

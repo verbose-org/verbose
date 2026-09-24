@@ -10,7 +10,7 @@ impl Parser {
         let mut seen = HashSet::new();
         let (mut intention, mut source, mut input, mut phases, mut limit) =
             (None, None, None, None, None);
-        let (mut mode, mut max_in_flight) = (None, None);
+        let (mut mode, mut max_in_flight, mut native_memory) = (None, None, None);
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let attribute = self.peek_attribute_name();
             let key = if let Some(attr) = &attribute {
@@ -63,6 +63,15 @@ impl Parser {
                     }
                     limit = Some(n as u32);
                 }
+                "native_memory" => {
+                    let n = self.expect_number()?;
+                    if !(1..=268_435_456).contains(&n) {
+                        return Err(
+                            self.error("execution native_memory must be in [1, 268435456] bytes")
+                        );
+                    }
+                    native_memory = Some(n as u32);
+                }
                 "max_in_flight" => {
                     let n = self.expect_number()?;
                     if !(1..=64).contains(&n) {
@@ -89,13 +98,17 @@ impl Parser {
         }
         let mode = if mode.as_deref() == Some("concurrent") {
             if limit.is_some() {
-                return Err(self.error("concurrent execution refuses native_stack: native scheduler layout is not supported yet"));
+                return Err(self.error("concurrent execution refuses native_stack: native memory uses native_memory, not native_stack"));
             }
             ExecutionMode::Concurrent {
+                native_memory,
                 max_in_flight: max_in_flight
                     .ok_or_else(|| self.error("concurrent execution requires max_in_flight"))?,
             }
         } else {
+            if native_memory.is_some() {
+                return Err(self.error("sequential execution does not accept native_memory"));
+            }
             if max_in_flight.is_some() {
                 return Err(self.error("sequential execution does not accept max_in_flight"));
             }

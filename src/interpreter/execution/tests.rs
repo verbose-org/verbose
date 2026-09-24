@@ -294,6 +294,7 @@ fn concurrent_reference_matches_sequential_and_native_across_admission_limits() 
     ));
     fs::create_dir_all(&dir).unwrap();
     let binary = dir.join("run");
+    let concurrent_binary = dir.join("concurrent");
     for phases in [
         "clamp, nonnegative, label".to_string(),
         "label, clamp, label".into(),
@@ -312,9 +313,18 @@ fn concurrent_reference_matches_sequential_and_native_across_admission_limits() 
             let mut concurrent = sequential.clone();
             if let Item::Execution(e) = concurrent.items.last_mut().unwrap() {
                 e.mode = ExecutionMode::Concurrent {
+                    native_memory: Some(1_000_000),
                     max_in_flight: limit,
                 };
             }
+            native::compile_native(
+                &concurrent,
+                "inspect_readings",
+                concurrent_binary.to_str().unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
             for rows in [
                 vec![("café", 2), ("b", 1000)],
                 vec![("", i64::MIN), ("🚀", i64::MAX)],
@@ -334,6 +344,26 @@ fn concurrent_reference_matches_sequential_and_native_across_admission_limits() 
                 assert_eq!(
                     (out.status.code(), out.stdout, out.stderr),
                     (Some(status), raw, vec![])
+                );
+                let native_concurrent = Command::new("timeout")
+                    .arg("10s")
+                    .arg(&concurrent_binary)
+                    .args(
+                        rows.iter()
+                            .flat_map(|(s, n)| [s.to_string(), n.to_string()]),
+                    )
+                    .output()
+                    .unwrap();
+                let mut expected = Vec::new();
+                let status =
+                    write(&concurrent, "inspect_readings", &data, false, &mut expected).unwrap();
+                assert_eq!(
+                    (
+                        native_concurrent.status.code(),
+                        native_concurrent.stdout,
+                        native_concurrent.stderr
+                    ),
+                    (Some(status), expected, vec![])
                 );
                 let (mut a, mut b) = (Vec::new(), Vec::new());
                 assert_eq!(
@@ -355,7 +385,10 @@ fn concurrent_records_and_runtime_errors_keep_the_sequential_prefix() {
     );
     let mut concurrent = sequential.clone();
     if let Item::Execution(e) = concurrent.items.last_mut().unwrap() {
-        e.mode = ExecutionMode::Concurrent { max_in_flight: 2 };
+        e.mode = ExecutionMode::Concurrent {
+            max_in_flight: 2,
+            native_memory: None,
+        };
     }
     for data in [
         records(&[("café", i64::MIN), ("a\"\n\\", i64::MAX)], "code"),

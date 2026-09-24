@@ -26,7 +26,7 @@ pub(super) fn run(
     mut emit: impl FnMut(usize, &Rule, usize, Value) -> Result<(), RuntimeError>,
 ) -> Result<i32, RuntimeError> {
     // Check every source contract. Concurrent admission retains the same closed
-    // pure phase subset; only sequential mode has an aggregate native budget.
+    // pure phase subset; native reservations do not bound this host interpreter.
     crate::execution::gate(program).map_err(|e| error(e.message))?;
     let execution = crate::execution::find(program, name)
         .ok_or_else(|| error(format!("no execution named '{name}'")))?;
@@ -44,7 +44,7 @@ pub(super) fn run(
         })
         .collect();
     let concepts: Vec<_> = iter_all_concepts(&program.items).collect();
-    if let ExecutionMode::Concurrent { max_in_flight } = execution.mode {
+    if let ExecutionMode::Concurrent { max_in_flight, .. } = execution.mode {
         let phases: Vec<_> = execution
             .phases
             .iter()

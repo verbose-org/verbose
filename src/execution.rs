@@ -1,5 +1,5 @@
 //! Source-owned execution order and resource contracts for pure phases.
-//! Only sequential executions have an implemented native layout and budget.
+//! Sequential stack ceilings and concurrent fixed-memory reservations.
 use crate::ast::*;
 use crate::native::{self, NativeError};
 use crate::stack_budget::SequenceReport;
@@ -77,7 +77,9 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
             {
                 errors.push(error(e, "native_stack must be in [1, 2097152] bytes"))
             }
-            ExecutionMode::Concurrent { max_in_flight } if !(1..=64).contains(&max_in_flight) => {
+            ExecutionMode::Concurrent { max_in_flight, .. }
+                if !(1..=64).contains(&max_in_flight) =>
+            {
                 errors.push(error(e, "max_in_flight must be in [1, 64]"))
             }
             _ => {}
@@ -103,7 +105,7 @@ fn shape_errors(p: &Program) -> Vec<VerifyError> {
 
 fn report_one(p: &Program, e: &Execution) -> Result<Report, VerifyError> {
     let ExecutionMode::Sequential { native_stack } = e.mode else {
-        return Err(error(e, "concurrent execution has no native stack report: scheduler and worker layout are not supported yet"));
+        return Err(error(e, "concurrent execution has no native stack report: use --memory-report for its fixed reservation"));
     };
     let names: Vec<_> = e.phases.iter().map(String::as_str).collect();
     let sequence = native::sequential_stack_report(p, &names)
@@ -133,6 +135,12 @@ pub fn verify(p: &Program) -> Vec<VerifyError> {
         .filter_map(|i| match i {
             Item::Execution(e) => match e.mode {
                 ExecutionMode::Sequential { .. } => report_one(p, e).err(),
+                ExecutionMode::Concurrent {
+                    native_memory: Some(_),
+                    ..
+                } => native::concurrent_memory_report(p, e)
+                    .err()
+                    .map(|cause| error(e, cause.message)),
                 ExecutionMode::Concurrent { .. } => {
                     // Reuse the existing closed pure phase analysis, including
                     // source rule budgets and the code/expansion limits. The

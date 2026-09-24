@@ -43,11 +43,16 @@ fn real_main() {
     let args: Vec<String> = env::args().collect();
 
     let stack_report = args.iter().any(|a| a == "--stack-report");
-    if stack_report {
+    let memory_report = args.iter().any(|a| a == "--memory-report");
+    if stack_report && memory_report {
+        eprintln!("--stack-report and --memory-report are separate analyses"); process::exit(2);
+    }
+    if stack_report || memory_report {
+        let report_flag = if memory_report { "--memory-report" } else { "--stack-report" };
         for flag in ["--native", "--wasm", "--input", "--stdin", "--stdin-raw", "--stream",
             "--benchmark", "--stats", "--disasm", "--http-server", "--echo-server", "--demo-http"] {
             if args.iter().any(|a| a == flag) {
-                eprintln!("--stack-report is a standalone native argv analysis; cannot combine with {flag}");
+                eprintln!("{report_flag} is a standalone native argv analysis; cannot combine with {flag}");
                 process::exit(2);
             }
         }
@@ -175,6 +180,7 @@ fn real_main() {
         eprintln!("                                       entry rule's single text field (large-blob input)");
         eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
+        eprintln!("  --memory-report [--json] --run <execution> Report a concurrent native memory reservation");
         eprintln!("  --stack-report [--json] --run <entry> Report checked native argv stack usage, without writing an artifact");
         eprintln!("  --echo-server <port> <output>      TCP echo server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
         eprintln!("  --demo-http <output>               HTTP server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
@@ -221,12 +227,25 @@ fn real_main() {
         process::exit(1);
     }
 
-    if stack_report {
+    if stack_report || memory_report {
         let name = find_flag(&args, "--run").or_else(|| program.items.iter().rev().find_map(|i| {
             if let ast::Item::Execution(e) = i { Some(e.name.clone()) } else { None }
         })).or_else(|| program.items.iter().rev().find_map(|i| {
             if let ast::Item::Rule(r) = i { Some(r.name.clone()) } else { None }
         })).unwrap_or_default();
+        if memory_report {
+            let result = execution::find(&program, &name).ok_or_else(|| native::NativeError {
+                message: "--memory-report requires a concurrent execution".into()
+            }).and_then(|e| native::concurrent_memory_report(&program, e));
+            match result {
+                Ok(report) => {
+                    if args.iter().any(|a| a == "--json") { println!("{}", report.json()); }
+                    else { println!("{report}"); }
+                }
+                Err(e) => { eprintln!("{e}"); process::exit(1); }
+            }
+            return;
+        }
         if execution::find(&program, &name).is_some() {
             match execution::report(&program, &name) {
                 Ok(report) => {
@@ -284,9 +303,21 @@ fn real_main() {
         }
     }
 
+    // A concurrent reservation report and its emitted mapping use the same
+    // original source lowering. Numeric body simplification remains local to
+    // that lowering; unrelated native entries retain their optimization path.
+    let concurrent_native = find_flag(&args, "--native").is_some() &&
+        find_flag(&args, "--run").or_else(|| execution::default_entry(&program))
+            .and_then(|name| execution::find(&program, &name))
+            .is_some_and(|e| matches!(e.mode, ast::ExecutionMode::Concurrent { .. }));
+
     // Optimize AST (platform-independent transformations)
     let show_stats = args.iter().any(|a| a == "--stats");
-    let (program, opt_stats) = optimizer::optimize_program(&program);
+    let (program, opt_stats) = if concurrent_native {
+        (program, optimizer::OptStats::default())
+    } else {
+        optimizer::optimize_program(&program)
+    };
 
     // Count every concept the program declares, including those nested
     // inside a `concept_group`. The `iter_all_concepts` helper centralises

@@ -1,0 +1,1 @@
+Run independent reading analyses with at most two native workers, ordered output, stop on failure and at most 20480 bytes of execution reservation.
