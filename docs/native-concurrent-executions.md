@@ -141,6 +141,10 @@ stdin/stream, HTTP execution scopes, WASM and self-hosted execution stay refused
 Existing standalone/sequential bytes must remain identical to the reference.
 Run serialized Rust tests, CLI checks, CIDX and bootstrap before delivery.
 
+The separate [concurrency benchmark](concurrent-benchmark.md) compares elapsed
+time, CPU accounting and memory snapshots with sequential phases. Bounded
+admission and storage do not by themselves establish a throughput improvement.
+
 Kernel ABI references: [clone](https://man7.org/linux/man-pages/man2/clone.2.html),
 [futex](https://man7.org/linux/man-pages/man2/futex.2.html). The generated runtime
 targets their Linux x86-64 raw syscall ABI, not the C wrapper calling convention.
