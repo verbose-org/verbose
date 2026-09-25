@@ -14,6 +14,11 @@ inspection, and experimentation also supported. The bundled generators use Claud
 the language and compiler are independent of that choice. Broad model authorability
 remains an evaluation question.
 
+[Source text](source-text.md) preserves UTF-8 literal bytes, including across
+the existing ASCII escapes. Lengths, indexing and text capacities remain
+byte-based; no Unicode normalization is performed. The Rust lexer's earlier
+non-ASCII byte expansion is fixed, with self-hosted differential coverage.
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable

@@ -10,15 +10,36 @@ is superseded for those supported constructs. Legacy `--http-server` and
 `--demo-http` entry points still have the distinct roles described below.
 Historical sizes and restrictions apply to the milestone where they were recorded.
 
-## Current source-literal gap (2026-09-25)
+## Source-literal UTF-8 corruption — fixed (2026-09-25)
 
-The Rust lexer's text-literal loop currently pushes each UTF-8 source byte as a
-separate character (`src/lexer.rs`, string-literal branch). For example, source
-`"é"` becomes `C3 83 C2 A9` (four bytes) instead of `C3 A9` (two). This predates
-service stack budgets; they count the resulting parsed/emitted bytes, so their
-storage bound remains valid. Counted HTTP input bytes are independent of this
-source-literal conversion. Fixing source-text fidelity and checking its bootstrap
-and compatibility consequences is separate language work.
+The Rust lexer's text-literal loop used to push each UTF-8 source byte as a
+separate character. Source `"é"` became `C3 83 C2 A9` (four bytes) instead of
+`C3 A9` (two). The lexer now retains source bytes and decodes only the existing
+ASCII escape pairs. Non-ASCII literals therefore intentionally change their
+output, comparisons, byte lengths and inferred capacities to the written value.
+There is no Unicode normalization. Source diagnostic columns remain byte-based.
+
+This predates service stack budgets; those budgets always counted the actual
+parsed/emitted bytes, so the bug did not invalidate their storage bound. Counted
+HTTP input bytes are independent of source-literal conversion. The self-hosted
+byte spans already preserve unescaped UTF-8 and need no source change. See the
+[source text contract and regression coverage](source-text.md).
+
+## Self-hosted ordinary text escapes
+
+The UTF-8 differential also exposed a separate pre-existing gap: the self-hosted
+compiler's `x86_stream_node` / `AstStr` branch writes the original source span
+between quotes, without decoding escapes. Ordinary output `"A\nB"` writes
+`41 5C 6E 42 0A`, whereas the Rust compiler writes `41 0A 42 0A`. Non-ASCII bytes
+in the same literal are preserved, but escape spellings remain verbatim. The
+value path in `x86_node` likewise carries the undecoded source span. Service and
+reaction literal blocks have a separate decoded-data path, so this is not a
+blanket absence of an escape decoder.
+
+Correcting the shared value representation and ordinary streaming output, with
+matching size calculations and bootstrap checks, remains separate work from the
+Rust UTF-8 lexer fix. ASCII escapes have the same discrepancy; it is not caused
+by non-ASCII text or by that correction.
 
 ## Three tiers of native output (important clarification)
 
