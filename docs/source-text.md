@@ -33,11 +33,12 @@ depended on the corrupted spelling needs to write that spelling explicitly.
 Storage reports continue to account for the bytes the compiler actually emits.
 
 The Rust front end is shared by interpretation, native emission and WASM. The
-self-hosted compiler's existing byte spans already preserve unescaped UTF-8, so
-its source does not need a matching change. Its ordinary text-output path still
-writes escape spellings verbatim, a separate pre-existing
-[gap](known-gaps.md#self-hosted-ordinary-text-escapes). This fix does not extend
-any backend's supported language subset.
+self-hosted compiler already preserved unescaped UTF-8. A subsequent
+[escape correction](self-hosted-text-escapes.md) decodes ordinary text constants
+before emission, retains their source offsets with inaccessible padding, and
+stores their decoded byte lengths. Its evaluator measures and reads encoded
+source spans through the same escape decoder. Neither correction extends a
+backend's supported language subset.
 
 ## Regression coverage
 
@@ -48,10 +49,12 @@ any backend's supported language subset.
 - Bounded native outputs accept exact byte capacities, reject one byte less and
   preserve an existing artifact on refusal. HTTP log budgets count source UTF-8.
 - WASM data segments preserve exact bytes and lengths. The `two_generation`
-  bootstrap suite runs the unescaped observable-byte fixtures through the
-  self-hosted compiler. Escaped text output and embedded source NUL are covered
-  through the Rust front end only: the self-hosted compiler's legacy `stdin-raw`
-  input is NUL-terminated.
+  bootstrap suite runs UTF-8 and escaped-text fixtures through the self-hosted
+  compiler, including the self-generated gen1. It compares explicit output,
+  errors, status, literal storage and ELF sizes, and refuses invalid escapes in
+  used/unused declarations and metadata before emission. Embedded source NUL
+  remains covered through the Rust front end only: the self-hosted compiler's
+  legacy `stdin-raw` input is NUL-terminated.
 
 Run `cargo test source_utf8 -- --test-threads=1` for the focused checks. Run
 `cargo test --release source_utf8 -- --ignored --test-threads=1` with an unlimited

@@ -29898,9 +29898,13 @@ rule le64_neg
         // now-mandatory attributes to each of this probe's 2 declarations (+96 B of
         // SOURCE), so every row moved by exactly +96 or exactly 0. The 0 row is the
         // shape whose ELF embeds no source blob. The emitter is untouched.
+        // Re-pinned 2026-09-25 for decoded text constant storage: s1/s3/s4
+        // static-log files change only the two embedded source bytes `\n`
+        // to LF + zero padding. Compared against the parent emitter: headers,
+        // instructions and sizes are identical. No-log and s2 pins stay exact.
         let pins: [(usize, &str, usize, &str); 4] = [
             (943,  "df0770af321996236635c5c8be662691112d86ec14b830d1bc11b88699c0df96",
-             1121, "85990be98540cd48ba125d8a5e6a8e98f87e7dfb273d534f02d3e3469fcc63bc"),
+             1121, "8ea84b45ad9959246cd9f0ed9b7c5a522441725a93627d3cc73c2877bdbc317f"),
             (880,  "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e",
              1006, "6e52e040bd828b21c8dc5548234df4d7c7ced1cafeb51d5a731d46551327a9c2"),
             // s3 re-pinned +53 by the text-equality slice (2026-08-08): its handler
@@ -29910,9 +29914,9 @@ rule le64_neg
             // in place of the 12 B integer compare. s1/s2/s4 have no `==` and are
             // byte-identical, which is what localises the change to this one shape.
             (1429, "56ef93131eab5cd1cb838cc7637d9da5d3261fdf3d4f7b6089e3b31dea6832f6",
-             1603, "42976d7d993955d3787a3a17d8a63608fa3e12bf43886d9618465dac8d0afb32"),
+             1603, "4375930af53ffc00c6756cc95630002a7e9e944b4131ea2ba9b28801a455fded"),
             (1370, "9cd598fff90d51cfd87524569dbe88b20ae8f2b11d53e5b544448df2c0593946",
-             1544, "932456e179b64f1a6f4c282401e52dd5f9692015947f803bb7349959aeea8871"),
+             1544, "053e1d30befdc288caa84c7d8a3decdfb19d16a6f5f192faebed70d955513f5e"),
         ];
         // STATIC-LOG columns re-pinned by SLICE 5d (2026-08-10), which moved a static
         // log block from the pre-read slot to the post-parse one so a dropped request
@@ -29942,7 +29946,7 @@ rule le64_neg
             assert!(l.status.success(), "({tag}) static-log service must emit");
             assert_eq!(l.stdout.len(), lsz, "({tag}) static-log ELF size drifted");
             assert_eq!(sha256_hex(&l.stdout), lsha,
-                "({tag}) static-log ELF drifted from its post-5b.5 pin");
+                "({tag}) static-log ELF drifted from its decoded-text baseline");
             assert_eq!(log_block_syscalls(&l.stdout), 1,
                 "({tag}) a STATIC log must also go through ONE writev — the wrapper is \
                  emitted per content shape, not only for concats");
@@ -30759,9 +30763,13 @@ rule le64_neg
         // bytes while keeping its size. The zeros are the s2 rows, whose emitted
         // ELF does not embed the source blob at all, so a longer source cannot
         // reach them. A genuine emitter change could not produce that pattern.
+        // Re-pinned 2026-09-25 for decoded text constant storage. Only five
+        // rows move: s1/static and s3/s4 static/field. Each changes exactly two
+        // embedded source bytes (`\n` -> LF + padding); headers, instructions,
+        // sizes and every remaining row are byte-identical to the parent.
         let pins: [(&str, &str, usize, &str); 11] = [
             ("s1", "", 943, "eb81cac4f4d7e759c518c76f32eea1a5306acffcf779060fa779513836469871"),
-            ("s1", "static", 1117, "1496da8aec889b0be4bf07cf8d9b21e3de0d15ca2c1b71e670ee72b54b86c6d0"),
+            ("s1", "static", 1117, "8c8e9eca11da1172b41e6517947091e997e418416f968a0165123b0e9d34ae7a"),
             ("s2", "", 880, "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e"),
             ("s2", "static", 1006, "6e52e040bd828b21c8dc5548234df4d7c7ced1cafeb51d5a731d46551327a9c2"),
             ("s2", "field", 1092, "f90d706fa496a725c0c530b020e83a0b3addfce986c17326f6c46ea253a60b64"),
@@ -30779,11 +30787,11 @@ rule le64_neg
             // (the constant-response branch has no parse and so no post-parse slot),
             // as are all four no-log rows and both `field` rows.
             ("s3", "", 1425, "f15fad310e38d42b7f3c488025aacd7a61db7d32908c906091299b7ce46004a9"),
-            ("s3", "static", 1599, "be6bad2bab7f2f21d7f8aad8045da155bf2a0169314828dc3ef96c2299265a32"),
-            ("s3", "field", 1717, "8ee06503ef611d412ba4f1c674bae821cc97f544169d03bed527a13bb54b0934"),
+            ("s3", "static", 1599, "3a3c42f4075b024c9e65a2dfafff07208c9d3c2afcbad6a71f5583eb002b48cb"),
+            ("s3", "field", 1717, "53ea91e5a7e3d80ae360566b5e9bd39f182ca42146a54d0580e804b585b03895"),
             ("s4", "", 1366, "629bf06e1fddd1ea76f3475d280197341fdeea658d6048e12fb37c2cb56a902e"),
-            ("s4", "static", 1540, "68a6bc01a4b4008bb6a253dc138e93bdae3463cf5c82ea9ed1ebf1b5df1c5f93"),
-            ("s4", "field", 1658, "63de8ba68c995e8cfc175b6ebcc7abf01bcb5a7a1d4bf190cad169eeec0f1401"),
+            ("s4", "static", 1540, "6f6151f6f8f07bf6a4014ce01f301e7ef9cb344a23ef145947cdb2d85aaa706a"),
+            ("s4", "field", 1658, "3adaab5a73df1bc7e4e29582ffc7eb69ab5f1840c1ef8d3515bf22e90d52f988"),
         ];
         let logblock = |v: &str| -> &str {
             match v { "static" => static_log, "field" => field_log, _ => "" }
@@ -30795,9 +30803,8 @@ rule le64_neg
             assert!(o.status.success(), "({tag}/{variant}) must emit with no concurrency line");
             assert_eq!(o.stdout.len(), size, "({tag}/{variant}) ELF size drifted");
             assert_eq!(sha256_hex(&o.stdout), sha,
-                "({tag}/{variant}) a service with NO `concurrency:` line must emit \
-                 BYTE-IDENTICALLY to pre-S8 gen0 — every S8 term is gated on \
-                 `svc_concurrency == 2`, so code 0 is unchanged BY CONSTRUCTION");
+                "({tag}/{variant}) a service with NO `concurrency:` line must retain \
+                 its fixed sequential baseline, including decoded text constants");
             // No S8 bytes anywhere in a sequential-mode binary.
             assert_eq!(count(&o.stdout, SIGACTION), 0,
                 "({tag}/{variant}) a non-forked server must contain NO rt_sigaction block");
@@ -56482,6 +56489,14 @@ rule pick
             "R0 two-generation fixed point: gen1(source) == gen2(source) byte-for-byte \
              (gen1={} B, gen2={} B) — the compiler must reproduce its entire self",
             gen1_bytes.len(), gen2_bytes.len());
+
+        #[cfg(target_os = "linux")]
+        {
+            let base = std::env::temp_dir().join(format!("verbose-text-escapes-gen1-{}", std::process::id()));
+            fs::create_dir_all(&base).unwrap();
+            crate::source_text_tests::assert_selfhost_text_escapes(&gen1, &base);
+            fs::remove_dir_all(base).unwrap();
+        }
 
         // The new contract must remain an explicit refusal after self-compilation.
         for emitter in [&gen0, &gen1] {

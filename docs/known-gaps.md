@@ -25,7 +25,7 @@ HTTP input bytes are independent of source-literal conversion. The self-hosted
 byte spans already preserve unescaped UTF-8 and need no source change. See the
 [source text contract and regression coverage](source-text.md).
 
-## Self-hosted ordinary text escapes
+## Self-hosted ordinary text escapes — fixed (2026-09-25)
 
 The UTF-8 differential also exposed a separate pre-existing gap: the self-hosted
 compiler's `x86_stream_node` / `AstStr` branch writes the original source span
@@ -36,10 +36,43 @@ value path in `x86_node` likewise carries the undecoded source span. Service and
 reaction literal blocks have a separate decoded-data path, so this is not a
 blanket absence of an escape decoder.
 
-Correcting the shared value representation and ordinary streaming output, with
-matching size calculations and bootstrap checks, remains separate work from the
-Rust UTF-8 lexer fix. ASCII escapes have the same discrepancy; it is not caused
-by non-ASCII text or by that correction.
+The [correction](self-hosted-text-escapes.md) validates text tokens, decodes their
+constant storage at unchanged source offsets, and emits decoded lengths for both
+packed values and direct writes. Padding preserves the ELF layout but is outside
+the value span. The evaluator's encoded spans use the decoder for lengths/reads
+and map decoded substring boundaries back to source offsets. Metadata takes a
+separate validation path because the main tokenizer discards attribute lines.
+No target allocation, decoding loop or GC is introduced. This was independent of
+the Rust UTF-8 lexer defect: ASCII escapes had the same discrepancy.
+
+## Text alias output, shadowing and streamed substrings
+
+The escape differential exposed three older limitations. They reproduce with
+plain ASCII on the pre-correction reference (`edd46ca`); this correction does not
+change the affected lookup/classification/emission rules.
+
+- **Self-hosted alias output:** `let text = "old"; let first = text;
+  out = concat(first)` prints a decimal packed source-span descriptor rather
+  than `old`. These statements are separate source lines. `let_marks_textspan`
+  recognizes only an `AstStr` RHS, so an `AstVar` alias selects the number printer.
+  Numeric consumers such as `byte_at(first, 0)` use the packed value correctly.
+  A repair needs type classification through the visible binding environment,
+  shared by the size and emission walks.
+- **Repeated let names:** `let text = "old"; let first = text; let text = "new";
+  out = concat(first, text)` should print `oldnew`. The Rust CLI prints `oldold`,
+  and the self-hosted binary prints a descriptor followed by `old` (combining this
+  defect with the previous one). Self-hosted `let_index` and `let_rhs` take the
+  first matching name; simply taking the last would expose later bindings while
+  compiling earlier RHS expressions. A repair needs source-position-aware
+  lexical environments; Rust's optimized/native path also needs investigation.
+- **General streamed substring:** `out = concat(substring("abc", 1, 2))`
+  emits a self-hosted binary that traps. The `span_is_substring` arm in
+  `x86_stream_node` explicitly emits `0xCC`; the matching size walk counts one
+  byte. Scalar consumers of substring work, but this stream position needs a
+  real text-write path or an explicit refusal before emission.
+
+These are accepted-but-wrong programs, not supported forms to rely on. Agreement
+over the existing example corpus alone does not close these gaps.
 
 ## Three tiers of native output (important clarification)
 

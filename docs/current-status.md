@@ -18,6 +18,10 @@ remains an evaluation question.
 the existing ASCII escapes. Lengths, indexing and text capacities remain
 byte-based; no Unicode normalization is performed. The Rust lexer's earlier
 non-ASCII byte expansion is fixed, with self-hosted differential coverage.
+The self-hosted compiler also [decodes ordinary text escapes](self-hosted-text-escapes.md)
+in prepared constants, with no target decoding loop or allocation. Its separate
+alias-output, shadowing and streamed-substring limitations are listed in
+[known gaps](known-gaps.md#text-alias-output-shadowing-and-streamed-substrings).
 
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
