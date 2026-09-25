@@ -217,6 +217,15 @@ report includes control words, result capacities, worker stacks, page padding an
 guards; it excludes kernel/initial input/code storage and makes no RSS claim.
 The shipped interpreter remains the semantic reference.
 
+HTTP scope follow-up (2026-09-24): a service-level `native_stack` ceiling now
+checks the additional explicit stack per process, combining bounded reception,
+dispatch, pure bounded invocation storage and response sending. Sequential,
+forked/capped and pooled modes require both socket deadlines; logs, state and
+graceful-shutdown signal frames remain excluded. This separate scope preserves
+rule argv proofs and adds no emitted instructions for a sufficient declaration.
+The self-hosted compiler and WASM refuse the new contract explicitly. See
+[HTTP stack budgets](docs/http-stack-budget.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

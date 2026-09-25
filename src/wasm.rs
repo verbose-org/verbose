@@ -211,6 +211,9 @@ pub fn compile_wasm(
     if crate::execution::has_declarations(program) {
         return Err(WasmError { message: "WASM does not support source execution contracts".into() });
     }
+    if program.items.iter().any(|i| matches!(i, Item::Service(s) if s.native_stack.is_some())) {
+        return Err(WasmError { message: "WASM does not support service native_stack (native HTTP per-process stack contract)".into() });
+    }
     if crate::stack_budget::has_declarations(program) {
         return Err(WasmError { message: "WASM does not support proofs.native_stack (native x86-64 argv stack contract)".into() });
     }

@@ -1,0 +1,57 @@
+@verbose 0.1.0
+
+concept RequestView
+  @intention: "Bound the fields passed from the request to the formatter"
+  @source: http_stack.intent:1
+  fields:
+    path : text [..256]
+    count : number [0, 4096]
+
+rule describe
+  @intention: "Format the path and doubled byte count within 277 bytes"
+  @source: http_stack.intent:2
+  input:
+    view : RequestView
+  output:
+    out : text [..277]
+  logic:
+    out = concat(view.path, ":", view.count * 2)
+  proofs:
+    purity:
+      reads: [view.path, view.count]
+      calls: []
+    termination:
+      bound: 8
+
+rule handle
+  @intention: "Prepare a checked record and retain the response through sending"
+  @source: http_stack.intent:3
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    let saved = req.path
+    let view = RequestView { path: saved, count: length(req.body) }
+    let body = describe(view)
+    resp = HttpResponse { status: 200, body: body }
+  proofs:
+    purity:
+      reads: [req.path, req.body]
+      calls: [describe]
+    termination:
+      bound: 16
+
+service bounded_http
+  @intention: "Serve bounded requests under a per-process native stack ceiling"
+  @source: http_stack.intent:4
+  listen:
+    protocol: http_1_0
+    port: 18960
+    max_request: 4096
+  handler: handle
+  request_timeout: 1
+  response_timeout: 1
+  concurrency: pooled
+  workers: 2
+  native_stack: 8192

@@ -5,6 +5,7 @@ use std::{collections::HashMap, fs, path::Path, process::Command};
 mod text;
 mod sequential;
 mod retention;
+mod http;
 
 fn source(expr: &str, bindings: &str) -> String {
     let reads = if expr.contains("i.y") || bindings.contains("i.y") {
@@ -414,7 +415,7 @@ fn native_stack_self_hosted_refusal_is_scoped_and_precedes_raw_and_elf_output() 
     let control = source("i.x + i.y", "")
         .replace("    native_stack: 512\n", "")
         .replace("  hints:\n    overflow: [-1000, 1000]\n", "");
-    let cases = [
+    let mut cases = vec![
         (control.clone(), false),
         (
             control.replace("  proofs:\n", "  proofs:\n    native_stack : 512\n"),
@@ -443,13 +444,32 @@ fn native_stack_self_hosted_refusal_is_scoped_and_precedes_raw_and_elf_output() 
             false,
         ),
         (format!("{control}\n-- native_stack: 1\n"), false),
+        (control.replace("rule checked", "rule service"), false),
+        (control.replace("rule checked", "rule service").replace("  proofs:\n", "  proofs:\n    native_stack: 512\n"), true),
     ];
+    // No bounded text/deadline/pool declaration may hide a missing service
+    // token gate. The unchanged constant HTTP service must emit on its own.
+    let service = include_str!("../../examples/hello_http.verbose");
+    cases.extend([
+        (service.to_string(), false),
+        (format!("{service}\n  native_stack: 8192\n"), true),
+        (service.replace("  listen:", "  native_stack: 8192\n  listen:"), true),
+        (service.replace("Hello from Verbose over HTTP!", "native_stack: 1"), false),
+        (service.replace("service hello_server", "service rule"), false),
+        (format!("{}\n  native_stack: 8192\n", service.replace("service hello_server", "service rule")), true),
+    ]);
     let input = dir.join("input.verbose");
     for entry in ["elf_program_src", "x86_program_src", "verify_errors"] {
         let bin = dir.join(entry);
         native::compile_native_stdin_raw(&compiler, entry, bin.to_str().unwrap()).unwrap();
         for (case, refused) in &cases {
-            fs::write(&input, case).unwrap();
+            // verify_errors does not synthesize HTTP concepts (ELF/raw do).
+            // Supply those types so an unrelated missing-concept diagnostic
+            // cannot mask the service contract gate; the control must stay 0.
+            let checked = if entry == "verify_errors" && case.contains("rule hello_handler") {
+                case.replace("rule hello_handler", "concept HttpRequest\n  @intention: \"Request type for the verification probe\"\n  @source: hello_http.intent:1\n  fields:\n    path : text\n\nconcept HttpResponse\n  @intention: \"Response type for the verification probe\"\n  @source: hello_http.intent:1\n  fields:\n    status : number\n    body : text\n\nrule hello_handler")
+            } else { case.clone() };
+            fs::write(&input, checked).unwrap();
             // The tokenizer is recursive; pass the binary as a positional
             // shell argument, never interpolate source text or paths as code.
             let out = Command::new("sh")

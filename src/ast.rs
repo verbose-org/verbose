@@ -429,6 +429,9 @@ pub struct Service {
     pub workers: Option<u32>,
     /// Grace period after supervisor SIGTERM; only for bounded HTTP pools.
     pub shutdown_timeout: Option<u32>,
+    /// Additional explicit native stack ceiling per service process.
+    /// Separate from a rule's standalone argv proof; see http-stack-budget.md.
+    pub native_stack: Option<u32>,
 }
 
 impl Service {

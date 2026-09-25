@@ -129,10 +129,11 @@ retain their existing support.
 Future composition should cover execution scopes across the language: calls,
 successive phases, storage retained between them and bounded concurrent work.
 Command-line processing, batch pipelines and compiler passes are examples along
-with services. HTTP request/handler/response/log storage remains a concrete case
-for validating these reusable contracts. The present `native_stack` declaration
-still describes only the supported standalone argv entry; a whole-program or
-whole-service memory budget requires further analysis and an explicit scope.
+with services. A separate [service `native_stack` attribute](http-stack-budget.md)
+now combines bounded HTTP transport, pure handlers and response storage per
+process; logs, state and graceful shutdown are excluded. The rule's
+`proofs.native_stack` keeps its standalone argv meaning and cannot substitute for
+that service scope. Neither contract bounds total program/process memory.
 
 Checked rules can now also run as [sequential argv phases](sequential-stack-budgets.md)
 using `--run a,b,c`. With no stack values retained between phases, their aggregate
@@ -151,8 +152,9 @@ target/release/verbosec examples/native_stack.verbose --stack-report --run magni
 target/release/verbosec examples/native_stack.verbose --stack-report --run magnitude --json
 ```
 
-`--stack-report` writes no artifact, defaults to the last rule and accepts a
-comma-separated phase selection. It refuses
+`--stack-report` writes no artifact and accepts a comma-separated phase selection.
+With no explicit entry it selects the last execution, otherwise the last service,
+otherwise the last rule. It refuses
 compilation, execution or other input-mode flags in the same command. Unknown or
 unsupported entries fail with a diagnostic and nonzero status. An exceeded
 declaration fails source verification before a success report or artifact is
@@ -203,7 +205,7 @@ inspect the report rather than treating a budget as ABI stability.
 | Rust native, single argv entry | Supported; the declaration adds no runtime instructions |
 | Native sequential argv phases | Supported for checked phases over the same input concept; bounds combine by maximum |
 | Native stdin/raw/stream | Refused for entries reaching a budget declaration; strict numeric restrictions also remain |
-| HTTP/service/reaction contexts | Refused when they reach a budget declaration, including calls in after mutations or logs |
+| HTTP/service/reaction contexts | Refused when they reach a rule budget declaration; the separate [service attribute](http-stack-budget.md) covers bounded pure HTTP |
 | WASM | Refuses programs declaring `native_stack` before writing an artifact |
 | Self-hosted diagnostics, ELF and raw x86 emission | Detect and refuse the proof key; no stack planner yet |
 

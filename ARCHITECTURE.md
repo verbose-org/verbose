@@ -126,8 +126,11 @@ implemented mechanisms with specific contracts, not a whole-process memory proof
 
 This is already concrete for bounded HTTP reception: `max_request` determines a
 fixed frame buffer, receiving does not grow it, and oversize requests close the
-client. It is not yet a whole-service memory bound: response temporaries, callees,
-resources, kernel buffers, and process overhead have separate lifetimes and costs.
+client. A separate [service `native_stack` ceiling](docs/http-stack-budget.md)
+now combines that frame with dispatch, pure bounded callees and response storage
+through sending, per process. It excludes logs, state and graceful-shutdown signal
+frames in this first scope. Resources, kernel buffers and process overhead still
+have separate lifetimes and costs; this is not a total service memory quota.
 Reclaiming a request region means making its storage reusable, not erasing its
 bytes or releasing every page to the OS. Native emission alone establishes no
 performance or safety advantage over another native server.

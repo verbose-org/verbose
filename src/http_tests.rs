@@ -7,6 +7,7 @@ mod bounded_state_tests;
 mod text_inputs_tests;
 mod text_branches_tests;
 mod bounded_log_tests;
+mod stack_budget_tests;
 use crate::{
     ast::*,
     http_framing::{reference, Frame},

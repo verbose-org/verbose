@@ -52,6 +52,15 @@ pub(crate) fn sequential_stack_report(program: &Program, rules: &[&str]) -> Resu
     sequential::report(program, rules)
 }
 
+/// Prepare the real HTTP service without writing an artifact or opening sockets.
+pub(crate) fn service_stack_report(program: &Program, name: &str) -> Result<crate::stack_budget::http::Report, NativeError> {
+    let service = program.items.iter().find_map(|i| match i {
+        Item::Service(s) if s.name == name => Some(s), _ => None,
+    }).ok_or_else(|| NativeError { message: format!("no service named '{name}' for native stack analysis") })?;
+    let (_, report) = prepare_http10_dynamic_service(program, service, true)?;
+    report.ok_or_else(|| NativeError { message: "HTTP stack layout unavailable".into() })
+}
+
 pub(crate) fn concurrent_memory_report(program: &Program, e: &Execution) -> Result<concurrent::Report, NativeError> {
     concurrent::report(program, e)
 }
@@ -22667,6 +22676,18 @@ fn compile_http10_dynamic_service(
     service: &Service,
     output_path: &str,
 ) -> Result<(), NativeError> {
+    let (code, _) = prepare_http10_dynamic_service(program, service, service.native_stack.is_some())?;
+    write_server_elf(&code, output_path, "service", service.port)
+}
+
+fn prepare_http10_dynamic_service(
+    program: &Program,
+    service: &Service,
+    report_stack: bool,
+) -> Result<(Vec<u8>, Option<crate::stack_budget::http::Report>), NativeError> {
+    if report_stack {
+        crate::stack_budget::http::context(program, service).map_err(|message| NativeError { message })?;
+    }
     let handler = program
         .items
         .iter()
@@ -22764,12 +22785,11 @@ fn compile_http10_dynamic_service(
         }
     }
 
-    let code = emit_http10_dynamic_bytes(
+    emit_http10_dynamic_bytes(
         service, handler, &offsets, &no_rules, &no_ranges,
         &all_resources, &all_connections, &all_entropies,
-        &program_rules, &program_concepts, storage.as_ref(), &bounded_after,
-    )?;
-    write_server_elf(&code, output_path, "service", service.port)
+        &program_rules, &program_concepts, storage.as_ref(), &bounded_after, report_stack,
+    )
 }
 
 /// Duplicated shape of the verifier's synthesised HttpRequest concept,
@@ -23343,7 +23363,9 @@ fn emit_http10_dynamic_bytes(
     program_concepts: &[&Concept],
     bounded_storage: Option<&bounded_text::Fragment>,
     bounded_after: &HashMap<usize, bounded_text::Fragment>,
-) -> Result<Vec<u8>, NativeError> {
+    report_stack: bool,
+) -> Result<(Vec<u8>, Option<crate::stack_budget::http::Report>), NativeError> {
+    const STARTUP_STACK_BYTES: u8 = 16;
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
     let max_request = service.max_request;
@@ -23529,6 +23551,26 @@ fn emit_http10_dynamic_bytes(
     let frame_size: u32 = (frame_base as u32) + max_request;
     let buf_offset_from_rbp: i32 = -(frame_base + max_request as i32);
 
+    // Report the actual transport layout and the same placed fragment used
+    // below. The closed context excludes every unaccounted effect/dynamic path.
+    let stack_report = if report_stack {
+        let fragment = bounded_storage.ok_or_else(|| NativeError { message: "HTTP stack analysis requires bounded handler storage".into() })?;
+        let (handler_frame, expression_stack_bytes) = fragment.stack_layout();
+        Some(crate::stack_budget::http::Report {
+            service: service.name.clone(), handler: service.handler.clone(),
+            concurrency: match service.concurrency {
+                ConcurrencyMode::Sequential => "sequential", ConcurrencyMode::Forked => "forked", ConcurrencyMode::Pooled => "pooled",
+            },
+            declared_bytes: service.native_stack,
+            frame_bytes: frame_size as usize, request_buffer_bytes: max_request as usize,
+            request_metadata_bytes: frame_base_fixed as usize,
+            io_bookkeeping_bytes: http_io::Io::SIZE as usize,
+            dispatch_bookkeeping_bytes: (frame_base - frame_base_fixed - http_io::Io::SIZE) as usize,
+            startup_stack_bytes: STARTUP_STACK_BYTES as usize,
+            handler_frame, expression_stack_bytes, response_stack_bytes: ITOA_STACK_BYTES as usize,
+        })
+    } else { None };
+
     // ═══ AGGREGATE CALLEES (slice agg-svc-1) ═══════════════════
     // Every record-returning rule a handler `let` binds is emitted as a
     // CALLABLE — `emit_callable_into`, the exact prologue / rsi spill /
@@ -23675,7 +23717,7 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);                   // add rsp, 8
 
     // BIND
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);                   // sub rsp, 16
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, STARTUP_STACK_BYTES]);      // sub rsp, 16
     code.extend_from_slice(&[0x66, 0xC7, 0x04, 0x24, 0x02, 0x00]);       // word [rsp]=2
     code.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x02]);             // word [rsp+2]=port
     code.extend_from_slice(&port_be);
@@ -23687,7 +23729,7 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // rdx=16
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
     if admission.is_some() || pool.is_some() { abort_patches.extend(admission::check_syscall(&mut code)); }
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);                   // add rsp, 16
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, STARTUP_STACK_BYTES]);      // add rsp, 16
 
     // ═══ SIGCHLD = SIG_IGN (Phase 10 slice 10) ═════════════════
     // Forked mode only. Setting SIGCHLD's disposition to SIG_IGN tells
@@ -24448,7 +24490,7 @@ fn emit_http10_dynamic_bytes(
         code.extend_from_slice(&[0x0F, 0x05]);
     }
 
-    Ok(code)
+    Ok((code, stack_report))
 }
 
 /// Emit the HTTP/1.0 minimal parser: scan the read buffer for the first
@@ -24931,9 +24973,9 @@ fn emit_write_itoa_slot(code: &mut Vec<u8>, slot_off: i32, io: Option<http_io::I
     code.push(slot_off as i8 as u8);
 
     // Allocate 24 bytes on stack for the digit buffer (enough for i64)
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x18]);                    // sub rsp, 24
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, ITOA_STACK_BYTES]);         // sub rsp, 24
     // r8 = rsp + 24  (one-past-end cursor)
-    code.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, 0x18]);              // lea r8, [rsp+24]
+    code.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, ITOA_STACK_BYTES]);   // lea r8, [rsp+24]
 
     // Special case: value == 0 → emit single '0'
     // test rax, rax ; jnz itoa_loop
@@ -24972,7 +25014,7 @@ fn emit_write_itoa_slot(code: &mut Vec<u8>, slot_off: i32, io: Option<http_io::I
     code[patch_skip_loop] = (write_digits - patch_skip_loop - 1) as u8;
 
     // rdx (count) = (rsp + 24) - r8
-    code.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x18]);              // lea rdx, [rsp+24]
+    code.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, ITOA_STACK_BYTES]);   // lea rdx, [rsp+24]
     code.extend_from_slice(&[0x4C, 0x29, 0xC2]);                          // sub rdx, r8
     // rsi = r8 (start of digits)
     code.extend_from_slice(&[0x4C, 0x89, 0xC6]);                          // mov rsi, r8
@@ -24982,7 +25024,7 @@ fn emit_write_itoa_slot(code: &mut Vec<u8>, slot_off: i32, io: Option<http_io::I
     emit_http_segment(code, io, failures);
 
     // Release the 24-byte digit buffer
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);                    // add rsp, 24
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, ITOA_STACK_BYTES]);         // add rsp, 24
 }
 
 /// Emit a write() syscall for the handler-produced body: pointer at
@@ -56947,7 +56989,8 @@ rule pick
         // pipeline_stack adds per-record transfer, refused by the execution gate.
         // pipeline_totals keeps that refusal for computed numeric record fields.
         // gen0 returns 1 with zero output; EXPECTED_ACCEPTED stays 93.
-        const EXPECTED_TOTAL: usize = 190;
+        // http_stack adds a service-scoped native stack ceiling, also refused.
+        const EXPECTED_TOTAL: usize = 191;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

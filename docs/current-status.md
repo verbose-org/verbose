@@ -35,6 +35,14 @@ frames, placed text buffers and transient storage. `--stack-report` exposes the
 calculation as text or JSON. This does not bound interpreter or total process
 memory; see [native stack budgets](native-stack-budget.md).
 
+Pure bounded HTTP services can now declare a separate
+[`native_stack` ceiling](http-stack-budget.md) per process. It includes reception,
+dispatch, the expanded handler and response storage retained through sending.
+Sequential, forked/capped and pooled modes are supported with both socket
+deadlines. Logs, persistent state and graceful-shutdown signal frames remain
+outside this first service contract. A sufficient declaration adds no native
+instructions; `--stack-report` explains the same layout used for emission.
+
 The first [composition across execution phases](sequential-stack-budgets.md)
 runs checked rules sequentially over the same argv batch. It releases each frame
 before the next phase, combines bounds by maximum and stops after a failed phase.

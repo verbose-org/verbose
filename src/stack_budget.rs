@@ -1,8 +1,9 @@
-//! Source-selected ceilings for checked numeric and bounded text argv entries.
+//! Source-selected ceilings for checked argv entries and bounded HTTP services.
 //! Placement comes from the emitter, not an independent AST size estimate.
 use crate::ast::*;
 use crate::verifier::VerifyError;
 use std::collections::BTreeSet;
+pub(crate) mod http;
 
 /// Possible pre-existing owners, counted once each, not extra frame storage.
 /// Exclusive alternatives can share addresses while both contribute capacity.
@@ -198,7 +199,11 @@ impl std::fmt::Display for SequenceReport {
 pub fn has_declarations(p: &Program) -> bool {
     p.items
         .iter()
-        .any(|i| matches!(i, Item::Rule(r) if r.proofs.native_stack.is_some()))
+        .any(|i| match i {
+            Item::Rule(r) => r.proofs.native_stack.is_some(),
+            Item::Service(s) => s.native_stack.is_some(),
+            _ => false,
+        })
 }
 
 fn calls(e: &Expr, out: &mut BTreeSet<String>) {
@@ -298,7 +303,7 @@ pub fn verify(p: &Program) -> Vec<VerifyError> {
     if !errors.is_empty() {
         return errors;
     }
-    p.items.iter().filter_map(|i| {
+    let mut errors: Vec<_> = p.items.iter().filter_map(|i| {
         let Item::Rule(r) = i else { return None };
         let limit = r.proofs.native_stack?;
         let message = if !(1..=2_097_152).contains(&limit) {
@@ -318,7 +323,9 @@ pub fn verify(p: &Program) -> Vec<VerifyError> {
             context: format!("rule '{}' / proofs.native_stack", r.name),
             message,
         })
-    }).collect()
+    }).collect();
+    errors.extend(http::verify(p));
+    errors
 }
 
 #[cfg(test)]
