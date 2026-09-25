@@ -6,6 +6,7 @@ mod text;
 mod sequential;
 mod retention;
 mod http;
+mod http_logs;
 
 fn source(expr: &str, bindings: &str) -> String {
     let reads = if expr.contains("i.y") || bindings.contains("i.y") {

@@ -64,6 +64,13 @@ outside that limit. The 1 MiB per-log content limit is neither a disk quota nor
 a total service-memory bound. Logs run sequentially, so their temporary buffers
 do not accumulate across log blocks or requests.
 
+The separate [service `native_stack` ceiling](http-log-stack-budget.md) now
+combines transport, retained handler storage and the maximum log/send scratch.
+It shares the emitter's concat sizing layout, including alignment and numeric
+allowances. The report distinguishes content capacity from buffer reservation;
+logs' sequential peaks are not summed. This optional contract adds no runtime
+instructions and keeps the existing blocking I/O and error behavior below.
+
 ## Ordering and failure
 
 The order is handler, declared logs in source order, then response send. With

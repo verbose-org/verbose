@@ -406,8 +406,9 @@ partial effects, and the limits of the deadline.
 **Checked service stack (2026-09-24):** a service-level `native_stack: N` now
 checks additional explicit stack storage per process for pure bounded handlers,
 including reception, dispatch and sending. It supports sequential, forked and
-pooled HTTP with socket deadlines; logs, state and graceful shutdown are excluded
-from this first scope. See the [contract and support matrix](docs/http-stack-budget.md)
+pooled HTTP with socket deadlines. [Bounded service logs](docs/http-log-stack-budget.md)
+now contribute their sequential maximum; state and graceful shutdown remain
+excluded. See the [contract and support matrix](docs/http-stack-budget.md)
 and [source example](examples/http_stack.verbose). The ceiling adds no emitted
 instructions and does not claim total process memory or cache residency.
 

@@ -3,6 +3,7 @@ mod bounded_text;
 mod sequential;
 mod concurrent;
 mod http_io;
+mod http_log_stack;
 mod admission;
 mod pool;
 mod transport_asm;
@@ -9124,20 +9125,19 @@ fn emit_concat_to_buffer(
     )
 }
 
-/// Core concat-to-buffer emitter. When `is_nested`, skips the `mov r9, rsp`
-/// pre-alloc save (the outer's r9 survives), and rejects CallText args
-/// (Phase 2H-b scope restriction — one level of pre-eval).
-fn emit_concat_to_buffer_impl(
-    code: &mut Vec<u8>,
-    args: &[Expr],
-    input_name: &str,
-    concept: &Concept,
-    all_rules: &HashMap<&str, &Rule>,
-    offsets: &HashMap<&str, i32>,
-    field_ranges: &HashMap<&str, (i64, i64)>,
-    text_bindings: &TextBindings<'_>,
-    is_nested: bool,
-) -> Result<ConcatBufResult, NativeError> {
+// Shared by concat emission and bounded service-log stack accounting.
+struct ConcatLayout {
+    kinds: Vec<ConcatArgKind>,
+    static_total: i32,
+    has_dynamic: bool,
+    n_calls: i32,
+    call_slot_idx: Vec<i32>,
+}
+
+fn concat_layout(
+    args: &[Expr], input_name: &str, concept: &Concept,
+    text_bindings: &TextBindings<'_>, offsets: &HashMap<&str, i32>, is_nested: bool,
+) -> Result<ConcatLayout, NativeError> {
     // Classify every arg and tally the static worst case. A text-field arg,
     // a bound text var, or a Call arg means sizing must be runtime-dynamic.
     let mut kinds: Vec<ConcatArgKind> = Vec::with_capacity(args.len());
@@ -9227,6 +9227,26 @@ fn emit_concat_to_buffer_impl(
     if static_total == 0 && !has_dynamic {
         return Err(NativeError { message: "concat with zero total size".into() });
     }
+
+    Ok(ConcatLayout { kinds, static_total, has_dynamic, n_calls, call_slot_idx })
+}
+
+/// Core concat-to-buffer emitter. When `is_nested`, skips the `mov r9, rsp`
+/// pre-alloc save (the outer's r9 survives), and rejects CallText args
+/// (Phase 2H-b scope restriction — one level of pre-eval).
+fn emit_concat_to_buffer_impl(
+    code: &mut Vec<u8>,
+    args: &[Expr],
+    input_name: &str,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    is_nested: bool,
+) -> Result<ConcatBufResult, NativeError> {
+    let ConcatLayout { kinds, static_total, has_dynamic, n_calls, call_slot_idx } =
+        concat_layout(args, input_name, concept, text_bindings, offsets, is_nested)?;
 
     if !has_dynamic {
         // Fast path — compile-time-sized buffer, unchanged from before.
@@ -23553,7 +23573,7 @@ fn emit_http10_dynamic_bytes(
 
     // Report the actual transport layout and the same placed fragment used
     // below. The closed context excludes every unaccounted effect/dynamic path.
-    let stack_report = if report_stack {
+    let mut stack_report = if report_stack {
         let fragment = bounded_storage.ok_or_else(|| NativeError { message: "HTTP stack analysis requires bounded handler storage".into() })?;
         let (handler_frame, expression_stack_bytes) = fragment.stack_layout();
         Some(crate::stack_budget::http::Report {
@@ -23568,6 +23588,7 @@ fn emit_http10_dynamic_bytes(
             dispatch_bookkeeping_bytes: (frame_base - frame_base_fixed - http_io::Io::SIZE) as usize,
             startup_stack_bytes: STARTUP_STACK_BYTES as usize,
             handler_frame, expression_stack_bytes, response_stack_bytes: ITOA_STACK_BYTES as usize,
+            logs: Vec::new(),
         })
     } else { None };
 
@@ -24330,13 +24351,18 @@ fn emit_http10_dynamic_bytes(
         // same stub the fetch block uses. `on_error: abort` on the open /
         // write themselves stays on `abort_patches` (operator class).
         let log_scope = ClientAbortScope::begin();
-        for log_block in &service.logs {
+        for (index, log_block) in service.logs.iter().enumerate() {
             if let Effect::AppendFile { path, content } = &log_block.effect {
                 let rewritten = if bounded_storage.is_some() {
                     rewrite_bounded_log_content(content, &handler.input_name)
                 } else {
                     rewrite_log_content(content, &handler.input_name)
                 };
+                if let Some(report) = &mut stack_report {
+                    report.logs.push(http_log_stack::report(index, log_block.on_error, &rewritten,
+                        &handler.input_name, &log_concept, &log_text_bindings, &log_offsets,
+                        bounded_storage.expect("stack report requires bounded storage").response_capacity()?)?);
+                }
                 emit_append_file_call(
                     &mut code,
                     path,
@@ -56990,7 +57016,8 @@ rule pick
         // pipeline_totals keeps that refusal for computed numeric record fields.
         // gen0 returns 1 with zero output; EXPECTED_ACCEPTED stays 93.
         // http_stack adds a service-scoped native stack ceiling, also refused.
-        const EXPECTED_TOTAL: usize = 191;
+        // http_log_stack retains the bounded-text/service-ceiling refusal.
+        const EXPECTED_TOTAL: usize = 192;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

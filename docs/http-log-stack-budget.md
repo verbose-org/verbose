@@ -1,6 +1,6 @@
 # Composing bounded service logs with the HTTP stack ceiling
 
-Design recorded before implementation, 2026-09-25. Extend the existing service
+Implemented after the separately committed design, 2026-09-25. Extend the existing service
 `native_stack` contract to the already verified synchronous `append_file` log
 boundary. This is lifetime composition between a producer and sequential
 consumers; HTTP supplies a concrete transport frame and borrowing example.
@@ -65,6 +65,26 @@ ceilings/bounded handlers. No self-hosted source extension is needed. Rule-level
 argv stack proofs keep their separate meaning and remain refused in services.
 
 ## Validation
+
+[`http_log_stack.verbose`](../examples/http_log_stack.verbose) declares two
+sequential logs under an 8,192-byte ceiling. Its report currently gives 5,584
+bytes per process: 4,336 fixed service bytes, eight saved base-pointer bytes,
+344 placed handler bytes, 16 saved handler-register bytes and an 880-byte log
+peak. The first log's content capacity is 586 bytes, while the emitter reserves
+856 aligned buffer bytes plus 24 formatting bytes; the second log needs 288
+bytes. Their contribution is 880, not 1,168. Exactly 5,584 passes; 5,583 refuses.
+
+```sh
+cargo build
+target/debug/verbosec examples/http_log_stack.verbose --stack-report --json
+target/debug/verbosec examples/http_log_stack.verbose --native /tmp/http-log-stack
+python3 tools/check_bounded_text_logs.py
+```
+
+The strace harness uses an exact service ceiling for each failure-policy fixture,
+checks eight success/failure cases and verifies that its deliberately premature
+response release is detected. This measures functional correctness and storage
+reclamation, not performance.
 
 - Exact/one-byte-small ceilings, all dispatch modes, literal/empty/static/dynamic
   logs, numbers, repeated fields, method/path over-reservation, counted binary

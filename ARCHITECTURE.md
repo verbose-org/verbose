@@ -128,8 +128,9 @@ This is already concrete for bounded HTTP reception: `max_request` determines a
 fixed frame buffer, receiving does not grow it, and oversize requests close the
 client. A separate [service `native_stack` ceiling](docs/http-stack-budget.md)
 now combines that frame with dispatch, pure bounded callees and response storage
-through sending, per process. It excludes logs, state and graceful-shutdown signal
-frames in this first scope. Resources, kernel buffers and process overhead still
+through sending, per process. [Bounded logs](docs/http-log-stack-budget.md) add
+their sequential maximum below the retained handler region. State and graceful
+shutdown signal frames remain excluded. Resources, kernel buffers and process overhead still
 have separate lifetimes and costs; this is not a total service memory quota.
 Reclaiming a request region means making its storage reusable, not erasing its
 bytes or releasing every page to the OS. Native emission alone establishes no

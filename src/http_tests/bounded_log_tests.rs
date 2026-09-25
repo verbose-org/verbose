@@ -13,6 +13,11 @@ fn source(path: &str, content: &str) -> String {
         .replace(CONTENT, content)
 }
 
+fn checked_stack(source: &str) -> String {
+    let report = crate::native::service_stack_report(&parse(source), "bounded_http").unwrap();
+    format!("{source}  native_stack: {}\n", report.stack_bound_bytes())
+}
+
 #[test]
 fn bounded_logs_borrow_binary_responses_and_reclaim_across_worker_modes() {
     let path = format!("/tmp/verbose-bounded-log-{}", std::process::id());
@@ -34,7 +39,7 @@ fn bounded_logs_borrow_binary_responses_and_reclaim_across_worker_modes() {
             if !deadlines {
                 src = src.replace("  request_timeout: 2\n  response_timeout: 2\n", "");
             }
-            let server = Server::start(&src);
+            let server = Server::start(&if deadlines { checked_stack(&src) } else { src });
             let pids = if mode.contains("pooled") {
                 wait_count(&server, 2)
             } else if mode.is_empty() {
@@ -87,6 +92,14 @@ fn bounded_logs_borrow_binary_responses_and_reclaim_across_worker_modes() {
                     "malformed client was logged"
                 );
             }
+            if deadlines {
+                let mut partial = server.connect();
+                partial.write_all(b"POST / HTTP/1.0\r\nContent-Length: 1\r\n\r\n").unwrap();
+                let mut response = Vec::new();
+                partial.read_to_end(&mut response).unwrap();
+                assert!(response.is_empty());
+                assert_eq!(fs::read(&path).unwrap(), expected, "incomplete client was logged");
+            }
             assert_eq!(
                 server.request(b"GET /after HTTP/1.0\r\n\r\n"),
                 wire(b"</after>")
@@ -120,7 +133,7 @@ fn bounded_logs_read_parser_fields_even_when_only_the_log_uses_body() {
         .replace("[request.method, request.body, request.path]", "[request.path]")
         .replace("resp.status, \" \", resp.body", "resp.status, \" \", req.body, \" \", resp.body")
         .replace("let message = \"shadow\"", "let message = \"shadow\"\n    let body = \"shadow\"\n    let req = \"shadow\"\n    let resp = \"shadow\"");
-    let server = Server::start(&src);
+    let server = Server::start(&checked_stack(&src));
     assert_eq!(
         server.request(b"POST /only-log HTTP/1.0\r\nContent-Length: 4\r\n\r\nx\0\xffz"),
         wire(b"</only-log>")
@@ -154,7 +167,7 @@ fn bounded_logs_keep_open_and_write_error_policies() {
             let mut src = source(&target, r#"concat(resp.body)"#)
                 .replace("on_error: abort", &format!("on_error: {policy}"));
             src.push_str(&format!("  log:\n    append_file \"{path}\" \"later\"\n"));
-            let mut server = Server::start(&src);
+            let mut server = Server::start(&checked_stack(&src));
             let response = server.request(b"GET /failure HTTP/1.0\r\n\r\n");
             if policy == "drop" {
                 assert_eq!(response, wire(b"</failure>"));
@@ -187,7 +200,7 @@ fn bounded_logs_abort_terminates_pool_after_worker_failure() {
         "{}  concurrency: pooled\n  workers: 2\n",
         source("/dev/full", "concat(resp.body)")
     );
-    let mut server = Server::start(&src);
+    let mut server = Server::start(&checked_stack(&src));
     wait_count(&server, 2);
     assert!(server.request(b"GET /failure HTTP/1.0\r\n\r\n").is_empty());
     let deadline = Instant::now() + Duration::from_secs(3);

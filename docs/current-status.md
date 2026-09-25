@@ -39,8 +39,10 @@ Pure bounded HTTP services can now declare a separate
 [`native_stack` ceiling](http-stack-budget.md) per process. It includes reception,
 dispatch, the expanded handler and response storage retained through sending.
 Sequential, forked/capped and pooled modes are supported with both socket
-deadlines. Logs, persistent state and graceful-shutdown signal frames remain
-outside this first service contract. A sufficient declaration adds no native
+deadlines. [Sequential bounded logs](http-log-stack-budget.md) now contribute
+their maximum temporary requirement while the handler result remains retained.
+Persistent state and graceful-shutdown signal frames remain outside this
+service contract. A sufficient declaration adds no native
 instructions; `--stack-report` explains the same layout used for emission.
 
 The first [composition across execution phases](sequential-stack-budgets.md)

@@ -2,6 +2,30 @@
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Log {
+    pub index: usize,
+    pub on_error: &'static str,
+    pub strategy: &'static str,
+    pub content_capacity_bytes: usize,
+    pub buffer_bytes: usize,
+    pub sizing_stack_bytes: usize,
+    pub formatting_stack_bytes: usize,
+}
+
+impl Log {
+    pub fn stack_bound_bytes(&self) -> usize {
+        self.sizing_stack_bytes.max(self.buffer_bytes + self.formatting_stack_bytes)
+    }
+    fn json(&self) -> String {
+        format!(concat!("{{\"index\":{},\"on_error\":\"{}\",\"strategy\":\"{}\",",
+            "\"content_capacity_bytes\":{},\"buffer_bytes\":{},\"sizing_stack_bytes\":{},",
+            "\"formatting_stack_bytes\":{},\"stack_bound_bytes\":{}}}"),
+            self.index, self.on_error, self.strategy, self.content_capacity_bytes,
+            self.buffer_bytes, self.sizing_stack_bytes, self.formatting_stack_bytes, self.stack_bound_bytes())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Report {
     pub service: String,
     pub handler: String,
@@ -16,16 +40,20 @@ pub(crate) struct Report {
     pub handler_frame: TextFrame,
     pub expression_stack_bytes: usize,
     pub response_stack_bytes: usize,
+    pub logs: Vec<Log>,
 }
 
 impl Report {
+    pub fn log_stack_bytes(&self) -> usize {
+        self.logs.iter().map(Log::stack_bound_bytes).max().unwrap_or(0)
+    }
     pub fn stack_bound_bytes(&self) -> usize {
         8 + self.frame_bytes + self.startup_stack_bytes.max(
             self.handler_frame.frame_bytes() + self.handler_frame.saved_register_bytes
-                + self.expression_stack_bytes.max(self.response_stack_bytes))
+                + self.expression_stack_bytes.max(self.log_stack_bytes()).max(self.response_stack_bytes))
     }
     pub fn json(&self) -> String {
-        format!(concat!(
+        let mut json = format!(concat!(
             "{{\"schema_version\":1,\"target\":\"x86_64-linux\",",
             "\"entry_mode\":\"http_1_0\",\"scope\":\"additional_service_stack_per_process\",",
             "\"service\":\"{}\",\"handler\":\"{}\",\"concurrency\":\"{}\",",
@@ -42,7 +70,13 @@ impl Report {
             self.io_bookkeeping_bytes, self.dispatch_bookkeeping_bytes, self.startup_stack_bytes,
             self.expression_stack_bytes, self.response_stack_bytes,
             self.handler_frame.frame_bytes(), self.handler_frame.slot_bytes, self.handler_frame.buffer_bytes,
-            self.handler_frame.saved_register_bytes)
+            self.handler_frame.saved_register_bytes);
+        if !self.logs.is_empty() {
+            json.pop();
+            json.push_str(&format!(",\"log_stack_bytes\":{},\"logs\":[{}]}}", self.log_stack_bytes(),
+                self.logs.iter().map(Log::json).collect::<Vec<_>>().join(",")));
+        }
+        json
     }
 }
 
@@ -59,7 +93,17 @@ impl std::fmt::Display for Report {
             self.handler_frame.buffer_bytes, self.handler_frame.saved_register_bytes)?;
         writeln!(f, "  saved base pointer: 8 bytes; startup/expression/response scratch: {}/{}/{} bytes",
             self.startup_stack_bytes, self.expression_stack_bytes, self.response_stack_bytes)?;
-        writeln!(f, "  peak = 8 + service frame + max(startup, handler frame + saved registers + max(expression, response))")?;
+        if self.logs.is_empty() {
+            writeln!(f, "  peak = 8 + service frame + max(startup, handler frame + saved registers + max(expression, response))")?;
+        } else {
+            for log in &self.logs {
+                writeln!(f, "  log[{}] ({}, {}): content capacity {}, buffer {}, sizing/formatting scratch {}/{}, peak {} bytes",
+                    log.index, log.strategy, log.on_error, log.content_capacity_bytes, log.buffer_bytes,
+                    log.sizing_stack_bytes, log.formatting_stack_bytes, log.stack_bound_bytes())?;
+            }
+            writeln!(f, "  sequential logs: {} bytes maximum, with the handler frame retained", self.log_stack_bytes())?;
+            writeln!(f, "  peak = 8 + service frame + max(startup, handler frame + saved registers + max(expression, logs, response))")?;
+        }
         write!(f, "  excludes initial argv/environment, code/static data, OS/kernel and interpreter storage; not total RSS or a pool-wide sum")
     }
 }
@@ -72,8 +116,8 @@ pub(crate) fn context(p: &Program, s: &Service) -> Result<(), String> {
         return Err(error.into());
     }
     if s.max_request < 64 { return Err("service native_stack requires max_request >= 64".into()); }
-    if !s.logs.is_empty() || !s.state_fields.is_empty() || !s.after_sets.is_empty() {
-        return Err("service native_stack does not yet cover logs, state or after mutations".into());
+    if !s.state_fields.is_empty() || !s.after_sets.is_empty() {
+        return Err("service native_stack does not yet cover state or after mutations".into());
     }
     if s.shutdown_timeout.is_some() {
         return Err("service native_stack does not yet cover shutdown_timeout signal frames".into());
