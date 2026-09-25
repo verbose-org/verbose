@@ -87,3 +87,11 @@ concept and refuses the missing field. Separately, a text-valued WASM `if` fails
 module validation on both parent and changed compilers, even without lets. That
 older emitter gap is [documented separately](known-gaps.md#wasm-text-valued-conditionals);
 the shared cross-backend conditional probe uses numeric arms.
+
+CI also exposed an existing race in the pooled-worker death test: its HTTP
+request immediately followed SIGSTOP, so a worker could accept that connection
+before being suspended and leave the client waiting. The test now waits for the
+stopped state, checks that the supervisor and worker set survive, resumes before
+probing service health, then stops the worker again before killing a peer. This
+preserves coverage that pool cleanup reaps stopped workers. The change is to the
+test synchronization only; no server code or timeout is changed.

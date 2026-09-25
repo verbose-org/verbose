@@ -223,9 +223,24 @@ fn pooled_workers_worker_death_terminates_and_reaps_pool() {
     for p in &pids {
         idle_stack(*p);
     }
+    let stopped = || {
+        fs::read_to_string(format!("/proc/{}/stat", pids[0])).unwrap()
+            .split_whitespace().nth(2) == Some("T")
+    };
     assert_eq!(unsafe { kill(pids[0] as i32, 19) }, 0); // stopped != terminated
+    until(stopped);
+    assert!(server.child.try_wait().unwrap().is_none());
+    assert_eq!(children(&server), pids);
+    // Signal delivery is asynchronous. A connection racing SIGSTOP can be
+    // accepted by this worker and then wait for its resumption. Check service
+    // health after SIGCONT instead of assuming another acceptor handles it.
+    assert_eq!(unsafe { kill(pids[0] as i32, 18) }, 0);
     assert_eq!(server.request(b"GET / HTTP/1.0\r\n\r\n"), wire(b""));
     assert_eq!(children(&server), pids);
+    // Keep the cleanup obligation: a peer death must kill/reap even a stopped
+    // worker, not just the workers currently running or blocked in accept.
+    assert_eq!(unsafe { kill(pids[0] as i32, 19) }, 0);
+    until(stopped);
     assert_eq!(unsafe { kill(pids[1] as i32, 9) }, 0);
     let mut status = None;
     until(|| {
