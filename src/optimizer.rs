@@ -231,15 +231,12 @@ fn optimize_rule(rule: &Rule, field_ranges: &HashMap<String, (i64, i64)>) -> Rul
     // reference site, and the binding drops out of the list. The native
     // backend's `emit_eval_expr` produces a scalar i64 in rax; text values
     // don't fit that shape and were rejected outright. Inlining at the
-    // optimiser level keeps every backend on the same semantics path
-    // (interpreter, transpiler, native, wasm) and removes the "text lets
-    // are rejected" asymmetry without threading a text-value calling
-    // convention through every emitter.
+    // optimiser level shares constant propagation between interpretation,
+    // native emission and WASM without changing their value representations.
     //
     // Scope: only text *literals* (Expr::Text) are inlined. Non-literal
-    // text bindings (`let x = concat(...)`, `let x = req.field`) still
-    // fall through to the backend and may error — their fix needs real
-    // runtime slot allocation and is left to a future slice.
+    // text bindings (`let x = concat(...)`, `let x = req.field`) retain
+    // their eager evaluation through each backend's existing binding path.
     let (inlined_bindings, inlined_logic) =
         inline_text_literal_lets(&rule.logic.bindings, &rule.logic.value);
 
@@ -272,7 +269,9 @@ fn optimize_rule(rule: &Rule, field_ranges: &HashMap<String, (i64, i64)>) -> Rul
 /// is removed and every later reference to `name` (in subsequent bindings
 /// and in the final logic) is substituted with the literal. Bindings whose
 /// RHS is not a text literal after earlier substitutions are kept in
-/// place. Returns the kept bindings and the rewritten logic.
+/// place. A rebinding replaces the visible substitution only AFTER rewriting
+/// its RHS. Earlier aliases already hold their captured literal values.
+/// Returns the kept bindings and the rewritten logic.
 fn inline_text_literal_lets(
     bindings: &[(String, Expr)],
     logic: &Expr,
@@ -286,6 +285,9 @@ fn inline_text_literal_lets(
         let substituted = substitutions
             .iter()
             .fold(expr.clone(), |acc, (n, r)| substitute_ident(&acc, n, r));
+        // The new binding shadows the previous one regardless of its type.
+        // Invalidate after rewriting so `let x = x` still sees the old value.
+        substitutions.retain(|(n, _)| n != name);
         match &substituted {
             Expr::Text(_) => {
                 substitutions.push((name.clone(), substituted));

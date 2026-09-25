@@ -22,6 +22,11 @@ The self-hosted compiler also [decodes ordinary text escapes](self-hosted-text-e
 in prepared constants, with no target decoding loop or allocation. Its separate
 alias-output, shadowing and streamed-substring limitations are listed in
 [known gaps](known-gaps.md#text-alias-output-shadowing-and-streamed-substrings).
+The shared Rust optimizer now [respects sequential text let bindings](text-let-shadowing.md):
+rebinding a name replaces its current constant, while earlier aliases retain
+their captured values. The verifier checks each RHS against the types visible
+at that point. Differential probes cover interpretation, native and supported
+WASM forms; the separate self-hosted binding lookup remains pending.
 
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable

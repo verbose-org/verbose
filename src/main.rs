@@ -18,6 +18,8 @@ mod lexer;
 mod source_text_tests;
 mod native;
 mod optimizer;
+#[cfg(test)]
+mod let_scope_tests;
 mod parser;
 mod validate_x86;
 mod verifier;

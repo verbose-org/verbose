@@ -245,6 +245,14 @@ ELF emission. Both gen0 and gen1 run the observable-byte matrix. Separate legacy
 alias-output, shadowing and streamed-substring gaps remain documented.
 See [source text](docs/source-text.md).
 
+Text binding follow-up (2026-09-25): the shared Rust optimizer now replaces a
+name's old text substitution only after rewriting the new RHS. Captured aliases
+keep their earlier value; nonliteral bindings retain eager evaluation. The
+verifier checks RHS types against the preceding environment instead of the
+final one. Differential regressions cover original/optimized interpretation,
+native output and supported WASM execution, with no new target storage or GC.
+Self-hosted lookup remains separate. See [sequential text lets](docs/text-let-shadowing.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

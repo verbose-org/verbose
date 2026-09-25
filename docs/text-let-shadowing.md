@@ -43,6 +43,17 @@ separate first-match binding lookup and alias-output classification defect,
 documented in [known gaps](known-gaps.md#text-alias-output-shadowing-and-streamed-substrings).
 Those require their own handling of visible binding environments.
 
+The differential probes also expose a verification defect: checking every RHS
+against the final binding map rejects `let x = "abc"; let x = length(x)` and
+can accept an earlier mistyped use after a later rebinding changes its type.
+Check each RHS against the environment visible before that binding, then install
+its inferred type. Check the result against the final environment. Seed context
+and service-state types before the first binding, and retain the existing
+conservative handling of nested binders and input/context shadowing. The separate
+binding-concept collector must likewise infer a RHS before removing its old name.
+This is the same sequential-scope correction in the verifier, not a general
+replacement of legacy inference or a new acceptance contract.
+
 ## Verification
 
 - Compare original and optimized interpretation against explicit values for
@@ -51,6 +62,8 @@ Those require their own handling of visible binding environments.
 - Exercise nested binders and both branches without substituting through a local
   shadow. Preserve failures in eagerly evaluated bindings whose values are later
   replaced or unused.
+- Refuse mistyped earlier RHSes even when a later binding would give the name a
+  compatible type, and retain the inferred type after a self-alias.
 - Compare exact native stdout, stderr and status, and execute supported WASM
   cases in Node. Unsupported backend forms remain outside positive assertions.
 - Compare the existing example corpus with the parent Rust compiler, including
@@ -58,3 +71,19 @@ Those require their own handling of visible binding environments.
   or benchmark is part of this correction.
 - Run the normal Rust suite serially, Python harnesses and CIDX checks. CI also
   runs the self-hosted bootstrap; no self-hosted source changes are planned here.
+
+## Recorded validation (2026-09-25)
+
+All five focused regressions pass, including actual native and Node WASM
+execution. The normal serialized Rust suite passes 874 tests (28 explicitly
+ignored), and the Python harness suite passes 97 tests. Comparing all 192 existing
+examples with parent `d9b2e08` preserves acceptance (189 accepted), diagnostics
+and native bytes; two builds per compiler/example establish reproducibility.
+Existing service stack reports also remain identical. CIDX validate, doctor
+and security pass; Trivy retains the existing Python dependency findings.
+
+The manual record probe `let x = i; let x = x; out = x.missing` now retains its
+concept and refuses the missing field. Separately, a text-valued WASM `if` fails
+module validation on both parent and changed compilers, even without lets. That
+older emitter gap is [documented separately](known-gaps.md#wasm-text-valued-conditionals);
+the shared cross-backend conditional probe uses numeric arms.
