@@ -1,0 +1,43 @@
+@verbose 0.1.0
+concept Input
+  @intention: "UTF-8 input"
+  @source: invoices.intent:1
+  fields:
+    s : text [..128]
+    index : number
+rule probe
+  @intention: "Preserve UTF-8 source bytes"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    out : number
+  logic:
+    out = measure(Box { content: "rec\né" })
+  proofs:
+    purity:
+      reads: []
+      calls: [measure]
+    termination:
+      bound: 100
+
+concept Box
+  @intention: "record"
+  @source: invoices.intent:1
+  fields:
+    content : text
+rule measure
+  @intention: "read decoded content"
+  @source: invoices.intent:1
+  input:
+    b : Box
+  output:
+    out : number
+  logic:
+    out = byte_at(b.content, 3)
+  proofs:
+    purity:
+      reads: [b.content]
+      calls: []
+    termination:
+      bound: 100

@@ -39,6 +39,7 @@ fn parse(source: &str) -> Program {
 // Expected results name the original source bytes, not values re-read from AST.
 fn cases() -> Vec<(String, &'static str, &'static str, i64, Value)> {
     let mut cases = vec![
+        ("\"é\\n€\\r\\t🦀\\\\\\\"\"".into(), "text", "", 0, Value::Text("é\n€\r\t🦀\\\"".into())),
         ("\"é€🦀e\u{301}\"".into(), "text", "", 0, Value::Text("é€🦀e\u{301}".into())),
         ("concat(\"é\", i.s, \"🦀\")".into(), "text", "€", 0, Value::Text("é€🦀".into())),
         ("length(\"é€🦀\")".into(), "number", "", 0, Value::Number(9)),
@@ -63,9 +64,6 @@ fn expected_stdout(value: &Value) -> Vec<u8> {
 fn source_utf8_interpreter_and_native_preserve_text_operations() {
     let path = std::env::temp_dir().join(format!("verbose-source-utf8-{}", std::process::id()));
     let mut fixtures = cases();
-    // gen0's ordinary AstStr output still writes escape spellings verbatim;
-    // that separate existing gap is documented in docs/known-gaps.md.
-    fixtures.push(("\"é\\n€\\r\\t🦀\\\\\\\"\"".into(), "text", "", 0, Value::Text("é\n€\r\t🦀\\\"".into())));
     // The self-hosted compiler's legacy stdin-raw transport is NUL-terminated.
     fixtures.push(("\"é\0🦀\"".into(), "text", "", 0, Value::Text("é\0🦀".into())));
     for (expr, output, text, index, expected) in fixtures {
@@ -119,6 +117,34 @@ fn source_utf8_wasm_embeds_exact_literal_bytes() {
 }
 
 #[test]
+fn selfhost_text_evaluator_decodes_lengths_reads_and_slice_boundaries() {
+    let p = parse(&fs::read_to_string("examples/vexprparse.verbose").unwrap());
+    let path = std::env::temp_dir().join(format!("verbose-text-escape-eval-{}", std::process::id()));
+    native::compile_native(&p, "eval_main", path.to_str().unwrap(), false, false).unwrap();
+    for (expr, expected) in [
+        (r#"length("a\nb")"#, b"3\n"),
+        (r#"length(substring("a\nb", 1, 3))"#, b"2\n"),
+        (r#"length(substring("a\\nb", 1, 3))"#, b"2\n"),
+        (r#"length(substring("a\nb", 1, 1))"#, b"0\n"),
+        (r#"length(substring("a\nb", 0, 4))"#, b"1\n"), // invalid slice -> defensive VNum(0), whose printed length is 1
+    ] {
+        let src = format!("rule main\n  logic:\n    out = {expr}\n");
+        let r = Command::new(&path).args([&src, "0"]).output().unwrap();
+        assert_eq!((r.status.code(), r.stdout, r.stderr), (Some(0), expected.to_vec(), vec![]));
+    }
+    for (expr, expected) in [
+        (r#"byte_at("a\nb", 1)"#, b"10\n"),
+        (r#"byte_at(substring("a\nb", 1, 3), 0)"#, b"10\n"),
+        (r#"byte_at(substring("a\\nb", 1, 3), 0)"#, b"92\n"),
+    ] {
+        let src = format!("rule main\n  logic:\n    out = {expr}\n");
+        let r = Command::new(&path).args([&src, "0"]).output().unwrap();
+        assert_eq!((r.status.code(), r.stdout, r.stderr), (Some(0), expected.to_vec(), vec![]));
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 #[ignore = "builds the self-hosted emitter; run with the two_generation bootstrap suite"]
 fn two_generation_source_utf8_literals_match_reference() {
     let base = std::env::temp_dir().join(format!("verbose-source-utf8-gen0-{}", std::process::id()));
@@ -140,5 +166,111 @@ fn two_generation_source_utf8_literals_match_reference() {
         let result = Command::new(&output).args([text, &index.to_string()]).output().unwrap();
         assert_eq!((result.status.code(), result.stdout, result.stderr), (Some(0), expected_stdout(&expected), vec![]), "{expr}");
     }
+    assert_selfhost_text_escapes(&compiler, &base);
     fs::remove_dir_all(base).unwrap();
+}
+
+/// Also run by the fixed-point bootstrap on gen1, not just the Rust-built gen0.
+pub(crate) fn assert_selfhost_text_escapes(compiler: &Path, base: &Path) {
+    let binary = base.join("escape-probe");
+    let reference = base.join("escape-reference");
+    let emit = |source: &str| {
+        let mut child = Command::new(compiler).arg("0").stdin(Stdio::piped())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(source.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let check = |src: &str, stdout: &[u8], stderr: &[u8], status: i32| {
+        let p = parse(src);
+        assert!(verifier::verify_program(&p, Path::new("examples")).is_empty(), "{src}");
+        // Match the CLI pipeline; some legacy scalar/text forms require folding.
+        native::compile_native(&optimizer::optimize_program(&p).0, "probe", reference.to_str().unwrap(), false, false)
+            .unwrap_or_else(|e| panic!("reference: {src}: {e}"));
+        let r = Command::new(&reference).args(["a\nb", "0"]).output().unwrap();
+        assert_eq!((r.status.code(), r.stdout, r.stderr), (Some(status), stdout.to_vec(), stderr.to_vec()), "reference: {src}");
+        let r = emit(src);
+        assert!(r.status.success() && r.stdout.starts_with(b"\x7fELF"), "{src}: {:?}", r.stderr);
+        // A complete ELF: both load sizes must include all constant-data padding.
+        let size = u64::from_le_bytes(r.stdout[96..104].try_into().unwrap()) as usize;
+        assert_eq!(size, r.stdout.len());
+        assert_eq!(&r.stdout[96..104], &r.stdout[104..112]);
+        fs::write(&binary, &r.stdout).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let result = Command::new(&binary).args(["a\nb", "0"]).output().unwrap();
+        assert_eq!((result.status.code(), result.stdout, result.stderr), (Some(status), stdout.to_vec(), stderr.to_vec()), "self-hosted: {src}");
+        r.stdout
+    };
+    for (expr, ty, stdout, stderr, status) in [
+        (r#""a\nb\r\t\\\"é€🦀""#, "text", "a\nb\r\t\\\"é€🦀\n".as_bytes(), &b""[..], 0),
+        (r#""\\n""#, "text", &b"\\n\n"[..], &b""[..], 0),
+        (r#"concat("", "a\n", "b\t")"#, "text", &b"a\nb\t\n"[..], &b""[..], 0),
+        (r#"if i.index == 0 then "a\n" else "b\t""#, "text", &b"a\n\n"[..], &b""[..], 0),
+        (r#"if i.index == 1 then "a\n" else "b\t""#, "text", &b"b\t\n"[..], &b""[..], 0),
+        (r#"length("a\nb")"#, "number", &b"3\n"[..], &b""[..], 0),
+        (r#"byte_at("a\nb", 1)"#, "number", &b"10\n"[..], &b""[..], 0),
+        (r#"byte_at("a\nb", 2)"#, "number", &b"98\n"[..], &b""[..], 0),
+        (r#"byte_at("a\nb", 3)"#, "number", &b""[..], &b""[..], 1),
+        (r#"byte_at(substring("é\n🦀", 2, 3), 0)"#, "number", &b"10\n"[..], &b""[..], 0),
+        (r#"length(substring("a\nb", 1, 3))"#, "number", &b"2\n"[..], &b""[..], 0),
+        (r#"byte_at(substring("a\nb", 1, 3), 0)"#, "number", &b"10\n"[..], &b""[..], 0),
+        (r#"length(substring("a\nb", 0, 4))"#, "number", &b""[..], &b""[..], 1),
+        (r#"if i.s == "a\nb" then 7 else 0"#, "number", &b"7\n"[..], &b""[..], 0),
+        (r#"if i.s == "a\\nb" then 0 else 7"#, "number", &b"7\n"[..], &b""[..], 0),
+        (r#"Err("oops\né")"#, "Result(number, text)", &b""[..], "oops\né\n".as_bytes(), 1),
+        (r#"Ok("yes\né")"#, "Result(text, text)", "yes\né\n".as_bytes(), &b""[..], 0),
+        (r#"b"\x41\n\x00\xff""#, "bytes", &b"A\n\0\xff"[..], &b""[..], 0),
+    ] {
+        check(&source(expr, ty), stdout, stderr, status);
+    }
+    // Text aliases are usable by scalar consumers; direct alias printing has
+    // a pre-existing self-hosted type-classification gap (see known-gaps.md).
+    let src = source("byte_at(first, 3)", "number").replace("    out = byte_at", "    let text = \"old\\n\"\n    let first = text\n    out = byte_at");
+    check(&src, b"10\n", b"", 0);
+    let relay = source(r#""call\né""#, "text").split("rule probe").nth(1).unwrap().to_string();
+    let src = source("relay(i)", "text").replace("reads: []", "reads: [i]").replace("calls: []", "calls: [relay]") + "\nrule relay" + &relay;
+    check(&src, "call\né\n".as_bytes(), b"", 0);
+    let callee = source(r#"Err("a\nb")"#, "Result(number, text)").split("rule probe").nth(1).unwrap().to_string();
+    let src = source("match_result(fetch_result(i), value => value, error => length(error))", "number")
+        .replace("reads: []", "reads: [i]").replace("calls: []", "calls: [fetch_result]") + "\nrule fetch_result" + &callee;
+    check(&src, b"3\n", b"", 0);
+    check(include_str!("../tests/fixtures/text_escapes_record.verbose"), b"10\n", b"", 0);
+    check(include_str!("../tests/fixtures/text_escapes_variant.verbose"), b"10\n", b"", 0);
+    // Exercise every word alignment and compare the entire transformed data
+    // image with an independent lexer-based oracle, including metadata/comments.
+    for alignment in 0..4 {
+        let src = source(r#"concat("a\n", "\t", "é\"", "\\n")"#, "text")
+            .replace("Preserve UTF-8 source bytes", r#"Preserve \"UTF-8\" source bytes"#);
+        let src = format!("-- {} comment has \\q and \"quotes\"\n{src}", " ".repeat(alignment));
+        let bytes = check(&src, "a\n\té\"\\n\n".as_bytes(), b"", 0);
+        let mut expected = src.as_bytes().to_vec();
+        for token in Lexer::new(&src).tokenize().unwrap() {
+            let crate::lexer::TokenKind::StringLit(decoded) = token.kind else { continue };
+            // The self-hosted tokenizer discards attribute lines. Validate
+            // their grammar separately but leave their unused storage raw.
+            if src.lines().nth(token.line - 1).unwrap().trim_start().starts_with('@') { continue; }
+            let start = src.split_inclusive('\n').take(token.line - 1).map(str::len).sum::<usize>() + token.col;
+            let mut end = start;
+            while src.as_bytes()[end] != b'"' {
+                end += if src.as_bytes()[end] == b'\\' { 2 } else { 1 };
+            }
+            expected[start..end].fill(0);
+            expected[start..start + decoded.len()].copy_from_slice(decoded.as_bytes());
+        }
+        expected.resize((expected.len() + 3) & !3, 0);
+        assert!(bytes.ends_with(&expected), "constant-data offsets/alignment: {alignment}");
+    }
+    for bad in [r#""bad\q""#, r#""bad\x41""#, r#""bad\u00e9""#, r#""bad\é""#, "\"bad", "\"bad\\", "\"bad\\\""] {
+        let src = source(bad, "text");
+        assert!(Lexer::new(&src).tokenize().is_err());
+        let r = emit(&src);
+        assert_eq!((r.status.code(), r.stdout), (Some(1), vec![]), "invalid text: {bad}");
+        // Even an unused invalid rule must block the whole artifact.
+        let unused = src.replacen("@verbose 0.1.0\n", "", 1).replace("concept Input", "concept Unused").replace("rule probe", "rule unused");
+        let r = emit(&(source("1", "number") + &unused));
+        assert_eq!((r.status.code(), r.stdout), (Some(1), vec![]), "unused invalid text: {bad}");
+    }
+    for bad in [r#"bad\q"#, r#"bad\x41"#, "bad\\", "bad\n"] {
+        let r = emit(&source("1", "number").replace("UTF-8 input", bad));
+        assert_eq!((r.status.code(), r.stdout), (Some(1), vec![]), "invalid metadata: {bad:?}");
+    }
 }

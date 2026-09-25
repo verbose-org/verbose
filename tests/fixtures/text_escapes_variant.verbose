@@ -1,0 +1,49 @@
+@verbose 0.1.0
+concept Input
+  @intention: "UTF-8 input"
+  @source: invoices.intent:1
+  fields:
+    s : text [..128]
+    index : number
+rule probe
+  @intention: "Preserve UTF-8 source bytes"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    out : number
+  logic:
+    out = extract(Choice::One { value: "a\nb" })
+  proofs:
+    purity:
+      reads: []
+      calls: [extract]
+    termination:
+      bound: 100
+
+concept_group G [max_depth: 8, max_nodes: 64]
+  @intention: "tagged text"
+  @source: invoices.intent:1
+  concept Choice
+    @intention: "tagged text"
+    @source: invoices.intent:1
+    variants:
+      One of (value : text)
+      Empty
+rule extract
+  @intention: "read decoded payload"
+  @source: invoices.intent:1
+  input:
+    t : Choice
+  output:
+    out : number
+  logic:
+    out = match t:
+      One(value) => byte_at(value, 1)
+      Empty => 0
+  proofs:
+    purity:
+      reads: [t]
+      calls: []
+    termination:
+      bound: 100

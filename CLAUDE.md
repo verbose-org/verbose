@@ -238,8 +238,11 @@ bytes instead of widening each byte into a separate character. Length, indexing,
 equality and text capacities use the written bytes, without normalization; ASCII
 escapes and byte-based source columns retain their meaning. Native programs gain
 no runtime conversion. Cross-backend fixtures and bootstrap checks cover the
-correction; a separate pre-existing self-hosted ordinary-text escape gap is
-recorded in [known gaps](docs/known-gaps.md#self-hosted-ordinary-text-escapes).
+correction. The subsequent [self-hosted escape correction](docs/self-hosted-text-escapes.md)
+prepares decoded ordinary text constants at unchanged offsets and records their
+decoded lengths. Invalid text tokens, including attribute values, refuse before
+ELF emission. Both gen0 and gen1 run the observable-byte matrix. Separate legacy
+alias-output, shadowing and streamed-substring gaps remain documented.
 See [source text](docs/source-text.md).
 
 ## Dev workflow (cidx + branch-protected main)

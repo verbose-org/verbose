@@ -600,8 +600,8 @@ concept_group VExpr [max_depth: 4096, max_nodes: 8000000]
   -- — no global table) plus its evaluated field values as a ValueList. Text values arc
   -- slice 1: a target TEXT value is a SPAN into the interpreted source — VText carries
   -- (start, len) indexing ea.src, no heap, no copying. An AstStr(start, len) evaluates
-  -- to VText with the surrounding quotes stripped (the token span includes both
-  -- quotes); substring produces a sub-span of the same source. Concat arc slice 1:
+  -- to an ENCODED VText span with quotes stripped. Shared length/read helpers
+  -- decode escapes; substring maps decoded boundaries back to this source. Concat arc slice 1:
   -- `concat` (fresh text) cannot be a span — but it doesn't need fresh STORAGE if it
   -- is never materialized. VConcat is a ROPE: a tree value whose leaves are existing
   -- spans (VText — zero copy) and numbers (VNum — read through its decimal
@@ -6377,9 +6377,9 @@ rule vdata_payload
 -- ============================================================================
 -- Text values arc slice 1: the three VText accessors + the three primitive-name
 -- span checks + the three scanner primitives. A target text value is a SPAN
--- (start, len) into the interpreted source, and the target's primitives are
--- implemented WITH THE HOST'S OWN primitives on that source: target
--- byte_at(t, i) = host byte_at(ec.src, t.start + i). Every host byte_at call is
+-- (start, len) into the encoded interpreted source. Shared helpers decode
+-- escapes before measuring or indexing; substring maps decoded boundaries
+-- back to encoded offsets without copying. Every host byte_at call is
 -- GUARDED FIRST (the host primitive is fail-closed — sys_exit on OOB — and a
 -- buggy TARGET program must never kill the interpreter): out-of-bounds target
 -- reads produce a defensive VNum 0, total, never abort.
@@ -6709,7 +6709,7 @@ concept VLenState
 
 -- vlength: the byte length of a Value read as text/bytes — THE shared rope walker
 -- (prim_length reports it; vbyte_at's descent steers by it). VText -> the span
--- length; VNum -> the decimal rendering's width (digit count, +1 for '-' when
+-- decoded length; VNum -> the decimal rendering's width (digit count, +1 for '-' when
 -- negative); VConcat -> left + right, recursively; VData -> 0 (a variant value
 -- has no text reading — defensive, mirroring the accessors above). Bytes tier B2:
 -- VBLit -> the escape-aware decoded byte count; VBLe -> the fixed le width (4/8).
@@ -6726,7 +6726,7 @@ rule vlength
     out = match vl.v:
       VNum(n) => if n < 0 then 1 + mag_digits(MagState { m: 0 - n }) else mag_digits(MagState { m: n })
       VData(tag, payload) => 0
-      VText(start, len) => len
+      VText(start, len) => bytelit_decoded_len(DecodeState { src: vl.src, start: start, len: len, i: 0 })
       VConcat(left, right) => vlength(VLenState { v: left, src: vl.src }) + vlength(VLenState { v: right, src: vl.src })
       VBLit(start, len) => bytelit_decoded_len(DecodeState { src: vl.src, start: start, len: len, i: 0 })
       VBLe(value, width) => width
@@ -6752,7 +6752,7 @@ concept VByteState
     src : text [..256]
 
 -- vbyte_at: the i-th byte of a Value read as text — the shared rope descent.
--- VText -> the HOST byte_at on the interpreted source, bounds-guarded FIRST
+-- VText -> a decoded byte from the encoded source span, bounds-guarded FIRST
 -- (same fail-closed-host / defensive-interpreter split as prim_byte_at pre-rope);
 -- VNum -> the i-th byte of the decimal rendering ('-' at 0 for negatives, then
 -- mag_digit_at on the magnitude); VConcat -> descend left when i falls inside
@@ -6773,7 +6773,7 @@ rule vbyte_at
     out = match bs.v:
       VNum(n) => if n < 0 then (if bs.i == 0 then 45 else if bs.i >= 1 and bs.i < 1 + mag_digits(MagState { m: 0 - n }) then mag_digit_at(DigitState { m: 0 - n, k: bs.i - 1 }) else 0) else (if bs.i >= 0 and bs.i < mag_digits(MagState { m: n }) then mag_digit_at(DigitState { m: n, k: bs.i }) else 0)
       VData(tag, payload) => 0
-      VText(start, len) => if bs.i >= 0 and bs.i < len then byte_at(bs.src, start + bs.i) else 0
+      VText(start, len) => if bs.i >= 0 and bs.i < bytelit_decoded_len(DecodeState { src: bs.src, start: start, len: len, i: 0 }) then bytelit_byte_at(DecodeState { src: bs.src, start: start, len: len, i: bs.i }) else 0
       VConcat(left, right) => if bs.i < vlength(VLenState { v: left, src: bs.src }) then vbyte_at(VByteState { v: left, i: bs.i, src: bs.src }) else vbyte_at(VByteState { v: right, i: bs.i - vlength(VLenState { v: left, src: bs.src }), src: bs.src })
       VBLit(start, len) => if bs.i >= 0 and bs.i < bytelit_decoded_len(DecodeState { src: bs.src, start: start, len: len, i: 0 }) then bytelit_byte_at(DecodeState { src: bs.src, start: start, len: len, i: bs.i }) else 0
       VBLe(value, width) => if bs.i >= 0 and bs.i < width then value / pow256(PowState { k: bs.i }) % 256 else 0
@@ -7875,8 +7875,8 @@ rule prim_byte_at
       bound : 4000
 
 
--- prim_length: the target-language length(t). A VText's byte length as a VNum;
--- no host call at all — the span already carries its length. Concat arc slice 1:
+-- prim_length: the target-language length(t). A VText's decoded byte length
+-- as a VNum; the encoded source span is measured through the shared decoder. Concat arc slice 1:
 -- routed through vlength, which extends the reading to VNum (decimal digit count,
 -- +1 for '-' when negative) and VConcat (recursive rope sum). A VData argument
 -- stays a defensive VNum 0 (vlength's VData arm).
@@ -7900,8 +7900,8 @@ rule prim_length
 
 -- prim_substring: the target-language substring(t, a, b) — the half-open byte
 -- slice [a, b) of a text span, as a NEW span into the same source (no copying:
--- start' = t.start + a, len' = b - a). Guard: t is a VText and 0 <= a <= b <=
--- t.len, which preserves the span invariant (start' + len' <= start + len <=
+-- decoded boundaries a/b map to encoded source cursors). Guard: t is a VText
+-- and 0 <= a <= b <= decoded length, preserving the encoded span invariant (start' + len' <= start + len <=
 -- length(src)) so every later host byte_at through this span stays in bounds.
 -- Anything else is a defensive VNum 0 — total, never abort. Concat arc slice 1:
 -- substring on a rope (VConcat) or a number stays REFUSED semantics — vtext_is
@@ -7919,11 +7919,13 @@ rule prim_substring
     let tv = eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: ec.args }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })
     let av = vnum_of(eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: arg_tail(ATailState { args: ec.args }) }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts }))
     let bv = vnum_of(eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: arg_tail(ATailState { args: arg_tail(ATailState { args: ec.args }) }) }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts }))
-    out = if vtext_is(tv) == 1 and (av >= 0 and (av <= bv and bv <= vtext_len(tv))) then Value::VText { start: vtext_start(tv) + av, len: bv - av } else Value::VNum { n: 0 }
+    let start = text_decoded_offset(DecodeState { src: ec.src, start: vtext_start(tv), len: vtext_len(tv), i: av })
+    let end = text_decoded_offset(DecodeState { src: ec.src, start: vtext_start(tv), len: vtext_len(tv), i: bv })
+    out = if vtext_is(tv) == 1 and (av >= 0 and (av <= bv and bv <= vlength(VLenState { v: tv, src: ec.src }))) then Value::VText { start: start, len: end - start } else Value::VNum { n: 0 }
   proofs:
     purity:
       reads : [ec.args, ec.env, ec.src, ec.prog, ec.concepts]
-      calls : [eval_ast_env, vnum_of, arg_head, arg_tail, vtext_is, vtext_start, vtext_len]
+      calls : [eval_ast_env, vnum_of, arg_head, arg_tail, vtext_is, vtext_start, vtext_len, text_decoded_offset, vlength]
     termination:
       bound : 4000
 
@@ -9231,6 +9233,9 @@ rule attr_line_errors
       bound : 256
 
 
+-- Attribute lines are absent from the parser token stream. Tokenize their
+-- contents separately for the shared text-literal grammar check; they remain
+-- raw in the constant-data image because no runtime value refers to them.
 -- attr_errors: the verrs contribution. Walks the source LINE BY LINE with the
 -- tokenizer's own `line_width` / `next_line_start` pair, and for every line
 -- whose first non-space byte is `@` (64) adds that line's verdict. The
@@ -9258,11 +9263,11 @@ rule attr_errors
     let cstart = s.pos + width
     let nls = next_line_start(ScanState { source: s.source, pos: s.pos })
     let c0 = if cstart >= len then 0 else byte_at(s.source, cstart)
-    out = if s.pos >= len then 0 else if c0 == 64 then attr_line_errors(ScanState { source: s.source, pos: cstart }) + attr_errors(ScanState { source: s.source, pos: nls }) else attr_errors(ScanState { source: s.source, pos: nls })
+    out = if s.pos >= len then 0 else if c0 == 64 then attr_line_errors(ScanState { source: s.source, pos: cstart }) + text_token_errors(ProgramState { cell: tokenize_line(ScanState { source: s.source, pos: cstart + 1 }), src: s.source }) + attr_errors(ScanState { source: s.source, pos: nls }) else attr_errors(ScanState { source: s.source, pos: nls })
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [line_width, next_line_start, attr_line_errors, attr_errors]
+      calls : [line_width, next_line_start, attr_line_errors, attr_errors, text_token_errors, tokenize_line]
     termination:
       bound : 65535
 
@@ -23625,11 +23630,11 @@ rule verify_errors
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source })
+    out = text_token_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
-      calls : [execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
+      calls : [execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list, text_token_errors]
     termination:
       bound : 256
 
@@ -29834,10 +29839,11 @@ rule x86_node
       -- RuntimeError); it is recorded in the gaps table in CLAUDE.md.
       AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x0f\xb6\x04\x02\x50\xeb\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05") else b"\x6a\x00") else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4c\xc1\x50") else b"\x6a\x00") else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4f\xc1\x50") else b"\x6a\x00") else if span_is_bitwise(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_bitwise_call(bg) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x41\x5e\x50") else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(541065216 + 65536 * resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(542113792 + 65536 * connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then b"\xcc" else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + arena_scope(code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
       -- Text values slice 2: a string literal compiles to ONE packed i64 —
-      -- (start+1) * 2^32 + (len-2), quotes stripped, the SAME numbers as eval's
-      -- VText (the token span includes both quotes; a lone-quote token packs len
-      -- 0). mov rax, imm64 ; push rax — 11 bytes, same shape as AstNum.
-      AstStr(start, len) => concat(b"\x48\xb8", le64((start + 1) * 4294967296 + (if len >= 2 then len - 2 else 0)), b"\x50")
+      -- (start+1) * 2^32 + decoded length, quotes stripped. Unlike eval's
+      -- encoded VText span, this addresses the prepared constant-data image.
+      -- mov rax, imm64 ; push rax — 11 bytes, same shape as AstNum.
+      -- Constant-data preparation decodes in place; the packed span excludes padding.
+      AstStr(start, len) => concat(b"\x48\xb8", le64((start + 1) * 4294967296 + bytelit_decoded_len(DecodeState { src: bg.src, start: start + 1, len: (if len >= 2 then len - 2 else 0), i: 0 })), b"\x50")
       AstBytes(start, len) => b"\xcc"
       AstBool(value) => b"\xcc"
       -- Off-threading fix (text values slice 2): the THEN branch starts 10 bytes
@@ -29931,7 +29937,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, bin_text_mode, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, x86_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load, span_is_fetch, connection_index_of]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, bin_text_mode, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, x86_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load, span_is_fetch, connection_index_of, bytelit_decoded_len]
     termination:
       bound : 8000
 
@@ -30550,7 +30556,7 @@ rule x86_stream_node
       AstNot(inner) => b"\xcc"
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if let_marks_textspan(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else b"\xcc")
       AstField(base, fstart, flen) => if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
-      AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil }) + start + 1), b"\x48\xc7\xc2", le32(if len >= 2 then len - 2 else 0), b"\x0f\x05")
+      AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil }) + start + 1), b"\x48\xc7\xc2", le32(bytelit_decoded_len(DecodeState { src: bg.src, start: start + 1, len: (if len >= 2 then len - 2 else 0), i: 0 })), b"\x0f\x05")
       AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then b"" else concat(b"\xe9", le32(4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)), emit_bytes_data(BytesEmitState { src: bg.src, start: start, len: len, i: 0, dlen: bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) }), b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x35", le32(0 - (21 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4))), b"\x48\xc7\xc2", le32(bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 })), b"\x0f\x05")
       AstBool(value) => b"\xcc"
       AstErr => b"\xcc"
@@ -35223,7 +35229,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(text_token_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -35291,11 +35297,11 @@ rule elf_program_src
     -- trampoline REPLACES the entry_rule_* trampoline cascade (the trigger IS the
     -- head/entry proc, gated + open/write/close instead of itoa+print).
     let has_reaction = if reaction_list_len(rxs) > 0 then 1 else 0
-    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else if entryrec == 1 then concat(b"\xe8", le32(62 + entryrjfs + (if anytx == 1 then 86 else 0)), b"\x50", x86_json_record(JsonRecState { fields: entryrfields, esize: 8 * (max_payload_fields(concepts) + 1), off: 0 - (61 + entryrjfs + (if anytx == 1 then 86 else 0)), src: s.source, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns }), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrybool == 1 then concat(b"\xe8", le32(78 + (if anytx == 1 then 86 else 0)), b"\x31\xdb\x48\x85\xc0\x74\x14\x48\xb8\x74\x72\x75\x65\x0a\x00\x00\x00\x50\x48\xc7\xc2\x05\x00\x00\x00\xeb\x14\x48\xb8\x66\x61\x6c\x73\x65\x0a\x00\x00\x50\x48\xc7\xc2\x06\x00\x00\x00\xb3\x01\x48\x89\xe6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x89\xdf\x0f\x05") else if entrytextspan == 1 then concat(b"\xe8", le32(75 + (if anytx == 1 then 86 else 0)), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else if entryrec == 1 then concat(b"\xe8", le32(62 + entryrjfs + (if anytx == 1 then 86 else 0)), b"\x50", x86_json_record(JsonRecState { fields: entryrfields, esize: 8 * (max_payload_fields(concepts) + 1), off: 0 - (61 + entryrjfs + (if anytx == 1 then 86 else 0)), src: s.source, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns }), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrybool == 1 then concat(b"\xe8", le32(78 + (if anytx == 1 then 86 else 0)), b"\x31\xdb\x48\x85\xc0\x74\x14\x48\xb8\x74\x72\x75\x65\x0a\x00\x00\x00\x50\x48\xc7\xc2\x05\x00\x00\x00\xeb\x14\x48\xb8\x66\x61\x6c\x73\x65\x0a\x00\x00\x50\x48\xc7\xc2\x06\x00\x00\x00\xb3\x01\x48\x89\xe6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x89\xdf\x0f\x05") else if entrytextspan == 1 then concat(b"\xe8", le32(75 + (if anytx == 1 then 86 else 0)), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then text_blob(TextBlobState { src: s.source, cell: next_escaped_text(ProgramState { cell: toks, src: s.source }), pos: 0, cursor: 0, word: 0, used: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list]
+      calls : [execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list, text_token_errors, text_blob, next_escaped_text]
     termination:
       bound : 256
 
@@ -35740,6 +35746,160 @@ rule body_type
       calls : [begin_tokenize, parse_program, parse_concepts, rl_head_body, block_binds, block_result, field_concept_tenv, rl_head_input, build_tenv, type_of_env]
     termination:
       bound : 256
+
+
+-- Text escapes are validated separately from the token-boundary scanner: the
+-- latter also scans byte literals, whose hexadecimal escape grammar is wider.
+rule text_content_errors
+  @intention: "Reject unknown or truncated escapes in a quoted text content span"
+  @source: vexprparse.intent:1774
+  input:
+    ds : DecodeState
+  output:
+    out : number
+  logic:
+    let c = if ds.len <= 0 then 0 else byte_at(ds.src, ds.start)
+    let e = if ds.len < 2 then 0 else byte_at(ds.src, ds.start + 1)
+    out = if ds.len <= 0 then 0 else if c == 10 then 1 else if c == 92 then (if ds.len < 2 then 1 else if e == 110 or e == 114 or e == 116 or e == 92 or e == 34 then text_content_errors(DecodeState { src: ds.src, start: ds.start + 2, len: ds.len - 2, i: 0 }) else 1) else text_content_errors(DecodeState { src: ds.src, start: ds.start + 1, len: ds.len - 1, i: 0 })
+  proofs:
+    purity:
+      reads : [ds.src, ds.start, ds.len]
+      calls : [text_content_errors]
+    termination:
+      bound : 4000000
+      decreasing : len
+
+rule text_token_errors
+  @intention: "Reject unclosed or invalid text tokens including unused declarations and metadata"
+  @source: vexprparse.intent:1774
+  input:
+    st : ProgramState
+  output:
+    out : number
+  logic:
+    let t = head_tok(st.cell)
+    let start = tok_str_start(t)
+    let len = tok_str_len(t)
+    let bad = if tok_kind(t) == 900 then 1 else if tok_is_str(t) == 0 then 0 else if len < 2 or start + len > length(st.src) then 1 else if byte_at(st.src, start + len - 1) != 34 then 1 else text_content_errors(DecodeState { src: st.src, start: start + 1, len: len - 2, i: 0 })
+    out = if tok_kind(t) == 0 then 0 else bad + text_token_errors(ProgramState { cell: advance(Advance { lst: st.cell, k: 1 }), src: st.src })
+  proofs:
+    purity:
+      reads : [st.cell, st.src]
+      calls : [head_tok, tok_str_start, tok_str_len, tok_is_str, text_content_errors, tok_kind, text_token_errors, advance]
+    termination:
+      bound : 4000000
+
+-- The evaluator keeps encoded VText spans. Map a decoded slice boundary back
+-- to the raw cursor without materializing its bytes; malformed calls clamp.
+rule text_decoded_offset
+  @intention: "Source offset of a decoded byte boundary in an encoded text span"
+  @source: vexprparse.intent:1774
+  input:
+    ds : DecodeState
+  output:
+    out : number
+  logic:
+    out = if ds.i <= 0 or ds.len <= 0 then ds.start else text_decoded_offset(DecodeState { src: ds.src, start: ds.start + bytelit_unit_width(ds), len: ds.len - bytelit_unit_width(ds), i: ds.i - 1 })
+  proofs:
+    purity:
+      reads : [ds.i, ds.len, ds.start, ds.src, ds]
+      calls : [text_decoded_offset, bytelit_unit_width]
+    termination:
+      bound : 4000000
+      decreasing : i
+
+-- Only escaped Str tokens need transformed storage. ByteLit, comments and
+-- unescaped text retain their raw bytes. The token cursor only moves forward.
+rule next_escaped_text
+  @intention: "First remaining text token containing an escape, or the end token"
+  @source: vexprparse.intent:1774
+  input:
+    st : ProgramState
+  output:
+    out : TokenList
+  logic:
+    let t = head_tok(st.cell)
+    out = if tok_kind(t) == 0 then st.cell else if tok_is_str(t) == 1 and span_has_backslash(BsScanState { src: st.src, start: tok_str_start(t) + 1, len: tok_str_len(t) - 2 }) == 1 then st.cell else next_escaped_text(ProgramState { cell: advance(Advance { lst: st.cell, k: 1 }), src: st.src })
+  proofs:
+    purity:
+      reads : [st.cell, st.src]
+      calls : [head_tok, tok_kind, tok_is_str, span_has_backslash, tok_str_start, tok_str_len, next_escaped_text, advance]
+    termination:
+      bound : 4000000
+
+concept TextBlobState
+  @intention: "Forward constant-data emission cursor with a partial little-endian word"
+  @source: vexprparse.intent:1774
+  fields:
+    src : text [..256]
+    cell : TokenList
+    pos : number [0, 4000000]
+    cursor : number [0, 4000000]
+    word : number [0, 4294967295]
+    used : number [0, 3]
+
+rule text_blob_raw_word
+  @intention: "Four original source bytes packed as one word, zero-padded at EOF"
+  @source: vexprparse.intent:1774
+  input:
+    sb : SrcBlobState
+  output:
+    out : number
+  logic:
+    out = (if sb.pos < length(sb.src) then byte_at(sb.src, sb.pos) else 0) + 256 * (if sb.pos + 1 < length(sb.src) then byte_at(sb.src, sb.pos + 1) else 0) + 65536 * (if sb.pos + 2 < length(sb.src) then byte_at(sb.src, sb.pos + 2) else 0) + 16777216 * (if sb.pos + 3 < length(sb.src) then byte_at(sb.src, sb.pos + 3) else 0)
+  proofs:
+    purity:
+      reads : [sb.pos, sb.src]
+      calls : []
+    termination:
+      bound : 64
+
+-- Preserve each original source offset and the original aligned file size.
+-- A literal's decoded bytes precede padding within its former content span;
+-- value descriptors never include that padding. Raw regions keep word copies.
+rule text_blob
+  @intention: "Emit constant data with decoded text spans at unchanged source offsets"
+  @source: vexprparse.intent:1774
+  input:
+    tb : TextBlobState
+  output:
+    out : bytes
+  logic:
+    let t = head_tok(tb.cell)
+    let start = tok_str_start(t) + 1
+    let end = tok_str_start(t) + tok_str_len(t) - 1
+    out = if tb.pos >= length(tb.src) then (if tb.used == 0 then b"" else le32(tb.word)) else if tok_kind(t) == 0 then (if tb.used == 0 then src_blob(SrcBlobState { src: tb.src, pos: tb.pos }) else text_blob_step(tb)) else if tb.pos >= end then text_blob(TextBlobState { src: tb.src, cell: next_escaped_text(ProgramState { cell: advance(Advance { lst: tb.cell, k: 1 }), src: tb.src }), pos: tb.pos, cursor: 0, word: tb.word, used: tb.used }) else if tb.used == 0 and tb.pos + 4 <= start then concat(le32(text_blob_raw_word(SrcBlobState { src: tb.src, pos: tb.pos })), text_blob(TextBlobState { src: tb.src, cell: tb.cell, pos: tb.pos + 4, cursor: tb.cursor, word: 0, used: 0 })) else text_blob_step(tb)
+  proofs:
+    purity:
+      reads : [tb.cell, tb.pos, tb.src, tb.used, tb.word, tb, tb.cursor]
+      calls : [head_tok, tok_str_start, tok_str_len, tok_kind, src_blob, text_blob_step, text_blob, next_escaped_text, advance, text_blob_raw_word]
+    termination:
+      bound : 4000000
+
+rule text_blob_step
+  @intention: "Append one decoded or original byte to the constant-data word"
+  @source: vexprparse.intent:1774
+  input:
+    tb : TextBlobState
+  output:
+    out : bytes
+  logic:
+    let t = head_tok(tb.cell)
+    let start = tok_str_start(t) + 1
+    let end = tok_str_start(t) + tok_str_len(t) - 1
+    let inside = if tok_is_str(t) == 1 and tb.pos >= start and tb.pos < end then 1 else 0
+    let cursor = if tb.cursor < start then start else tb.cursor
+    let available = if inside == 1 and cursor < end then 1 else 0
+    let value = if inside == 0 then byte_at(tb.src, tb.pos) else if available == 1 then bytelit_unit_byte(DecodeState { src: tb.src, start: cursor, len: end - cursor, i: 0 }) else 0
+    let next = if available == 1 then cursor + bytelit_unit_width(DecodeState { src: tb.src, start: cursor, len: end - cursor, i: 0 }) else cursor
+    let word = tb.word + value * pow256(PowState { k: tb.used })
+    out = if tb.used == 3 then concat(le32(word), text_blob(TextBlobState { src: tb.src, cell: tb.cell, pos: tb.pos + 1, cursor: next, word: 0, used: 0 })) else text_blob(TextBlobState { src: tb.src, cell: tb.cell, pos: tb.pos + 1, cursor: next, word: word, used: tb.used + 1 })
+  proofs:
+    purity:
+      reads : [tb.cell, tb.pos, tb.cursor, tb.src, tb.word, tb.used]
+      calls : [head_tok, tok_str_start, tok_str_len, tok_is_str, bytelit_unit_byte, bytelit_unit_width, pow256, text_blob]
+    termination:
+      bound : 4000000
 
 
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
