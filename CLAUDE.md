@@ -233,6 +233,15 @@ existing method/path allowances, alignment and numeric scratch. Source/log
 semantics and native bytes stay unchanged; state and graceful shutdown remain
 outside the contract. See [log stack composition](docs/http-log-stack-budget.md).
 
+Source text correction (2026-09-25): the Rust lexer now preserves UTF-8 literal
+bytes instead of widening each byte into a separate character. Length, indexing,
+equality and text capacities use the written bytes, without normalization; ASCII
+escapes and byte-based source columns retain their meaning. Native programs gain
+no runtime conversion. Cross-backend fixtures and bootstrap checks cover the
+correction; a separate pre-existing self-hosted ordinary-text escape gap is
+recorded in [known gaps](docs/known-gaps.md#self-hosted-ordinary-text-escapes).
+See [source text](docs/source-text.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

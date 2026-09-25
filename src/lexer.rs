@@ -268,11 +268,11 @@ impl<'a> Lexer<'a> {
 
         if c == b'"' {
             // String literal with a small, closed set of escape sequences:
-            // \n, \t, \\, \". Anything else after a backslash is a lex error —
+            // \n, \r, \t, \\, \". Anything else after a backslash is a lex error —
             // we do not silently pass "\q" through as two characters, because
             // that would let typos slip into string content without warning.
             self.advance();
-            let mut s = String::new();
+            let mut bytes = Vec::new();
             while self.pos < self.src.len() && self.src[self.pos] != b'"' {
                 let ch = self.src[self.pos];
                 if ch == b'\n' {
@@ -293,16 +293,16 @@ impl<'a> Lexer<'a> {
                     }
                     let esc = self.src[self.pos];
                     match esc {
-                        b'n' => s.push('\n'),
-                        b't' => s.push('\t'),
+                        b'n' => bytes.push(b'\n'),
+                        b't' => bytes.push(b'\t'),
                         // Phase 11 slice 1: `\r` joins the closed set so
                         // wire-protocol literals (HTTP/1.0 CRLF, raw TCP
                         // line terminators) can be expressed without
                         // out-of-band bytes. Same audit discipline as the
                         // other escapes — typos still fail at lex time.
-                        b'r' => s.push('\r'),
-                        b'\\' => s.push('\\'),
-                        b'"' => s.push('"'),
+                        b'r' => bytes.push(b'\r'),
+                        b'\\' => bytes.push(b'\\'),
+                        b'"' => bytes.push(b'"'),
                         other => {
                             return Err(LexError {
                                 line: self.line,
@@ -316,7 +316,7 @@ impl<'a> Lexer<'a> {
                     }
                     self.advance();
                 } else {
-                    s.push(ch as char);
+                    bytes.push(ch);
                     self.advance();
                 }
             }
@@ -328,6 +328,10 @@ impl<'a> Lexer<'a> {
                 });
             }
             self.advance();
+            // Lexer::new accepts valid UTF-8. Copying source bytes and replacing
+            // only ASCII escape pairs with ASCII bytes preserves that invariant.
+            // Keep byte-based cursor/diagnostic positions and reuse the buffer.
+            let s = String::from_utf8(bytes).expect("text literal preserves source UTF-8");
             self.emit_token(TokenKind::StringLit(s), start_line, start_col);
             return Ok(());
         }
@@ -770,6 +774,37 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn source_utf8_literals_preserve_bytes_and_escape_boundaries() {
+        for text in ["", "ASCII", "é", "€", "🦀", "e\u{301}", "\0", "é€🦀\0"] {
+            let source = format!("\"{text}\\n\\r\\t\\\\\\\"{text}\" b\"{text}\"");
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            assert_eq!(tokens[0].kind, TokenKind::StringLit(format!("{text}\n\r\t\\\"{text}")));
+            assert_eq!(tokens[1].kind, TokenKind::BytesLit(text.as_bytes().to_vec()));
+        }
+        // Preserve scalar boundaries at every UTF-8 width, without normalization.
+        let text = "\u{7f}\u{80}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{ffff}\u{10000}\u{10ffff}";
+        assert_eq!(kinds(&format!("\"{text}\""))[0], TokenKind::StringLit(text.into()));
+    }
+
+    #[test]
+    fn source_utf8_literals_keep_byte_columns_and_closed_escapes() {
+        let tokens = Lexer::new("\"é🦀\" next\n\"€\"").tokenize().unwrap();
+        assert_eq!((tokens[1].line, tokens[1].col), (1, 10));
+        let last = tokens.iter().find(|t| t.kind == TokenKind::StringLit("€".into())).unwrap();
+        assert_eq!((last.line, last.col), (2, 1));
+        for suffix in ["q", "x41", "u00e9"] {
+            let error = Lexer::new(&format!("\"é\\{suffix}\"")).tokenize().unwrap_err();
+            assert_eq!((error.line, error.col), (1, 5));
+            assert!(error.message.contains("unknown escape"));
+        }
+        for source in ["\"é", "\"é\n", "\"é\\"] {
+            let error = Lexer::new(source).tokenize().unwrap_err();
+            assert_eq!((error.line, error.col), (1, 1));
+            assert!(error.message.contains("unterminated string literal"));
+        }
     }
 
     #[test]

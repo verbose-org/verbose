@@ -14,6 +14,8 @@ mod http_framing;
 mod http_tests;
 mod interpreter;
 mod lexer;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod source_text_tests;
 mod native;
 mod optimizer;
 mod parser;

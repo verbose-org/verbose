@@ -17,7 +17,9 @@ fn http_log_stack_matches_static_and_dynamic_emission_in_every_dispatch_mode() {
         for (content, strategy, capacity, buffer, sizing, formatting, timestamp) in [
             ("\"\"", "literal", 0, 0, 0, 0, false),
             ("\"ab\"", "literal", 2, 0, 0, 0, false),
+            ("\"é\"", "literal", 2, 0, 0, 0, false),
             ("concat(\"ab\", resp.status)", "static", 22, 24, 0, 24, false),
+            ("concat(\"é\", resp.status)", "static", 22, 24, 0, 24, false),
             ("concat(req.method, req.path)", "static", 264, 264, 0, 0, false),
             ("concat(resp.body)", "dynamic", 277, 280, 0, 0, false),
             ("concat(req.method, req.path, resp.body, resp.status)", "dynamic", 561, 832, 8, 24, false),
@@ -96,8 +98,8 @@ fn http_log_stack_unknown_or_excessive_effects_preserve_existing_artifacts() {
 
 #[test]
 fn http_log_stack_counts_typed_literal_bytes_and_signed_number_scratch() {
-    // Exercise the emitter boundary directly; the legacy source lexer expands
-    // non-ASCII literal bytes when constructing its String (a separate gap).
+    // Exercise the typed emitter boundary too, including i64::MIN, which the
+    // source lexer cannot spell directly as a signed numeric literal.
     let mut p = parse(SOURCE);
     service(&mut p).logs = vec![LogBlock {
         effect: Effect::AppendFile { path: "/tmp/unused-http-stack.log".into(),
