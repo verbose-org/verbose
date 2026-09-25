@@ -18,7 +18,8 @@ This first service scope requires:
 
 - `protocol: http_1_0` and both existing request/response deadlines;
 - a handler in the existing pure, acyclic bounded-text call graph;
-- no service state, after mutations or service logs;
+- no service state or after mutations; existing bounded `append_file` logs are
+  included through the [sequential log composition](http-log-stack-budget.md);
 - no `shutdown_timeout`: the draining pool's asynchronous signal frames need
   separate accounting before this contract can cover that mode.
 
@@ -49,14 +50,17 @@ words, bounded socket-I/O bookkeeping, admission/pool bookkeeping, and the
 temporaries have a 16-byte peak. Receive/parse/dispatch use fixed frame slots.
 The handler reserves its placed scalar words and text buffers plus saved rbp/rbx
 (16 bytes), and retains that complete region through response sending. Expression
-formatting and response header formatting are sequential peaks; the latter uses
-one 24-byte numeric buffer at a time. The enclosing calculation is:
+formatting, log temporaries and response header formatting are sequential peaks;
+the latter uses one 24-byte numeric buffer at a time. Each log frees its buffer
+before the next log starts, while the handler region remains retained. The
+enclosing calculation is:
 
 ```
 8 + service_frame_bytes
   + max(startup_scratch_bytes,
         handler_frame_bytes + 16
-          + max(handler_expression_scratch_bytes, response_scratch_bytes))
+          + max(handler_expression_scratch_bytes, largest_log_stack_bytes,
+                response_scratch_bytes))
 ```
 
 Sequential/pool close paths reset rsp to the fixed frame even after malformed
@@ -73,6 +77,12 @@ scratch. Default report selection may choose a service when no execution is
 declared; existing explicit rule/sequence reports keep their meaning. Reporting
 an eligible service without a ceiling is useful, but unsupported services refuse
 instead of falling back to a handler-only argv estimate.
+
+Services with logs add an ordered `logs` array and `log_stack_bytes` to schema 1.
+Each entry distinguishes content capacity, the actual emitter's bounded buffer
+reservation and temporary formatting/sizing peaks. No-log reports are unchanged.
+The ceiling does not bound blocking log I/O latency, disk growth or durability;
+existing effect ordering, error policies and short-write behavior are preserved.
 
 ## Backend and verification boundary
 

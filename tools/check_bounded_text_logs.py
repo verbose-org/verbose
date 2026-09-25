@@ -2,7 +2,7 @@
 
 Run cargo build, then python3 tools/check_bounded_text_logs.py. Standard library
 only; requires strace, ptrace permission and loopback sockets. Keeps artifacts.
-Checks log/send failure ordering, frame/fd reclamation, allocation syscalls and
+Checks the exact service stack ceiling, log/send failure ordering, frame/fd reclamation, allocation syscalls and
 a negative control that deliberately releases response storage before logging.
 """
 import json
@@ -36,6 +36,14 @@ source += f'''  log:
 for policy in ['abort', 'drop']:
     path = WORK / f'{policy}.verbose'
     path.write_text(source.replace('port: 18966', f'port: {port}').replace('POLICY', policy))
+    path.write_text(path.read_text() + '  native_stack: 65536\n')
+    report = json.loads(subprocess.run([
+        str(ROOT / 'target/debug/verbosec'), str(path), '--stack-report', '--json'],
+        check=True, capture_output=True).stdout)
+    peaks = [entry['stack_bound_bytes'] for entry in report['logs']]
+    assert report['log_stack_bytes'] == max(peaks) < sum(peaks)
+    path.write_text(path.read_text().replace('native_stack: 65536',
+        f"native_stack: {report['stack_bound_bytes']}"))
     subprocess.run([str(ROOT / 'target/debug/verbosec'), str(path), '--native',
                     str(WORK / policy), '--run', 'bounded_log_http'],
                    check=True, capture_output=True)

@@ -10,6 +10,16 @@ is superseded for those supported constructs. Legacy `--http-server` and
 `--demo-http` entry points still have the distinct roles described below.
 Historical sizes and restrictions apply to the milestone where they were recorded.
 
+## Current source-literal gap (2026-09-25)
+
+The Rust lexer's text-literal loop currently pushes each UTF-8 source byte as a
+separate character (`src/lexer.rs`, string-literal branch). For example, source
+`"é"` becomes `C3 83 C2 A9` (four bytes) instead of `C3 A9` (two). This predates
+service stack budgets; they count the resulting parsed/emitted bytes, so their
+storage bound remains valid. Counted HTTP input bytes are independent of this
+source-literal conversion. Fixing source-text fidelity and checking its bootstrap
+and compatibility consequences is separate language work.
+
 ## Three tiers of native output (important clarification)
 
 Not every native binary the repo produces is "a program described in Verbose".

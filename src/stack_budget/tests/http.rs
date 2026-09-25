@@ -1,12 +1,12 @@
 use super::*;
 
-const SOURCE: &str = include_str!("../../../examples/http_stack.verbose");
+pub(super) const SOURCE: &str = include_str!("../../../examples/http_stack.verbose");
 
-fn service(p: &mut Program) -> &mut Service {
+pub(super) fn service(p: &mut Program) -> &mut Service {
     p.items.iter_mut().find_map(|i| match i { Item::Service(s) => Some(s), _ => None }).unwrap()
 }
 
-fn binary(p: &Program) -> Vec<u8> {
+pub(super) fn binary(p: &Program) -> Vec<u8> {
     let path = format!("/tmp/verbose-http-stack-layout-{}", std::process::id());
     native::compile_service(p, "bounded_http", &path).unwrap();
     let bytes = fs::read(&path).unwrap();
@@ -18,11 +18,22 @@ fn binary(p: &Program) -> Vec<u8> {
 // AST/layout metadata. Failure edges can join at different depths: close/reset
 // must converge before re-entering accept. Unlike argv, exit has no fallthrough.
 fn service_machine_peak(code: &[u8]) -> usize {
+    service_machine_peak_with_logs(code, &[])
+}
+
+// Dynamic allocations receive independent fixture bounds, not report metadata.
+// Locations are pinned by the opcode and then validated on reachable CFG paths.
+pub(super) fn service_machine_peak_with_logs(code: &[u8], dynamic_buffers: &[usize]) -> usize {
+    let sites: Vec<_> = code.windows(3).enumerate().filter_map(|(pc, b)|
+        (b == [0x48, 0x29, 0xc4]).then_some(pc)).collect();
+    assert_eq!(sites.len(), dynamic_buffers.len());
+    let dynamic: HashMap<_, _> = sites.into_iter().zip(dynamic_buffers.iter().copied()).collect();
     #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
     struct State {
         depth: i64,
         rbp: Option<i64>,
         r10: Option<i64>,
+        r9: Option<i64>,
         saved: Vec<(i64, Option<i64>)>,
     }
     let mut work = vec![(0, State::default())];
@@ -39,7 +50,7 @@ fn service_machine_peak(code: &[u8]) -> usize {
         match ins {
             [0x55] => { state.depth += 8; state.saved.push((state.depth, state.rbp)); }
             [0x50..=0x57] | [0x6a, _] => state.depth += 8,
-            [0x58..=0x5f] => panic!("unexpected pop in retained HTTP frame at {pc}"),
+            [0x58..=0x5b] | [0x5e..=0x5f] => state.depth -= 8,
             [0x48, 0x89, 0xe5] => state.rbp = Some(state.depth),
             [0x49, 0x89, 0xea] => state.r10 = state.rbp,
             [0x4c, 0x8b, 0x55, 0x08] => {
@@ -48,12 +59,17 @@ fn service_machine_peak(code: &[u8]) -> usize {
             }
             [0x4c, 0x89, 0xd5] => state.rbp = state.r10,
             [0x48, 0x81, 0xec, a, b, c, d] => state.depth += i32::from_le_bytes([*a, *b, *c, *d]) as i64,
+            [0x49, 0x89, 0xe1] => state.r9 = Some(state.depth),
+            [0x4c, 0x89, 0xcc] => state.depth = state.r9.expect("dynamic log cleanup without save"),
+            [0x48, 0x29, 0xc4] => state.depth += *dynamic.get(&pc).expect("unknown dynamic allocation") as i64,
+            [0x48, 0x81, 0xc4, a, b, c, d] => state.depth -= i32::from_le_bytes([*a, *b, *c, *d]) as i64,
             [0x48, 0x83, 0xec, n] => state.depth += *n as i8 as i64,
             [0x48, 0x83, 0xc4, n] => state.depth -= *n as i8 as i64,
             [0x48, 0x8d, 0xa5, a, b, c, d] => {
                 state.depth = state.rbp.expect("reset without frame") - i32::from_le_bytes([*a, *b, *c, *d]) as i64;
                 state.saved.retain(|(d, _)| *d <= state.depth);
                 state.r10 = None;
+                state.r9 = None;
             }
             [0xe8, ..] | [0xc3] => panic!("unaccounted runtime call/return at {pc}"),
             _ => {}
@@ -133,8 +149,7 @@ fn http_stack_syntax_and_direct_context_refusals_preserve_artifacts() {
         ("both request_timeout", Box::new(|s| s.request_timeout = None)),
         ("http_1_0", Box::new(|s| s.protocol = Protocol::RawTcp)),
         ("shutdown_timeout", Box::new(|s| s.shutdown_timeout = Some(1))),
-        ("logs, state", Box::new(|s| s.logs.push(LogBlock { effect: Effect::AppendFile {
-            path: "/tmp/unused-http-stack.log".into(), content: Expr::Text("x".into()) }, on_error: ErrorPolicy::Drop }))),
+        ("require append_file", Box::new(|s| s.logs.push(LogBlock { effect: Effect::Print(vec![Expr::Text("x".into())]), on_error: ErrorPolicy::Drop }))),
         ("bounded-text call graph", Box::new(|s| s.handler = "missing".into())),
     ];
     for (expected, mutate) in mutations {

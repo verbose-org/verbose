@@ -66,7 +66,7 @@ input text bounds above 1 MiB.
 | Interpreter | Value semantics, annotated input checks and result backstop |
 | Native Linux x86-64 | Checked subset with fixed invocation storage |
 | HTTP service | Pure handler without state or after mutations; checked service logs can borrow its completed response. Also a complete annotated text call in a sequential service's `after` block, copied into bounded text state |
-| HTTP service stack ceiling | Separate [`native_stack` attribute](http-stack-budget.md) includes transport and retained response; excludes logs, state and graceful shutdown |
+| HTTP service stack ceiling | Separate [`native_stack` attribute](http-stack-budget.md) includes transport, retained response and sequential bounded logs; excludes state and graceful shutdown |
 | WASM | Explicit refusal of participating rules and services before artifact emission |
 | Self-hosted compiler | Output-section token refusal in both ELF and raw machine-code entry points |
 

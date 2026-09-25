@@ -95,7 +95,7 @@ class HTTPStackCLI(unittest.TestCase):
             (self.original.replace("  response_timeout: 1\n", ""), b"both request_timeout"),
             (self.original + "  shutdown_timeout: 1\n", b"shutdown_timeout"),
             (self.original + '  state:\n    count : number = 0\n', b"without state or after mutations"),
-            (self.original + '  log:\n    append_file "/tmp/unused-stack.log" "x"\n    on_error: drop\n', b"logs, state"),
+            (self.original + '  log:\n    append_file "/tmp/unused-stack.log" concat(length(resp.body))\n    on_error: drop\n', b"concat only"),
             (self.original.replace("    purity:\n", "    native_stack: 8192\n    purity:\n", 1), b"not service or reaction contexts"),
             (self.original.replace("view.count * 2", "view.count / 0"), b"divisor range [0, 0] includes zero"),
         ]
@@ -120,6 +120,55 @@ class HTTPStackCLI(unittest.TestCase):
 
     def test_wasm_refuses_service_contract_before_artifact(self):
         target = self.base / "output.wasm"
+        target.write_bytes(b"preserve")
+        out = self.compile("--wasm", target, "--run", "describe")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn(b"WASM does not support service native_stack", out.stderr)
+        self.assertEqual(target.read_bytes(), b"preserve")
+
+    def test_log_report_counts_emitter_reservation_and_composes_by_maximum(self):
+        for name in ["http_log_stack.verbose", "http_log_stack.intent"]:
+            (self.base / name).write_bytes((ROOT / "examples" / name).read_bytes())
+        self.source = self.base / "http_log_stack.verbose"
+        original = self.source.read_text()
+        report = self.report()
+        self.assertEqual(report["stack_bound_bytes"], 5584)
+        self.assertEqual(report["request_metadata_bytes"], 72)
+        self.assertEqual(report["log_stack_bytes"], 880)
+        logs = report["logs"]
+        self.assertEqual([entry["index"] for entry in logs], [0, 1])
+        self.assertEqual([entry["on_error"] for entry in logs], ["abort", "drop"])
+        self.assertEqual([entry["content_capacity_bytes"] for entry in logs], [586, 287])
+        self.assertEqual([entry["buffer_bytes"] for entry in logs], [856, 288])
+        self.assertEqual([entry["stack_bound_bytes"] for entry in logs], [880, 288])
+        self.assertIn(b"sequential logs: 880 bytes maximum", self.compile("--stack-report").stdout)
+        artifacts = []
+        for limit in ["native_stack: 5584", "native_stack: 8192", ""]:
+            self.source.write_text(original.replace("native_stack: 8192", limit))
+            target = self.base / "logged-server"
+            out = self.compile("--native", target)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            artifacts.append(target.read_bytes())
+        self.assertEqual(artifacts[0], artifacts[1])
+        self.assertEqual(artifacts[0], artifacts[2])
+        self.source.write_text(original.replace("native_stack: 8192", "native_stack: 5583"))
+        out = self.compile("--native", target)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn(b"5584 bytes per process exceeds declared 5583", out.stderr)
+        self.assertEqual(target.read_bytes(), artifacts[0])
+
+    def test_log_ceiling_checks_unselected_services_and_refuses_wasm(self):
+        logs = '\n  log:\n    append_file "/tmp/unused-stack.log" concat(resp.body)\n    on_error: drop\n'
+        unselected = self.original[self.original.index("service bounded_http"):].replace(
+            "service bounded_http", "service unused").replace("native_stack: 8192", "native_stack: 4720")
+        self.source.write_text(self.original + unselected + logs)
+        out = self.compile("--stack-report", "--run", "describe", "--json")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(out.stdout, b"")
+        self.assertIn(b"service 'unused' / native_stack", out.stderr)
+        self.assertIn(b"exceeds declared 4720", out.stderr)
+        self.source.write_text(self.original + logs)
+        target = self.base / "logged.wasm"
         target.write_bytes(b"preserve")
         out = self.compile("--wasm", target, "--run", "describe")
         self.assertNotEqual(out.returncode, 0)

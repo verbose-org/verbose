@@ -131,7 +131,8 @@ successive phases, storage retained between them and bounded concurrent work.
 Command-line processing, batch pipelines and compiler passes are examples along
 with services. A separate [service `native_stack` attribute](http-stack-budget.md)
 now combines bounded HTTP transport, pure handlers and response storage per
-process; logs, state and graceful shutdown are excluded. The rule's
+process, including the [maximum bounded log scratch](http-log-stack-budget.md);
+state and graceful shutdown are excluded. The rule's
 `proofs.native_stack` keeps its standalone argv meaning and cannot substitute for
 that service scope. Neither contract bounds total program/process memory.
 

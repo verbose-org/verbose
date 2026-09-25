@@ -743,6 +743,16 @@ pub(super) fn prepare(p: &Program, name: &str, concept: &Concept) -> Result<Frag
 }
 
 impl Fragment {
+    pub(super) fn response_capacity(&self) -> Result<usize, NativeError> {
+        if let Value::Record(name, fields) = &self.result {
+            if name == "HttpResponse" {
+                if let Some((_, Value::Text { cap, .. })) = fields.iter().find(|(n, _)| n == "body") {
+                    return Ok(*cap);
+                }
+            }
+        }
+        Err(error("HTTP stack analysis requires a bounded response body"))
+    }
     pub(super) fn stack_layout(&self) -> (crate::stack_budget::TextFrame, usize) {
         (crate::stack_budget::TextFrame {
             slot_bytes: self.slot_bytes,

@@ -226,6 +226,13 @@ rule argv proofs and adds no emitted instructions for a sufficient declaration.
 The self-hosted compiler and WASM refuse the new contract explicitly. See
 [HTTP stack budgets](docs/http-stack-budget.md).
 
+Sequential effect follow-up (2026-09-25): bounded service logs now contribute their
+maximum temporary stack beneath the retained handler region. The report shares
+concat classification/sizing with emission, including dynamic counted lengths,
+existing method/path allowances, alignment and numeric scratch. Source/log
+semantics and native bytes stay unchanged; state and graceful shutdown remain
+outside the contract. See [log stack composition](docs/http-log-stack-budget.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.
