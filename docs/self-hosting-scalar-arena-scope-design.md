@@ -4,6 +4,13 @@ Grounded in a code-level scoping pass (evidence as vexprparse.verbose:line /
 native.rs:line / verifier.rs:line). The arena-reclamation chantier; this doc is
 SLICE 1 (the primitive + one zero-drift application). Slices 2-3 sketched.
 
+Update (2026-09-26): the Rust-native scalar path now saves/restores the arena
+mark too. The earlier identity shortcut below was sufficient for its original
+stack-record walks; [lexical binding views](self-hosted-bindings.md) allocate
+actual `concept_group` nodes and require reclaim. Numeric values and earlier
+live nodes survive ordinary and nested scopes; the declared arena size stays
+unchanged. The historical no-allocation assumption below is superseded.
+
 ## The problem (measured)
 gen1 (the self-emitted compiler) peaks ~15.4 GiB emitting the full self-source
 (690 rules / 1.32 MB), vs the ~2.55 GiB when `arena_scope` shipped (~509 rules).

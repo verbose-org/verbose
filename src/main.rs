@@ -16,6 +16,8 @@ mod interpreter;
 mod lexer;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod source_text_tests;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod selfhost_binding_tests;
 mod native;
 mod optimizer;
 #[cfg(test)]

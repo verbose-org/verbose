@@ -20,13 +20,18 @@ byte-based; no Unicode normalization is performed. The Rust lexer's earlier
 non-ASCII byte expansion is fixed, with self-hosted differential coverage.
 The self-hosted compiler also [decodes ordinary text escapes](self-hosted-text-escapes.md)
 in prepared constants, with no target decoding loop or allocation. Its separate
-alias-output, shadowing and streamed-substring limitations are listed in
+streamed-substring limitation is listed in
 [known gaps](known-gaps.md#text-alias-output-shadowing-and-streamed-substrings).
 The shared Rust optimizer now [respects sequential text let bindings](text-let-shadowing.md):
 rebinding a name replaces its current constant, while earlier aliases retain
 their captured values. The verifier checks each RHS against the types visible
 at that point. Differential probes cover interpretation, native and supported
-WASM forms; the separate self-hosted binding lookup remains pending.
+WASM forms. The [self-hosted binding correction](self-hosted-bindings.md) now
+resolves the latest visible definition, preserves captured text/record aliases,
+and gives nested binders precedence over outer names. Compiler-only binding
+views preserve frame positions; emitted programs gain no allocator or GC.
+Legacy Rust-native dynamic text rebinding and the self-hosted evaluator's text
+equality remain separate documented gaps.
 
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable

@@ -251,7 +251,18 @@ keep their earlier value; nonliteral bindings retain eager evaluation. The
 verifier checks RHS types against the preceding environment instead of the
 final one. Differential regressions cover original/optimized interpretation,
 native output and supported WASM execution, with no new target storage or GC.
-Self-hosted lookup remains separate. See [sequential text lets](docs/text-let-shadowing.md).
+See [sequential text lets](docs/text-let-shadowing.md).
+
+Self-hosted binding follow-up (2026-09-26): latest-visible lookup and preceding
+binding views now preserve source-order let evaluation, captured text/record
+aliases, parameter shadowing and nested binder slots. Stream sizing, printing
+and text equality share the packed-span classifier. Binding resolution preserves
+target value widths and frame slots. Compiler-side views are reclaimed through
+existing arena scopes; the Rust scalar path now restores the mark for real
+concept-group allocations, with the saved word included in scratch accounting.
+Gen0/gen1 differential probes use the original-AST interpreter and explicit
+outcomes; legacy Rust-native dynamic text rebinding and self-hosted evaluator
+text equality are independent gaps. See [lexical bindings](docs/self-hosted-bindings.md).
 
 ## Dev workflow (cidx + branch-protected main)
 
