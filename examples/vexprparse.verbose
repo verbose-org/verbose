@@ -25423,9 +25423,9 @@ concept ParamIndexState
 
 
 -- LetIndexState: a binding list to scan for a name span, plus the source and the
--- query span (a var reference) and the index reached so far. Returns the 0-based
--- source-order index of the matching let binding, or -1 if the name is not a let
--- of the current proc. Same shape as ParamIndexState but over a Binding cons-list.
+-- query span, the index reached and the last matching index (`found`). Start
+-- with idx 0 and found -1. A forward scan replaces found at each visible match,
+-- returning the latest one without walking any suffix more than once.
 concept LetIndexState
   @intention: "A binding list + source + a query name span + the index reached, to find a let's position"
   @source: vexprparse.intent:56
@@ -25435,6 +25435,7 @@ concept LetIndexState
     q_start : number [0, 4000000]
     q_len : number [0, 4000000]
     idx : number
+    found : number
 
 
 -- ProcOffState: the program to walk + a running byte offset + the callee name
@@ -25509,14 +25510,69 @@ rule param_index
       bound : 512
 
 
--- let_index: the 0-based source-order index of the let binding whose name span
--- byte-matches the query span, or -1 if none. The length check guards name_eq
+-- Compiler-only binding views preserve every frame index while hiding future
+-- definitions. Nested temporaries therefore still begin after all let slots.
+concept BindingView
+  @intention: "A binding list and the number of earlier entries visible at a source position"
+  @source: vexprparse.intent:1776
+  fields:
+    binds : Binding
+    visible : number
+
+rule earlier_bindings
+  @intention: "Mask names and values after a visible prefix while preserving frame positions"
+  @source: vexprparse.intent:1776
+  input:
+    bv : BindingView
+  output:
+    out : Binding
+  logic:
+    out = match bv.binds:
+      BCons(name_start, name_len, value, rest) => if bv.visible > 0 then Binding::BCons { name_start: name_start, name_len: name_len, value: value, rest: earlier_bindings(BindingView { binds: rest, visible: bv.visible - 1 }) } else Binding::BCons { name_start: 0, name_len: 0, value: Ast::AstErr, rest: earlier_bindings(BindingView { binds: rest, visible: 0 }) }
+      BNil => Binding::BNil
+  proofs:
+    purity:
+      reads : [bv.binds, bv.visible]
+      calls : [earlier_bindings]
+    termination:
+      bound : 4000
+
+concept BindingSlot
+  @intention: "A binding list and the source-order slot whose RHS is requested"
+  @source: vexprparse.intent:1776
+  fields:
+    binds : Binding
+    idx : number
+
+rule binding_value
+  @intention: "The RHS at a source-order binding slot, or AstErr for an absent slot"
+  @source: vexprparse.intent:1776
+  input:
+    bs : BindingSlot
+  output:
+    out : Ast
+  logic:
+    out = match bs.binds:
+      BCons(name_start, name_len, value, rest) => if bs.idx == 0 then value else if bs.idx > 0 then binding_value(BindingSlot { binds: rest, idx: bs.idx - 1 }) else Ast::AstErr
+      BNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [bs.binds, bs.idx]
+      calls : [binding_value]
+    termination:
+      bound : 4000
+
+
+-- let_index: the source-order index of the LAST visible binding whose name
+-- byte-matches the query span, or -1 if none. Masked entries have zero name length
+-- and never match. Nested binders are appended, so they shadow outer bindings.
+-- The length check guards name_eq
 -- (which assumes equal lengths), exactly like param_index / name_bound. A let at
 -- index j lives in the frame slot [rbp - 8*(j+1)] (below rbp; the params are at
 -- positive disp above rbp), so the codegen uses this index to compute the let's
 -- negative displacement.
 rule let_index
-  @intention: "The 0-based index of the let binding matching a name span, or -1 if not a let"
+  @intention: "The source-order index of the latest visible binding matching a name span, or -1"
   @source: vexprparse.intent:56
   input:
     li : LetIndexState
@@ -25524,20 +25580,20 @@ rule let_index
     out : number
   logic:
     out = match li.binds:
-      BCons(name_start, name_len, value, rest) => if name_len == li.q_len and name_eq(NameEqState { src: li.src, a_start: name_start, b_start: li.q_start, len: li.q_len, off: 0 }) == 1 then li.idx else let_index(LetIndexState { binds: rest, src: li.src, q_start: li.q_start, q_len: li.q_len, idx: li.idx + 1 })
-      BNil => 0 - 1
+      BCons(name_start, name_len, value, rest) => let_index(LetIndexState { binds: rest, src: li.src, q_start: li.q_start, q_len: li.q_len, idx: li.idx + 1, found: if name_len > 0 and name_len == li.q_len and name_eq(NameEqState { src: li.src, a_start: name_start, b_start: li.q_start, len: li.q_len, off: 0 }) == 1 then li.idx else li.found })
+      BNil => li.found
   proofs:
     purity:
-      reads : [li.binds, li.src, li.q_start, li.q_len, li.idx]
-      calls : [name_eq, let_index]
+      reads : [li.binds, li.src, li.q_start, li.q_len, li.idx, li.found]
+      calls : [let_index, name_eq]
     termination:
       bound : 512
 
 
 -- let_rhs (records-arc slice 3): the RHS VALUE Ast of the let binding whose name
 -- span byte-matches the query span, or the sentinel Ast::AstErr if the name is not
--- a let of the current proc. Exact mirror of let_index (same BCons walk, same
--- name_eq guard), but returns the binding's `value` Ast instead of its index. The
+-- a let of the current proc. Use let_index's selected slot so value and layout
+-- classification share exactly the same lexical resolution as emitted loads. The
 -- codegen uses this to resolve a let-bound record's CONCEPT at COMPILE time: for
 -- `let s = Foo { ... }` the binding's value is AstVariant(Foo, ...), so AstField
 -- reads the concept from the RHS without any runtime tag.
@@ -25549,24 +25605,20 @@ rule let_rhs
   output:
     out : Ast
   logic:
-    out = match li.binds:
-      BCons(name_start, name_len, value, rest) => if name_len == li.q_len and name_eq(NameEqState { src: li.src, a_start: name_start, b_start: li.q_start, len: li.q_len, off: 0 }) == 1 then value else let_rhs(LetIndexState { binds: rest, src: li.src, q_start: li.q_start, q_len: li.q_len, idx: li.idx + 1 })
-      BNil => Ast::AstErr
+    out = binding_value(BindingSlot { binds: li.binds, idx: let_index(li) })
   proofs:
     purity:
-      reads : [li.binds, li.src, li.q_start, li.q_len, li.idx]
-      calls : [name_eq, let_rhs]
+      reads : [li, li.binds]
+      calls : [binding_value, let_index]
     termination:
       bound : 512
 
 
 -- ast_is_variant / ast_variant_cstart / ast_variant_clen (records-arc slice 3):
 -- shallow readers of an AstVariant node (a `Concept::Variant { ... }` / record
--- construction). Used by static_concept_of's let branch on the RESULT of let_rhs
--- (slice 4 — the readers date from slice 3, whose AstField gate they served
--- directly): if the let's RHS is a construction, its concept-name span (cstart,
--- clen) resolves the concept at compile time (find_concept_index), so the field's
--- payload slot is known statically. A non-AstVariant RHS yields 0 / not-a-variant,
+-- construction). Historical slice-3 readers: static_concept_of now resolves
+-- the RHS recursively in its preceding binding view, including record aliases.
+-- A non-AstVariant RHS yields 0 / not-a-variant,
 -- so the resolver returns -1 and the codegen keeps the int3 fallback. (Slice 3's
 -- ast_is_var / ast_var_start / ast_var_len readers were deleted in slice 4: the
 -- resolver's AstVar match arm binds the span directly.)
@@ -26044,16 +26096,15 @@ rule field_concept_of
 -- static_concept_of (records-arc slice 4): resolve a field-access base
 -- expression to its record concept's 0-based index at COMPILE time, or -1 when
 -- the base is out of the compilable subset. The three resolving arms:
---   AstVar — param first (typed param -> its PCons ty span via the
---     params_to_fields + field_concept_of walk; untyped -> -1, never inferred),
---     else the let branch (RHS a construction -> its concept span, slice 3's
---     check verbatim).
+--   AstVar — latest visible let first: resolve its RHS in the preceding view,
+--     so an alias keeps the captured layout across later redefinitions. Otherwise
+--     use the typed parameter's PCons span; an untyped parameter remains -1.
 --   AstVariant — field access directly on a construction: its own concept span.
 --   AstField — CHAINED access: recurse on the base, then resolve the accessed
 --     field's declared-type span within the base concept's FieldList.
--- Everything else is -1. Recursion is on a sub-part of the packed input's Ast
--- field, so bound-only termination + the native recursion breadcrumb, exactly
--- like the other packed-input walkers (code_size_node / let_rhs / ...).
+-- Everything else is -1. Recursion follows an AST child or strictly reduces the
+-- visible binding index; frame positions and the list length remain unchanged.
+-- Like the other packed-input walkers, this still uses bound-only termination.
 rule static_concept_of
   @intention: "Resolve a field-access base expression to its record concept's 0-based index at compile time, or -1"
   @source: vexprparse.intent:56
@@ -26067,7 +26118,7 @@ rule static_concept_of
       AstBin(op, lhs, rhs) => 0 - 1
       AstNeg(inner) => 0 - 1
       AstNot(inner) => 0 - 1
-      AstVar(start, len) => if param_index(ParamIndexState { params: sc.params, src: sc.src, q_start: start, q_len: len, idx: 0 }) >= 0 then field_concept_of(FieldTyConceptState { fields: params_to_fields(sc.params), src: sc.src, q_start: start, q_len: len, concepts: sc.concepts }) else (if ast_is_variant(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })) == 1 then (if find_concept_index(FindConceptIdxState { concepts: sc.concepts, src: sc.src, q_start: ast_variant_cstart(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })), q_len: ast_variant_clen(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })), idx: 0 }) == 999999 then 0 - 1 else find_concept_index(FindConceptIdxState { concepts: sc.concepts, src: sc.src, q_start: ast_variant_cstart(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })), q_len: ast_variant_clen(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })), idx: 0 })) else 0 - 1)
+      AstVar(start, len) => if let_index(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) >= 0 then static_concept_of(StaticConceptState { node: let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }), src: sc.src, params: sc.params, lets: earlier_bindings(BindingView { binds: sc.lets, visible: let_index(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) }), concepts: sc.concepts }) else field_concept_of(FieldTyConceptState { fields: params_to_fields(sc.params), src: sc.src, q_start: start, q_len: len, concepts: sc.concepts })
       AstField(base, fstart, flen) => if static_concept_of(StaticConceptState { node: base, src: sc.src, params: sc.params, lets: sc.lets, concepts: sc.concepts }) >= 0 then field_concept_of(FieldTyConceptState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: sc.concepts, idx: static_concept_of(StaticConceptState { node: base, src: sc.src, params: sc.params, lets: sc.lets, concepts: sc.concepts }) })), src: sc.src, q_start: fstart, q_len: flen, concepts: sc.concepts }) else 0 - 1
       AstCall(callee_start, callee_len, args) => 0 - 1
       AstStr(start, len) => 0 - 1
@@ -26093,7 +26144,7 @@ rule static_concept_of
   proofs:
     purity:
       reads : [sc.node, sc.src, sc.params, sc.lets, sc.concepts]
-      calls : [param_index, field_concept_of, params_to_fields, ast_is_variant, let_rhs, ast_variant_cstart, ast_variant_clen, find_concept_index, static_concept_of, cd_fields, concept_at_index]
+      calls : [cd_fields, concept_at_index, earlier_bindings, field_concept_of, find_concept_index, let_index, let_rhs, params_to_fields, static_concept_of]
     termination:
       bound : 8000
 
@@ -28722,32 +28773,6 @@ rule arm_payload_by_name
       bound : 4000
 
 
--- let_marks_textspan: 1 iff the binding entry matching the query name carries
--- a span-marked value (an AstStr — the typed-binder dummy, or a real
--- string-literal let RHS, whose slot holds the packed span either way). The
--- ONE rule both stream walks call for the AstVar let-branch dispatch —
--- code_size_stream_node for the +36-vs-+6 count, x86_stream_node for the
--- bytes — so the size/emit pair cannot disagree about which sequence is there
--- (the two-pass drift edge, same discipline as bin_text_mode).
-rule let_marks_textspan
-  @intention: "1 if the named binding entry's stored value marks a packed text span, 0 otherwise"
-  @source: vexprparse.intent:64
-  input:
-    li : LetIndexState
-  output:
-    out : number
-  logic:
-    out = match li.binds:
-      BCons(name_start, name_len, value, rest) => if name_len == li.q_len and name_eq(NameEqState { src: li.src, a_start: name_start, b_start: li.q_start, len: li.q_len, off: 0 }) == 1 then ast_is_str(value) else let_marks_textspan(LetIndexState { binds: rest, src: li.src, q_start: li.q_start, q_len: li.q_len, idx: 0 })
-      BNil => 0
-  proofs:
-    purity:
-      reads : [li.binds, li.src, li.q_start, li.q_len]
-      calls : [name_eq, ast_is_str, let_marks_textspan]
-    termination:
-      bound : 4000
-
-
 -- ============================================================================
 -- COLLECTIONS tier slice 6 — record-element collections (`collection(Concept)`).
 -- The five reduction loops (sum / count / fold / all / any) gain a CONCEPT
@@ -29499,9 +29524,9 @@ rule code_size_args
 
 -- LetGenState: drives the let-store prologue. `rem` is the suffix of bindings
 -- still to emit (walked structurally); `all_binds` is the proc's FULL binding list
--- (the unchanging name-resolution env — so a value referencing an EARLIER let
--- resolves correctly, and `let_index` against `all_binds` yields the right
--- absolute source-order slot). `off` is the absolute byte position where the next
+-- from which each RHS derives a view exposing only entries before `idx`.
+-- Masking preserves absolute frame slots and the nested temporary base. Each
+-- view is reclaimed after its one size/emission walk. `off` is where the next
 -- store sequence begins (threaded so a value's nested call lands its rel32). idx
 -- is the source-order index of `rem`'s head (its frame slot is [rbp - 8*(idx+1)]).
 concept LetGenState
@@ -29524,9 +29549,9 @@ concept LetGenState
 -- code_size_let_stores: the EXACT byte count the let-store prologue emits for a
 -- proc's binding list — for each `let NAME = e` it's code_size_node(e) (the value
 -- ops) + 1 (pop rax, 58) + 7 (mov [rbp-disp], rax — always-disp32 form 48 89 85
--- + le32). Each value is sized with the FULL binding env (lg.all_binds) so an
--- earlier-let reference resolves identically to the emit pass (a var load is 6 B
--- whether it resolves to a param or a let, so the size is slot-independent). BNil
+-- + le32). Each value is sized with the same preceding binding view as emission.
+-- A var load is 6 B whether it resolves to a param or a let; text/equality sizing
+-- also needs the binding's captured representation. BNil
 -- -> 0. Sizes ignore `off`, so 0 is threaded.
 rule code_size_let_stores
   @intention: "Exact byte count of the let-store prologue: per let, code_size_node(value) + 8"
@@ -29537,12 +29562,12 @@ rule code_size_let_stores
     out : number
   logic:
     out = match lg.rem:
-      BCons(name_start, name_len, value, rest) => code_size_node(ByteGenState { node: value, src: lg.src, off: 0, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns}) + 8 + code_size_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: 0, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns})
+      BCons(name_start, name_len, value, rest) => arena_scope(code_size_node(ByteGenState { node: value, src: lg.src, off: 0, params: lg.params, lets: earlier_bindings(BindingView { binds: lg.all_binds, visible: lg.idx }), prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns})) + 8 + code_size_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: 0, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns})
       BNil => 0
   proofs:
     purity:
       reads : [lg.rem, lg.all_binds, lg.src, lg.params, lg.idx, lg.prog, lg.concepts, lg.sizes, lg.ress, lg.conns]
-      calls : [code_size_node, code_size_let_stores]
+      calls : [code_size_let_stores, code_size_node, earlier_bindings]
     termination:
       bound : 8000
 
@@ -29550,7 +29575,7 @@ rule code_size_let_stores
 -- x86_let_stores: emit the let-store prologue. For each `let NAME = e` in source
 -- order: <x86_node(e)> (value pushed) ; pop rax (58) ; mov [rbp - 8*(idx+1)], rax
 -- (always-disp32: 48 89 85 + le32 of the NEGATIVE displacement). Each value is
--- lowered against the FULL binding env (lg.all_binds) so an earlier let resolves;
+-- lowered against the preceding view, before the new name becomes visible.
 -- `off` is threaded so a value's nested call computes its rel32 against the right
 -- site (off advances by code_size_node(value) + 8 per let). The mov's disp is
 -- 0 - 8*(idx+1) (a negative slot below rbp), emitted via le32 (two's complement).
@@ -29563,20 +29588,20 @@ rule x86_let_stores
     out : bytes
   logic:
     out = match lg.rem:
-      BCons(name_start, name_len, value, rest) => concat(x86_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns}), b"\x58\x48\x89\x85", le32(0 - 8 * (lg.idx + 1)), x86_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: lg.off + arena_scope(code_size_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns})) + 8, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns}))
+      BCons(name_start, name_len, value, rest) => concat(arena_scope(x86_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: earlier_bindings(BindingView { binds: lg.all_binds, visible: lg.idx }), prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns})), b"\x58\x48\x89\x85", le32(0 - 8 * (lg.idx + 1)), x86_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: lg.off + arena_scope(code_size_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: earlier_bindings(BindingView { binds: lg.all_binds, visible: lg.idx }), prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns})) + 8, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress , conns: lg.conns}))
       BNil => b""
   proofs:
     purity:
       reads : [lg.rem, lg.all_binds, lg.src, lg.off, lg.params, lg.idx, lg.prog, lg.concepts, lg.sizes, lg.ress, lg.conns]
-      calls : [x86_node, code_size_node, x86_let_stores]
+      calls : [code_size_node, earlier_bindings, x86_let_stores, x86_node]
     termination:
       bound : 8000
 
 
 -- proc_size: the exact byte length of one rule's emitted proc =
---   prologue 4 (55 48 89 e5) + body's result-expr code + epilogue 6
---   (58 48 89 ec 5d c3). The body's let-bindings are NOT lowered in this brick
--- (a let-bound name traps via the var path), so the body is the block result only.
+--   prologue 4 (55 48 89 e5) + optional frame reservation + eager let stores
+--   + body's result-expr code + epilogue 6 (58 48 89 ec 5d c3).
+-- Frame slots cover all source-order lets and nested binders.
 -- The `off` passed to code_size_node is irrelevant to a SIZE (sizes don't depend
 -- on absolute position), so 0 is used.
 rule proc_size
@@ -29777,7 +29802,7 @@ rule x86_node
       AstBin(op, lhs, rhs) => if op == 30 or op == 31 then concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0", (if op == 30 then b"\x0f\x84" else b"\x0f\x85"), le32(arena_scope(code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 13), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0\x0f\x95\xc0\x0f\xb6\xc0\x50", (if op == 30 then b"\xeb\x03\x31\xc0\x50" else b"\xeb\x02\x6a\x01")) else concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 16 then b"\x59\x58\x48\x99\x48\xf7\xf9\x50" else if op == 17 then b"\x59\x58\x48\x99\x48\xf7\xf9\x48\x89\xd0\x50" else if op == 30 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x20\xc8\x0f\xb6\xc0\x50" else if op == 31 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x08\xc8\x0f\xb6\xc0\x50" else if (op == 1 or op == 6) and bin_text_mode(bg) == 1 then concat(b"\x59\x58\x89\xc2\x89\xce\x48\x39\xf2\x75\x34\x48\xc1\xe8\x20\x48\xc1\xe9\x20\x48\xbf", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xf8\x48\x01\xf9\x48\x85\xd2\x74\x13\x40\x8a\x30\x40\x3a\x31\x75\x0f\x48\xff\xc0\x48\xff\xc1\x48\xff\xca\xeb\xe8", (if op == 1 then b"\x6a\x01\xeb\x02\x6a\x00" else b"\x6a\x00\xeb\x02\x6a\x01")) else if (op == 1 or op == 6) and bin_text_mode(bg) == 2 then b"\xcc" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
       AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\xf7\xd8\x50")
       AstNot(inner) => b"\xcc"
-      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(0 - 8 * (let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) + 1))) else b"\xcc")
+      AstVar(start, len) => if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) >= 0 then concat(b"\xff\xb5", le32(0 - 8 * (let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) + 1))) else if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))) else b"\xcc"
       -- records-arc slice 4: field access via the UNIFIED static resolver. The base
       -- can be a TYPED param (`rule f(s : Foo)` ... s.field — the record-input shape),
       -- a let-bound construction (slice 3's case, now the resolver's let branch), a
@@ -29937,7 +29962,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, bin_text_mode, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, x86_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load, span_is_fetch, connection_index_of, bytelit_decoded_len]
+      calls : [arg_first, arg_list_len, arm_list_len, ast_var_len, ast_var_start, bin_text_mode, blob_end_off, bytelit_decoded_len, callee_is_texty, cd_fields, cd_name_len, cd_name_start, code_size_args, code_size_arms, code_size_node, coll_elem_nfields, concept_at_index, connection_index_of, count_binds, field_index_of, let_index, lets_append_binders, lets_append_elem_binders, max_payload_fields, param_index, param_list_len, proc_offset, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_bitwise, span_is_byte_at, span_is_concat, span_is_fetch, span_is_length, span_is_max, span_is_min, span_is_read, span_is_substring, static_concept_of, variant_tag, vfield_len, x86_args, x86_arms, x86_binder_loads, x86_bitwise_call, x86_dispatch, x86_elem_load, x86_node, x86_vfields, x86_vpops]
     termination:
       bound : 8000
 
@@ -30045,7 +30070,7 @@ rule code_size_stream_node
       AstBin(op, lhs, rhs) => code_size_node(bg) + 6
       AstNeg(inner) => code_size_node(bg) + 6
       AstNot(inner) => 1
-      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 42 else code_size_node(bg) + 6) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if let_marks_textspan(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 1 then code_size_node(bg) + 36 else code_size_node(bg) + 6) else 1)
+      AstVar(start, len) => if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) >= 0 or param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then code_size_node(bg) + (if ast_span_text(bg) == 1 then 36 else 6) else 1
       AstField(base, fstart, flen) => if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then code_size_node(bg) + 36 else code_size_node(bg) + 6
       AstStr(start, len) => 33
       AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then 0 else 35 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)
@@ -30099,7 +30124,7 @@ rule code_size_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [code_size_node, code_size_stream_node, ast_field_is_text, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, let_marks_textspan, arm_list_len, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_list_len, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders, fold_stream_ok, ast_call_args, arg_rest, fold_size_cargs, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index, map_out_nf, code_size_map_record, code_size_filter_record, span_is_fetch, connection_index_of]
+      calls : [arg_first, arg_list_len, arg_rest, arm_list_len, ast_call_args, ast_field_is_text, ast_span_text, ast_var_len, ast_var_start, bytelit_decoded_len, callee_is_texty, cd_name_len, cd_name_start, code_size_args, code_size_filter_record, code_size_map_record, code_size_node, code_size_stream_node, coll_elem_nfields, concept_at_index, connection_index_of, fold_size_cargs, fold_stream_ok, let_index, lets_append_binders, lets_append_elem_binders, map_out_nf, param_index, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_byte_at, span_is_concat, span_is_fetch, span_is_le32, span_is_le64, span_is_length, span_is_read, span_is_substring, static_concept_of, stream_size_arms, stream_size_cargs]
     termination:
       bound : 8000
 
@@ -30554,7 +30579,7 @@ rule x86_stream_node
       AstBin(op, lhs, rhs) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
       AstNeg(inner) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
       AstNot(inner) => b"\xcc"
-      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if let_marks_textspan(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else b"\xcc")
+      AstVar(start, len) => if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) >= 0 or param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if ast_span_text(bg) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else b"\xcc"
       AstField(base, fstart, flen) => if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
       AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil }) + start + 1), b"\x48\xc7\xc2", le32(bytelit_decoded_len(DecodeState { src: bg.src, start: start + 1, len: (if len >= 2 then len - 2 else 0), i: 0 })), b"\x0f\x05")
       AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then b"" else concat(b"\xe9", le32(4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)), emit_bytes_data(BytesEmitState { src: bg.src, start: start, len: len, i: 0, dlen: bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) }), b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x35", le32(0 - (21 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4))), b"\x48\xc7\xc2", le32(bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 })), b"\x0f\x05")
@@ -30622,7 +30647,7 @@ rule x86_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, ast_field_is_text, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, let_marks_textspan, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds, fold_stream_ok, ast_call_args, arg_rest, x86_fold_cargs, fold_size_cargs, x86_elem_load, lets_append_elem_binders, static_concept_of, cd_fields, cd_name_start, cd_name_len, concept_at_index, map_out_nf, x86_map_record, x86_filter_record, span_is_fetch, connection_index_of]
+      calls : [arg_first, arg_list_len, arg_rest, arm_list_len, ast_call_args, ast_field_is_text, ast_span_text, ast_var_len, ast_var_start, blob_end_off, bytelit_decoded_len, callee_is_texty, cd_fields, cd_name_len, cd_name_start, code_size_args, code_size_node, code_size_stream_node, coll_elem_nfields, concept_at_index, connection_index_of, count_binds, emit_bytes_data, fold_size_cargs, fold_stream_ok, let_index, lets_append_binders, lets_append_elem_binders, map_out_nf, max_payload_fields, param_index, proc_offset, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_byte_at, span_is_concat, span_is_fetch, span_is_le32, span_is_le64, span_is_length, span_is_read, span_is_substring, static_concept_of, stream_size_arms, x86_args, x86_elem_load, x86_filter_record, x86_fold_cargs, x86_map_record, x86_node, x86_stream_arms, x86_stream_cargs, x86_stream_dispatch, x86_stream_node]
     termination:
       bound : 8000
 
@@ -31189,17 +31214,19 @@ rule ast_field_is_text
 -- ============ TEXT EQUALITY (2026-08-08) ============
 -- ast_span_text: 1 iff the node's VALUE is a resolvable packed text SPAN — the
 -- (start * 2^32 + len) Number every text value in gen0 carries, whose bytes live
--- at src_base + start. Four shapes qualify:
+-- at src_base + start. The supported shapes are:
 --   * AstStr           — a literal, spanning into the embedded source blob;
 --   * a text-typed AstField — argv / stdin bytes copied into the fixed region by
 --     x86_argv_marshal / x86_elem_field_loads, PRE-BIASED by (0x20000000 -
 --     src_base) so the one src_base dereferences both origins;
---   * a text-typed param (AstVar with declared ty 2);
+--   * AstVar — resolve the latest visible let's RHS in its preceding view,
+--     otherwise use the parameter's declared type (ty 2 means text);
 --   * read(<resource>) and substring(...) — both spans under the same base.
+-- The same classifier drives text equality, stream sizing and stream emission.
 -- Everything else is 0. In particular FRESH text (concat, a texty rule call) has
 -- NO span, which is exactly why bin_text_mode traps on it rather than guessing.
 rule ast_span_text
-  @intention: "1 if the node evaluates to a packed text span (literal / text field / text param / read / substring), 0 otherwise"
+  @intention: "1 if the node resolves to a packed text span, following aliases in their defining scope, 0 otherwise"
   @source: vexprparse.intent:70
   input:
     bg : ByteGenState
@@ -31211,7 +31238,7 @@ rule ast_span_text
       AstBin(op, lhs, rhs) => 0
       AstNeg(inner) => 0
       AstNot(inner) => 0
-      AstVar(start, len) => if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 1 else 0
+      AstVar(start, len) => if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) >= 0 then ast_span_text(ByteGenState { node: let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }), src: bg.src, off: bg.off, params: bg.params, lets: earlier_bindings(BindingView { binds: bg.lets, visible: let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) else (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 1 else 0)
       AstField(base, fstart, flen) => ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts })
       AstCall(callee_start, callee_len, args) => if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len })
       AstStr(start, len) => 1
@@ -31235,10 +31262,10 @@ rule ast_span_text
       AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
-      reads : [bg.node, bg.src, bg.params, bg.lets, bg.concepts]
-      calls : [param_ty, ast_field_is_text, span_is_read, span_is_substring]
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
+      calls : [ast_field_is_text, ast_span_text, earlier_bindings, let_index, let_rhs, param_ty, span_is_read, span_is_substring]
     termination:
-      bound : 32
+      bound : 4000
 
 
 -- bin_text_mode: the ONE rule that decides how an AstBin `==` / `!=` lowers.

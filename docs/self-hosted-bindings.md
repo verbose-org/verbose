@@ -1,6 +1,6 @@
 # Self-hosted lexical binding resolution
 
-Design fixed before implementation, 2026-09-26.
+Design fixed before implementation, 2026-09-26. Implemented on the same date.
 
 ## Contract
 
@@ -11,11 +11,25 @@ Nested match/reduction binders shadow outer lets and parameters only within thei
 body. Forward references and references to an otherwise unbound self remain
 verification errors before an ELF artifact is emitted.
 
-The evaluator's front-consed environments already implement this order. Native
-self-hosted emission instead searches the full source-order list for its first
-match, prefers parameters over lets, and recognizes only literal text RHSes when
-printing a binding. This can read the wrong frame slot or print a packed text
+The evaluator's front-consed environments already implement this order. Before
+this correction, native self-hosted emission searched the full source-order list
+for its first match, preferred parameters over lets, and recognized only literal
+text RHSes when
+printing a binding. This could read the wrong frame slot or print a packed text
 descriptor as a number. Both sizing and emission must use the same resolution.
+
+For example, this rule body prints `oldnew`:
+
+```verbose
+let text = "old"
+let first = text
+let text = "new"
+out = concat(first, text)
+```
+
+`first` keeps the earlier value; the final `text` uses the later definition.
+In `let text = length(text)`, the RHS similarly reads the preceding text value,
+then introduces a numeric binding. Earlier aliases retain their text representation.
 
 ## Representation and lowering
 
@@ -58,3 +72,38 @@ checking acceptance, diagnostics, deterministic bytes and explaining any changed
 emission. Run the serialized normal Rust suite, Python/CIDX checks and the full
 two-generation bootstrap with the new probes included after self-compilation.
 No performance benchmark is part of this slice.
+
+## Validation boundaries
+
+The dedicated matrix has 17 semantic programs, an additional 1,800-let capacity
+probe, four refusal cases and one eager failure case. It compares exact values, stdout, stderr, status and ELF size;
+the bootstrap runs the same emission matrix with gen1. Original-AST Rust
+interpretation supplies the semantic reference for the 17 positive cases.
+The self-hosted evaluator additionally checks supported input-free scalar
+observations; its text equality is independently incorrect and excluded as an
+oracle. Rust native is compared where supported, with exact existing refusal
+messages pinned for unsupported combinations. Its dynamic text-to-number
+rebinding defect is documented separately, not adopted as an expected result.
+
+Parameter probes shadow an unused input. Reading a parameter before a same-name
+let also meets a pre-existing purity limitation: the dependency walk treats the
+name as local throughout the block. This slice does not change that verifier;
+it tests own-RHS reads against earlier lets and keeps purity declarations honest.
+
+## Reclaiming compiler-side views
+
+The unchanged crypto corpus exposed a necessary lifetime correction: retaining
+all masked views through a large rule exhausts the compiler's fixed arena.
+Each RHS now creates its view inside an existing `arena_scope` around the size
+or streaming walk. Only the numeric size or already-written bytes leave that
+scope; the original AST and frame layout predate it and remain live.
+
+The Rust native scalar `arena_scope` path previously acted as identity because
+its original callers only allocated stack-passed records. Binding views allocate
+real `concept_group` nodes, so that shortcut no longer suffices. Scalar lowering
+now saves/restores the arena mark when an arena exists, preserving the numeric
+result; scratch accounting includes the saved word. Streaming reclaim already
+works. A small fixed-arena regression checks exhaustion without scopes, success
+with ordinary/nested scopes, and preservation of an earlier live value. This
+restores the existing scoped-reclamation contract; it adds no allocator, larger
+arena or garbage collector.

@@ -1772,3 +1772,8 @@ tokens and downstream structural counts describe a damaged stream. NATIVE-ONLY
 for newline-bearing sources, same as count_rules.
 Refuse top-level execution contracts in diagnostics and raw/ELF output until source phase composition is implemented.
 Decode the closed text escape set in shared literal values and output, preserve source offsets and emitted storage size, and refuse malformed text before emission.
+
+Self-hosted lexical binding resolution (2026-09-26): each let RHS sees only
+earlier definitions, aliases retain their captured representation, and the
+latest visible let or nested binder takes precedence over a parameter. Preserve
+source-order frame slots while sharing resolution between sizing and emission.

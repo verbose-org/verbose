@@ -15538,7 +15538,9 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Length(inner) => max_stack_depth(inner),
         // `abs(<number_expr>)` — 5-byte inline (cqo; xor rax, rdx; sub rax, rdx),
         // no eval-stack push, the inner's depth dominates.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => max_stack_depth(inner),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::AbortIf(inner) => max_stack_depth(inner),
+        // The scalar arena mark stays on the stack throughout inner evaluation.
+        Expr::ArenaScope(inner) => 1 + max_stack_depth(inner),
         // `min(a, b)` / `max(a, b)` — branch-free cmp + cmov; left is
         // evaluated and pushed, right is evaluated, so same shape as Binary.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -16119,25 +16121,22 @@ fn emit_eval_expr(
             })
         }
         Expr::ArenaScope(inner) => {
-            // Scalar-result arena_scope: `arena_scope(<number-expr>)` returns
-            // the inner NUMBER unchanged; its only effect is to reclaim the
-            // arena nodes the inner walk allocated. In gen0 (this Rust runner)
-            // plain-concept records are STACK-passed (slice-5.3 ABI), so the
-            // inner allocates ZERO concept_group arena nodes and there is
-            // nothing to reclaim — the reset is a genuine no-op here. So we
-            // simply evaluate the inner to rax and leave it there, PRESERVING
-            // rax. We must NOT reuse the streaming reset (emit_streaming_bytes_body's
-            // ArenaScope arm), which clobbers rax via `pop rax`. gen0's bytes are
-            // never byte-compared to gen1/gen2 (only gen1==gen2 is pinned), so
-            // this needs functional correctness (the returned number == the
-            // inner's value), not byte-identity with the self-hosted arm. The
-            // r14-reset reclaim that actually saves RSS lives in the self-hosted
-            // x86_node arm (examples/vexprparse.verbose). See
-            // docs/self-hosting-scalar-arena-scope-design.md.
+            // Preserve the numeric result while reclaiming the inner walk's
+            // nodes. Plain records are stack-passed here, but the walk can also
+            // allocate concept_group values (e.g. self-hosted binding views).
+            // Streaming reset pops into rax; scalar reset must use scratch rcx.
+            if let Some(ac) = arena_ctx {
+                code.extend_from_slice(&[0x41, 0xFF, 0xB3]); // push [r11 + size]
+                code.extend_from_slice(&((ac.max_nodes as i32) * ac.entry_size).to_le_bytes());
+            }
             emit_eval_expr(
                 code, inner, input_name, offsets, all_rules,
                 field_ranges, text_bindings, self_call, arena_ctx,
             )?;
+            if let Some(ac) = arena_ctx {
+                code.extend_from_slice(&[0x59, 0x49, 0x89, 0x8B]); // pop rcx; mov [r11 + size], rcx
+                code.extend_from_slice(&((ac.max_nodes as i32) * ac.entry_size).to_le_bytes());
+            }
             Ok(())
         }
         Expr::AbortIf(_) => {
@@ -54235,7 +54234,7 @@ rule two
             &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
         );
         let li = format!(
-            "rule main\n  logic:\n    let binds = Binding::BCons {{ name_start: 0, name_len: 2, value: Ast::AstNum {{ value: 1 }}, rest: Binding::BCons {{ name_start: 3, name_len: 2, value: Ast::AstNum {{ value: 2 }}, rest: Binding::BNil }} }}\n    out = let_index(LetIndexState {{ binds: binds, src: \"ab cd\", q_start: 3, q_len: 2, idx: 0 }})\n  proofs:\n    purity:\n      reads : []\n      calls : [let_index]\n    termination:\n      bound : 8\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+            "rule main\n  logic:\n    let binds = Binding::BCons {{ name_start: 0, name_len: 2, value: Ast::AstNum {{ value: 1 }}, rest: Binding::BCons {{ name_start: 3, name_len: 2, value: Ast::AstNum {{ value: 2 }}, rest: Binding::BNil }} }}\n    out = let_index(LetIndexState {{ binds: binds, src: \"ab cd\", q_start: 3, q_len: 2, idx: 0, found: 0 - 1 }})\n  proofs:\n    purity:\n      reads : []\n      calls : [let_index]\n    termination:\n      bound : 8\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
             group, name_eq_concept, name_eq_rule, li_concept, li_rule);
         assert_eq!(run(&em, &li), 1, "verbatim let_index+name_eq: second binding matches (eval)");
         assert_eq!(run_compiled(&li, "let_index"), 1,
@@ -56495,6 +56494,7 @@ rule pick
             let base = std::env::temp_dir().join(format!("verbose-text-escapes-gen1-{}", std::process::id()));
             fs::create_dir_all(&base).unwrap();
             crate::source_text_tests::assert_selfhost_text_escapes(&gen1, &base);
+            crate::selfhost_binding_tests::assert_selfhost_bindings(&gen1, &base, None);
             fs::remove_dir_all(base).unwrap();
         }
 

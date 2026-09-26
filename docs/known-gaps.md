@@ -47,38 +47,42 @@ the Rust UTF-8 lexer defect: ASCII escapes had the same discrepancy.
 
 ## Text alias output, shadowing and streamed substrings
 
-The escape differential exposed three older limitations. They reproduce with
-plain ASCII on the pre-correction reference (`edd46ca`). The subsequent shared
-optimizer correction below addresses the Rust text-literal substitution defect;
-the self-hosted lookup/classification/emission limitations remain.
+The escape differential exposed three older limitations, reproduced with plain
+ASCII on reference `edd46ca`. The first two now have scoped corrections:
 
-- **Self-hosted alias output:** `let text = "old"; let first = text;
-  out = concat(first)` prints a decimal packed source-span descriptor rather
-  than `old`. These statements are separate source lines. `let_marks_textspan`
-  recognizes only an `AstStr` RHS, so an `AstVar` alias selects the number printer.
-  Numeric consumers such as `byte_at(first, 0)` use the packed value correctly.
-  A repair needs type classification through the visible binding environment,
-  shared by the size and emission walks.
-- **Repeated let names:** `let text = "old"; let first = text; let text = "new";
-  out = concat(first, text)` should print `oldnew`. The Rust CLI used to print `oldold`,
-  and the self-hosted binary prints a descriptor followed by `old` (combining this
-  defect with the previous one). Self-hosted `let_index` and `let_rhs` take the
-  first matching name; simply taking the last would expose later bindings while
-  compiling earlier RHS expressions. A repair needs source-position-aware
-  lexical environments. The [Rust correction](text-let-shadowing.md) now replaces
-  an obsolete literal substitution after rewriting the new RHS, including when
-  rebinding to a nonliteral or a number. Its verifier also checks RHS types in
-  source order. Original/optimized interpretation, native and supported WASM
-  probes agree; this does not repair self-hosted lookup or establish general
-  shadowing support in every legacy backend form.
-- **General streamed substring:** `out = concat(substring("abc", 1, 2))`
-  emits a self-hosted binary that traps. The `span_is_substring` arm in
-  `x86_stream_node` explicitly emits `0xCC`; the matching size walk counts one
-  byte. Scalar consumers of substring work, but this stream position needs a
-  real text-write path or an explicit refusal before emission.
+- **Self-hosted alias output — fixed (2026-09-26):** `let text = "old";
+  let first = text; out = concat(first)` used to print a packed span as a number.
+  The [lexical binding correction](self-hosted-bindings.md) follows aliases in
+  their defining scope and shares span classification across sizing, output and
+  equality. Literal, field and other existing packed-span values are covered;
+  fresh concat/call text still has no storable one-word representation.
+- **Repeated let names — fixed in the scoped paths:** `let text = "old";
+  let first = text; let text = "new"; out = concat(first, text)` now prints
+  `oldnew`. The [Rust optimizer correction](text-let-shadowing.md) preserves
+  captured literal substitutions. Self-hosted resolution now selects the latest
+  visible binding, while each RHS sees only previous definitions. Masked future
+  entries preserve frame indices and nested temporary positions. This includes
+  numeric/text local changes, record aliases and nested match/reduction binders;
+  it is not general shadowing support in every legacy backend.
+- **General streamed substring — still open:**
+  `out = concat(substring("abc", 1, 2))` emits a self-hosted binary that traps.
+  The `span_is_substring` arm in `x86_stream_node` explicitly emits `0xCC`; the
+  matching size walk counts one byte. Scalar consumers and let-held packed
+  spans are separate paths. This direct stream position needs a real text-write
+  path or an explicit refusal before emission.
 
-These are accepted-but-wrong programs, not supported forms to rely on. Agreement
-over the existing example corpus alone does not close these gaps.
+These examples are separate source statements. Agreement over the existing
+example corpus alone does not close accepted-but-wrong cases; dedicated
+observable-output regressions cover the corrected paths in gen0 and gen1.
+
+## Self-hosted evaluator text equality
+
+`eval_main`'s legacy binary evaluation converts `VText` operands through
+`vnum_of`, which yields zero. Different texts can therefore compare equal.
+The lexical-binding probes use original-AST Rust interpretation and explicit
+expected bytes for text equality, not this evaluator as an oracle. The native
+self-hosted byte-comparison path is independent. Fixing the evaluator's value
+comparison is separate from binding resolution.
 
 ## WASM text-valued conditionals
 
@@ -91,6 +95,22 @@ optimizer correction leaves this defect unchanged; it needs a text multi-value
 block signature or an explicit refusal. The cross-backend let-scope branch probe
 therefore uses numeric arm results. Successful module emission alone is not
 evidence that a WASM program can run.
+
+## Legacy Rust native dynamic text rebinding
+
+The self-hosted binding probes expose a separate parent Rust-native defect
+(`d1fd6ff`): `let x = i.s; let a = x; let x = i.n; out = concat(a, x)` prints
+the text twice instead of the captured text followed by the number. The shared
+optimizer only substitutes literal text; the legacy native binding lookup keeps
+the earlier `BoundText` classification for this dynamic rebinding. The original
+interpreter is correct. The self-hosted binding regression therefore uses that
+interpreter and explicit expected bytes for this form, not the Rust-native
+output as an oracle. This is outside the self-hosted emitter correction.
+
+Two nearby legacy Rust-native shapes explicitly refuse instead: rebinding a
+literal text to a numeric let, or capturing a numeric alias before a text let,
+then using both as direct `concat` arguments. Their diagnostic remains pinned
+in the cross-backend probes; the self-hosted emitter is checked independently.
 
 ## Three tiers of native output (important clarification)
 
