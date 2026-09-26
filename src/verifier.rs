@@ -3133,51 +3133,23 @@ fn check_rule_types(
     state_concept: Option<&Concept>,
     errors: &mut Vec<VerifyError>,
 ) {
-    let bindings = collect_binding_concepts(rule, all_rules, input_concept, concepts, state_concept);
-
-    // The binding map the TYPE CHECK gets, with every name that is also a
-    // lambda / `match` arm binder somewhere in the logic removed.
-    //
-    // `infer_expr_type` resolves a bare `Ident` through this map (that is what
-    // catches `let p = mk(i)` then `out = p * 1000`), and the arm bodies of
-    // `match_result` / `match` ARE visited by the type check while their
-    // binders' scope is not tracked. Without this filter a binder shadowing a
-    // record-typed `let` would be read as that let and could produce an error
-    // about a name that, inside that arm, means something else. Filtering only
-    // ever REMOVES inference, so it cannot invent a diagnostic.
-    //
-    // The field-existence loop above keeps the unfiltered map on purpose: it
-    // is driven by `facts.local_reads`, from which `collect_expr_facts` has
-    // already dropped every binder-rooted path.
+    // The legacy checker does not track nested binder types. Keep its
+    // conservative filter, but apply it to the environment visible at each
+    // source position, never to a final map used retroactively for every RHS.
     let mut shadowed = collect_lambda_bound_names(&rule.logic.value);
     for (_, rhs) in &rule.logic.bindings {
         shadowed.extend(collect_lambda_bound_names(rhs));
     }
-    let bindings = Bindings {
-        records: bindings
-            .records
-            .iter()
-            .filter(|(name, _)| !shadowed.contains(name.as_str()))
-            .map(|(name, c)| (name.clone(), *c))
-            .collect(),
-        scalars: bindings
-            .scalars
-            .iter()
-            .filter(|(name, _)| !shadowed.contains(name.as_str()))
-            .map(|(name, t)| (name.clone(), t.clone()))
-            .collect(),
-    };
-
-    // Keep the call check's top-level environment in source order. The
-    // existing result-type pass below uses the final, filtered environment.
-    let mut call_bindings = bindings.clone();
-    for (name, _) in &rule.logic.bindings {
-        call_bindings.records.remove(name);
-        call_bindings.scalars.remove(name);
-    }
+    let mut call_bindings = initial_binding_concepts(rule, concepts, state_concept);
     let mut call_shadowed = Vec::new();
     for (name, rhs) in &rule.logic.bindings {
         check_call_argument_types(rhs, rule, all_rules, input_concept, concepts, &call_bindings, &call_shadowed, errors);
+        // A let has no declared type. Its inferred type lets the checker
+        // recurse into operands, using only bindings visible BEFORE this RHS.
+        let bindings = call_bindings.without_names(&shadowed);
+        if let Some(t) = infer_expr_type(rhs, rule, all_rules, input_concept, &bindings) {
+            check_expr_against(rhs, &t, rule, all_rules, input_concept, concepts, &bindings, errors);
+        }
         let ty = if expr_mentions_names(rhs, &call_shadowed) { None } else {
             infer_expr_type(rhs, rule, all_rules, input_concept, &call_bindings)
         };
@@ -3195,36 +3167,7 @@ fn check_rule_types(
     }
     check_call_argument_types(&rule.logic.value, rule, all_rules, input_concept, concepts, &call_bindings, &call_shadowed, errors);
 
-    // Every `let` RHS, checked against ITS OWN inferred type.
-    //
-    // Until this landed, `check_expr_against` ran on `rule.logic.value` and
-    // nothing else, so a `let` RHS was never type-checked at all — and that
-    // makes every operand check in this pass one `let` away from being
-    // bypassed. Measured: `let z = t.s * 2` then `out = z` on a text field
-    // verified clean and its native binary printed a randomized stack
-    // address, exactly as the direct `out = t.s * 2` form did, because
-    // `infer_expr_type(Ident("z"))` is None so the body check stays silent.
-    //
-    // A `let` has no DECLARED type to check against, so the expected type is
-    // the RHS's own inferred type: the outer comparison is then true by
-    // construction and can never fire, and the whole effect of the call is to
-    // RECURSE into the sub-expressions. Un-inferable RHSes (`map`/`fold`/
-    // `Ok(..)`/a lambda-bound var) yield None and are skipped, which is the
-    // same conservative posture the body check already takes.
-    for (_, rhs) in &rule.logic.bindings {
-        if let Some(t) = infer_expr_type(rhs, rule, all_rules, input_concept, &bindings) {
-            check_expr_against(
-                rhs,
-                &t,
-                rule,
-                all_rules,
-                input_concept,
-                concepts,
-                &bindings,
-                errors,
-            );
-        }
-    }
+    let bindings = call_bindings.without_names(&shadowed);
 
     // Type-shape check: the logic expression must be compatible with the
     // declared output_ty. We do bidirectional checking from the top down —
@@ -5597,13 +5540,22 @@ fn concept_field_error(c: &Concept, field_name: &str, path: &[String]) -> Option
 /// input-field twin `let p = req.path` then `p * 2` — verified clean: the
 /// operand check (PR #182) looked at `p`, found nothing, and stayed silent.
 ///
-/// Both maps are built by `collect_binding_concepts` in source order, then
-/// filtered by `check_rule_types` against every lambda / `match` binder in
-/// the logic, so a binder shadowing a `let` is never misread as that `let`.
+/// Both maps are filled in source order. The legacy type check filters each
+/// visible environment against every lambda / `match` binder in the logic,
+/// so a binder shadowing a `let` is never misread as that `let`.
 #[derive(Default, Clone)]
 struct Bindings<'a> {
     records: HashMap<String, &'a Concept>,
     scalars: HashMap<String, Type>,
+}
+
+impl<'a> Bindings<'a> {
+    fn without_names(&self, names: &HashSet<String>) -> Self {
+        let mut filtered = self.clone();
+        filtered.records.retain(|name, _| !names.contains(name));
+        filtered.scalars.retain(|name, _| !names.contains(name));
+        filtered
+    }
 }
 
 fn record_concept_of<'a>(
@@ -5617,6 +5569,31 @@ fn record_concept_of<'a>(
             .filter(|c| c.variants.is_empty()),
         _ => None,
     }
+}
+
+/// Bindings visible before the first let, including service state and context.
+fn initial_binding_concepts<'a>(
+    rule: &Rule,
+    all_concepts: &HashMap<String, &'a Concept>,
+    state_concept: Option<&'a Concept>,
+) -> Bindings<'a> {
+    let mut env: Bindings<'a> = Bindings::default();
+
+    // Slice `state-read-typing`: a service handler sees `state` as the
+    // service's synthetic state concept (`service_state_concept`). Seeded
+    // FIRST so a later `let` can be typed through it, and so a `let` named
+    // `state` shadows it exactly as it would shadow any other binding.
+    if let Some(c) = state_concept {
+        env.records.insert("state".to_string(), c);
+    }
+
+    if let (Some(cn), Some(cty)) = (&rule.context_name, &rule.context_ty) {
+        if let Some(c) = record_concept_of(cty, all_concepts) {
+            env.records.insert(cn.clone(), c);
+        }
+    }
+
+    env
 }
 
 /// Every binding in a rule's scope this pass can type: the `context:`
@@ -5646,21 +5623,7 @@ fn collect_binding_concepts<'a>(
     all_concepts: &HashMap<String, &'a Concept>,
     state_concept: Option<&'a Concept>,
 ) -> Bindings<'a> {
-    let mut env: Bindings<'a> = Bindings::default();
-
-    // Slice `state-read-typing`: a service handler sees `state` as the
-    // service's synthetic state concept (`service_state_concept`). Seeded
-    // FIRST so a later `let` can be typed through it, and so a `let` named
-    // `state` shadows it exactly as it would shadow any other binding.
-    if let Some(c) = state_concept {
-        env.records.insert("state".to_string(), c);
-    }
-
-    if let (Some(cn), Some(cty)) = (&rule.context_name, &rule.context_ty) {
-        if let Some(c) = record_concept_of(cty, all_concepts) {
-            env.records.insert(cn.clone(), c);
-        }
-    }
+    let mut env = initial_binding_concepts(rule, all_concepts, state_concept);
 
     // Source order, so a later binding can see an earlier one.
     for (name, rhs) in &rule.logic.bindings {
@@ -5698,9 +5661,10 @@ fn collect_binding_concepts<'a>(
         // scrutinee inference is a separate slice); everything else scalar
         // goes to `scalars`; an un-inferable RHS leaves the name untyped,
         // which is the conservative silence this pass always kept.
+        let ty = infer_expr_type(rhs, rule, all_rules, input_concept, &env);
         env.records.remove(name.as_str());
         env.scalars.remove(name.as_str());
-        match infer_expr_type(rhs, rule, all_rules, input_concept, &env) {
+        match ty {
             Some(Type::Named(n)) => {
                 if let Some(c) = record_concept_of(&Type::Named(n), all_concepts) {
                     env.records.insert(name.clone(), c);

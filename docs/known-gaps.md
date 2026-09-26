@@ -48,8 +48,9 @@ the Rust UTF-8 lexer defect: ASCII escapes had the same discrepancy.
 ## Text alias output, shadowing and streamed substrings
 
 The escape differential exposed three older limitations. They reproduce with
-plain ASCII on the pre-correction reference (`edd46ca`); this correction does not
-change the affected lookup/classification/emission rules.
+plain ASCII on the pre-correction reference (`edd46ca`). The subsequent shared
+optimizer correction below addresses the Rust text-literal substitution defect;
+the self-hosted lookup/classification/emission limitations remain.
 
 - **Self-hosted alias output:** `let text = "old"; let first = text;
   out = concat(first)` prints a decimal packed source-span descriptor rather
@@ -59,12 +60,17 @@ change the affected lookup/classification/emission rules.
   A repair needs type classification through the visible binding environment,
   shared by the size and emission walks.
 - **Repeated let names:** `let text = "old"; let first = text; let text = "new";
-  out = concat(first, text)` should print `oldnew`. The Rust CLI prints `oldold`,
+  out = concat(first, text)` should print `oldnew`. The Rust CLI used to print `oldold`,
   and the self-hosted binary prints a descriptor followed by `old` (combining this
   defect with the previous one). Self-hosted `let_index` and `let_rhs` take the
   first matching name; simply taking the last would expose later bindings while
   compiling earlier RHS expressions. A repair needs source-position-aware
-  lexical environments; Rust's optimized/native path also needs investigation.
+  lexical environments. The [Rust correction](text-let-shadowing.md) now replaces
+  an obsolete literal substitution after rewriting the new RHS, including when
+  rebinding to a nonliteral or a number. Its verifier also checks RHS types in
+  source order. Original/optimized interpretation, native and supported WASM
+  probes agree; this does not repair self-hosted lookup or establish general
+  shadowing support in every legacy backend form.
 - **General streamed substring:** `out = concat(substring("abc", 1, 2))`
   emits a self-hosted binary that traps. The `span_is_substring` arm in
   `x86_stream_node` explicitly emits `0xCC`; the matching size walk counts one
@@ -73,6 +79,18 @@ change the affected lookup/classification/emission rules.
 
 These are accepted-but-wrong programs, not supported forms to rely on. Agreement
 over the existing example corpus alone does not close these gaps.
+
+## WASM text-valued conditionals
+
+The let-scope differential also exposed a separate older WASM defect. On the
+parent Rust compiler (`d9b2e08`), the simple text output
+`out = if i.n > 0 then "old" else "new"` compiles successfully but Node rejects
+the module during validation. The general `Expr::If` emitter declares a scalar
+block result, while text arms leave two values (pointer and length). The shared
+optimizer correction leaves this defect unchanged; it needs a text multi-value
+block signature or an explicit refusal. The cross-backend let-scope branch probe
+therefore uses numeric arm results. Successful module emission alone is not
+evidence that a WASM program can run.
 
 ## Three tiers of native output (important clarification)
 
