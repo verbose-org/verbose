@@ -12,7 +12,7 @@ use std::{
     fs,
     io::Write,
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -273,7 +273,7 @@ fn selfhost_evaluator_compares_decoded_text_values() {
 
 /// The bootstrap calls this for gen0 and gen1, exercising the evaluator itself
 /// after self-hosted emission, rather than just target text-comparison code.
-pub(crate) fn assert_emitted_evaluator(compiler: &Path, base: &Path) {
+pub(crate) fn assert_emitted_evaluator(compiler: &Path, base: &Path) -> PathBuf {
     let src = fs::read_to_string("examples/vexprparse.verbose").unwrap();
     let index = src
         .lines()
@@ -307,4 +307,5 @@ pub(crate) fn assert_emitted_evaluator(compiler: &Path, base: &Path) {
     fs::write(&evaluator, r.stdout).unwrap();
     fs::set_permissions(&evaluator, fs::Permissions::from_mode(0o755)).unwrap();
     assert_equality(&evaluator);
+    evaluator
 }

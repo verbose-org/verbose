@@ -1781,3 +1781,8 @@ source-order frame slots while sharing resolution between sizing and emission.
 Self-hosted evaluator equality (2026-09-26): compare decoded text values by
 contents, preserve numeric equality, and never coerce text operands to zero.
 Read existing spans and concat trees without materializing comparison buffers.
+
+Self-hosted named constructors (2026-09-27): evaluate each initializer once in
+written order, then place its value in the declared field slot. Reject missing,
+unknown or duplicate fields before emission. Preserve target storage and the
+existing eight-byte pop/store sequence; support both records and variants.

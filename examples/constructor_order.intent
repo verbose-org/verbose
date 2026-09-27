@@ -1,0 +1,3 @@
+Read a numeric input for a named-field construction.
+Declare first and second as the two positions of a pair.
+Evaluate the second initializer first, but retain the declared field identities.

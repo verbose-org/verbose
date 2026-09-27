@@ -56496,7 +56496,9 @@ rule pick
             crate::source_text_tests::assert_selfhost_text_escapes(&gen1, &base);
             crate::selfhost_binding_tests::assert_selfhost_bindings(&gen1, &base, None);
             for compiler in [&gen0, &gen1] {
-                crate::selfhost_equality_tests::assert_emitted_evaluator(compiler, &base);
+                let evaluator = crate::selfhost_equality_tests::assert_emitted_evaluator(compiler, &base);
+                crate::selfhost_constructor_tests::assert_constructors(compiler, &evaluator, &base);
+                crate::selfhost_constructor_tests::assert_emitted_drivers(compiler, &base);
             }
             fs::remove_dir_all(base).unwrap();
         }
@@ -57005,7 +57007,7 @@ rule pick
         // stays 97; no gaps-table row moves (the record-let row's declared-
         // entry half is unreachable here because the handler gate fires
         // first).
-        const EXPECTED_ACCEPTED: usize = 93;
+        const EXPECTED_ACCEPTED: usize = 94;
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.
@@ -57032,10 +57034,13 @@ rule pick
         // workload_profile adds predicted cases to that same refused scope.
         // pipeline_stack adds per-record transfer, refused by the execution gate.
         // pipeline_totals keeps that refusal for computed numeric record fields.
-        // gen0 returns 1 with zero output; EXPECTED_ACCEPTED stays 93.
+        // gen0 returns 1 with zero output for these contract examples.
         // http_stack adds a service-scoped native stack ceiling, also refused.
         // http_log_stack retains the bounded-text/service-ceiling refusal.
-        const EXPECTED_TOTAL: usize = 192;
+        // constructor_order adds one accepted example at its subject rule #0.
+        // Its reversed named fields now produce the interpreted value, pinned
+        // separately by the constructor matrix and both bootstrap generations.
+        const EXPECTED_TOTAL: usize = 193;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

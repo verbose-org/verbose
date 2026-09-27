@@ -1,0 +1,31 @@
+@verbose 0.1.0
+
+concept Input
+  @intention: "Numeric input for the constructor-order example"
+  @source: constructor_order.intent:1
+  fields:
+    n : number
+
+concept Pair
+  @intention: "Two named numeric fields in declaration order"
+  @source: constructor_order.intent:2
+  fields:
+    first : number
+    second : number
+
+rule field_order
+  @intention: "Write initializers in reverse order and read their named values"
+  @source: constructor_order.intent:3
+  input:
+    i : Input
+  output:
+    out : number
+  logic:
+    let p = Pair { second: i.n + 1, first: i.n }
+    out = p.first * 100 + p.second
+  proofs:
+    purity:
+      reads: [i.n]
+      calls: []
+    termination:
+      bound: 16
