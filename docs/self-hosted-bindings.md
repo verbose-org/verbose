@@ -80,8 +80,9 @@ probe, four refusal cases and one eager failure case. It compares exact values, 
 the bootstrap runs the same emission matrix with gen1. Original-AST Rust
 interpretation supplies the semantic reference for the 17 positive cases.
 The self-hosted evaluator additionally checks supported input-free scalar
-observations; its text equality is independently incorrect and excluded as an
-oracle. Rust native is compared where supported, with exact existing refusal
+observations, including text equality after its separate
+[value-comparison correction](self-hosted-evaluator-equality.md).
+Rust native is compared where supported, with exact existing refusal
 messages pinned for unsupported combinations. Its dynamic text-to-number
 rebinding defect is documented separately, not adopted as an expected result.
 

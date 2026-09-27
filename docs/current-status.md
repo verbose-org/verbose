@@ -30,8 +30,10 @@ WASM forms. The [self-hosted binding correction](self-hosted-bindings.md) now
 resolves the latest visible definition, preserves captured text/record aliases,
 and gives nested binders precedence over outer names. Compiler-only binding
 views preserve frame positions; emitted programs gain no allocator or GC.
-Legacy Rust-native dynamic text rebinding and the self-hosted evaluator's text
-equality remain separate documented gaps.
+The [self-hosted evaluator](self-hosted-evaluator-equality.md) also compares
+decoded text contents across spans, aliases, slices and concat trees; numeric
+values retain numeric equality. Comparison creates no copied text. Legacy
+Rust-native dynamic text rebinding remains a separate documented gap.
 
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable

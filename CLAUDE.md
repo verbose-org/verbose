@@ -261,8 +261,19 @@ target value widths and frame slots. Compiler-side views are reclaimed through
 existing arena scopes; the Rust scalar path now restores the mark for real
 concept-group allocations, with the saved word included in scratch accounting.
 Gen0/gen1 differential probes use the original-AST interpreter and explicit
-outcomes; legacy Rust-native dynamic text rebinding and self-hosted evaluator
-text equality are independent gaps. See [lexical bindings](docs/self-hosted-bindings.md).
+outcomes; legacy Rust-native dynamic text rebinding is a separate gap.
+See [lexical bindings](docs/self-hosted-bindings.md).
+
+Self-hosted evaluator equality (2026-09-26): `==` / `!=` now dispatch on evaluated
+value kinds, comparing decoded spans or concat contents instead of coercing text
+to zero. Span cursors advance directly; concat comparisons reuse the existing
+length/byte readers without materializing text. A scalar arena scope reclaims
+temporary operands and cursor records before constructing the boolean Value.
+Their i64::MIN decimal case uses its fixed representation. The regression matrix
+also runs on evaluators emitted by gen0 and gen1. Native target comparison code
+is unchanged; the interpreter's
+defensive invalid-program behavior is not a new type or error contract.
+See [evaluator equality](docs/self-hosted-evaluator-equality.md).
 
 ## Dev workflow (cidx + branch-protected main)
 

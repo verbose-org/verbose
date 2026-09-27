@@ -1777,3 +1777,7 @@ Self-hosted lexical binding resolution (2026-09-26): each let RHS sees only
 earlier definitions, aliases retain their captured representation, and the
 latest visible let or nested binder takes precedence over a parameter. Preserve
 source-order frame slots while sharing resolution between sizing and emission.
+
+Self-hosted evaluator equality (2026-09-26): compare decoded text values by
+contents, preserve numeric equality, and never coerce text operands to zero.
+Read existing spans and concat trees without materializing comparison buffers.

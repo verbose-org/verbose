@@ -56495,6 +56495,9 @@ rule pick
             fs::create_dir_all(&base).unwrap();
             crate::source_text_tests::assert_selfhost_text_escapes(&gen1, &base);
             crate::selfhost_binding_tests::assert_selfhost_bindings(&gen1, &base, None);
+            for compiler in [&gen0, &gen1] {
+                crate::selfhost_equality_tests::assert_emitted_evaluator(compiler, &base);
+            }
             fs::remove_dir_all(base).unwrap();
         }
 

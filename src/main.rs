@@ -18,6 +18,8 @@ mod lexer;
 mod source_text_tests;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod selfhost_binding_tests;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod selfhost_equality_tests;
 mod native;
 mod optimizer;
 #[cfg(test)]
