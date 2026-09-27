@@ -77,12 +77,26 @@ observable-output regressions cover the corrected paths in gen0 and gen1.
 
 ## Self-hosted evaluator text equality
 
-`eval_main`'s legacy binary evaluation converts `VText` operands through
-`vnum_of`, which yields zero. Different texts can therefore compare equal.
-The lexical-binding probes use original-AST Rust interpretation and explicit
-expected bytes for text equality, not this evaluator as an oracle. The native
-self-hosted byte-comparison path is independent. Fixing the evaluator's value
-comparison is separate from binding resolution.
+Corrected by the [value-comparison follow-up](self-hosted-evaluator-equality.md)
+(2026-09-26): `eval_main` dispatches on value kinds and compares decoded text
+contents instead of converting both operands to zero. The lexical-binding
+probes now include it for input-free text equality. The native self-hosted
+byte-comparison path remains independent. Concat comparisons reuse the
+evaluator's existing potentially quadratic length/byte walks; unchecked invalid
+programs retain defensive behavior, without a new diagnostic/error channel.
+
+## Self-hosted record construction field order
+
+The evaluator's `eval_vfields` and native emitter's `x86_vfields` preserve
+constructor field order, while field reads use declaration order. For a record
+declared as `first, second`, `let p = Pair { second: 2, first: 1 }` followed by
+`out = p.first` reads the wrong payload slot; the evaluator returns 2 instead of 1.
+This is the older assumption recorded in the
+[record field design](self-hosting-records-astfield-design.md#astfield-eval),
+rediscovered while checking the equality helpers. Those helpers construct their
+records in declaration order. General constructor reordering remains separate;
+a correction must preserve source-order evaluation while placing each value
+in its declared field slot.
 
 ## WASM text-valued conditionals
 

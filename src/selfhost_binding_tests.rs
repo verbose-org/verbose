@@ -127,10 +127,10 @@ pub(crate) fn assert_selfhost_bindings(compiler: &Path, base: &Path, evaluator: 
             Value::Number(n) => format!("{n}\n").into_bytes(),
             _ => unreachable!(),
         };
-        // eval_main has no input marshalling and its legacy text equality
-        // coerces both spans to zero. Neither is an oracle for those forms.
+        // eval_main has no input marshalling; input-free scalar observations
+        // also cover equality of decoded text values.
         if let Some(evaluator) =
-            evaluator.filter(|_| ty == "number" && !body.contains("i.") && !body.contains("=="))
+            evaluator.filter(|_| ty == "number" && !body.contains("i."))
         {
             let r = Command::new(evaluator).args([&src, "0"]).output().unwrap();
             assert_eq!(

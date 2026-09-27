@@ -5883,7 +5883,7 @@ rule eval_ast_env
   logic:
     out = match ea.node:
       AstNum(value) => Value::VNum { n: value }
-      AstBin(op, lhs, rhs) => Value::VNum { n: if op == 13 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) + vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 14 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) - vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 15 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) * vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 16 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) / vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 17 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) % vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 1 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) == vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 6 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 19 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) < vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 20 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) > vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 5 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) <= vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 4 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) >= vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 30 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 and vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then 1 else 0) else if op == 31 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 or vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then 1 else 0) else 0 }
+      AstBin(op, lhs, rhs) => Value::VNum { n: if op == 13 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) + vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 14 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) - vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 15 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) * vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 16 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) / vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 17 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) % vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 1 then arena_scope(values_equal(ValueEqState { left: eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), right: eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), src: ea.src })) else if op == 6 then 1 - arena_scope(values_equal(ValueEqState { left: eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), right: eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), src: ea.src })) else if op == 19 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) < vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 20 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) > vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 5 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) <= vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 4 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) >= vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 30 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 and vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then 1 else 0) else if op == 31 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 or vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then 1 else 0) else 0 }
       AstNeg(inner) => Value::VNum { n: 0 - vnum_of(eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) }
       AstNot(inner) => Value::VNum { n: if vnum_of(eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) == 0 then 1 else 0 }
       AstVar(start, len) => venv_lookup(VEnvLookState { env: ea.env, src: ea.src, q_start: start, q_len: len })
@@ -5960,7 +5960,7 @@ rule eval_ast_env
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
-      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, eval_match_result, eval_reduce, eval_fold, eval_mapfilter, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_arena_scope, span_is_abort_if, span_is_read, arg_first, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64, span_is_fetch]
+      calls : [values_equal, eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, eval_match_result, eval_reduce, eval_fold, eval_mapfilter, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_arena_scope, span_is_abort_if, span_is_read, arg_first, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64, span_is_fetch]
     termination:
       bound : 4000
 
@@ -6715,6 +6715,8 @@ concept VLenState
 -- VBLit -> the escape-aware decoded byte count; VBLe -> the fixed le width (4/8).
 -- The value is a FIELD of VLenState (not the rule input directly), so termination
 -- is bound-only + the native recursion breadcrumb, exactly like vbyte_at.
+-- i64::MIN has no positive i64 magnitude: use its fixed width and, in vbyte_at,
+-- its guarded constant decimal bytes instead of overflowing during negation.
 rule vlength
   @intention: "The byte length of a value read as text/bytes: span length, decimal width of a number, decoded byte-literal length, le width, or the recursive sum over a rope"
   @source: vexprparse.intent:68
@@ -6724,7 +6726,7 @@ rule vlength
     out : number
   logic:
     out = match vl.v:
-      VNum(n) => if n < 0 then 1 + mag_digits(MagState { m: 0 - n }) else mag_digits(MagState { m: n })
+      VNum(n) => if n == 0 - 9223372036854775807 - 1 then 20 else if n < 0 then 1 + mag_digits(MagState { m: 0 - n }) else mag_digits(MagState { m: n })
       VData(tag, payload) => 0
       VText(start, len) => bytelit_decoded_len(DecodeState { src: vl.src, start: start, len: len, i: 0 })
       VConcat(left, right) => vlength(VLenState { v: left, src: vl.src }) + vlength(VLenState { v: right, src: vl.src })
@@ -6771,7 +6773,7 @@ rule vbyte_at
     out : number
   logic:
     out = match bs.v:
-      VNum(n) => if n < 0 then (if bs.i == 0 then 45 else if bs.i >= 1 and bs.i < 1 + mag_digits(MagState { m: 0 - n }) then mag_digit_at(DigitState { m: 0 - n, k: bs.i - 1 }) else 0) else (if bs.i >= 0 and bs.i < mag_digits(MagState { m: n }) then mag_digit_at(DigitState { m: n, k: bs.i }) else 0)
+      VNum(n) => if n == 0 - 9223372036854775807 - 1 then (if bs.i >= 0 and bs.i < 20 then byte_at("-9223372036854775808", bs.i) else 0) else if n < 0 then (if bs.i == 0 then 45 else if bs.i >= 1 and bs.i < 1 + mag_digits(MagState { m: 0 - n }) then mag_digit_at(DigitState { m: 0 - n, k: bs.i - 1 }) else 0) else (if bs.i >= 0 and bs.i < mag_digits(MagState { m: n }) then mag_digit_at(DigitState { m: n, k: bs.i }) else 0)
       VData(tag, payload) => 0
       VText(start, len) => if bs.i >= 0 and bs.i < bytelit_decoded_len(DecodeState { src: bs.src, start: start, len: len, i: 0 }) then bytelit_byte_at(DecodeState { src: bs.src, start: start, len: len, i: bs.i }) else 0
       VConcat(left, right) => if bs.i < vlength(VLenState { v: left, src: bs.src }) then vbyte_at(VByteState { v: left, i: bs.i, src: bs.src }) else vbyte_at(VByteState { v: right, i: bs.i - vlength(VLenState { v: left, src: bs.src }), src: bs.src })
@@ -35925,6 +35927,138 @@ rule text_blob_step
     purity:
       reads : [tb.cell, tb.pos, tb.cursor, tb.src, tb.word, tb.used]
       calls : [head_tok, tok_str_start, tok_str_len, tok_is_str, bytelit_unit_byte, bytelit_unit_width, pow256, text_blob]
+    termination:
+      bound : 4000000
+
+
+-- Value equality in the evaluator is independent of native target emission.
+-- Compare numeric values numerically and decoded text contents byte by byte.
+-- Rust lowering stack-passes these records; self-hosted lowering uses its arena.
+-- eval_ast_env scopes the whole comparison, returning only a number before
+-- constructing its VNum result, so temporary operand/cursor nodes do not escape.
+concept ValueEqState
+  @intention: "Two evaluated operands and their encoded source for value equality"
+  @source: vexprparse.intent:1781
+  fields:
+    left : Value
+    right : Value
+    src : text [..4194304]
+
+-- 0 is unsupported, 1 numeric, 2 text. A concat is text only if all its
+-- leaves are text or numbers; bytes and aggregate values stay outside equality.
+rule value_eq_kind
+  @intention: "Classify equality operands without coercing text to numbers"
+  @source: vexprparse.intent:1781
+  input:
+    v : Value
+  output:
+    out : number
+  logic:
+    out = match v:
+      VNum(n) => 1
+      VText(start, len) => 2
+      VConcat(left, right) => if value_eq_kind(left) != 0 and value_eq_kind(right) != 0 then 2 else 0
+      VData(tag, payload) => 0
+      VBLit(start, len) => 0
+      VBLe(value, width) => 0
+  proofs:
+    purity:
+      reads : [v]
+      calls : [value_eq_kind]
+    termination:
+      bound : 4000
+      structural : v
+
+rule values_equal
+  @intention: "Compare two evaluated numbers or decoded text values with matching kinds"
+  @source: vexprparse.intent:1781
+  input:
+    eq : ValueEqState
+  output:
+    out : number
+  logic:
+    let left_kind = value_eq_kind(eq.left)
+    let right_kind = value_eq_kind(eq.right)
+    out = if left_kind == 0 or left_kind != right_kind then 0 else if left_kind == 1 then (if vnum_of(eq.left) == vnum_of(eq.right) then 1 else 0) else if vtext_is(eq.left) == 1 and vtext_is(eq.right) == 1 then text_spans_equal(TextSpanEqState { src: eq.src, a_start: vtext_start(eq.left), a_len: vtext_len(eq.left), b_start: vtext_start(eq.right), b_len: vtext_len(eq.right) }) else text_values_equal(eq)
+  proofs:
+    purity:
+      reads : [eq.left, eq.right, eq.src, eq]
+      calls : [value_eq_kind, vnum_of, vtext_is, text_spans_equal, vtext_start, vtext_len, text_values_equal]
+    termination:
+      bound : 128
+
+concept TextSpanEqState
+  @intention: "Forward cursors and remaining encoded lengths of two text spans"
+  @source: vexprparse.intent:1781
+  fields:
+    src : text [..4194304]
+    a_start : number [0, 4194304]
+    a_len : number [0, 4194304]
+    b_start : number [0, 4194304]
+    b_len : number [0, 4194304]
+
+-- Guard both ends before decoding. Encoded lengths need not match: a raw tab
+-- and its escaped spelling have the same decoded byte. Each cursor advances
+-- by its own unit width, so equal spans are read in linear time.
+rule text_spans_equal
+  @intention: "Compare decoded source spans with forward cursors and no copied text"
+  @source: vexprparse.intent:1781
+  input:
+    eq : TextSpanEqState
+  output:
+    out : number
+  logic:
+    out = if eq.a_len == 0 or eq.b_len == 0 then (if eq.a_len == eq.b_len then 1 else 0) else if bytelit_unit_byte(DecodeState { src: eq.src, start: eq.a_start, len: eq.a_len, i: 0 }) != bytelit_unit_byte(DecodeState { src: eq.src, start: eq.b_start, len: eq.b_len, i: 0 }) then 0 else text_spans_equal(TextSpanEqState { src: eq.src, a_start: eq.a_start + bytelit_unit_width(DecodeState { src: eq.src, start: eq.a_start, len: eq.a_len, i: 0 }), a_len: eq.a_len - bytelit_unit_width(DecodeState { src: eq.src, start: eq.a_start, len: eq.a_len, i: 0 }), b_start: eq.b_start + bytelit_unit_width(DecodeState { src: eq.src, start: eq.b_start, len: eq.b_len, i: 0 }), b_len: eq.b_len - bytelit_unit_width(DecodeState { src: eq.src, start: eq.b_start, len: eq.b_len, i: 0 }) })
+  proofs:
+    purity:
+      reads : [eq.a_len, eq.b_len, eq.src, eq.a_start, eq.b_start]
+      calls : [bytelit_unit_byte, text_spans_equal, bytelit_unit_width]
+    termination:
+      bound : 4000000
+
+rule text_values_equal
+  @intention: "Check decoded lengths before comparing text concatenation contents"
+  @source: vexprparse.intent:1781
+  input:
+    eq : ValueEqState
+  output:
+    out : number
+  logic:
+    let left_len = vlength(VLenState { v: eq.left, src: eq.src })
+    let right_len = vlength(VLenState { v: eq.right, src: eq.src })
+    out = if left_len != right_len then 0 else text_value_bytes_equal(TextValueEqState { left: eq.left, right: eq.right, src: eq.src, i: 0, len: left_len })
+  proofs:
+    purity:
+      reads : [eq.left, eq.right, eq.src]
+      calls : [vlength, text_value_bytes_equal]
+    termination:
+      bound : 64
+
+concept TextValueEqState
+  @intention: "A shared decoded byte index within two text values of equal length"
+  @source: vexprparse.intent:1781
+  fields:
+    left : Value
+    right : Value
+    src : text [..4194304]
+    i : number [0, 9223372036854775807]
+    len : number [0, 9223372036854775807]
+
+-- Reuse existing rope readers; never flatten or allocate a comparison buffer.
+-- Their repeated descents can be quadratic, as in the other evaluator consumers.
+rule text_value_bytes_equal
+  @intention: "Compare already length-checked text values through their existing byte readers"
+  @source: vexprparse.intent:1781
+  input:
+    eq : TextValueEqState
+  output:
+    out : number
+  logic:
+    out = if eq.i >= eq.len then 1 else if vbyte_at(VByteState { v: eq.left, i: eq.i, src: eq.src }) != vbyte_at(VByteState { v: eq.right, i: eq.i, src: eq.src }) then 0 else text_value_bytes_equal(TextValueEqState { left: eq.left, right: eq.right, src: eq.src, i: eq.i + 1, len: eq.len })
+  proofs:
+    purity:
+      reads : [eq.i, eq.len, eq.left, eq.src, eq.right]
+      calls : [vbyte_at, text_value_bytes_equal]
     termination:
       bound : 4000000
 
