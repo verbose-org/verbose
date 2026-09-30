@@ -42,6 +42,13 @@ field mappings before output. Source-declared constructors keep their native
 storage and instruction counts; the evaluator may allocate a reordered value
 list in its existing arena.
 
+The [constructor type follow-up](self-hosted-constructor-types.md) additionally
+checks scalar kinds and exact nominal payload types under sequential let,
+parameter and match-binder scopes. Unknown types and unsupported stored
+bytes/collection/Result fields refuse before self-hosted ELF/raw output. These
+are compiler checks with unchanged target lowering; general type-checking parity
+and Result component inference remain separate work.
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable

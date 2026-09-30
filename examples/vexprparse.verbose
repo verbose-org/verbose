@@ -36286,18 +36286,771 @@ rule eval_payload_permute
       bound : 4000
 
 
+-- Constructor obligations use a separate strict environment. Type codes are
+-- 0 number, 1 bool, 2 text, 3 unknown/error, 4 bytes, 1000..999999 nominal.
+-- Flat collections use 1000000 + element code only for typing local binders;
+-- containers and bytes are not admitted as stored constructor payloads.
+concept ConstructorTypeCode
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    value : number
+
+
+rule constructor_leaf_type
+  @intention: "Whether a type is a scalar or an exact named concept"
+  @source: vexprparse.intent:1790
+  input:
+    t : ConstructorTypeCode
+  output:
+    out : number
+  logic:
+    out = if t.value == 0 or t.value == 1 or t.value == 2 or t.value == 4 or (t.value >= 1000 and t.value < 1000000) then 1 else 0
+  proofs:
+    purity:
+      reads : [t.value]
+      calls : []
+    termination:
+      bound : 4000
+
+
+rule constructor_collection_type
+  @intention: "Carry a known flat collection element type without runtime metadata"
+  @source: vexprparse.intent:1790
+  input:
+    t : ConstructorTypeCode
+  output:
+    out : number
+  logic:
+    out = if constructor_leaf_type(ConstructorTypeCode { value: t.value }) == 1 then 1000000 + t.value else 3
+  proofs:
+    purity:
+      reads : [t.value]
+      calls : [constructor_leaf_type]
+    termination:
+      bound : 4000
+
+
+rule constructor_element_type
+  @intention: "Recover a known collection element type or fail closed"
+  @source: vexprparse.intent:1790
+  input:
+    t : ConstructorTypeCode
+  output:
+    out : number
+  logic:
+    out = if t.value >= 1000000 and t.value < 2000000 then (if constructor_leaf_type(ConstructorTypeCode { value: t.value - 1000000 }) == 1 then t.value - 1000000 else 3) else 3
+  proofs:
+    purity:
+      reads : [t.value]
+      calls : [constructor_leaf_type]
+    termination:
+      bound : 4000
+
+
+concept ConstructorDeclaredType
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    ty : number
+    start : number
+    len : number
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_declared_type
+  @intention: "Resolve declared scalar and nominal types without a numeric fallback"
+  @source: vexprparse.intent:1790
+  input:
+    dt : ConstructorDeclaredType
+  output:
+    out : number
+  logic:
+    out = if dt.len == 0 then (if dt.ty == 0 or dt.ty == 1 or dt.ty == 2 then dt.ty else 3) else if dt.ty == 3 then constructor_collection_type(ConstructorTypeCode { value: resolve_type(ResolveTypeState { concepts: dt.concepts, src: dt.src, ty_start: dt.start, ty_len: dt.len }) }) else resolve_type(ResolveTypeState { concepts: dt.concepts, src: dt.src, ty_start: dt.start, ty_len: dt.len })
+  proofs:
+    purity:
+      reads : [dt.concepts, dt.len, dt.src, dt.start, dt.ty]
+      calls : [constructor_collection_type, resolve_type]
+    termination:
+      bound : 4000
+
+
+rule constructor_head_type
+  @intention: "Read the exact type of a declared field or parameter"
+  @source: vexprparse.intent:1790
+  input:
+    ft : FieldConceptTenvState
+  output:
+    out : number
+  logic:
+    out = if field_list_len(ft.fields) == 0 then 3 else constructor_declared_type(ConstructorDeclaredType { ty: fl_head_ty(ft.fields), start: fl_head_ty_start(ft.fields), len: fl_head_ty_len(ft.fields), concepts: ft.concepts, src: ft.src })
+  proofs:
+    purity:
+      reads : [ft.concepts, ft.fields, ft.src]
+      calls : [constructor_declared_type, field_list_len, fl_head_ty, fl_head_ty_len, fl_head_ty_start]
+    termination:
+      bound : 4000
+
+
+concept ConstructorFieldAt
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    fields : FieldList
+    idx : number
+
+
+rule constructor_field_at
+  @intention: "Borrow the field list beginning at an already resolved slot"
+  @source: vexprparse.intent:1790
+  input:
+    fa : ConstructorFieldAt
+  output:
+    out : FieldList
+  logic:
+    out = if fa.idx < 0 then FieldList::FNil else if fa.idx == 0 then fa.fields else constructor_field_at(ConstructorFieldAt { fields: fl_tail(fa.fields), idx: fa.idx - 1 })
+  proofs:
+    purity:
+      reads : [fa.fields, fa.idx]
+      calls : [constructor_field_at, fl_tail]
+    termination:
+      bound : 4000
+
+
+rule constructor_field_type
+  @intention: "Resolve a named field including the closed synthetic HTTP layouts"
+  @source: vexprparse.intent:1790
+  input:
+    ft : FieldTyOfState
+  output:
+    out : number
+  logic:
+    let idx = constructor_field_index(FieldIdxState { fields: ft.fields, src: ft.src, q_start: ft.q_start, q_len: ft.q_len, idx: 0 })
+    out = if idx < 0 then 3 else constructor_head_type(FieldConceptTenvState { fields: constructor_field_at(ConstructorFieldAt { fields: ft.fields, idx: idx }), concepts: ft.concepts, src: ft.src })
+  proofs:
+    purity:
+      reads : [ft.concepts, ft.fields, ft.q_len, ft.q_start, ft.src]
+      calls : [constructor_field_at, constructor_field_index, constructor_head_type]
+    termination:
+      bound : 4000
+
+
+rule constructor_select_type
+  @intention: "Type a field selection only from a known named record"
+  @source: vexprparse.intent:1790
+  input:
+    fs : FieldSelTyState
+  output:
+    out : number
+  logic:
+    out = if fs.base_ty >= 1000 and fs.base_ty < 1000000 then constructor_field_type(FieldTyOfState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: fs.concepts, idx: fs.base_ty - 1000 })), src: fs.src, q_start: fs.fstart, q_len: fs.flen, concepts: fs.concepts }) else 3
+  proofs:
+    purity:
+      reads : [fs.base_ty, fs.concepts, fs.flen, fs.fstart, fs.src]
+      calls : [cd_fields, concept_at_index, constructor_field_type]
+    termination:
+      bound : 4000
+
+
+rule constructor_type_env
+  @intention: "Seed every parameter with its declared type including scalar parameters"
+  @source: vexprparse.intent:1790
+  input:
+    ft : FieldConceptTenvState
+  output:
+    out : Env
+  logic:
+    out = match ft.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: constructor_head_type(ft), rest: constructor_type_env(FieldConceptTenvState { fields: rest, concepts: ft.concepts, src: ft.src }) }
+      FNil => Env::ENil
+  proofs:
+    purity:
+      reads : [ft, ft.concepts, ft.fields, ft.src]
+      calls : [constructor_head_type, constructor_type_env]
+    termination:
+      bound : 4000
+
+
+rule constructor_type_lookup
+  @intention: "Resolve the latest binding without guessing the type of an unknown name"
+  @source: vexprparse.intent:1790
+  input:
+    el : EnvLookState
+  output:
+    out : number
+  logic:
+    out = match el.env:
+      ECons(name_start, name_len, val, rest) => if name_len == el.q_len and name_eq(NameEqState { src: el.src, a_start: name_start, b_start: el.q_start, len: name_len, off: 0 }) == 1 then val else constructor_type_lookup(EnvLookState { env: rest, src: el.src, q_start: el.q_start, q_len: el.q_len })
+      ENil => 3
+  proofs:
+    purity:
+      reads : [el.env, el.q_len, el.q_start, el.src]
+      calls : [constructor_type_lookup, name_eq]
+    termination:
+      bound : 4000
+
+
+rule constructor_bind_binders
+  @intention: "Bind positional match variables to their exact declared payload types"
+  @source: vexprparse.intent:1790
+  input:
+    bb : BindBindersState
+  output:
+    out : Env
+  logic:
+    out = match bb.binders:
+      BindCons(start, len, rest) => Env::ECons { name_start: start, name_len: len, val: constructor_head_type(FieldConceptTenvState { fields: bb.fields, concepts: bb.concepts, src: bb.src }), rest: constructor_bind_binders(BindBindersState { binders: rest, fields: fl_tail(bb.fields), tenv: bb.tenv, concepts: bb.concepts, src: bb.src }) }
+      BindNil => bb.tenv
+  proofs:
+    purity:
+      reads : [bb.binders, bb.concepts, bb.fields, bb.src, bb.tenv]
+      calls : [constructor_bind_binders, constructor_head_type, fl_tail]
+    termination:
+      bound : 4000
+
+
+concept ConstructorArmEnv
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    scrut_ty : number
+    vstart : number
+    vlen : number
+    binders : BinderList
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_arm_env
+  @intention: "Build a match arm scope with unknown types on unresolved payloads"
+  @source: vexprparse.intent:1790
+  input:
+    ae : ConstructorArmEnv
+  output:
+    out : Env
+  logic:
+    let variants = if ae.scrut_ty >= 1000 and ae.scrut_ty < 1000000 then cd_variants(concept_at_index(ConceptAtState { concepts: ae.concepts, idx: ae.scrut_ty - 1000 })) else VariantList::VarNil
+    let fields = variant_payload(FindVariantState { variants: variants, src: ae.src, q_start: ae.vstart, q_len: ae.vlen })
+    out = constructor_bind_binders(BindBindersState { binders: ae.binders, fields: fields, tenv: ae.tenv, concepts: ae.concepts, src: ae.src })
+  proofs:
+    purity:
+      reads : [ae.binders, ae.concepts, ae.scrut_ty, ae.src, ae.tenv, ae.vlen, ae.vstart]
+      calls : [cd_variants, concept_at_index, constructor_bind_binders, variant_payload]
+    termination:
+      bound : 4000
+
+
+concept ConstructorTypedArms
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    arms : ArmList
+    scrut_ty : number
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_common_type
+  @intention: "Combine match result types with a disjoint empty-list sentinel"
+  @source: vexprparse.intent:1790
+  input:
+    ct : ArmsTypeCombineState
+  output:
+    out : number
+  logic:
+    out = if ct.rest_ty < 0 then ct.head_ty else if ct.head_ty == ct.rest_ty and ct.head_ty != 3 then ct.head_ty else 3
+  proofs:
+    purity:
+      reads : [ct.head_ty, ct.rest_ty]
+      calls : []
+    termination:
+      bound : 4000
+
+
+rule constructor_strict_arm_type
+  @intention: "Type a match arm only after resolving its identity and payload arity"
+  @source: vexprparse.intent:1790
+  input:
+    ab : ArmBodyTypeState
+  output:
+    out : number
+  logic:
+    let fields = variant_payload(FindVariantState { variants: ab.vlist, src: ab.src, q_start: ab.vstart, q_len: ab.vlen })
+    out = if variant_present(FindVariantState { variants: ab.vlist, src: ab.src, q_start: ab.vstart, q_len: ab.vlen }) == 0 or binder_list_len(ab.binders) != field_list_len(fields) then 3 else constructor_value_type(TypeArg { node: ab.body, tenv: constructor_bind_binders(BindBindersState { binders: ab.binders, fields: fields, tenv: ab.tenv, concepts: ab.concepts, src: ab.src }), src: ab.src, prog: ab.prog, concepts: ab.concepts })
+  proofs:
+    purity:
+      reads : [ab.binders, ab.body, ab.concepts, ab.prog, ab.src, ab.tenv, ab.vlen, ab.vlist, ab.vstart]
+      calls : [binder_list_len, constructor_bind_binders, constructor_value_type, field_list_len, variant_payload, variant_present]
+    termination:
+      bound : 4000
+
+
+rule constructor_arms_type
+  @intention: "Require one known result type across every match arm"
+  @source: vexprparse.intent:1790
+  input:
+    ca : ConstructorTypedArms
+  output:
+    out : number
+  logic:
+    out = match ca.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => constructor_common_type(ArmsTypeCombineState { head_ty: constructor_strict_arm_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: cd_variants(concept_at_index(ConceptAtState { concepts: ca.concepts, idx: ca.scrut_ty - 1000 })), tenv: ca.tenv, src: ca.src, prog: ca.prog, concepts: ca.concepts }), rest_ty: constructor_arms_type(ConstructorTypedArms { arms: rest, scrut_ty: ca.scrut_ty, tenv: ca.tenv, prog: ca.prog, concepts: ca.concepts, src: ca.src }) })
+      ArmNil => 0 - 1
+  proofs:
+    purity:
+      reads : [ca.arms, ca.concepts, ca.prog, ca.scrut_ty, ca.src, ca.tenv]
+      calls : [cd_variants, concept_at_index, constructor_arms_type, constructor_common_type, constructor_strict_arm_type]
+    termination:
+      bound : 4000
+
+
+concept ConstructorMatchType
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    scrut_ty : number
+    arms : ArmList
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_match_type
+  @intention: "Type match results only after resolving their scrutinee"
+  @source: vexprparse.intent:1790
+  input:
+    cm : ConstructorMatchType
+  output:
+    out : number
+  logic:
+    out = if cm.scrut_ty >= 1000 and cm.scrut_ty < 1000000 then constructor_match_finish(ConstructorTypeCode { value: constructor_arms_type(ConstructorTypedArms { arms: cm.arms, scrut_ty: cm.scrut_ty, tenv: cm.tenv, prog: cm.prog, concepts: cm.concepts, src: cm.src }) }) else 3
+  proofs:
+    purity:
+      reads : [cm.arms, cm.concepts, cm.prog, cm.scrut_ty, cm.src, cm.tenv]
+      calls : [constructor_arms_type, constructor_match_finish]
+    termination:
+      bound : 4000
+
+
+rule constructor_match_finish
+  @intention: "Reject an empty match when determining an initializer type"
+  @source: vexprparse.intent:1790
+  input:
+    t : ConstructorTypeCode
+  output:
+    out : number
+  logic:
+    out = if t.value < 0 then 3 else t.value
+  proofs:
+    purity:
+      reads : [t.value]
+      calls : []
+    termination:
+      bound : 4000
+
+
+concept ConstructorCallType
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    args : ArgList
+    start : number
+    len : number
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+concept ConstructorArgType
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    args : ArgList
+    idx : number
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_arg_type
+  @intention: "Type one primitive argument or reject a missing argument"
+  @source: vexprparse.intent:1790
+  input:
+    ca : ConstructorArgType
+  output:
+    out : number
+  logic:
+    out = match ca.args:
+      ArgCons(head, tail) => if ca.idx == 0 then constructor_value_type(TypeArg { node: head, tenv: ca.tenv, prog: ca.prog, concepts: ca.concepts, src: ca.src }) else constructor_arg_type(ConstructorArgType { args: tail, idx: ca.idx - 1, tenv: ca.tenv, prog: ca.prog, concepts: ca.concepts, src: ca.src })
+      ArgNil => 3
+  proofs:
+    purity:
+      reads : [ca.args, ca.concepts, ca.idx, ca.prog, ca.src, ca.tenv]
+      calls : [constructor_arg_type, constructor_value_type]
+    termination:
+      bound : 4000
+
+
+concept ConstructorPrimitiveType
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    kind : number
+    args : ArgList
+    start : number
+    len : number
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_primitive_type
+  @intention: "Check primitive arity and operand types before using its result type"
+  @source: vexprparse.intent:1790
+  input:
+    cp : ConstructorPrimitiveType
+  output:
+    out : number
+  logic:
+    let n = arg_list_len(cp.args)
+    let a = constructor_arg_type(ConstructorArgType { args: cp.args, idx: 0, tenv: cp.tenv, prog: cp.prog, concepts: cp.concepts, src: cp.src })
+    let b = if n >= 2 then constructor_arg_type(ConstructorArgType { args: cp.args, idx: 1, tenv: cp.tenv, prog: cp.prog, concepts: cp.concepts, src: cp.src }) else 3
+    let d = if n >= 3 then constructor_arg_type(ConstructorArgType { args: cp.args, idx: 2, tenv: cp.tenv, prog: cp.prog, concepts: cp.concepts, src: cp.src }) else 3
+    out = if cp.kind == 1 then (if n == 1 and (a == 0 or a == 4) then a else 3) else if cp.kind == 2 then (if n == 2 and (a == 2 or a == 4) and b == 0 then 0 else 3) else if cp.kind == 3 then (if n == 1 and (a == 2 or a == 4 or constructor_element_type(ConstructorTypeCode { value: a }) != 3) then 0 else 3) else if cp.kind == 4 then (if n == 3 and a == 2 and b == 0 and d == 0 then 2 else 3) else if cp.kind == 5 or cp.kind == 8 then (if n == 2 and a == 0 and b == 0 then 0 else 3) else if cp.kind == 6 or cp.kind == 7 then (if n == 1 and a == 0 then 4 else 3) else if cp.kind == 9 then (if n == 1 and a == 0 then 0 else 3) else 3
+  proofs:
+    purity:
+      reads : [cp.args, cp.concepts, cp.kind, cp.prog, cp.src, cp.tenv]
+      calls : [arg_list_len, constructor_arg_type, constructor_element_type]
+    termination:
+      bound : 4000
+
+
+rule constructor_concat_type
+  @intention: "Check every concat operand using strict constructor type inference"
+  @source: vexprparse.intent:1790
+  input:
+    ca : ConcatArgsTyState
+  output:
+    out : number
+  logic:
+    out = match ca.args:
+      ArgCons(head, tail) => concat_mode_combine(ConcatCombineState { head_mode: concat_arg_mode(ConcatArgModeState { t: constructor_value_type(TypeArg { node: head, tenv: ca.tenv, prog: ca.prog, concepts: ca.concepts, src: ca.src }) }), rest_mode: constructor_concat_type(ConcatArgsTyState { args: tail, tenv: ca.tenv, prog: ca.prog, concepts: ca.concepts, src: ca.src }) })
+      ArgNil => 8888
+  proofs:
+    purity:
+      reads : [ca.args, ca.concepts, ca.prog, ca.src, ca.tenv]
+      calls : [concat_arg_mode, concat_mode_combine, constructor_concat_type, constructor_value_type]
+    termination:
+      bound : 4000
+
+
+concept ConstructorCallArgs
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    args : ArgList
+    params : FieldList
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_call_args
+  @intention: "Require declared argument types for calls used in constructor values"
+  @source: vexprparse.intent:1790
+  input:
+    ca : ConstructorCallArgs
+  output:
+    out : number
+  logic:
+    out = match ca.args:
+      ArgCons(head, tail) => (if constructor_head_type(FieldConceptTenvState { fields: ca.params, concepts: ca.concepts, src: ca.src }) != 3 and constructor_value_type(TypeArg { node: head, tenv: ca.tenv, prog: ca.prog, concepts: ca.concepts, src: ca.src }) == constructor_head_type(FieldConceptTenvState { fields: ca.params, concepts: ca.concepts, src: ca.src }) then 0 else 1) + constructor_call_args(ConstructorCallArgs { args: tail, params: fl_tail(ca.params), tenv: ca.tenv, prog: ca.prog, concepts: ca.concepts, src: ca.src })
+      ArgNil => if field_list_len(ca.params) == 0 then 0 else 1
+  proofs:
+    purity:
+      reads : [ca.args, ca.concepts, ca.params, ca.prog, ca.src, ca.tenv]
+      calls : [constructor_call_args, constructor_head_type, constructor_value_type, field_list_len, fl_tail]
+    termination:
+      bound : 4000
+
+
+rule constructor_rule_call_type
+  @intention: "Use a known callee output declaration without expanding the call graph"
+  @source: vexprparse.intent:1790
+  input:
+    c : ConstructorCallType
+  output:
+    out : number
+  logic:
+    let callee = find_rule(FindRuleState { rules: c.prog, src: c.src, q_start: c.start, q_len: c.len })
+    let bad = constructor_call_args(ConstructorCallArgs { args: c.args, params: params_to_fields(rule_params_of(callee)), tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src })
+    out = if rd_name_len(callee) == 0 or bad > 0 then 3 else if rd_out_ty_len(callee) > 0 then constructor_declared_type(ConstructorDeclaredType { ty: rd_out_ty(callee), start: rd_out_ty_start(callee), len: rd_out_ty_len(callee), concepts: c.concepts, src: c.src }) else 3
+  proofs:
+    purity:
+      reads : [c.args, c.concepts, c.len, c.prog, c.src, c.start, c.tenv]
+      calls : [constructor_call_args, constructor_declared_type, find_rule, params_to_fields, rd_name_len, rd_out_ty, rd_out_ty_len, rd_out_ty_start, rule_params_of]
+    termination:
+      bound : 4000
+
+
+rule constructor_call_type
+  @intention: "Resolve supported primitive results and declared rule results"
+  @source: vexprparse.intent:1790
+  input:
+    c : ConstructorCallType
+  output:
+    out : number
+  logic:
+    out = if span_is_concat(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then concat_ty_final(ConcatFinalState { m: constructor_concat_type(ConcatArgsTyState { args: c.args, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) }) else if span_is_arena_scope(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 1, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_byte_at(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 2, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_length(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 3, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_substring(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 4, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_min(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 5, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_max(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 5, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_le32(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 6, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_le64(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 6, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_abort_if(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 7, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_bnot(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 9, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else if span_is_bitwise(SpanCheck { src: c.src, start: c.start, len: c.len }) == 1 then constructor_primitive_type(ConstructorPrimitiveType { kind: 8, args: c.args, start: c.start, len: c.len, tenv: c.tenv, prog: c.prog, concepts: c.concepts, src: c.src }) else constructor_rule_call_type(c)
+  proofs:
+    purity:
+      reads : [c, c.args, c.concepts, c.len, c.prog, c.src, c.start, c.tenv]
+      calls : [concat_ty_final, constructor_concat_type, constructor_primitive_type, constructor_rule_call_type, span_is_abort_if, span_is_arena_scope, span_is_bitwise, span_is_bnot, span_is_byte_at, span_is_concat, span_is_le32, span_is_le64, span_is_length, span_is_max, span_is_min, span_is_substring]
+    termination:
+      bound : 4000
+
+
+concept ConstructorReduceType
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    coll : Ast
+    body : Ast
+    item_start : number
+    item_len : number
+    kind : number
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_reduce_type
+  @intention: "Type scalar reductions and flat collection transformations in their binder scope"
+  @source: vexprparse.intent:1790
+  input:
+    cr : ConstructorReduceType
+  output:
+    out : number
+  logic:
+    let coll_ty = constructor_value_type(TypeArg { node: cr.coll, tenv: cr.tenv, prog: cr.prog, concepts: cr.concepts, src: cr.src })
+    let elem = constructor_element_type(ConstructorTypeCode { value: coll_ty })
+    let body_ty = constructor_value_type(TypeArg { node: cr.body, tenv: Env::ECons { name_start: cr.item_start, name_len: cr.item_len, val: elem, rest: cr.tenv }, prog: cr.prog, concepts: cr.concepts, src: cr.src })
+    out = if elem == 3 then 3 else if cr.kind == 1 then (if body_ty == 0 then 0 else 3) else if cr.kind == 2 then (if body_ty == 1 then 0 else 3) else if cr.kind == 3 then (if body_ty == 1 then 1 else 3) else if cr.kind == 4 then constructor_collection_type(ConstructorTypeCode { value: body_ty }) else (if body_ty == 1 then coll_ty else 3)
+  proofs:
+    purity:
+      reads : [cr.body, cr.coll, cr.concepts, cr.item_len, cr.item_start, cr.kind, cr.prog, cr.src, cr.tenv]
+      calls : [constructor_collection_type, constructor_element_type, constructor_value_type]
+    termination:
+      bound : 4000
+
+
+concept ConstructorFoldType
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    coll : Ast
+    init : Ast
+    body : Ast
+    acc_start : number
+    acc_len : number
+    item_start : number
+    item_len : number
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_fold_type
+  @intention: "Require a fold accumulator to retain one known type"
+  @source: vexprparse.intent:1790
+  input:
+    cf : ConstructorFoldType
+  output:
+    out : number
+  logic:
+    let elem = constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: cf.coll, tenv: cf.tenv, prog: cf.prog, concepts: cf.concepts, src: cf.src }) })
+    let initial = constructor_value_type(TypeArg { node: cf.init, tenv: cf.tenv, prog: cf.prog, concepts: cf.concepts, src: cf.src })
+    let result = constructor_value_type(TypeArg { node: cf.body, tenv: Env::ECons { name_start: cf.item_start, name_len: cf.item_len, val: elem, rest: Env::ECons { name_start: cf.acc_start, name_len: cf.acc_len, val: initial, rest: cf.tenv } }, prog: cf.prog, concepts: cf.concepts, src: cf.src })
+    out = if elem == 3 or initial == 3 or result != initial then 3 else initial
+  proofs:
+    purity:
+      reads : [cf.acc_len, cf.acc_start, cf.body, cf.coll, cf.concepts, cf.init, cf.item_len, cf.item_start, cf.prog, cf.src, cf.tenv]
+      calls : [constructor_element_type, constructor_value_type]
+    termination:
+      bound : 4000
+
+
+rule constructor_value_type
+  @intention: "Infer a constructor initializer type in its exact lexical scope"
+  @source: vexprparse.intent:1790
+  input:
+    t : TypeArg
+  output:
+    out : number
+  logic:
+    out = match t.node:
+      AstNum(value) => 0
+      AstBool(value) => 1
+      AstStr(start, len) => 2
+      AstBytes(start, len) => 4
+      AstErr => 3
+      AstVar(start, len) => constructor_type_lookup(EnvLookState { env: t.tenv, src: t.src, q_start: start, q_len: len })
+      AstField(base, fstart, flen) => constructor_select_type(FieldSelTyState { base_ty: constructor_value_type(TypeArg { node: base, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }), fstart: fstart, flen: flen, src: t.src, concepts: t.concepts })
+      AstNeg(inner) => if constructor_value_type(TypeArg { node: inner, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }) == 0 then 0 else 3
+      AstNot(inner) => if constructor_value_type(TypeArg { node: inner, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }) == 1 then 1 else 3
+      AstBin(op, lhs, rhs) => bin_type(BinTypeState { op: op, lt: constructor_value_type(TypeArg { node: lhs, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }), rt: constructor_value_type(TypeArg { node: rhs, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }) })
+      AstIf(cond, thn, els) => if_type(IfTypeState { ct: constructor_value_type(TypeArg { node: cond, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }), tt: constructor_value_type(TypeArg { node: thn, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }), et: constructor_value_type(TypeArg { node: els, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }) })
+      AstVariant(cstart, clen, vstart, vlen, fields) => resolve_type(ResolveTypeState { concepts: t.concepts, src: t.src, ty_start: cstart, ty_len: clen })
+      AstCall(callee_start, callee_len, args) => constructor_call_type(ConstructorCallType { args: args, start: callee_start, len: callee_len, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstMatch(scrut, arms) => constructor_match_type(ConstructorMatchType { scrut_ty: constructor_value_type(TypeArg { node: scrut, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src }), arms: arms, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstOk(inner) => 3
+      AstResErr(inner) => 3
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 3
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => constructor_fold_type(ConstructorFoldType { coll: coll, init: init, body: body, acc_start: acc_start, acc_len: acc_len, item_start: item_start, item_len: item_len, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstSum(coll, item_start, item_len, body) => constructor_reduce_type(ConstructorReduceType { coll: coll, body: body, item_start: item_start, item_len: item_len, kind: 1, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstMinFold(coll, item_start, item_len, body) => constructor_reduce_type(ConstructorReduceType { coll: coll, body: body, item_start: item_start, item_len: item_len, kind: 1, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstMaxFold(coll, item_start, item_len, body) => constructor_reduce_type(ConstructorReduceType { coll: coll, body: body, item_start: item_start, item_len: item_len, kind: 1, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstCount(coll, item_start, item_len, body) => constructor_reduce_type(ConstructorReduceType { coll: coll, body: body, item_start: item_start, item_len: item_len, kind: 2, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstAll(coll, item_start, item_len, body) => constructor_reduce_type(ConstructorReduceType { coll: coll, body: body, item_start: item_start, item_len: item_len, kind: 3, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstAny(coll, item_start, item_len, body) => constructor_reduce_type(ConstructorReduceType { coll: coll, body: body, item_start: item_start, item_len: item_len, kind: 3, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstMap(coll, item_start, item_len, body) => constructor_reduce_type(ConstructorReduceType { coll: coll, body: body, item_start: item_start, item_len: item_len, kind: 4, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+      AstFilter(coll, item_start, item_len, body) => constructor_reduce_type(ConstructorReduceType { coll: coll, body: body, item_start: item_start, item_len: item_len, kind: 5, tenv: t.tenv, prog: t.prog, concepts: t.concepts, src: t.src })
+  proofs:
+    purity:
+      reads : [t.concepts, t.node, t.prog, t.src, t.tenv]
+      calls : [bin_type, constructor_call_type, constructor_fold_type, constructor_match_type, constructor_reduce_type, constructor_select_type, constructor_type_lookup, constructor_value_type, if_type, resolve_type]
+    termination:
+      bound : 4000
+
+
+concept ConstructorPayloadTypes
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    fields : VFieldList
+    declared : FieldList
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+concept ConstructorTypePair
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    expected : number
+    actual : number
+
+
+rule constructor_type_pair_errors
+  @intention: "Reject mismatches and unresolved or unsupported stored payload types"
+  @source: vexprparse.intent:1790
+  input:
+    ct : ConstructorTypePair
+  output:
+    out : number
+  logic:
+    out = if ct.expected != 4 and constructor_leaf_type(ConstructorTypeCode { value: ct.expected }) == 1 and ct.actual == ct.expected then 0 else 1
+  proofs:
+    purity:
+      reads : [ct.actual, ct.expected]
+      calls : [constructor_leaf_type]
+    termination:
+      bound : 4000
+
+
+rule constructor_payload_type_errors
+  @intention: "Compare every written initializer with its named declared field type"
+  @source: vexprparse.intent:1790
+  input:
+    cp : ConstructorPayloadTypes
+  output:
+    out : number
+  logic:
+    out = match cp.fields:
+      VFCons(name_start, name_len, val, rest) => constructor_type_pair_errors(ConstructorTypePair { expected: constructor_field_type(FieldTyOfState { fields: cp.declared, src: cp.src, q_start: name_start, q_len: name_len, concepts: cp.concepts }), actual: constructor_value_type(TypeArg { node: val, tenv: cp.tenv, prog: cp.prog, concepts: cp.concepts, src: cp.src }) }) + constructor_payload_type_errors(ConstructorPayloadTypes { fields: rest, declared: cp.declared, tenv: cp.tenv, prog: cp.prog, concepts: cp.concepts, src: cp.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [cp.concepts, cp.declared, cp.fields, cp.prog, cp.src, cp.tenv]
+      calls : [constructor_field_type, constructor_payload_type_errors, constructor_type_pair_errors, constructor_value_type]
+    termination:
+      bound : 4000
+
+
 concept ConstructorCheckAst
-  @intention: "Constructor layout checking through ast"
-  @source: vexprparse.intent:1785
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
   fields:
     node : Ast
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+concept ConstructorCheckArgs
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    args : ArgList
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+concept ConstructorCheckVfields
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    fields : VFieldList
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+concept ConstructorCheckArms
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    arms : ArmList
+    scrut_ty : number
+    tenv : Env
+    prog : RuleList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+concept ConstructorCheckBinds
+  @intention: "Typing context for constructor values"
+  @source: vexprparse.intent:1790
+  fields:
+    binds : Binding
+    result : Ast
+    tenv : Env
+    prog : RuleList
     concepts : ConceptList
     src : text [..4194304]
 
 
 rule constructor_check_ast
-  @intention: "Count invalid constructor layouts throughout ast"
-  @source: vexprparse.intent:1785
+  @intention: "Check every constructor layout and value type in its lexical scope"
+  @source: vexprparse.intent:1790
   input:
     cc : ConstructorCheckAst
   output:
@@ -36310,167 +37063,132 @@ rule constructor_check_ast
       AstBytes(start, len) => 0
       AstVar(start, len) => 0
       AstErr => 0
-      AstField(base, fstart, flen) => constructor_check_ast(ConstructorCheckAst { node: base, concepts: cc.concepts, src: cc.src })
-      AstNeg(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, concepts: cc.concepts, src: cc.src })
-      AstNot(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, concepts: cc.concepts, src: cc.src })
-      AstOk(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, concepts: cc.concepts, src: cc.src })
-      AstResErr(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, concepts: cc.concepts, src: cc.src })
-      AstBin(op, lhs, rhs) => constructor_check_ast(ConstructorCheckAst { node: lhs, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: rhs, concepts: cc.concepts, src: cc.src })
-      AstIf(cond, thn, els) => constructor_check_ast(ConstructorCheckAst { node: cond, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: thn, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: els, concepts: cc.concepts, src: cc.src })
-      AstCall(callee_start, callee_len, args) => constructor_check_args(ConstructorCheckArgs { args: args, concepts: cc.concepts, src: cc.src })
-      AstVariant(cstart, clen, vstart, vlen, fields) => (if constructor_shape_ok(VariantTagState { concepts: cc.concepts, src: cc.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }) == 1 then constructor_field_set_errors(ConstructorFieldsState { fields: fields, declared: constructor_fields(VariantTagState { concepts: cc.concepts, src: cc.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), src: cc.src }) else 1) + constructor_check_vfields(ConstructorCheckVfields { fields: fields, concepts: cc.concepts, src: cc.src })
-      AstMatch(scrut, arms) => constructor_check_ast(ConstructorCheckAst { node: scrut, concepts: cc.concepts, src: cc.src }) + constructor_check_arms(ConstructorCheckArms { arms: arms, concepts: cc.concepts, src: cc.src })
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => constructor_check_ast(ConstructorCheckAst { node: scrut, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: ok_body, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: err_body, concepts: cc.concepts, src: cc.src })
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: init, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
-      AstAll(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
-      AstAny(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
-      AstMap(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
-      AstFilter(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
-      AstSum(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
-      AstCount(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
-      AstMinFold(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
-      AstMaxFold(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstField(base, fstart, flen) => constructor_check_ast(ConstructorCheckAst { node: base, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstNeg(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstNot(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstOk(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstResErr(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstBin(op, lhs, rhs) => constructor_check_ast(ConstructorCheckAst { node: lhs, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: rhs, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstIf(cond, thn, els) => constructor_check_ast(ConstructorCheckAst { node: cond, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: thn, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: els, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstCall(callee_start, callee_len, args) => constructor_check_args(ConstructorCheckArgs { args: args, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstVariant(cstart, clen, vstart, vlen, fields) => (if constructor_shape_ok(VariantTagState { concepts: cc.concepts, src: cc.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }) == 1 then constructor_field_set_errors(ConstructorFieldsState { fields: fields, declared: constructor_fields(VariantTagState { concepts: cc.concepts, src: cc.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), src: cc.src }) + constructor_payload_type_errors(ConstructorPayloadTypes { fields: fields, declared: constructor_fields(VariantTagState { concepts: cc.concepts, src: cc.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) else 1) + constructor_check_vfields(ConstructorCheckVfields { fields: fields, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstMatch(scrut, arms) => constructor_check_ast(ConstructorCheckAst { node: scrut, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_arms(ConstructorCheckArms { arms: arms, scrut_ty: constructor_value_type(TypeArg { node: scrut, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }), tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => constructor_check_ast(ConstructorCheckAst { node: scrut, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: ok_body, tenv: Env::ECons { name_start: ok_bstart, name_len: ok_blen, val: 3, rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: err_body, tenv: Env::ECons { name_start: err_bstart, name_len: err_blen, val: 3, rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: init, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: Env::ECons { name_start: acc_start, name_len: acc_len, val: constructor_value_type(TypeArg { node: init, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }), rest: cc.tenv } }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstAll(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstAny(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstMap(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstFilter(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstSum(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstCount(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstMinFold(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      AstMaxFold(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, tenv: Env::ECons { name_start: item_start, name_len: item_len, val: constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: coll, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
   proofs:
     purity:
-      reads : [cc.node, cc.concepts, cc.src]
-      calls : [constructor_check_ast, constructor_check_args, constructor_shape_ok, constructor_field_set_errors, constructor_fields, constructor_check_vfields, constructor_check_arms]
+      reads : [cc.concepts, cc.node, cc.prog, cc.src, cc.tenv]
+      calls : [constructor_check_args, constructor_check_arms, constructor_check_ast, constructor_check_vfields, constructor_element_type, constructor_field_set_errors, constructor_fields, constructor_payload_type_errors, constructor_shape_ok, constructor_value_type]
     termination:
       bound : 4000
 
 
-concept ConstructorCheckArgs
-  @intention: "Constructor layout checking through args"
-  @source: vexprparse.intent:1785
-  fields:
-    args : ArgList
-    concepts : ConceptList
-    src : text [..4194304]
-
-
 rule constructor_check_args
-  @intention: "Count invalid constructor layouts throughout args"
-  @source: vexprparse.intent:1785
+  @intention: "Find constructor obligations in every call argument"
+  @source: vexprparse.intent:1790
   input:
     cc : ConstructorCheckArgs
   output:
     out : number
   logic:
     out = match cc.args:
-      ArgCons(head, tail) => constructor_check_ast(ConstructorCheckAst { node: head, concepts: cc.concepts, src: cc.src }) + constructor_check_args(ConstructorCheckArgs { args: tail, concepts: cc.concepts, src: cc.src })
+      ArgCons(head, tail) => constructor_check_ast(ConstructorCheckAst { node: head, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_args(ConstructorCheckArgs { args: tail, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
       ArgNil => 0
   proofs:
     purity:
-      reads : [cc.args, cc.concepts, cc.src]
-      calls : [constructor_check_ast, constructor_check_args]
+      reads : [cc.args, cc.concepts, cc.prog, cc.src, cc.tenv]
+      calls : [constructor_check_args, constructor_check_ast]
     termination:
       bound : 4000
 
 
-concept ConstructorCheckVfields
-  @intention: "Constructor layout checking through vfields"
-  @source: vexprparse.intent:1785
-  fields:
-    fields : VFieldList
-    concepts : ConceptList
-    src : text [..4194304]
-
-
 rule constructor_check_vfields
-  @intention: "Count invalid constructor layouts throughout vfields"
-  @source: vexprparse.intent:1785
+  @intention: "Find nested constructors inside every initializer"
+  @source: vexprparse.intent:1790
   input:
     cc : ConstructorCheckVfields
   output:
     out : number
   logic:
     out = match cc.fields:
-      VFCons(name_start, name_len, val, rest) => constructor_check_ast(ConstructorCheckAst { node: val, concepts: cc.concepts, src: cc.src }) + constructor_check_vfields(ConstructorCheckVfields { fields: rest, concepts: cc.concepts, src: cc.src })
+      VFCons(name_start, name_len, val, rest) => constructor_check_ast(ConstructorCheckAst { node: val, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_vfields(ConstructorCheckVfields { fields: rest, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
       VFNil => 0
   proofs:
     purity:
-      reads : [cc.fields, cc.concepts, cc.src]
+      reads : [cc.concepts, cc.fields, cc.prog, cc.src, cc.tenv]
       calls : [constructor_check_ast, constructor_check_vfields]
     termination:
       bound : 4000
 
 
-concept ConstructorCheckArms
-  @intention: "Constructor layout checking through arms"
-  @source: vexprparse.intent:1785
-  fields:
-    arms : ArmList
-    concepts : ConceptList
-    src : text [..4194304]
-
-
 rule constructor_check_arms
-  @intention: "Count invalid constructor layouts throughout arms"
-  @source: vexprparse.intent:1785
+  @intention: "Check each match arm under its own payload binder types"
+  @source: vexprparse.intent:1790
   input:
     cc : ConstructorCheckArms
   output:
     out : number
   logic:
     out = match cc.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src }) + constructor_check_arms(ConstructorCheckArms { arms: rest, concepts: cc.concepts, src: cc.src })
+      ArmCons(vstart, vlen, binders, body, rest) => constructor_check_ast(ConstructorCheckAst { node: body, tenv: constructor_arm_env(ConstructorArmEnv { scrut_ty: cc.scrut_ty, vstart: vstart, vlen: vlen, binders: binders, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }), prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_arms(ConstructorCheckArms { arms: rest, scrut_ty: cc.scrut_ty, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
       ArmNil => 0
   proofs:
     purity:
-      reads : [cc.arms, cc.concepts, cc.src]
-      calls : [constructor_check_ast, constructor_check_arms]
+      reads : [cc.arms, cc.concepts, cc.prog, cc.scrut_ty, cc.src, cc.tenv]
+      calls : [constructor_arm_env, constructor_check_arms, constructor_check_ast]
     termination:
       bound : 4000
 
 
-concept ConstructorCheckBinds
-  @intention: "Constructor layout checking through binds"
-  @source: vexprparse.intent:1785
-  fields:
-    binds : Binding
-    concepts : ConceptList
-    src : text [..4194304]
-
-
 rule constructor_check_binds
-  @intention: "Count invalid constructor layouts throughout binds"
-  @source: vexprparse.intent:1785
+  @intention: "Check sequential lets before extending the environment with the new binding"
+  @source: vexprparse.intent:1790
   input:
     cc : ConstructorCheckBinds
   output:
     out : number
   logic:
     out = match cc.binds:
-      BCons(name_start, name_len, value, rest) => constructor_check_ast(ConstructorCheckAst { node: value, concepts: cc.concepts, src: cc.src }) + constructor_check_binds(ConstructorCheckBinds { binds: rest, concepts: cc.concepts, src: cc.src })
-      BNil => 0
+      BCons(name_start, name_len, value, rest) => constructor_check_ast(ConstructorCheckAst { node: value, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }) + constructor_check_binds(ConstructorCheckBinds { binds: rest, result: cc.result, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: constructor_value_type(TypeArg { node: value, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src }), rest: cc.tenv }, prog: cc.prog, concepts: cc.concepts, src: cc.src })
+      BNil => constructor_check_ast(ConstructorCheckAst { node: cc.result, tenv: cc.tenv, prog: cc.prog, concepts: cc.concepts, src: cc.src })
   proofs:
     purity:
-      reads : [cc.binds, cc.concepts, cc.src]
-      calls : [constructor_check_ast, constructor_check_binds]
+      reads : [cc.binds, cc.concepts, cc.prog, cc.result, cc.src, cc.tenv]
+      calls : [constructor_check_ast, constructor_check_binds, constructor_value_type]
     termination:
       bound : 4000
 
 
 rule constructor_check_rule
-  @intention: "Check named constructor layouts in every let and rule result"
-  @source: vexprparse.intent:1785
+  @intention: "Check constructor obligations throughout one rule using declared parameter types"
+  @source: vexprparse.intent:1790
   input:
     tr : TCheckRuleState
   output:
     out : number
   logic:
     let body = rd_body(tr.rd)
-    out = constructor_check_binds(ConstructorCheckBinds { binds: block_binds(body), concepts: tr.concepts, src: tr.src }) + constructor_check_ast(ConstructorCheckAst { node: block_result(body), concepts: tr.concepts, src: tr.src })
+    let tenv = constructor_type_env(FieldConceptTenvState { fields: params_to_fields(rule_params_of(tr.rd)), concepts: tr.concepts, src: tr.src })
+    out = constructor_check_binds(ConstructorCheckBinds { binds: block_binds(body), result: block_result(body), tenv: tenv, prog: tr.prog, concepts: tr.concepts, src: tr.src })
   proofs:
     purity:
-      reads : [tr.rd, tr.concepts, tr.src]
-      calls : [rd_body, constructor_check_binds, block_binds, constructor_check_ast, block_result]
+      reads : [tr.concepts, tr.prog, tr.rd, tr.src]
+      calls : [block_binds, block_result, constructor_check_binds, constructor_type_env, params_to_fields, rd_body, rule_params_of]
     termination:
       bound : 4000
 
 
 rule constructor_check_rules
-  @intention: "Reject unresolved constructor layouts before raw native emission"
-  @source: vexprparse.intent:1785
+  @intention: "Reject constructor layout and type obligations before raw emission"
+  @source: vexprparse.intent:1790
   input:
     tl : TCheckListState
   output:
@@ -36481,7 +37199,7 @@ rule constructor_check_rules
       RNil => 0
   proofs:
     purity:
-      reads : [tl.iter, tl.src, tl.prog, tl.concepts]
+      reads : [tl.concepts, tl.iter, tl.prog, tl.src]
       calls : [constructor_check_rule, constructor_check_rules]
     termination:
       bound : 4000

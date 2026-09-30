@@ -285,6 +285,15 @@ before ELF/raw output. Payload type-checking parity and the legacy Rust-native
 variant evaluation-order path remain separate. See
 [constructor ordering](docs/self-hosted-constructor-order.md).
 
+Self-hosted constructor types (2026-09-30): the constructor walk now checks
+number/bool/text and exact nominal payload types using a strict lexical
+environment, including sequential aliases, scalar parameters and variant
+binders. Unknown inference and stored bytes/collections/Results refuse before
+ELF/raw output. Target lowering is unchanged; checker temporaries use existing
+scalar arena scopes. General return-contract checking and the Rust verifier's
+separate constructor-scope omissions remain follow-ups. See
+[constructor types](docs/self-hosted-constructor-types.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

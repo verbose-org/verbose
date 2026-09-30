@@ -95,11 +95,34 @@ same instructions and storage as before. Missing, unknown or duplicate fields
 refuse before ELF or raw emission. This supersedes the source-order assumption
 in the [historical record design](self-hosting-records-astfield-design.md#astfield-eval).
 
-This does not complete self-hosted payload type checking or the unchecked
-evaluator's error/effect model. The Rust native variant lowering separately
+The [payload type follow-up](self-hosted-constructor-types.md) now checks number,
+bool, text and nominal record/variant fields in their lexical scopes. Stored
+bytes, collections and Results refuse, as do values needing unsupported Result
+component inference. This does not complete general self-hosted type parity or
+the unchecked evaluator's error/effect model. Calls used to type initializers
+check arguments and use declared outputs; the existing declaration-versus-body
+checks are a separate limitation.
+
+The same probes exposed Rust-verifier constructor omissions: future lets can
+be visible through the final environment, and constructors in variant/Result
+arms can miss binder types. The self-hosted strict walk refuses these cases;
+the Rust checks still need their own lexical-scope correction.
+
+The Rust native variant lowering separately
 walks initializer expressions in declaration order; it is not used as the
 source-order oracle for this correction. Some legacy Rust-native local-record
 shapes explicitly refuse as rich operations. Those paths are unchanged.
+
+## Self-hosted nested collection lowering
+
+Constructor type regressions also exposed a separate pre-existing emission gap:
+`sum(map(i.items, x => x + 1), x => take(Pair { first: x, second: 2 }))`
+and the corresponding `filter(i.items, x => x > 2)` shape compile but trap
+at runtime. Here `i.items` is `collection(number)` and `take` returns `p.first`
+from a `Pair` parameter. Parent `457ee4c` and the constructor-type follow-up
+emit identical 721-byte binaries for the minimal probes. Their types can be
+checked, but this is not native support for arbitrary nested collections.
+The emitter needs a dedicated lowering path or an explicit pre-output refusal.
 
 ## WASM text-valued conditionals
 
