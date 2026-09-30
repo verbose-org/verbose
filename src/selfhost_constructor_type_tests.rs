@@ -187,7 +187,7 @@ fn rejected() -> Vec<String> {
     out
 }
 
-const TAKE: &str = r#"
+pub(crate) const TAKE: &str = r#"
 rule take
   @intention: "A declared numeric record consumer"
   @source: invoices.intent:1
@@ -255,14 +255,13 @@ pub(crate) fn assert_types(compiler: &Path, raw: &Path, checker: &Path, base: &P
             );
         }
     }
-    // Rust's legacy constructor walk uses the final let environment and misses
-    // these nested binder types. Pin the stricter self-hosted refusals separately.
+    // Both verifiers must refuse future lets and mistyped local binders.
     let future =
         make("    let p = Pair { first: later, second: 2 }\n    let later = 7\n    out = 7");
     let arm = source("    let p = Choice::Label { n: 7, text: \"x\" }\n    out = match p:\n      Label(n, text) => take(Pair { first: text, second: n })\n      Trio(a, b, c) => 0\n      Link(value, next) => 0\n      Empty => 0", TAKE, "take");
     let result = source("    let value = 7\n    out = match_result(Ok(\"x\"), value => take(Pair { first: value, second: 2 }), error => 0)", TAKE, "take");
     for future in [future, arm, result] {
-        assert!(verifier::verify_program(&parse(&future), Path::new("examples")).is_empty());
+        assert!(!verifier::verify_program(&parse(&future), Path::new("examples")).is_empty());
         for backend in [compiler, raw] {
             let r = send(backend, &future, 0, false);
             assert_eq!(

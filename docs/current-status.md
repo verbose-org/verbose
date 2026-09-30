@@ -49,6 +49,12 @@ bytes/collection/Result fields refuse before self-hosted ELF/raw output. These
 are compiler checks with unchanged target lowering; general type-checking parity
 and Result component inference remain separate work.
 
+The [Rust constructor checker](constructor-lexical-scopes.md) now follows
+source-order lets, captured aliases and typed variant/Result/collection binders.
+Every constructor field must have an established compatible type, including
+its computation's operands and branches. Rust retains its existing bytes,
+collection and Result types; backend capability limits remain separate.
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable

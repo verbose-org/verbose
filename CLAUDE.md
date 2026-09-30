@@ -290,9 +290,14 @@ number/bool/text and exact nominal payload types using a strict lexical
 environment, including sequential aliases, scalar parameters and variant
 binders. Unknown inference and stored bytes/collections/Results refuse before
 ELF/raw output. Target lowering is unchanged; checker temporaries use existing
-scalar arena scopes. General return-contract checking and the Rust verifier's
-separate constructor-scope omissions remain follow-ups. See
+scalar arena scopes. General return-contract checking remains a follow-up. See
 [constructor types](docs/self-hosted-constructor-types.md).
+
+Rust constructor scopes (2026-09-30): a dedicated lexical walk now requires
+established payload types through sequential lets, captured aliases and typed
+variant/Result/collection binders. Unknown facts mask outer bindings and cannot
+prove a constructor field. Rust's existing storage types remain available,
+subject to each backend's limits. See [lexical constructor obligations](docs/constructor-lexical-scopes.md).
 
 ## Dev workflow (cidx + branch-protected main)
 

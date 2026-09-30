@@ -103,10 +103,13 @@ the unchecked evaluator's error/effect model. Calls used to type initializers
 check arguments and use declared outputs; the existing declaration-versus-body
 checks are a separate limitation.
 
-The same probes exposed Rust-verifier constructor omissions: future lets can
-be visible through the final environment, and constructors in variant/Result
-arms can miss binder types. The self-hosted strict walk refuses these cases;
-the Rust checks still need their own lexical-scope correction.
+The [Rust lexical constructor walk](constructor-lexical-scopes.md) now rejects
+future-let references and mistyped variant/Result binders as well. It checks
+constructor dependencies in their actual scopes, including collection binders
+and aliases. General legacy typing outside constructor obligations remains
+incomplete. Fields using a fold accumulator require an established type; a
+fold body containing constructors also refuses changed accumulator types.
+No loop type solver is introduced.
 
 The Rust native variant lowering separately
 walks initializer expressions in declaration order; it is not used as the
