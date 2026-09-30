@@ -87,10 +87,10 @@ recursive builder instead of asking the constructor checker to guess its
 return type; their observable list sums and printed expressions remain the same.
 
 The regression work exposed three separate Rust-verifier omissions: a constructor
-can see a future let through its final environment, and constructor checks in
-variant/Result arms can miss the local binder type. Dedicated probes record
-these stricter self-hosted refusals separately from shared negative cases.
-Closing the Rust omissions is a follow-up, not an assumed reference guarantee.
+could accept a future let with no established type, and constructor checks in
+variant/Result arms could miss the local binder type. These probes now require
+both compilers to refuse, following the separate
+[Rust lexical correction](constructor-lexical-scopes.md).
 
 All changes to production logic are in `examples/vexprparse.verbose`. The ELF
 gate uses the existing rule checker; raw emission uses the existing pre-output

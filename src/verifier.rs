@@ -6,6 +6,9 @@ use std::path::Path as StdPath;
 use crate::ast::*;
 use crate::parser::PRIMITIVE_CALL_NAMES;
 
+#[path = "constructor_types.rs"]
+mod constructor_types;
+
 #[derive(Debug)]
 pub struct VerifyError {
     pub context: String,
@@ -3089,6 +3092,9 @@ fn verify_rule(
     if bounded_contract { return; }
     let mut baseline: Vec<VerifyError> = Vec::new();
     check_rule_types(rule, all_rules, input_concept, concepts, None, &mut baseline);
+    // For a handler's baseline retain only established operand diagnostics.
+    // Actual constructor obligations need each service's declared state type.
+    constructor_types::check_rule(rule, all_rules, concepts, None, state_scopes.is_empty(), &mut baseline);
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
     for e in &baseline {
         *seen.entry((e.context.clone(), e.message.clone())).or_insert(0) += 1;
@@ -3097,6 +3103,7 @@ fn verify_rule(
     for scope in state_scopes {
         let mut scoped: Vec<VerifyError> = Vec::new();
         check_rule_types(rule, all_rules, input_concept, concepts, Some(&scope.concept), &mut scoped);
+        constructor_types::check_rule(rule, all_rules, concepts, Some(&scope.concept), true, &mut scoped);
         let mut budget = seen.clone();
         let note = state_scope_note(&facts, scope);
         for e in scoped {
@@ -3108,7 +3115,11 @@ fn verify_rule(
             }
             errors.push(VerifyError {
                 context: format!("service '{}' / handler '{}' / logic", scope.service.name, rule.name),
-                message: format!("{}; {}", e.message, note),
+                message: if let Some((_, field)) = e.context.split_once(" / constructor ") {
+                    format!("constructor {}: {}; {}", field, e.message, note)
+                } else {
+                    format!("{}; {}", e.message, note)
+                },
             });
         }
     }
@@ -4224,22 +4235,8 @@ fn check_expr_against(
                     ),
                 });
             }
-            // Per-field type check: each provided field's expression must
-            // match the declared payload field's type (when inferable).
-            for (field_name, field_expr) in fields {
-                if let Some(decl) = variant.fields.iter().find(|f| &f.name == field_name) {
-                    check_expr_against(
-                        field_expr,
-                        &decl.ty,
-                        rule,
-                        all_rules,
-                        input_concept,
-                        all_concepts,
-                        bindings,
-                        errors,
-                    );
-                }
-            }
+            // Payload obligations are checked by constructor_types in their
+            // lexical environment, including let order and typed arm binders.
         }
         // Phase A slice 3 — pattern match over a sum-type's variants.
         // Cross-check the scrutinee resolves to a sum-type concept, every
@@ -4432,22 +4429,8 @@ fn check_expr_against(
                     ),
                 });
             }
-            // Per-field type check: each provided field's expression must
-            // match the declared field type (when inferable).
-            for (field_name, field_expr) in fields {
-                if let Some(decl) = concept.fields.iter().find(|f| &f.name == field_name) {
-                    check_expr_against(
-                        field_expr,
-                        &decl.ty,
-                        rule,
-                        all_rules,
-                        input_concept,
-                        all_concepts,
-                        bindings,
-                        errors,
-                    );
-                }
-            }
+            // Payload obligations are checked by constructor_types in their
+            // lexical environment, including let order and typed arm binders.
         }
         _ => {
             if let Some(inferred) = infer_expr_type(expr, rule, all_rules, input_concept, bindings) {
