@@ -128,8 +128,15 @@ The parent emitter (`2652e46`) produced 721-byte binaries that trapped for
 `sum(map(i.items, x => x + 1), x => take(Pair { first: x, second: 2 }))`
 and the corresponding filter shape. The new refusal closes that emission hole;
 implementing collection composition still requires a value representation or
-an order-preserving lowering design. Other legacy element/input layout gaps,
-including the `retirement` record-element map trap, remain outside this guard.
+an order-preserving lowering design. The subsequent [scalar map slice](self-hosted-scalar-map.md)
+fixes the `retirement` record-element map trap: supported number/bool projections
+stream their output and release element temporaries. It checks direct trailing
+collection inputs, number/text element layouts, copy capacities and text-slot
+lifetimes. Intermediate collection values and other legacy layout gaps remain
+outside that support; a successful capability check is not general backend parity.
+In particular, the full `payroll.verbose` file now refuses because its uncalled
+`names` rule has unsupported text collection output; isolating its supported
+record/scalar projections keeps those rules available.
 
 ## WASM text-valued conditionals
 

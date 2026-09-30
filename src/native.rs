@@ -57015,7 +57015,12 @@ rule pick
         // Constructor payload checking deliberately refuses tagged_bonuses:
         // read(resource) does not establish a field type in its strict subset.
         // Both ELF and raw emission refuse before producing bytes.
-        const EXPECTED_ACCEPTED: usize = 93;
+        // 93 -> 92: scalar-map capability checks refuse payroll's text-output
+        // `names` rule, including when another entry is selected. The parent
+        // emitted an int3 for it. Isolated record-output compute_bonuses and
+        // high_earners retain byte-identical code; the salaries projection now
+        // executes correctly. Retirement keeps its acceptance and now works.
+        const EXPECTED_ACCEPTED: usize = 92;
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.

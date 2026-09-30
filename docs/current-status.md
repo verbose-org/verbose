@@ -61,6 +61,13 @@ ELF/raw emission. Every parsed rule and branch is checked; typing stays separate
 Supported direct reductions and streamed output retain their emitted code.
 See [collection lowering](self-hosted-collection-lowering.md).
 
+Self-hosted [scalar maps](self-hosted-scalar-map.md) now stream number/bool
+projections from flat number/text records, and bool projections from numbers.
+`retirement_status` prints booleans and retains the sticky false exit status.
+The new path checks argv tails and text-copy capacity, restores the arena after
+each scalar result and rejects unsupported layouts or text-slot lifetimes before
+emission. Existing numeric and record-output paths keep their lowering.
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable

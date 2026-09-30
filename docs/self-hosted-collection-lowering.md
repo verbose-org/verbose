@@ -103,3 +103,8 @@ ELF header or raw instruction prefix.
 
 The normal suite also pins the example's conventional last-rule entry. New
 compiler helpers precede `count_cells_src`, preserving its JSON fixture entry.
+
+The [scalar map follow-up](self-hosted-scalar-map.md) adds number/bool output from
+flat records and bool output from numbers. It extends `collection_lowering_check`
+with output-type/layout failures and text-slot lifetime refusals; the producer
+placement and collection-returning-call boundary above is unchanged.
