@@ -1786,3 +1786,7 @@ Self-hosted named constructors (2026-09-27): evaluate each initializer once in
 written order, then place its value in the declared field slot. Reject missing,
 unknown or duplicate fields before emission. Preserve target storage and the
 existing eight-byte pop/store sequence; support both records and variants.
+
+Self-hosted constructor types (2026-09-30): check each value against its named
+field declaration in the correct lexical scope. Unknown inference refuses the
+constructor obligation; preserve native code and existing unrelated contracts.

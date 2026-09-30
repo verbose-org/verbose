@@ -16,13 +16,13 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-fn parse(src: &str) -> Program {
+pub(crate) fn parse(src: &str) -> Program {
     Parser::new(Lexer::new(src).tokenize().unwrap())
         .parse_program()
         .unwrap()
 }
 
-fn source(body: &str, extra: &str, calls: &str) -> String {
+pub(crate) fn source(body: &str, extra: &str, calls: &str) -> String {
     let reads = if body.contains("i.n") { "i.n" } else { "" };
     format!(
         r#"@verbose 0.1.0
@@ -87,7 +87,7 @@ rule probe
     )
 }
 
-fn send(executable: &Path, src: &str, index: usize, unlimited: bool) -> Output {
+pub(crate) fn send(executable: &Path, src: &str, index: usize, unlimited: bool) -> Output {
     let mut command = if unlimited {
         let mut c = Command::new("sh");
         c.args([
@@ -116,14 +116,14 @@ fn send(executable: &Path, src: &str, index: usize, unlimited: bool) -> Output {
     child.wait_with_output().unwrap()
 }
 
-fn install(output: Output, path: &Path) {
+pub(crate) fn install(output: Output, path: &Path) {
     assert_eq!((output.status.code(), output.stderr), (Some(0), vec![]));
     assert!(output.stdout.starts_with(b"\x7fELF"));
     fs::write(path, output.stdout).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn interpreted(p: &Program) -> Result<Value, interpreter::RuntimeError> {
+pub(crate) fn interpreted(p: &Program) -> Result<Value, interpreter::RuntimeError> {
     let rules: Vec<_> = p
         .items
         .iter()
@@ -421,6 +421,7 @@ pub(crate) fn assert_emitted_drivers(compiler: &Path, base: &Path) {
             for (literal, expected) in [
                 ("Pair { second: 2, first: 1 }", b"0\n"),
                 ("Pair { first: 1 }", b"1\n"),
+                ("Pair { first: \"wrong\", second: 2 }", b"1\n"),
             ] {
                 let probe = source(&format!("    let p = {literal}\n    out = 7"), "", "");
                 let r = send(&driver, &probe, 0, false);
@@ -432,6 +433,12 @@ pub(crate) fn assert_emitted_drivers(compiler: &Path, base: &Path) {
             }
         }
     }
+    crate::selfhost_constructor_type_tests::assert_types(
+        compiler,
+        &base.join("constructor-x86_program_src"),
+        &base.join("constructor-type_check"),
+        base,
+    );
 }
 
 #[test]

@@ -32284,7 +32284,7 @@ rule le64_neg
         // Field access AFTER other code — the compounding-offset drift catcher.
         let compound = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    let t = s.a + 1\n    out = t + s.b".to_string();
         // R7 variant list-sum (AstField never fires) — must stay 6 / 15.
-        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(SEED))\n  proofs:\n    purity:\n      reads : []\n      calls : [sum_list, build]\n    termination:\n      bound : 8\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\n  proofs:\n    purity:\n      reads : [n]\n      calls : [build]\n    termination:\n      bound : 64\nrule sum_list(l : Lst)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0\n  proofs:\n    purity:\n      reads : [l]\n      calls : [sum_list]\n    termination:\n      bound : 64";
+        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(SEED))\n  proofs:\n    purity:\n      reads : []\n      calls : [sum_list, build]\n    termination:\n      bound : 8\nrule build(n)\n  output:\n    out : Lst\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\n  proofs:\n    purity:\n      reads : [n]\n      calls : [build]\n    termination:\n      bound : 64\nrule sum_list(l : Lst)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0\n  proofs:\n    purity:\n      reads : [l]\n      calls : [sum_list]\n    termination:\n      bound : 64";
         let lst3 = lst.replace("SEED", "3");
         let lst5 = lst.replace("SEED", "5");
         let scalar = "rule main\n  logic:\n    out = 2 + 3".to_string();
@@ -32400,7 +32400,7 @@ rule le64_neg
         // Slice-3 regression: the let-bound case (the resolver's let branch).
         let let_bound = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    out = s.a".to_string();
         // R7 variant list-sum: AstField never fires — the match/variant path unchanged.
-        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(3))\n  proofs:\n    purity:\n      reads : []\n      calls : [sum_list, build]\n    termination:\n      bound : 8\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\n  proofs:\n    purity:\n      reads : [n]\n      calls : [build]\n    termination:\n      bound : 64\nrule sum_list(l : Lst)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0\n  proofs:\n    purity:\n      reads : [l]\n      calls : [sum_list]\n    termination:\n      bound : 64".to_string();
+        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(3))\n  proofs:\n    purity:\n      reads : []\n      calls : [sum_list, build]\n    termination:\n      bound : 8\nrule build(n)\n  output:\n    out : Lst\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\n  proofs:\n    purity:\n      reads : [n]\n      calls : [build]\n    termination:\n      bound : 64\nrule sum_list(l : Lst)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0\n  proofs:\n    purity:\n      reads : [l]\n      calls : [sum_list]\n    termination:\n      bound : 64".to_string();
 
         let cases: &[(String, i64)] = &[
             (param_access, 49),
@@ -47084,6 +47084,8 @@ service echo
     max_request : 65536
 
   handler: handle
+  request_timeout: 5
+  response_timeout: 5
 "#
         );
         let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
@@ -47091,6 +47093,9 @@ service echo
         let errs = crate::verifier::verify_program(&program, std::path::Path::new("examples"));
         assert!(errs.is_empty(), "echo service must verify; got {errs:#?}");
 
+        // A 60 KB request can arrive in several TCP reads. Use the existing
+        // bounded assembly contract above; the legacy single-read transport
+        // cannot establish the complete-body premise of this size regression.
         // ── 3. THE RUNTIME PROOF THAT [..4096] WAS FALSE ─────────────
         let out = std::env::temp_dir().join("verbosec_test_body_bound_tracks_max_request");
         compile_service(&program, "echo", out.to_str().unwrap()).expect("echo service compiles");
@@ -54998,7 +55003,7 @@ rule two
         // exact string, plus the trampoline's trailing newline.
         let print_chain = |n: u32| -> String {
             format!(
-                "concept_group G [max_depth: 64, max_nodes: 4096]\n  concept Expr\n    variants:\n      Int of (v : number)\n      Add of (lhs : Expr, rhs : Expr)\nconcept Seed\n  fields:\n    n : number\nrule main\n  logic:\n    out = print_expr(build_chain(Seed {{ n: {n} }}))\n  proofs:\n    purity:\n      reads : []\n      calls : [print_expr, build_chain]\n    termination:\n      bound : 8\nrule build_chain(s : Seed)\n  logic:\n    out = if s.n == 0 then Expr::Int {{ v: 0 }} else Expr::Add {{ lhs: Expr::Int {{ v: s.n }}, rhs: build_chain(Seed {{ n: s.n - 1 }}) }}\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [build_chain]\n    termination:\n      bound : 64\nrule print_expr(e : Expr)\n  logic:\n    out = match e: Int(v) => concat(v)  Add(l, r) => concat(print_expr(l), \"+\", print_expr(r))\n  proofs:\n    purity:\n      reads : [e]\n      calls : [print_expr]\n    termination:\n      bound : 64"
+                "concept_group G [max_depth: 64, max_nodes: 4096]\n  concept Expr\n    variants:\n      Int of (v : number)\n      Add of (lhs : Expr, rhs : Expr)\nconcept Seed\n  fields:\n    n : number\nrule main\n  logic:\n    out = print_expr(build_chain(Seed {{ n: {n} }}))\n  proofs:\n    purity:\n      reads : []\n      calls : [print_expr, build_chain]\n    termination:\n      bound : 8\nrule build_chain(s : Seed)\n  output:\n    out : Expr\n  logic:\n    out = if s.n == 0 then Expr::Int {{ v: 0 }} else Expr::Add {{ lhs: Expr::Int {{ v: s.n }}, rhs: build_chain(Seed {{ n: s.n - 1 }}) }}\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [build_chain]\n    termination:\n      bound : 64\nrule print_expr(e : Expr)\n  logic:\n    out = match e: Int(v) => concat(v)  Add(l, r) => concat(print_expr(l), \"+\", print_expr(r))\n  proofs:\n    purity:\n      reads : [e]\n      calls : [print_expr]\n    termination:\n      bound : 64"
             )
         };
         expect_stdout(&print_chain(3), "3+2+1+0\n", "pc3");
@@ -57007,7 +57012,10 @@ rule pick
         // stays 97; no gaps-table row moves (the record-let row's declared-
         // entry half is unreachable here because the handler gate fires
         // first).
-        const EXPECTED_ACCEPTED: usize = 94;
+        // Constructor payload checking deliberately refuses tagged_bonuses:
+        // read(resource) does not establish a field type in its strict subset.
+        // Both ELF and raw emission refuse before producing bytes.
+        const EXPECTED_ACCEPTED: usize = 93;
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.
