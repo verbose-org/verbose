@@ -35,6 +35,13 @@ decoded text contents across spans, aliases, slices and concat trees; numeric
 values retain numeric equality. Comparison creates no copied text. Legacy
 Rust-native dynamic text rebinding remains a separate documented gap.
 
+The [named constructor correction](self-hosted-constructor-order.md) preserves
+written initializer order while placing record and variant values in their
+declared slots. Self-hosted ELF and raw emission reject incomplete or ambiguous
+field mappings before output. Source-declared constructors keep their native
+storage and instruction counts; the evaluator may allocate a reordered value
+list in its existing arena.
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable

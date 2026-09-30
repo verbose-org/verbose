@@ -5911,7 +5911,7 @@ rule eval_ast_env
       -- R6c: construct a runtime variant value. `tag` is the variant's identity
       -- (variant_tag resolves the concept/variant name spans against the ConceptList);
       -- `payload` is the cons-list of evaluated field values (eval_vfields).
-      AstVariant(cstart, clen, vstart, vlen, fields) => Value::VData { tag: variant_tag(VariantTagState { concepts: ea.concepts, src: ea.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), payload: eval_vfields(EvalVFieldsState { fields: fields, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) }
+      AstVariant(cstart, clen, vstart, vlen, fields) => Value::VData { tag: variant_tag(VariantTagState { concepts: ea.concepts, src: ea.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), payload: eval_payload_order(EvalPayloadOrderState { values: eval_vfields(EvalVFieldsState { fields: fields, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), fields: fields, declared: constructor_fields(VariantTagState { concepts: ea.concepts, src: ea.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), src: ea.src }) }
       -- R6c: evaluate the scrutinee to a Value, then dispatch to the arm whose variant
       -- tag equals the scrutinee's, binding the arm's binders positionally to the
       -- scrutinee's payload (eval_match).
@@ -5960,7 +5960,7 @@ rule eval_ast_env
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
-      calls : [values_equal, eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, eval_match_result, eval_reduce, eval_fold, eval_mapfilter, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_arena_scope, span_is_abort_if, span_is_read, arg_first, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64, span_is_fetch]
+      calls : [eval_payload_order, constructor_fields, values_equal, eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, eval_match_result, eval_reduce, eval_fold, eval_mapfilter, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_arena_scope, span_is_abort_if, span_is_read, arg_first, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64, span_is_fetch]
     termination:
       bound : 4000
 
@@ -8061,8 +8061,8 @@ concept FieldIdxState
 -- field_index_of: the 0-based position of the field whose name byte-equals the query
 -- span (-1 if none). Mirror of find_variant_index over a FieldList: the k-th record
 -- field lives at the k-th payload slot, so AstField reads the payload at this index.
--- Assumes construction field order == declaration order (records-arc slice 2). Bound-
--- only termination (the shrinking list tail is a field of the packed input) + the
+-- Constructor values are placed in declaration order after source-order evaluation.
+-- Bound-only termination (the shrinking list tail is a field of the packed input) + the
 -- native recursion breadcrumb, exactly like find_variant_index / find_concept_index.
 rule field_index_of
   @intention: "The 0-based position of the field whose name matches the query span (-1 if none)"
@@ -19412,11 +19412,11 @@ rule tcheck_rule
     -- element-type match is outside this lattice, exactly like collection(number)
     -- which resolves to < 1000 and never tripped this arm). Skip the concept-out
     -- match check when the declared output is itself a collection (out_ty == 3).
-    out = bad_binds + (if result_ty == 3 then 1 else 0) + (if ret != 9 and result_ty != 3 and ret != result_ty then 1 else 0) + (if declared_out >= 1000 and result_ty != 3 and rd_out_ty(tr.rd) != 3 and declared_out != result_ty then 1 else 0)
+    out = arena_scope(constructor_check_rule(tr)) + bad_binds + (if result_ty == 3 then 1 else 0) + (if ret != 9 and result_ty != 3 and ret != result_ty then 1 else 0) + (if declared_out >= 1000 and result_ty != 3 and rd_out_ty(tr.rd) != 3 and declared_out != result_ty then 1 else 0)
   proofs:
     purity:
-      reads : [tr.rd, tr.src, tr.prog, tr.concepts]
-      calls : [rd_body, block_binds, block_result, params_to_fields, rule_params_of, field_concept_tenv, build_tenv, tcheck_binds, type_of_env, rd_return_type, resolve_type, rd_out_ty_start, rd_out_ty_len, rd_out_ty]
+      reads : [tr, tr.rd, tr.src, tr.prog, tr.concepts]
+      calls : [constructor_check_rule, rd_body, block_binds, block_result, params_to_fields, rule_params_of, field_concept_tenv, build_tenv, tcheck_binds, type_of_env, rd_return_type, resolve_type, rd_out_ty_start, rd_out_ty_len, rd_out_ty]
     termination:
       bound : 4000
 
@@ -26183,15 +26183,15 @@ concept ByteGenVFields
     conns : ConnectionList
 
 
--- VPopState: the remaining variant fields to pop off the CPU stack + the payload slot
--- the next pop stores into (counting DOWN from n-1). The first pop takes the top of
--- stack (field[n-1]) into slot n-1, so field j lands in slot j.
+-- VPopState: written constructor fields plus the borrowed declared layout.
+-- Recurse to the last initializer first, then emit each pop into its named slot.
 concept VPopState
-  @intention: "The remaining variant fields to pop + the payload slot the next pop stores into"
+  @intention: "Written constructor fields and declared layout for named payload stores"
   @source: vexprparse.intent:64
   fields:
     rem : VFieldList
-    slot : number
+    declared : FieldList
+    src : text [..4194304]
 
 
 -- vfield_len: the number of fields in a variant construction's VFieldList (cons-walk
@@ -26716,10 +26716,10 @@ rule concepts_append_result
 -- output ty span). concepts_append_http appends the two built-in concepts at the
 -- tail with these NAME spans so resolve_type / find_concept_index byte-match the
 -- handler's AstVariant against them (Finding 1 — the synthetic concepts must be
--- VISIBLE to the verify walk). Field name/type spans are 0 (bogus) on purpose:
--- the verifier only resolves the concept NAME during a record construction, never
--- its declared field types, and arena sizing counts fields by cons length — both
--- are unaffected by the field spans.
+-- VISIBLE to the verify walk). Zero field-name spans mark built-in metadata.
+-- constructor_field_index resolves its closed status/body and method/path/body
+-- names; field typing retains its older synthetic-field path. Arena sizing
+-- still counts the same fields by cons length.
 concept HttpAppendState
   @intention: "A concept list + the HttpRequest/HttpResponse name spans from the handler, to append the two built-in service concepts"
   @source: vexprparse.intent:74
@@ -26735,7 +26735,7 @@ concept HttpAppendState
 -- HttpResponse (status number + body text) concepts at the TAIL of a concept list,
 -- so a `service` handler that NAMES HttpResponse in an AstVariant resolves to a real
 -- concept code (>= 1000) instead of ERROR. The name spans come from the handler; the
--- field spans are 0 (never resolved during construction — see the concept comment).
+-- field spans are 0 (the closed built-in constructor lookup handles them).
 rule concepts_append_http
   @intention: "Append the built-in HttpRequest + HttpResponse concepts (with handler-sourced name spans) at the tail of a concept list"
   @source: vexprparse.intent:74
@@ -28383,9 +28383,9 @@ rule x86_vfields
 
 
 -- x86_vpops: emit the pop+store block moving each pushed field value from the CPU
--- stack into its arena payload slot. The FIRST pop takes the top of stack (field[n-1])
--- into slot n-1 ([node_addr + 8 + 8*(n-1)]); slot counts DOWN, so field j lands in
--- slot j. Per field: pop rcx (59) ; mov [rax + 8 + 8*slot], rcx (48 89 88 + le32 disp).
+-- stack into its named arena payload slot. Reverse traversal follows the stack
+-- order while name lookup selects the declared destination. Each pop/store stays
+-- eight bytes: pop rcx (59); mov [rax + 8 + 8*slot], rcx (48 89 88 + le32 disp).
 rule x86_vpops
   @intention: "Emit pop+store of each variant field value into its arena payload slot"
   @source: vexprparse.intent:64
@@ -28395,12 +28395,12 @@ rule x86_vpops
     out : bytes
   logic:
     out = match vp.rem:
-      VFCons(name_start, name_len, val, rest) => concat(b"\x59\x48\x89\x88", le32(8 + 8 * vp.slot), x86_vpops(VPopState { rem: rest, slot: vp.slot - 1 }))
+      VFCons(name_start, name_len, val, rest) => concat(x86_vpops(VPopState { rem: rest, declared: vp.declared, src: vp.src }), b"\x59\x48\x89\x88", le32(8 + 8 * arena_scope(constructor_field_index(FieldIdxState { fields: vp.declared, src: vp.src, q_start: name_start, q_len: name_len, idx: 0 }))))
       VFNil => b""
   proofs:
     purity:
-      reads : [vp.rem, vp.slot]
-      calls : [x86_vpops]
+      reads : [vp.rem, vp.declared, vp.src]
+      calls : [x86_vpops, constructor_field_index]
     termination:
       bound : 4000
 
@@ -29887,10 +29887,10 @@ rule x86_node
       -- Then the arena-write suffix: node_addr = r15 + r14*entry_size (mov rax,r14 ;
       -- imul rax,rax,E ; add rax,r15); write the 8-byte tag (mov qword[rax],tag);
       -- pop each field value into its payload slot [rax + 8 + 8*i] (x86_vpops, popping
-      -- top-of-stack into the highest slot first); leave the INDEX on the stack
+      -- in reverse source order into each named slot); leave the INDEX on the stack
       -- (push r14 = the variant value); inc r14 (bump the node count). entry_size and
       -- tag are self-computed from the ConceptList threaded through bg.concepts.
-      AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_vfields(ByteGenVFields { fields: fields, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x4c\x89\xf0\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\xc7\x00", le32(variant_tag(VariantTagState { concepts: bg.concepts, src: bg.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen })), x86_vpops(VPopState { rem: fields, slot: vfield_len(fields) - 1 }), b"\x41\x56\x49\xff\xc6")
+      AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_vfields(ByteGenVFields { fields: fields, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x4c\x89\xf0\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\xc7\x00", le32(variant_tag(VariantTagState { concepts: bg.concepts, src: bg.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen })), x86_vpops(VPopState { rem: fields, declared: constructor_fields(VariantTagState { concepts: bg.concepts, src: bg.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), src: bg.src }), b"\x41\x56\x49\xff\xc6")
       -- R7b: match dispatch. Emit scrut (pushes index); pop rax (58); node_addr =
       -- r15 + index*entry_size (imul rax,rax,E 48 69 c0+le32 ; add rax,r15 4c 01 f8);
       -- load tag mov rcx,[rax] (48 8b 08); the cmp/je dispatch chain (x86_dispatch);
@@ -29964,7 +29964,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [arg_first, arg_list_len, arm_list_len, ast_var_len, ast_var_start, bin_text_mode, blob_end_off, bytelit_decoded_len, callee_is_texty, cd_fields, cd_name_len, cd_name_start, code_size_args, code_size_arms, code_size_node, coll_elem_nfields, concept_at_index, connection_index_of, count_binds, field_index_of, let_index, lets_append_binders, lets_append_elem_binders, max_payload_fields, param_index, param_list_len, proc_offset, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_bitwise, span_is_byte_at, span_is_concat, span_is_fetch, span_is_length, span_is_max, span_is_min, span_is_read, span_is_substring, static_concept_of, variant_tag, vfield_len, x86_args, x86_arms, x86_binder_loads, x86_bitwise_call, x86_dispatch, x86_elem_load, x86_node, x86_vfields, x86_vpops]
+      calls : [constructor_fields, arg_first, arg_list_len, arm_list_len, ast_var_len, ast_var_start, bin_text_mode, blob_end_off, bytelit_decoded_len, callee_is_texty, cd_fields, cd_name_len, cd_name_start, code_size_args, code_size_arms, code_size_node, coll_elem_nfields, concept_at_index, connection_index_of, count_binds, field_index_of, let_index, lets_append_binders, lets_append_elem_binders, max_payload_fields, param_index, param_list_len, proc_offset, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_bitwise, span_is_byte_at, span_is_concat, span_is_fetch, span_is_length, span_is_max, span_is_min, span_is_read, span_is_substring, static_concept_of, variant_tag, x86_args, x86_arms, x86_binder_loads, x86_bitwise_call, x86_dispatch, x86_elem_load, x86_node, x86_vfields, x86_vpops]
     termination:
       bound : 8000
 
@@ -31483,18 +31483,20 @@ rule x86_program_src
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    let concepts0 = parse_concepts(ProgramState { cell: toks, src: s.source })
-    let concepts = if program_uses_result(UsesTextRules { rules: prog, src: s.source }) == 1 then concepts_append_result(concepts0) else concepts0
+    let parsed_concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
     let ress = parse_resources(ProgramState { cell: toks, src: s.source })
     let conns = parse_connections(ProgramState { cell: toks, src: s.source })
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
     let svcs = parse_services(ProgramState { cell: toks, src: s.source })
+    let handler = find_rule(FindRuleState { rules: prog, src: s.source, q_start: svc_handler_start(svc_head(svcs)), q_len: svc_handler_len(svc_head(svcs)) })
+    let concepts0 = if service_list_len(svcs) > 0 then concepts_append_http(HttpAppendState { concepts: parsed_concepts, req_start: fl_head_ty_start(rd_input(handler)), req_len: fl_head_ty_len(rd_input(handler)), resp_start: rd_out_ty_start(handler), resp_len: rd_out_ty_len(handler) }) else parsed_concepts
+    let concepts = if program_uses_result(UsesTextRules { rules: prog, src: s.source }) == 1 then concepts_append_result(concepts0) else concepts0
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
-    out = concat(abort_if(overflow_contract_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
+    out = concat(abort_if(arena_scope(constructor_check_rules(TCheckListState { iter: prog, src: s.source, prog: prog, concepts: concepts0 })) + overflow_contract_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [overflow_contract_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
+      calls : [find_rule, svc_handler_start, svc_head, svc_handler_len, service_list_len, concepts_append_http, fl_head_ty_start, rd_input, fl_head_ty_len, rd_out_ty_start, rd_out_ty_len, constructor_check_rules, overflow_contract_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
     termination:
       bound : 256
 
@@ -36061,6 +36063,428 @@ rule text_value_bytes_equal
       calls : [vbyte_at, text_value_bytes_equal]
     termination:
       bound : 4000000
+
+
+-- Named constructor layout: source-order evaluation, declaration-order storage.
+-- Lookup and permutation operate on existing metadata; target slots stay fixed.
+rule constructor_fields
+  @intention: "Borrow the declared payload fields for a record or named variant"
+  @source: vexprparse.intent:1785
+  input:
+    vt : VariantTagState
+  output:
+    out : FieldList
+  logic:
+    let c = find_concept(FindConceptState { concepts: vt.concepts, src: vt.src, q_start: vt.cstart, q_len: vt.clen })
+    out = if vt.cstart == vt.vstart then cd_fields(c) else variant_payload(FindVariantState { variants: cd_variants(c), src: vt.src, q_start: vt.vstart, q_len: vt.vlen })
+  proofs:
+    purity:
+      reads : [vt.concepts, vt.src, vt.cstart, vt.clen, vt.vstart, vt.vlen]
+      calls : [find_concept, cd_fields, variant_payload, cd_variants]
+    termination:
+      bound : 64
+
+
+rule constructor_shape_ok
+  @intention: "Require an existing record or variant identity before resolving payload slots"
+  @source: vexprparse.intent:1785
+  input:
+    vt : VariantTagState
+  output:
+    out : number
+  logic:
+    let c = find_concept(FindConceptState { concepts: vt.concepts, src: vt.src, q_start: vt.cstart, q_len: vt.clen })
+    out = if cd_name_len(c) == 0 then 0 else if vt.cstart == vt.vstart then (if variant_list_len(cd_variants(c)) == 0 then 1 else 0) else variant_present(FindVariantState { variants: cd_variants(c), src: vt.src, q_start: vt.vstart, q_len: vt.vlen })
+  proofs:
+    purity:
+      reads : [vt.concepts, vt.src, vt.cstart, vt.clen, vt.vstart, vt.vlen]
+      calls : [find_concept, cd_name_len, variant_list_len, cd_variants, variant_present]
+    termination:
+      bound : 64
+
+
+concept VFieldIndexState
+  @intention: "A constructor field list and a queried name for source-position lookup"
+  @source: vexprparse.intent:1785
+  fields:
+    fields : VFieldList
+    src : text [..4194304]
+    q_start : number
+    q_len : number
+    idx : number
+
+
+rule vfield_index_of
+  @intention: "Find the source position of a named initializer without evaluating it"
+  @source: vexprparse.intent:1785
+  input:
+    fi : VFieldIndexState
+  output:
+    out : number
+  logic:
+    out = match fi.fields:
+      VFCons(name_start, name_len, val, rest) => if name_len == fi.q_len and name_eq(NameEqState { src: fi.src, a_start: name_start, b_start: fi.q_start, len: fi.q_len, off: 0 }) == 1 then fi.idx else vfield_index_of(VFieldIndexState { fields: rest, src: fi.src, q_start: fi.q_start, q_len: fi.q_len, idx: fi.idx + 1 })
+      VFNil => 0 - 1
+  proofs:
+    purity:
+      reads : [fi.fields, fi.src, fi.q_start, fi.q_len, fi.idx]
+      calls : [name_eq, vfield_index_of]
+    termination:
+      bound : 4000
+
+
+concept ConstructorFieldsState
+  @intention: "Written initializers and declared fields sharing one source"
+  @source: vexprparse.intent:1785
+  fields:
+    fields : VFieldList
+    declared : FieldList
+    src : text [..4194304]
+
+
+-- Synthetic HTTP layouts use anonymous fields, unlike parsed declarations.
+-- Resolve only their closed built-in names; never treat anonymous metadata as
+-- a wildcard destination. Other layouts use ordinary declared-name lookup.
+rule constructor_field_index
+  @intention: "Use declared-name lookup unless metadata marks a built-in layout"
+  @source: vexprparse.intent:1785
+  input:
+    fi : FieldIdxState
+  output:
+    out : number
+  logic:
+    out = if fl_head_len(fi.fields) > 0 then field_index_of(fi) else constructor_builtin_field_index(fi)
+  proofs:
+    purity:
+      reads : [fi.fields, fi]
+      calls : [fl_head_len, field_index_of, constructor_builtin_field_index]
+    termination:
+      bound : 16
+
+
+rule constructor_builtin_field_index
+  @intention: "Resolve a declared or closed built-in constructor field slot"
+  @source: vexprparse.intent:1785
+  input:
+    fi : FieldIdxState
+  output:
+    out : number
+  logic:
+    let n = field_list_len(fi.fields)
+    let synthetic = if n > 0 and fl_head_len(fi.fields) == 0 then 1 else 0
+    let response = if n == 2 and fl_head_ty(fi.fields) == 0 and fl_head_ty(fl_tail(fi.fields)) == 2 then 1 else 0
+    let request = if n == 3 and fl_head_ty(fi.fields) == 2 and fl_head_ty(fl_tail(fi.fields)) == 2 and fl_head_ty(fl_tail(fl_tail(fi.fields))) == 2 then 1 else 0
+    let body = if fi.q_len == 4 then (if byte_at(fi.src, fi.q_start) == 98 and byte_at(fi.src, fi.q_start + 1) == 111 and byte_at(fi.src, fi.q_start + 2) == 100 and byte_at(fi.src, fi.q_start + 3) == 121 then 1 else 0) else 0
+    let status = if fi.q_len == 6 then (if byte_at(fi.src, fi.q_start) == 115 and byte_at(fi.src, fi.q_start + 1) == 116 and byte_at(fi.src, fi.q_start + 2) == 97 and byte_at(fi.src, fi.q_start + 3) == 116 and byte_at(fi.src, fi.q_start + 4) == 117 and byte_at(fi.src, fi.q_start + 5) == 115 then 1 else 0) else 0
+    out = if synthetic == 0 then field_index_of(fi) else if response == 1 then (if status == 1 then 0 else if body == 1 then 1 else 0 - 1) else if request == 1 then (if span_is_method(SpanCheck { src: fi.src, start: fi.q_start, len: fi.q_len }) == 1 then 0 else if span_is_path(SpanCheck { src: fi.src, start: fi.q_start, len: fi.q_len }) == 1 then 1 else if body == 1 then 2 else 0 - 1) else 0 - 1
+  proofs:
+    purity:
+      reads : [fi.fields, fi.q_len, fi.src, fi.q_start, fi]
+      calls : [field_list_len, fl_head_len, fl_head_ty, fl_tail, field_index_of, span_is_method, span_is_path]
+    termination:
+      bound : 256
+
+
+rule constructor_named_field_errors
+  @intention: "Reject unknown and repeated initializer names"
+  @source: vexprparse.intent:1785
+  input:
+    cf : ConstructorFieldsState
+  output:
+    out : number
+  logic:
+    out = match cf.fields:
+      VFCons(name_start, name_len, val, rest) => (if constructor_field_index(FieldIdxState { fields: cf.declared, src: cf.src, q_start: name_start, q_len: name_len, idx: 0 }) < 0 or vfield_index_of(VFieldIndexState { fields: rest, src: cf.src, q_start: name_start, q_len: name_len, idx: 0 }) >= 0 then 1 else 0) + constructor_named_field_errors(ConstructorFieldsState { fields: rest, declared: cf.declared, src: cf.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [cf.fields, cf.declared, cf.src]
+      calls : [constructor_field_index, vfield_index_of, constructor_named_field_errors]
+    termination:
+      bound : 4000
+
+
+rule constructor_field_set_errors
+  @intention: "Require a complete bijection between initializer names and declared slots"
+  @source: vexprparse.intent:1785
+  input:
+    cf : ConstructorFieldsState
+  output:
+    out : number
+  logic:
+    out = (if vfield_len(cf.fields) == field_list_len(cf.declared) then 0 else 1) + constructor_named_field_errors(cf)
+  proofs:
+    purity:
+      reads : [cf.fields, cf.declared, cf]
+      calls : [vfield_len, field_list_len, constructor_named_field_errors]
+    termination:
+      bound : 32
+
+
+rule constructor_fields_in_order
+  @intention: "Recognize identity field order so evaluated payload lists can be reused"
+  @source: vexprparse.intent:1785
+  input:
+    cf : ConstructorFieldsState
+  output:
+    out : number
+  logic:
+    out = match cf.fields:
+      VFCons(name_start, name_len, val, rest) => if field_index_of(FieldIdxState { fields: cf.declared, src: cf.src, q_start: name_start, q_len: name_len, idx: 0 }) == 0 then constructor_fields_in_order(ConstructorFieldsState { fields: rest, declared: fl_tail(cf.declared), src: cf.src }) else 0
+      VFNil => if field_list_len(cf.declared) == 0 then 1 else 0
+  proofs:
+    purity:
+      reads : [cf.fields, cf.declared, cf.src]
+      calls : [field_index_of, constructor_fields_in_order, fl_tail, field_list_len]
+    termination:
+      bound : 4000
+
+
+concept EvalPayloadOrderState
+  @intention: "Already evaluated source-order values and their named destination fields"
+  @source: vexprparse.intent:1785
+  fields:
+    values : ValueList
+    fields : VFieldList
+    declared : FieldList
+    src : text [..4194304]
+
+
+rule eval_payload_order
+  @intention: "Reuse an ordered payload or permute its already evaluated values"
+  @source: vexprparse.intent:1785
+  input:
+    ep : EvalPayloadOrderState
+  output:
+    out : ValueList
+  logic:
+    out = if constructor_fields_in_order(ConstructorFieldsState { fields: ep.fields, declared: ep.declared, src: ep.src }) == 1 then ep.values else eval_payload_permute(ep)
+  proofs:
+    purity:
+      reads : [ep.fields, ep.declared, ep.src, ep.values, ep]
+      calls : [constructor_fields_in_order, eval_payload_permute]
+    termination:
+      bound : 32
+
+
+rule eval_payload_permute
+  @intention: "Place evaluated values in declaration order without repeating initializers"
+  @source: vexprparse.intent:1785
+  input:
+    ep : EvalPayloadOrderState
+  output:
+    out : ValueList
+  logic:
+    out = match ep.declared:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => ValueList::VLCons { head: vlist_nth(VListNthState { vs: ep.values, k: vfield_index_of(VFieldIndexState { fields: ep.fields, src: ep.src, q_start: name_start, q_len: name_len, idx: 0 }) }), tail: eval_payload_permute(EvalPayloadOrderState { values: ep.values, fields: ep.fields, declared: rest, src: ep.src }) }
+      FNil => ValueList::VLNil
+  proofs:
+    purity:
+      reads : [ep.declared, ep.values, ep.fields, ep.src]
+      calls : [vlist_nth, vfield_index_of, eval_payload_permute]
+    termination:
+      bound : 4000
+
+
+concept ConstructorCheckAst
+  @intention: "Constructor layout checking through ast"
+  @source: vexprparse.intent:1785
+  fields:
+    node : Ast
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_check_ast
+  @intention: "Count invalid constructor layouts throughout ast"
+  @source: vexprparse.intent:1785
+  input:
+    cc : ConstructorCheckAst
+  output:
+    out : number
+  logic:
+    out = match cc.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      AstField(base, fstart, flen) => constructor_check_ast(ConstructorCheckAst { node: base, concepts: cc.concepts, src: cc.src })
+      AstNeg(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, concepts: cc.concepts, src: cc.src })
+      AstNot(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, concepts: cc.concepts, src: cc.src })
+      AstOk(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, concepts: cc.concepts, src: cc.src })
+      AstResErr(inner) => constructor_check_ast(ConstructorCheckAst { node: inner, concepts: cc.concepts, src: cc.src })
+      AstBin(op, lhs, rhs) => constructor_check_ast(ConstructorCheckAst { node: lhs, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: rhs, concepts: cc.concepts, src: cc.src })
+      AstIf(cond, thn, els) => constructor_check_ast(ConstructorCheckAst { node: cond, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: thn, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: els, concepts: cc.concepts, src: cc.src })
+      AstCall(callee_start, callee_len, args) => constructor_check_args(ConstructorCheckArgs { args: args, concepts: cc.concepts, src: cc.src })
+      AstVariant(cstart, clen, vstart, vlen, fields) => (if constructor_shape_ok(VariantTagState { concepts: cc.concepts, src: cc.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }) == 1 then constructor_field_set_errors(ConstructorFieldsState { fields: fields, declared: constructor_fields(VariantTagState { concepts: cc.concepts, src: cc.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), src: cc.src }) else 1) + constructor_check_vfields(ConstructorCheckVfields { fields: fields, concepts: cc.concepts, src: cc.src })
+      AstMatch(scrut, arms) => constructor_check_ast(ConstructorCheckAst { node: scrut, concepts: cc.concepts, src: cc.src }) + constructor_check_arms(ConstructorCheckArms { arms: arms, concepts: cc.concepts, src: cc.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => constructor_check_ast(ConstructorCheckAst { node: scrut, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: ok_body, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: err_body, concepts: cc.concepts, src: cc.src })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: init, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstAll(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstAny(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstMap(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstFilter(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstSum(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstCount(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstMinFold(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+      AstMaxFold(coll, item_start, item_len, body) => constructor_check_ast(ConstructorCheckAst { node: coll, concepts: cc.concepts, src: cc.src }) + constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src })
+  proofs:
+    purity:
+      reads : [cc.node, cc.concepts, cc.src]
+      calls : [constructor_check_ast, constructor_check_args, constructor_shape_ok, constructor_field_set_errors, constructor_fields, constructor_check_vfields, constructor_check_arms]
+    termination:
+      bound : 4000
+
+
+concept ConstructorCheckArgs
+  @intention: "Constructor layout checking through args"
+  @source: vexprparse.intent:1785
+  fields:
+    args : ArgList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_check_args
+  @intention: "Count invalid constructor layouts throughout args"
+  @source: vexprparse.intent:1785
+  input:
+    cc : ConstructorCheckArgs
+  output:
+    out : number
+  logic:
+    out = match cc.args:
+      ArgCons(head, tail) => constructor_check_ast(ConstructorCheckAst { node: head, concepts: cc.concepts, src: cc.src }) + constructor_check_args(ConstructorCheckArgs { args: tail, concepts: cc.concepts, src: cc.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [cc.args, cc.concepts, cc.src]
+      calls : [constructor_check_ast, constructor_check_args]
+    termination:
+      bound : 4000
+
+
+concept ConstructorCheckVfields
+  @intention: "Constructor layout checking through vfields"
+  @source: vexprparse.intent:1785
+  fields:
+    fields : VFieldList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_check_vfields
+  @intention: "Count invalid constructor layouts throughout vfields"
+  @source: vexprparse.intent:1785
+  input:
+    cc : ConstructorCheckVfields
+  output:
+    out : number
+  logic:
+    out = match cc.fields:
+      VFCons(name_start, name_len, val, rest) => constructor_check_ast(ConstructorCheckAst { node: val, concepts: cc.concepts, src: cc.src }) + constructor_check_vfields(ConstructorCheckVfields { fields: rest, concepts: cc.concepts, src: cc.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [cc.fields, cc.concepts, cc.src]
+      calls : [constructor_check_ast, constructor_check_vfields]
+    termination:
+      bound : 4000
+
+
+concept ConstructorCheckArms
+  @intention: "Constructor layout checking through arms"
+  @source: vexprparse.intent:1785
+  fields:
+    arms : ArmList
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_check_arms
+  @intention: "Count invalid constructor layouts throughout arms"
+  @source: vexprparse.intent:1785
+  input:
+    cc : ConstructorCheckArms
+  output:
+    out : number
+  logic:
+    out = match cc.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => constructor_check_ast(ConstructorCheckAst { node: body, concepts: cc.concepts, src: cc.src }) + constructor_check_arms(ConstructorCheckArms { arms: rest, concepts: cc.concepts, src: cc.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [cc.arms, cc.concepts, cc.src]
+      calls : [constructor_check_ast, constructor_check_arms]
+    termination:
+      bound : 4000
+
+
+concept ConstructorCheckBinds
+  @intention: "Constructor layout checking through binds"
+  @source: vexprparse.intent:1785
+  fields:
+    binds : Binding
+    concepts : ConceptList
+    src : text [..4194304]
+
+
+rule constructor_check_binds
+  @intention: "Count invalid constructor layouts throughout binds"
+  @source: vexprparse.intent:1785
+  input:
+    cc : ConstructorCheckBinds
+  output:
+    out : number
+  logic:
+    out = match cc.binds:
+      BCons(name_start, name_len, value, rest) => constructor_check_ast(ConstructorCheckAst { node: value, concepts: cc.concepts, src: cc.src }) + constructor_check_binds(ConstructorCheckBinds { binds: rest, concepts: cc.concepts, src: cc.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [cc.binds, cc.concepts, cc.src]
+      calls : [constructor_check_ast, constructor_check_binds]
+    termination:
+      bound : 4000
+
+
+rule constructor_check_rule
+  @intention: "Check named constructor layouts in every let and rule result"
+  @source: vexprparse.intent:1785
+  input:
+    tr : TCheckRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(tr.rd)
+    out = constructor_check_binds(ConstructorCheckBinds { binds: block_binds(body), concepts: tr.concepts, src: tr.src }) + constructor_check_ast(ConstructorCheckAst { node: block_result(body), concepts: tr.concepts, src: tr.src })
+  proofs:
+    purity:
+      reads : [tr.rd, tr.concepts, tr.src]
+      calls : [rd_body, constructor_check_binds, block_binds, constructor_check_ast, block_result]
+    termination:
+      bound : 4000
+
+
+rule constructor_check_rules
+  @intention: "Reject unresolved constructor layouts before raw native emission"
+  @source: vexprparse.intent:1785
+  input:
+    tl : TCheckListState
+  output:
+    out : number
+  logic:
+    out = match tl.iter:
+      RCons(head, tail) => arena_scope(constructor_check_rule(TCheckRuleState { rd: head, src: tl.src, prog: tl.prog, concepts: tl.concepts })) + constructor_check_rules(TCheckListState { iter: tail, src: tl.src, prog: tl.prog, concepts: tl.concepts })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [tl.iter, tl.src, tl.prog, tl.concepts]
+      calls : [constructor_check_rule, constructor_check_rules]
+    termination:
+      bound : 4000
 
 
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The

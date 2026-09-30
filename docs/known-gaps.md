@@ -87,16 +87,19 @@ programs retain defensive behavior, without a new diagnostic/error channel.
 
 ## Self-hosted record construction field order
 
-The evaluator's `eval_vfields` and native emitter's `x86_vfields` preserve
-constructor field order, while field reads use declaration order. For a record
-declared as `first, second`, `let p = Pair { second: 2, first: 1 }` followed by
-`out = p.first` reads the wrong payload slot; the evaluator returns 2 instead of 1.
-This is the older assumption recorded in the
-[record field design](self-hosting-records-astfield-design.md#astfield-eval),
-rediscovered while checking the equality helpers. Those helpers construct their
-records in declaration order. General constructor reordering remains separate;
-a correction must preserve source-order evaluation while placing each value
-in its declared field slot.
+Corrected by the [named constructor follow-up](self-hosted-constructor-order.md)
+(2026-09-27). Records and variants evaluate their initializers in written order,
+then store values in the declared slots. The evaluator permutes already evaluated
+values; native emission resolves each pop's destination by field name, with the
+same instructions and storage as before. Missing, unknown or duplicate fields
+refuse before ELF or raw emission. This supersedes the source-order assumption
+in the [historical record design](self-hosting-records-astfield-design.md#astfield-eval).
+
+This does not complete self-hosted payload type checking or the unchecked
+evaluator's error/effect model. The Rust native variant lowering separately
+walks initializer expressions in declaration order; it is not used as the
+source-order oracle for this correction. Some legacy Rust-native local-record
+shapes explicitly refuse as rich operations. Those paths are unchanged.
 
 ## WASM text-valued conditionals
 

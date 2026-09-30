@@ -275,6 +275,16 @@ is unchanged; the interpreter's
 defensive invalid-program behavior is not a new type or error contract.
 See [evaluator equality](docs/self-hosted-evaluator-equality.md).
 
+Self-hosted named constructors (2026-09-27): records and variants evaluate each
+initializer in source order and place values in declaration-order slots. The
+evaluator permutes already evaluated payload values, reusing identity lists;
+the emitter maps reverse-source-order pops to named destination offsets. Each
+target pop/store stays eight bytes, with no new target storage or GC. A complete
+AST walk rejects unresolved, missing, unknown or duplicate constructor fields
+before ELF/raw output. Payload type-checking parity and the legacy Rust-native
+variant evaluation-order path remain separate. See
+[constructor ordering](docs/self-hosted-constructor-order.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.
