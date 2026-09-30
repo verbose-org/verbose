@@ -55,6 +55,12 @@ Every constructor field must have an established compatible type, including
 its computation's operands and branches. Rust retains its existing bytes,
 collection and Result types; backend capability limits remain separate.
 
+Self-hosted collection capability follow-up: intermediate `map`/`filter` values,
+collection-returning calls and nonproducer collection outputs now refuse before
+ELF/raw emission. Every parsed rule and branch is checked; typing stays separate.
+Supported direct reductions and streamed output retain their emitted code.
+See [collection lowering](self-hosted-collection-lowering.md).
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable

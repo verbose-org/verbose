@@ -118,14 +118,18 @@ shapes explicitly refuse as rich operations. Those paths are unchanged.
 
 ## Self-hosted nested collection lowering
 
-Constructor type regressions also exposed a separate pre-existing emission gap:
+The self-hosted compiler now explicitly refuses intermediate `map`/`filter`
+values, collection-returning calls and collection outputs without a top-level
+producer, before either ELF or raw output. Typing remains separate: a valid
+`sum(map(...), ...)` is still valid language syntax and interpreter behavior.
+See the [capability boundary](self-hosted-collection-lowering.md).
+
+The parent emitter (`2652e46`) produced 721-byte binaries that trapped for
 `sum(map(i.items, x => x + 1), x => take(Pair { first: x, second: 2 }))`
-and the corresponding `filter(i.items, x => x > 2)` shape compile but trap
-at runtime. Here `i.items` is `collection(number)` and `take` returns `p.first`
-from a `Pair` parameter. Parent `457ee4c` and the constructor-type follow-up
-emit identical 721-byte binaries for the minimal probes. Their types can be
-checked, but this is not native support for arbitrary nested collections.
-The emitter needs a dedicated lowering path or an explicit pre-output refusal.
+and the corresponding filter shape. The new refusal closes that emission hole;
+implementing collection composition still requires a value representation or
+an order-preserving lowering design. Other legacy element/input layout gaps,
+including the `retirement` record-element map trap, remain outside this guard.
 
 ## WASM text-valued conditionals
 

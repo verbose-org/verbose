@@ -50,3 +50,56 @@ CIDX controls and the existing corpus/fixed-point checks.
 
 The design commit is based on the parent PR's green normal suite (888 tests),
 27 bootstrap tests, 97 Python tests and all six remote checks on `26f1abd`.
+
+## Implemented boundary
+
+The implementation lives in `examples/vexprparse.verbose`. It reuses the full-tree
+lint state records and reclaims per-rule checking temporaries with `arena_scope`.
+Both output entry points invoke the same pass; ELF checks the original complete
+rule list before entry selection. The existing `type_check` and evaluator remain
+unchanged. The independent `collection_lowering_check` entry returns a decimal
+error count (zero means this specific boundary is satisfied).
+
+| Form | Self-hosted ELF / raw | Language interpreter |
+| --- | --- | --- |
+| Existing direct sum/count/fold/all/any/min/max | Existing lowering retained | Supported |
+| Final direct map/filter with `output: collection(...)` | Existing streaming lowering retained | Supported |
+| Map/filter in lets, branches, arguments or reductions | Refused before artifact bytes | Existing semantics |
+| Calls returning collections | Refused before artifact bytes | Existing semantics |
+| Collection output via alias, conditional or input identity | Refused before artifact bytes | Existing semantics |
+| Other element/input layouts | Existing backend limitations remain | Existing semantics |
+
+For example, `out = sum(i.items, x => x + 1)` keeps its direct reduction.
+`out = sum(map(i.items, x => x + 1), x => x)` now refuses in these output drivers.
+This is not a compiler rewrite between the two forms: the evaluator still
+calculates the written producer before the consumer. Rust native and WASM
+acceptance are unchanged.
+
+To inspect this capability independently of typing:
+
+```sh
+verbosec examples/vexprparse.verbose --native /tmp/collection-check --run collection_lowering_check --stdin-raw
+/tmp/collection-check 0 < program.verbose
+```
+
+The count describes unsupported placements/calls, not a complete backend
+verification report. The output drivers enforce it without writing a partial
+ELF header or raw instruction prefix.
+
+## Recorded validation
+
+- Serialized normal Rust suite: 889 passed, 28 explicitly ignored.
+- Python harnesses: 97 passed.
+- Complete 193-example emission comparison against `2652e46`: identical
+  acceptance, refusals and bytes, with two emissions per compiler.
+- Ten direct-operation witnesses retain identical native bytes and expected
+  stdout/stderr/status, including empty collections and byte-read failures.
+- The final self-source produces the same 3,262,670-byte ELF with the parent
+  and current emitters, twice each (SHA-256
+  `28fee081a5ac73b331b433a36b4faf355c525e870ed447f56f8ff709671ddd8a`).
+- CIDX configuration, environment and security phase pass. The security phase
+  still reports existing Python-environment dependency findings; passing it
+  is not a claim of zero vulnerabilities.
+
+The normal suite also pins the example's conventional last-rule entry. New
+compiler helpers precede `count_cells_src`, preserving its JSON fixture entry.

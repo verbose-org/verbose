@@ -439,6 +439,14 @@ pub(crate) fn assert_emitted_drivers(compiler: &Path, base: &Path) {
         &base.join("constructor-type_check"),
         base,
     );
+    let gate_index = src.lines().filter(|l| l.starts_with("rule "))
+        .position(|l| l == "rule collection_lowering_check").unwrap();
+    let gate = base.join("collection_lowering_check");
+    install(send(compiler, &src, gate_index, true), &gate);
+    crate::selfhost_collection_tests::assert_collections(
+        compiler, &base.join("constructor-x86_program_src"),
+        &base.join("constructor-type_check"), &gate, base,
+    );
 }
 
 #[test]

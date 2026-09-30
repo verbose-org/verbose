@@ -98,11 +98,11 @@ constructor gate. Per-rule scalar arena scopes reclaim checking temporaries.
 No target instruction, layout, lifetime or allocation algorithm changes; this
 does not claim that the compiler's own checking cost is unchanged.
 
-Nested `sum(map(...), ...)` and `sum(filter(...), ...)` probes exercise type
-inference only: the parent emitter already compiles these particular shapes to
-binaries that trap, and this slice emits identical bytes. Direct collection
-sum/fold probes also execute with explicit expected values. This does not add
-general collection-composition lowering.
+Nested `sum(map(...), ...)` and `sum(filter(...), ...)` probes still exercise
+valid type inference. A subsequent [capability guard](self-hosted-collection-lowering.md)
+now refuses their ELF/raw emission before output; the parent of this constructor
+slice emitted binaries that trapped. Direct collection sum/fold probes also
+execute with explicit expected values. General composition lowering is separate.
 
 ## Recorded validation
 

@@ -321,8 +321,8 @@ pub(crate) fn assert_types(compiler: &Path, raw: &Path, checker: &Path, base: &P
             (Some(0), b"0\n".to_vec(), vec![]),
             "{src}"
         );
-        // Nested map/filter lowering is a separate legacy limitation; only
-        // direct collection folds are a runtime oracle here.
+        // Typing remains valid, but the capability gate now rejects intermediate
+        // collections before either output driver writes artifact bytes.
         if expression.starts_with("fold(") {
             install(send(compiler, &src, 0, false), &executable);
             let r = Command::new(&executable)
@@ -334,6 +334,12 @@ pub(crate) fn assert_types(compiler: &Path, raw: &Path, checker: &Path, base: &P
                 (Some(0), b"16\n".to_vec(), vec![]),
                 "{src}"
             );
+        } else {
+            for backend in [compiler, raw] {
+                let r = send(backend, &src, 0, false);
+                assert_eq!((r.status.code(), r.stdout, r.stderr),
+                    (Some(1), vec![], vec![]), "{src}");
+            }
         }
     }
     // Resource reads are outside the strict initializer classifier. This is
