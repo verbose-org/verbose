@@ -1790,3 +1790,5 @@ existing eight-byte pop/store sequence; support both records and variants.
 Self-hosted constructor types (2026-09-30): check each value against its named
 field declaration in the correct lexical scope. Unknown inference refuses the
 constructor obligation; preserve native code and existing unrelated contracts.
+
+Self-hosted collection lowering: refuse intermediate map/filter values and collection-returning calls before ELF/raw output; preserve supported streamed outputs and independent typing.

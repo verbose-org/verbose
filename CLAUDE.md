@@ -299,6 +299,12 @@ variant/Result/collection binders. Unknown facts mask outer bindings and cannot
 prove a constructor field. Rust's existing storage types remain available,
 subject to each backend's limits. See [lexical constructor obligations](docs/constructor-lexical-scopes.md).
 
+Self-hosted collection capability follow-up: intermediate `map`/`filter` values,
+collection-returning calls and nonproducer collection outputs now refuse before
+ELF/raw emission. Every parsed rule and branch is checked; typing stays separate.
+Supported direct reductions and streamed output retain their emitted code.
+See [collection lowering](docs/self-hosted-collection-lowering.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

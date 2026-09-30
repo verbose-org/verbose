@@ -31492,11 +31492,11 @@ rule x86_program_src
     let concepts0 = if service_list_len(svcs) > 0 then concepts_append_http(HttpAppendState { concepts: parsed_concepts, req_start: fl_head_ty_start(rd_input(handler)), req_len: fl_head_ty_len(rd_input(handler)), resp_start: rd_out_ty_start(handler), resp_len: rd_out_ty_len(handler) }) else parsed_concepts
     let concepts = if program_uses_result(UsesTextRules { rules: prog, src: s.source }) == 1 then concepts_append_result(concepts0) else concepts0
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
-    out = concat(abort_if(arena_scope(constructor_check_rules(TCheckListState { iter: prog, src: s.source, prog: prog, concepts: concepts0 })) + overflow_contract_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
+    out = concat(abort_if(arena_scope(collection_lowering_errors(LintCalleesState { iter: prog, full: prog, src: s.source })) + arena_scope(constructor_check_rules(TCheckListState { iter: prog, src: s.source, prog: prog, concepts: concepts0 })) + overflow_contract_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [find_rule, svc_handler_start, svc_head, svc_handler_len, service_list_len, concepts_append_http, fl_head_ty_start, rd_input, fl_head_ty_len, rd_out_ty_start, rd_out_ty_len, constructor_check_rules, overflow_contract_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
+      calls : [collection_lowering_errors, find_rule, svc_handler_start, svc_head, svc_handler_len, service_list_len, concepts_append_http, fl_head_ty_start, rd_input, fl_head_ty_len, rd_out_ty_start, rd_out_ty_len, constructor_check_rules, overflow_contract_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
     termination:
       bound : 256
 
@@ -35260,7 +35260,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(text_token_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(collection_lowering_errors(LintCalleesState { iter: prog0, full: prog0, src: s.source })) + arena_scope(text_token_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -35332,7 +35332,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list, text_token_errors, text_blob, next_escaped_text]
+      calls : [collection_lowering_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list, text_token_errors, text_blob, next_escaped_text]
     termination:
       bound : 256
 
@@ -37203,6 +37203,192 @@ rule constructor_check_rules
       calls : [constructor_check_rule, constructor_check_rules]
     termination:
       bound : 4000
+
+
+-- Collection outputs are streamed, never materialized. Count every producer and
+-- collection-returning call in the whole tree, then exempt only each declared
+-- collection rule's root producer. Reuse the full-tree lint traversal states.
+-- This capability gate is deliberately independent of type_check.
+
+rule count_collection_args
+  @intention: "Count intermediate collection producers and calls in args"
+  @source: vexprparse.intent:1794
+  input:
+    a : BadCallArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_collection_ast(BadCallState { node: head, rules: a.rules, src: a.src }) + count_collection_args(BadCallArgsState { args: tail, rules: a.rules, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.rules, a.src]
+      calls : [count_collection_ast, count_collection_args]
+    termination:
+      bound : 4000
+
+
+rule count_collection_vfields
+  @intention: "Count intermediate collection producers and calls in vfields"
+  @source: vexprparse.intent:1794
+  input:
+    a : BadCallVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_collection_ast(BadCallState { node: val, rules: a.rules, src: a.src }) + count_collection_vfields(BadCallVFieldsState { fields: rest, rules: a.rules, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.rules, a.src]
+      calls : [count_collection_ast, count_collection_vfields]
+    termination:
+      bound : 4000
+
+
+rule count_collection_arms
+  @intention: "Count intermediate collection producers and calls in arms"
+  @source: vexprparse.intent:1794
+  input:
+    a : BadCallArmsState
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src }) + count_collection_arms(BadCallArmsState { arms: rest, rules: a.rules, src: a.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.rules, a.src]
+      calls : [count_collection_ast, count_collection_arms]
+    termination:
+      bound : 4000
+
+
+rule count_collection_ast
+  @intention: "Count intermediate collection producers and calls in ast"
+  @source: vexprparse.intent:1794
+  input:
+    a : BadCallState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_collection_ast(BadCallState { node: lhs, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: rhs, rules: a.rules, src: a.src })
+      AstNeg(inner) => count_collection_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstNot(inner) => count_collection_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => count_collection_ast(BadCallState { node: base, rules: a.rules, src: a.src })
+      AstCall(callee_start, callee_len, args) => (if rd_out_ty(find_rule(FindRuleState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len })) == 3 then 1 else 0) + count_collection_args(BadCallArgsState { args: args, rules: a.rules, src: a.src })
+      AstIf(cond, thn, els) => count_collection_ast(BadCallState { node: cond, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: thn, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: els, rules: a.rules, src: a.src })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_collection_vfields(BadCallVFieldsState { fields: fields, rules: a.rules, src: a.src })
+      AstMatch(scrut, arms) => count_collection_ast(BadCallState { node: scrut, rules: a.rules, src: a.src }) + count_collection_arms(BadCallArmsState { arms: arms, rules: a.rules, src: a.src })
+      AstOk(inner) => count_collection_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstResErr(inner) => count_collection_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => count_collection_ast(BadCallState { node: scrut, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: ok_body, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: err_body, rules: a.rules, src: a.src })
+      AstSum(coll, item_start, item_len, body) => count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstCount(coll, item_start, item_len, body) => count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: init, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstAll(coll, item_start, item_len, body) => count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstAny(coll, item_start, item_len, body) => count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMap(coll, item_start, item_len, body) => 1 + count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstFilter(coll, item_start, item_len, body) => 1 + count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMinFold(coll, item_start, item_len, body) => count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMaxFold(coll, item_start, item_len, body) => count_collection_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_collection_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+  proofs:
+    purity:
+      reads : [a.node, a.rules, a.src]
+      calls : [count_collection_ast, count_collection_args, count_collection_vfields, count_collection_arms, rd_out_ty, find_rule]
+    termination:
+      bound : 4000
+
+
+rule count_collection_binds
+  @intention: "Count intermediate collection producers and calls in binds"
+  @source: vexprparse.intent:1794
+  input:
+    b : BadCallBindsState
+  output:
+    out : number
+  logic:
+    out = match b.binds:
+      BCons(name_start, name_len, value, rest) => count_collection_ast(BadCallState { node: value, rules: b.rules, src: b.src }) + count_collection_binds(BadCallBindsState { binds: rest, rules: b.rules, src: b.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b.binds, b.rules, b.src]
+      calls : [count_collection_ast, count_collection_binds]
+    termination:
+      bound : 4000
+
+
+rule collection_lowering_rule
+  @intention: "Exempt only a declared collection rule's top-level streamed producer"
+  @source: vexprparse.intent:1794
+  input:
+    br : BadCallRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(br.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let bad_in_binds = count_collection_binds(BadCallBindsState { binds: binds, rules: br.rules, src: br.src })
+    let producer = ast_is_collection_node(result)
+    let collection_out = if rd_out_ty(br.rd) == 3 then 1 else 0
+    out = bad_in_binds + count_collection_ast(BadCallState { node: result, rules: br.rules, src: br.src }) - (if collection_out == 1 and producer == 1 then 1 else 0) + (if collection_out == 1 and producer == 0 then 1 else 0)
+  proofs:
+    purity:
+      reads : [br.rd, br.rules, br.src]
+      calls : [rd_body, block_binds, block_result, count_collection_binds, count_collection_ast, ast_is_collection_node, rd_out_ty]
+    termination:
+      bound : 64
+
+
+rule collection_lowering_errors
+  @intention: "Count unsupported collection compositions across every parsed rule"
+  @source: vexprparse.intent:1794
+  input:
+    lc : LintCalleesState
+  output:
+    out : number
+  logic:
+    out = match lc.iter:
+      RCons(head, tail) => arena_scope(collection_lowering_rule(BadCallRuleState { rd: head, rules: lc.full, src: lc.src })) + collection_lowering_errors(LintCalleesState { iter: tail, full: lc.full, src: lc.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [lc.iter, lc.full, lc.src]
+      calls : [collection_lowering_rule, collection_lowering_errors]
+    termination:
+      bound : 4000
+
+
+rule collection_lowering_check
+  @intention: "Report collection lowering capability errors independently of source typing"
+  @source: vexprparse.intent:1794
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    out = collection_lowering_errors(LintCalleesState { iter: prog, full: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, collection_lowering_errors]
+    termination:
+      bound : 256
+
 
 
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
