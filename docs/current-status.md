@@ -253,10 +253,12 @@ Threads, TLS, automatic worker replacement, and listener handoff remain separate
   restrictions have mechanical checks. Known rule-call argument types are compared
   with declared inputs, including calls nested in reductions and matches; unknown
   local binder types remain outside this check. See [proof classification](spec-proofs.md).
-- HTTP service record callees reject potentially failing `byte_at`, `substring`,
-  and `parse_int` checks until callee-to-handler error propagation exists. A
-  literal byte access with a constant valid index remains supported. Move a
-  runtime check to the handler's constructor argument to use client-only abort.
+- HTTP service record callees route emitted `byte_at` and `substring`
+  failures through a recovery stub that restores the handler frame and closes
+  only the client connection. This supports the existing single-level,
+  effect-free numeric-record calls; nested calls and text input fields remain
+  outside that subset. `parse_int` still has no supported text source within
+  these numeric-only callees; its unsupported operands are refused before emission.
 - `termination.bound` counts expression structure, not total runtime work.
   Recursion checks are separate.
 - [Numeric overflow contracts](numeric-overflow.md) now require known intervals
