@@ -14,8 +14,10 @@ body evaluation, decode the span, write its bytes and a newline, then restore
 the element arena mark. The next element can reuse the same storage only after
 publication. Preserve the outer count/cursor registers across both syscalls.
 Size and emit the same printing helper, including the final blob base. Text
-output returns status 0; existing input/body failures stop with status 1 and
-retain any completed native output prefix.
+output returns status 0. Checked count, copy, byte-index and substring-bound
+failures stop with status 1 and retain any completed native output prefix.
+Other scalar arithmetic retains its existing failure behavior; this slice does
+not introduce a general error boundary around body evaluation.
 
 The accepted expression subset is deliberately closed: number/bool/text
 literals, input/item scalar fields, scalar lets and captured aliases, scalar
@@ -70,6 +72,12 @@ The original-AST interpreter is the value oracle for valid UTF-8 spans. Its
 `Value::Text` is a Rust string: a slice splitting a UTF-8 code point becomes
 replacement characters. Native output preserves the selected bytes. Tests pin
 both outcomes instead of claiming parity on invalid UTF-8 fragments.
+
+The existing boolean evaluation difference also remains: native `and`/`or`
+short-circuit, while the Rust interpreter evaluates both operands. For a bounds
+check guarding a potentially failing expression, the differential fixtures use
+an explicit `if`, whose selected-arm evaluation agrees. The native scalar
+emitter is unchanged by this text-output slice.
 
 Inspection also confirms the existing self-hosted stdin source transport stops
 at NUL, and ordinary text escapes have no NUL spelling. This slice does not
