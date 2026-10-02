@@ -1794,3 +1794,5 @@ constructor obligation; preserve native code and existing unrelated contracts.
 Self-hosted collection lowering: refuse intermediate map/filter values and collection-returning calls before ELF/raw output; preserve supported streamed outputs and independent typing.
 
 Self-hosted scalar maps: stream typed number/bool projections, preserve boolean exit status, bound argv/text loads and reclaim each element's arena temporaries before advancing.
+
+Stream supported packed text map values before reusing element storage; refuse unsupported value shapes and eager bindings before ELF/raw output.

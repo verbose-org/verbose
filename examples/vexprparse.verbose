@@ -37460,7 +37460,7 @@ rule scalar_map_new
   logic:
     let kind = scalar_map_type(cr)
     let item = scalar_map_input_type(cr)
-    out = if kind == 1 or (kind == 0 and item >= 1000 and item < 1000000) then 1 else 0
+    out = if kind == 1 or kind == 2 or (kind == 0 and item >= 1000 and item < 1000000) then 1 else 0
   proofs:
     purity:
       reads : [cr]
@@ -37635,11 +37635,11 @@ rule scalar_map_check
     let item = scalar_map_input_type(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns })
     let cidx = static_concept_of(StaticConceptState { node: mc.coll, src: mc.src, params: mc.params, lets: mc.lets, concepts: mc.concepts })
     let fields = cd_fields(concept_at_index(ConceptAtState { concepts: mc.concepts, idx: cidx }))
-    out = if kind == 3 or kind != mc.declared then 1 else if kind >= 1000 and kind < 1000000 then 0 else if kind != 0 and kind != 1 then 1 else if scalar_map_new(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns }) == 0 then (if item == 0 then 0 else 1) else if scalar_map_layout(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns }) == 0 then 1 else if item == 0 then 0 else if item >= 1000 and item < 1000000 and field_list_len(fields) > 0 and field_list_number_or_text(fields) == 1 and scalar_map_plain_fields(FieldConceptTenvState { fields: fields, concepts: mc.concepts, src: mc.src }) == 1 and scalar_map_text_fields(fields) <= 16 then (if scalar_map_text_fields(fields) > 0 then scalar_map_text_ast(ScalarMapBody { node: mc.body, rules: mc.prog, src: mc.src, concepts: mc.concepts }) else 0) else 1
+    out = if kind == 3 or kind != mc.declared then 1 else if kind >= 1000 and kind < 1000000 then 0 else if kind != 0 and kind != 1 and kind != 2 then 1 else if kind == 2 and text_map_check(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns }) > 0 then 1 else if scalar_map_new(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns }) == 0 then (if item == 0 then 0 else 1) else if scalar_map_layout(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns }) == 0 then 1 else if item == 0 then 0 else if item >= 1000 and item < 1000000 and field_list_len(fields) > 0 and field_list_number_or_text(fields) == 1 and scalar_map_plain_fields(FieldConceptTenvState { fields: fields, concepts: mc.concepts, src: mc.src }) == 1 and scalar_map_text_fields(fields) <= 16 then (if scalar_map_text_fields(fields) > 0 then scalar_map_text_ast(ScalarMapBody { node: mc.body, rules: mc.prog, src: mc.src, concepts: mc.concepts }) else 0) else 1
   proofs:
     purity:
       reads : [mc.body, mc.coll, mc.concepts, mc.conns, mc.declared, mc.item_len, mc.item_start, mc.lets, mc.off, mc.params, mc.prog, mc.ress, mc.sizes, mc.src]
-      calls : [scalar_map_plain_fields, scalar_map_text_ast, cd_fields, concept_at_index, field_list_len, field_list_number_or_text, scalar_map_input_type, scalar_map_layout, scalar_map_new, scalar_map_text_fields, scalar_map_type, static_concept_of]
+      calls : [text_map_check, scalar_map_plain_fields, scalar_map_text_ast, cd_fields, concept_at_index, field_list_len, field_list_number_or_text, scalar_map_input_type, scalar_map_layout, scalar_map_new, scalar_map_text_fields, scalar_map_type, static_concept_of]
     termination:
       bound : 8000
 
@@ -37847,11 +37847,11 @@ rule scalar_map_print
   output:
     out : bytes
   logic:
-    out = if scalar_map_type(cr) == 1 then scalar_map_bool_line(cr) else concat(b"\x41\x51\xe8", le32(0 - (cr.off + 93)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59")
+    out = if scalar_map_type(cr) == 1 then scalar_map_bool_line(cr) else if scalar_map_type(cr) == 2 then scalar_map_text_line(cr) else concat(b"\x41\x51\xe8", le32(0 - (cr.off + 93)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59")
   proofs:
     purity:
       reads : [cr, cr.off]
-      calls : [scalar_map_bool_line, scalar_map_type]
+      calls : [scalar_map_bool_line, scalar_map_text_line, scalar_map_type]
     termination:
       bound : 8000
 
@@ -37870,12 +37870,12 @@ rule scalar_map_size
     let coll_sz = arena_scope(code_size_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }))
     let body_sz = arena_scope(code_size_node(ByteGenState { node: cr.body, src: cr.src, off: 0, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }))
     let load_sz = scalar_map_load_size(cr)
-    let print_sz = if scalar_map_type(cr) == 1 then 69 else 41
+    let print_sz = scalar_map_print_size(cr)
     out = coll_sz + load_sz + body_sz + print_sz + 156
   proofs:
     purity:
       reads : [cr, cr.body, cr.coll, cr.concepts, cr.conns, cr.lets, cr.off, cr.params, cr.prog, cr.ress, cr.sizes, cr.src]
-      calls : [cd_fields, code_size_node, concept_at_index, field_list_len, scalar_map_binders, scalar_map_load_size, scalar_map_type, static_concept_of]
+      calls : [cd_fields, code_size_node, concept_at_index, field_list_len, scalar_map_binders, scalar_map_load_size, scalar_map_print_size, static_concept_of]
     termination:
       bound : 8000
 
@@ -37894,12 +37894,12 @@ rule scalar_map_emit
     let coll_sz = arena_scope(code_size_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }))
     let body_sz = arena_scope(code_size_node(ByteGenState { node: cr.body, src: cr.src, off: 0, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }))
     let load_sz = scalar_map_load_size(cr)
-    let print_sz = if scalar_map_type(cr) == 1 then 69 else 41
+    let print_sz = scalar_map_print_size(cr)
     out = concat(x86_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }), b"\x41\x59\x49\x8b\x31\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8\x49\x89\xc0\x49\x83\xc1\x08", b"\x49\x8b\x04\x24\x49\x8d\x44\xc4\x08\x4c\x29\xc8\x48\xc1\xe8\x03\x31\xd2\xb9", le32(nf), b"\x48\xf7\xf1\x49\x39\xc0\x76\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05", b"\x48\xc7\x85", le32(0 - 8 * (count_binds(cr.lets) + 2)), b"\x00\x00\x00\x00", b"\x4d\x85\xc0\x0f\x84", le32(load_sz + body_sz + print_sz + 25), b"\x41\x56", (if cidx >= 0 then scalar_map_elem_load(ElemLoadState { nf: nf, tag: cidx * 256, esize: 8 * (max_payload_fields(cr.concepts) + 1), x_disp: 0 - 8 * (count_binds(cr.lets) + 1), efields: cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })), src_base: 4194304 + blob_end_off(ProgGenState { rules: cr.prog, src: cr.src, off: 0, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil }) }) else concat(b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(cr.lets) + 1)))), b"\x41\x50\x41\x51", x86_node(ByteGenState { node: cr.body, src: cr.src, off: cr.off + coll_sz + load_sz + 137, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }), b"\x58\x41\x59\x41\x58", scalar_map_print(CollRecState { coll: cr.coll, item_start: cr.item_start, item_len: cr.item_len, body: cr.body, src: cr.src, off: cr.off + coll_sz + load_sz + body_sz + 142, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }), b"\x41\x5e\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (load_sz + body_sz + print_sz + 34)))
   proofs:
     purity:
       reads : [cr, cr.body, cr.coll, cr.concepts, cr.conns, cr.item_len, cr.item_start, cr.lets, cr.off, cr.params, cr.prog, cr.ress, cr.sizes, cr.src]
-      calls : [blob_end_off, cd_fields, code_size_node, concept_at_index, count_binds, field_list_len, max_payload_fields, scalar_map_binders, scalar_map_elem_load, scalar_map_load_size, scalar_map_print, scalar_map_type, static_concept_of, x86_node]
+      calls : [blob_end_off, cd_fields, code_size_node, concept_at_index, count_binds, field_list_len, max_payload_fields, scalar_map_binders, scalar_map_elem_load, scalar_map_load_size, scalar_map_print, scalar_map_print_size, static_concept_of, x86_node]
     termination:
       bound : 8000
 
@@ -38074,6 +38074,176 @@ rule scalar_map_text_ast
       calls : [scalar_map_text_ast, scalar_map_text_args, scalar_map_text_vfields, scalar_map_text_arms, scalar_map_call_inputs, params_to_fields, rule_params_of, find_rule]
     termination:
       bound : 4000
+
+-- Text map values stay packed until publication; capability is checked before bytes.
+
+rule text_map_kind
+  @intention: "Resolve the strict type in the exact value lowering scope"
+  @source: vexprparse.intent:1798
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    let tenv = scalar_map_tenv(BuildTArg { binds: bg.lets, tenv: constructor_type_env(FieldConceptTenvState { fields: params_to_fields(bg.params), concepts: bg.concepts, src: bg.src }), src: bg.src, prog: bg.prog, concepts: bg.concepts })
+    out = constructor_value_type(TypeArg { node: bg.node, tenv: tenv, src: bg.src, prog: bg.prog, concepts: bg.concepts })
+  proofs:
+    purity:
+      reads : [bg.lets, bg.params, bg.concepts, bg.src, bg.prog, bg.node]
+      calls : [scalar_map_tenv, constructor_type_env, params_to_fields, constructor_value_type]
+    termination:
+      bound : 8000
+
+
+rule text_map_value
+  @intention: "Require a known scalar value and an established lowering"
+  @source: vexprparse.intent:1798
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    out = if text_map_kind(bg) > 2 then 1 else text_map_expr(bg)
+  proofs:
+    purity:
+      reads : [bg]
+      calls : [text_map_kind, text_map_expr]
+    termination:
+      bound : 8000
+
+
+rule text_map_expr
+  @intention: "Reject value shapes without the closed text map lowering"
+  @source: vexprparse.intent:1798
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    out = match bg.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => text_map_expr(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) + text_map_expr(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) + (if (op == 1 or op == 6) and text_map_kind(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) == 2 then (if bin_text_mode(bg) == 1 then 0 else 1) else 0)
+      AstNeg(inner) => text_map_expr(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns })
+      AstNot(inner) => text_map_expr(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => text_map_expr(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns })
+      AstCall(callee_start, callee_len, args) => if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 or span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 or span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 or span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 or span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then text_map_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) else 1
+      AstIf(cond, thn, els) => text_map_expr(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) + text_map_expr(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) + text_map_expr(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 1
+      AstErr => 1
+      AstVariant(cstart, clen, vstart, vlen, fields) => 1
+      AstMatch(scrut, arms) => 1
+      AstOk(inner) => 1
+      AstResErr(inner) => 1
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
+      AstSum(coll, item_start, item_len, body) => 1
+      AstCount(coll, item_start, item_len, body) => 1
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
+      AstAll(coll, item_start, item_len, body) => 1
+      AstAny(coll, item_start, item_len, body) => 1
+      AstMap(coll, item_start, item_len, body) => 1
+      AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 1
+      AstMaxFold(coll, item_start, item_len, body) => 1
+  proofs:
+    purity:
+      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
+      calls : [text_map_expr, text_map_kind, bin_text_mode, text_map_args, span_is_length, span_is_byte_at, span_is_substring, span_is_min, span_is_max]
+    termination:
+      bound : 8000
+
+
+rule text_map_args
+  @intention: "Check every evaluated primitive argument"
+  @source: vexprparse.intent:1798
+  input:
+    a : ByteGenArgs
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => text_map_expr(ByteGenState { node: head, src: a.src, off: a.off, params: a.params, lets: a.lets, prog: a.prog, concepts: a.concepts, sizes: a.sizes, ress: a.ress, conns: a.conns }) + text_map_args(ByteGenArgs { args: tail, src: a.src, off: a.off, params: a.params, lets: a.lets, prog: a.prog, concepts: a.concepts, sizes: a.sizes, ress: a.ress, conns: a.conns })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.src, a.off, a.params, a.lets, a.prog, a.concepts, a.sizes, a.ress, a.conns]
+      calls : [text_map_expr, text_map_args]
+    termination:
+      bound : 8000
+
+
+rule text_map_lets
+  @intention: "Check all eager scalar lets in their preceding lexical view"
+  @source: vexprparse.intent:1798
+  input:
+    lg : LetGenState
+  output:
+    out : number
+  logic:
+    out = match lg.rem:
+      BCons(name_start, name_len, value, rest) => arena_scope(text_map_value(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: earlier_bindings(BindingView { binds: lg.all_binds, visible: lg.idx }), prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress, conns: lg.conns })) + text_map_lets(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: lg.off, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress, conns: lg.conns })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [lg.rem, lg.all_binds, lg.src, lg.off, lg.params, lg.idx, lg.prog, lg.concepts, lg.sizes, lg.ress, lg.conns]
+      calls : [text_map_value, text_map_lets, earlier_bindings]
+    termination:
+      bound : 8000
+
+
+rule text_map_check
+  @intention: "Check text map bodies and eager bindings before artifact emission"
+  @source: vexprparse.intent:1798
+  input:
+    cr : CollRecState
+  output:
+    out : number
+  logic:
+    out = arena_scope(text_map_value(ByteGenState { node: cr.body, src: cr.src, off: cr.off, params: cr.params, lets: scalar_map_binders(cr), prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns })) + text_map_lets(LetGenState { rem: cr.lets, all_binds: cr.lets, src: cr.src, off: cr.off, params: cr.params, idx: 0, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns })
+  proofs:
+    purity:
+      reads : [cr, cr.body, cr.src, cr.off, cr.params, cr.prog, cr.concepts, cr.sizes, cr.ress, cr.conns, cr.lets]
+      calls : [text_map_value, text_map_lets, scalar_map_binders]
+    termination:
+      bound : 8000
+
+
+-- 52 bytes. RAX is the packed span; r8/r9 and the live arena mark survive.
+rule scalar_map_text_line
+  @intention: "Publish a packed text span before reclaiming its element storage"
+  @source: vexprparse.intent:1798
+  input:
+    cr : CollRecState
+  output:
+    out : bytes
+  logic:
+    out = concat(b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: cr.prog, src: cr.src, off: 0, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\xbf\x01\x00\x00\x00\xb8\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\x89\xe6\xba\x01\x00\x00\x00\xb8\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08")
+  proofs:
+    purity:
+      reads : [cr.prog, cr.src, cr.concepts, cr.sizes, cr.ress, cr.conns]
+      calls : [blob_end_off]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_print_size
+  @intention: "Share the scalar publication sizes between both loop passes"
+  @source: vexprparse.intent:1798
+  input:
+    cr : CollRecState
+  output:
+    out : number
+  logic:
+    out = if scalar_map_type(cr) == 1 then 69 else if scalar_map_type(cr) == 2 then 52 else 41
+  proofs:
+    purity:
+      reads : [cr]
+      calls : [scalar_map_type]
+    termination:
+      bound : 8000
+
 
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8

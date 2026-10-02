@@ -1,5 +1,9 @@
 # Self-hosted scalar map outputs
 
+The subsequent [text map slice](self-hosted-text-map.md) extends this loop to
+supported `collection(text)` outputs and supersedes the payroll refusal
+recorded below. The rest of this document records the number/bool slice.
+
 ## Design fixed before implementation
 
 Parent `ba7d382` (#264) refuses intermediate collections but still emits an

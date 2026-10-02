@@ -11,26 +11,26 @@ use std::{
     collections::HashMap, fs, os::unix::process::ExitStatusExt, path::Path, process::Command,
 };
 
-fn program(body: &str, kind: &str, fields: &str, lets: &str, extra: &str, calls: &str) -> String {
+pub(crate) fn program(body: &str, kind: &str, fields: &str, lets: &str, extra: &str, calls: &str) -> String {
     source(&format!("{lets}    out = map(i.items, e => {body})"), extra, calls)
         .replace("    n : number\nconcept Pair", &format!("    items : collection(Row)\nconcept Row\n  @intention: \"A map input element\"\n  @source: invoices.intent:1\n  fields:\n{fields}\nconcept Pair"))
         .replacen("    out : number\n  logic:", &format!("    out : collection({kind})\n  logic:"), 1)
         .replacen("reads: []", "reads: [i.items]", 1)
 }
-const FIELDS: &str = "    name : text\n    n : number";
+pub(crate) const FIELDS: &str = "    name : text\n    n : number";
 fn number(body: &str) -> String {
     program(body, "number", FIELDS, "", "", "")
 }
 fn boolean(body: &str) -> String {
     program(body, "bool", FIELDS, "", "", "")
 }
-fn row(name: &str, n: i64) -> Value {
+pub(crate) fn row(name: &str, n: i64) -> Value {
     Value::Record(HashMap::from([
         ("name".into(), Value::Text(name.into())),
         ("n".into(), Value::Number(n)),
     ]))
 }
-fn eval(
+pub(crate) fn eval(
     src: &str,
     rows: Vec<Value>,
     limit: Option<i64>,
@@ -48,7 +48,7 @@ fn eval(
     }
     interpreter::eval_rule(rules[0], &rules, &concepts, &[], &input)
 }
-fn assert_run(bin: &Path, argv: &[String], expected: &(i32, Vec<u8>), context: &str) {
+pub(crate) fn assert_run(bin: &Path, argv: &[String], expected: &(i32, Vec<u8>), context: &str) {
     let r = Command::new(bin).args(argv).output().unwrap();
     assert_eq!(
         (r.status.code(), r.stdout, r.stderr),
@@ -56,7 +56,7 @@ fn assert_run(bin: &Path, argv: &[String], expected: &(i32, Vec<u8>), context: &
         "{context}\n{argv:?}"
     );
 }
-fn emitted(compiler: &Path, src: &str, bin: &Path) {
+pub(crate) fn emitted(compiler: &Path, src: &str, bin: &Path) {
     let a = send(compiler, src, 0, false);
     let b = send(compiler, src, 0, false);
     assert_eq!(
@@ -64,9 +64,10 @@ fn emitted(compiler: &Path, src: &str, bin: &Path) {
         (b.status.code(), &b.stdout, &b.stderr),
         "reproducibility: {src}"
     );
+    assert_eq!(a.status.code(), Some(0), "emission: {src}");
     install(a, bin);
 }
-fn expected(src: &str, rows: Vec<Value>, limit: Option<i64>) -> (i32, Vec<u8>) {
+pub(crate) fn expected(src: &str, rows: Vec<Value>, limit: Option<i64>) -> (i32, Vec<u8>) {
     let Value::List(values) = eval(src, rows, limit).unwrap() else {
         panic!("collection required")
     };
@@ -329,11 +330,8 @@ pub(crate) fn assert_scalar_maps(compiler: &Path, raw: &Path, base: &Path) {
     );
 
     let mut refused = vec![
-        // The uncalled text projection is outside this slice, at every entry.
-        include_str!("../examples/payroll.verbose").to_owned(),
         program("e.n > 0", "number", FIELDS, "", "", ""),
         program("e.n", "bool", FIELDS, "", "", ""),
-        program("e.name", "text", FIELDS, "", "", ""),
         number("missing"),
         boolean("e.n > 0").replace("name : text", "name : bool"),
         boolean("e.n > 0").replace("name : text", "name : Pair"),

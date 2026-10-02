@@ -313,6 +313,13 @@ input path. Unknown output facts, unsupported layouts and nested traversals that
 could overwrite live text refuse before output. Existing numeric/record loops
 remain independent. See [scalar maps](docs/self-hosted-scalar-map.md).
 
+Self-hosted text-map follow-up: packed text fields, literals, captured scalar
+lets, conditionals and checked byte slices now stream before element storage
+is reclaimed. The complete payroll file is supported again, including `names`.
+The new scope checks eager lets and every branch, refusing fresh concat values,
+user-rule calls and unsupported value shapes before ELF/raw bytes. It adds no
+target buffer, reservation or GC. See [text maps](docs/self-hosted-text-map.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

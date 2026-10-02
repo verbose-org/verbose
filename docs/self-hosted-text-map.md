@@ -53,3 +53,39 @@ serialized normal Rust suite, Python harnesses, CIDX controls and the complete
 two-generation bootstrap. The design commit relies on the exact parent's
 green validation: 890 normal Rust, 27 bootstrap, 97 Python tests and six remote
 checks on `f46278a`, squash-merged as `39b9b74`.
+
+## Implemented boundary
+
+| Shape | Self-hosted ELF / raw |
+| --- | --- |
+| Number or supported flat-record elements → text | Checked scalar loop and 52-byte text printer |
+| Text field/literal, sequential scalar alias, compatible conditional, byte slice | Packed span; no result text copy |
+| `length`, `byte_at`, `min`, `max`, scalar operators in the new scope | Existing scalar lowering and bounds behavior |
+| Fresh concat, user-rule call, effect, constructor/match/Result, nested collection | Refused, including unused eager lets and unselected rules |
+| Text equality/inequality | Existing span comparison required for both operands |
+| Input layout and collection composition | Earlier scalar/collection capability limits retained |
+| Rust native / interpreter / WASM | Production code unchanged; their existing limits apply |
+
+The original-AST interpreter is the value oracle for valid UTF-8 spans. Its
+`Value::Text` is a Rust string: a slice splitting a UTF-8 code point becomes
+replacement characters. Native output preserves the selected bytes. Tests pin
+both outcomes instead of claiming parity on invalid UTF-8 fragments.
+
+Inspection also confirms the existing self-hosted stdin source transport stops
+at NUL, and ordinary text escapes have no NUL spelling. This slice does not
+extend that transport or grammar. Source fixtures therefore cover Unicode and
+ordinary escapes; a controlled emitted-blob mutation tests counted publication
+of an embedded NUL separately, without claiming source-level NUL support.
+
+For example, with the supported trailing collection input, this projection
+publishes one line per element:
+
+```verbose
+out = map(i.items, e => substring(e.name, 0, length(e.name)))
+```
+
+The regression matrix checks all six payroll entries on empty and populated
+input. The text storage test publishes 4,000 distinct names with the emitted
+arena reservation reduced to 4,096 bytes. Disabling the element-mark restore
+makes the same image exhaust that page. This demonstrates reuse of element
+nodes, not a new whole-program memory bound or a process RSS measurement.
