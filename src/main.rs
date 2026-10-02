@@ -27,6 +27,8 @@ mod selfhost_constructor_type_tests;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod selfhost_collection_tests;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod selfhost_scalar_map_tests;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod constructor_scope_tests;
 mod native;
 mod optimizer;

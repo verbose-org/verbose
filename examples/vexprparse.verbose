@@ -29424,7 +29424,7 @@ rule code_size_node
       AstNum(value) => 11
       AstBin(op, lhs, rhs) => code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 16 then 8 else if op == 17 then 11 else if op == 30 then 26 else if op == 31 then 25 else if (op == 1 or op == 6) and bin_text_mode(bg) == 1 then 65 else if (op == 1 or op == 6) and bin_text_mode(bg) == 2 then 1 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
       AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 5
-      AstNot(inner) => 1
+      AstNot(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: 0, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) + 12
       AstVar(start, len) => 6
       -- records-arc slice 4: a field access on any STATICALLY-RESOLVABLE base (typed
       -- param / let-bound construction / chained field / direct construction — the
@@ -29450,7 +29450,7 @@ rule code_size_node
       -- mov rax, imm64 (10) + push rax (1) = 11, same shape as AstNum.
       AstStr(start, len) => 11
       AstBytes(start, len) => 1
-      AstBool(value) => 1
+      AstBool(value) => 11
       AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})
       AstErr => 1
       -- R7a: a VariantConstruct emits the field-value pushes (code_size_vfields) +
@@ -29632,11 +29632,11 @@ rule proc_size
     -- (code 1) under a text output, sizes as the 1-byte int3 x86_proc emits.
     let ftc = ast_fold_texty_code(TextyState { node: result, src: pg.src, prog: pg.prog })
     let is_text_out = if rd_out_ty(pg.rd) == 2 then 1 else 0
-    out = 4 + subsize + storesize + (if is_coll_body != is_coll_out then 1 else if ftc == 2 and is_text_out == 0 then 1 else if ftc == 1 and is_text_out == 1 then 1 else if rule_is_texty(pg) == 1 then arena_scope(code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns})) + 2 else arena_scope(code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns}))) + 6
+    out = 4 + subsize + storesize + (if is_coll_body != is_coll_out then 1 else if ftc == 2 and is_text_out == 0 then 1 else if ftc == 1 and is_text_out == 1 then 1 else if rule_is_texty(pg) == 1 then arena_scope(code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns})) + (if scalar_map_bool_output(ScalarMapDeclared { rd: pg.rd, src: pg.src }) == 1 then 6 else 2) else arena_scope(code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns}))) + 6
   proofs:
     purity:
       reads : [pg, pg.rd, pg.src, pg.prog, pg.concepts, pg.sizes, pg.ress, pg.conns]
-      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rule_is_texty, code_size_stream_node, rule_params_of, ast_is_collection_node, rd_out_ty, ast_fold_texty_code]
+      calls : [scalar_map_bool_output, rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rule_is_texty, code_size_stream_node, rule_params_of, ast_is_collection_node, rd_out_ty, ast_fold_texty_code]
     termination:
       bound : 8000
 
@@ -29803,7 +29803,7 @@ rule x86_node
       -- them from one side only is how that pair desyncs.
       AstBin(op, lhs, rhs) => if op == 30 or op == 31 then concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0", (if op == 30 then b"\x0f\x84" else b"\x0f\x85"), le32(arena_scope(code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 13), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0\x0f\x95\xc0\x0f\xb6\xc0\x50", (if op == 30 then b"\xeb\x03\x31\xc0\x50" else b"\xeb\x02\x6a\x01")) else concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 16 then b"\x59\x58\x48\x99\x48\xf7\xf9\x50" else if op == 17 then b"\x59\x58\x48\x99\x48\xf7\xf9\x48\x89\xd0\x50" else if op == 30 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x20\xc8\x0f\xb6\xc0\x50" else if op == 31 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x08\xc8\x0f\xb6\xc0\x50" else if (op == 1 or op == 6) and bin_text_mode(bg) == 1 then concat(b"\x59\x58\x89\xc2\x89\xce\x48\x39\xf2\x75\x34\x48\xc1\xe8\x20\x48\xc1\xe9\x20\x48\xbf", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xf8\x48\x01\xf9\x48\x85\xd2\x74\x13\x40\x8a\x30\x40\x3a\x31\x75\x0f\x48\xff\xc0\x48\xff\xc1\x48\xff\xca\xeb\xe8", (if op == 1 then b"\x6a\x01\xeb\x02\x6a\x00" else b"\x6a\x00\xeb\x02\x6a\x01")) else if (op == 1 or op == 6) and bin_text_mode(bg) == 2 then b"\xcc" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
       AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\xf7\xd8\x50")
-      AstNot(inner) => b"\xcc"
+      AstNot(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }), b"\x58\x48\x85\xc0\x0f\x94\xc0\x48\x0f\xb6\xc0\x50")
       AstVar(start, len) => if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) >= 0 then concat(b"\xff\xb5", le32(0 - 8 * (let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) + 1))) else if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))) else b"\xcc"
       -- records-arc slice 4: field access via the UNIFIED static resolver. The base
       -- can be a TYPED param (`rule f(s : Foo)` ... s.field — the record-input shape),
@@ -29872,7 +29872,7 @@ rule x86_node
       -- Constant-data preparation decodes in place; the packed span excludes padding.
       AstStr(start, len) => concat(b"\x48\xb8", le64((start + 1) * 4294967296 + bytelit_decoded_len(DecodeState { src: bg.src, start: start + 1, len: (if len >= 2 then len - 2 else 0), i: 0 })), b"\x50")
       AstBytes(start, len) => b"\xcc"
-      AstBool(value) => b"\xcc"
+      AstBool(value) => concat(b"\x48\xb8", le64(value), b"\x50")
       -- Off-threading fix (text values slice 2): the THEN branch starts 10 bytes
       -- after the cond code (pop + test + je = 10), not 15 — the 5-byte
       -- jmp-over-els sits AFTER thn. The els offset (cond + 15 + thn) was already
@@ -30027,11 +30027,11 @@ rule x86_proc
     -- mirrors.
     let ftc = ast_fold_texty_code(TextyState { node: result, src: pg.src, prog: pg.prog })
     let is_text_out = if rd_out_ty(pg.rd) == 2 then 1 else 0
-    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns}), (if is_coll_body != is_coll_out then b"\xcc" else if ftc == 2 and is_text_out == 0 then b"\xcc" else if ftc == 1 and is_text_out == 1 then b"\xcc" else if rule_is_texty(pg) == 1 then concat(x86_stream_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns}), b"\x6a\x00") else x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns})), b"\x58\x48\x89\xec\x5d\xc3")
+    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns}), (if is_coll_body != is_coll_out then b"\xcc" else if ftc == 2 and is_text_out == 0 then b"\xcc" else if ftc == 1 and is_text_out == 1 then b"\xcc" else if rule_is_texty(pg) == 1 then concat(x86_stream_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns}), (if scalar_map_bool_output(ScalarMapDeclared { rd: pg.rd, src: pg.src }) == 1 then concat(b"\xff\xb5", le32(0 - 8 * (nlets + 2))) else b"\x6a\x00")) else x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress , conns: pg.conns})), b"\x58\x48\x89\xec\x5d\xc3")
   proofs:
     purity:
       reads : [pg, pg.rd, pg.src, pg.off, pg.prog, pg.concepts, pg.sizes, pg.ress, pg.conns]
-      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rule_is_texty, x86_stream_node, rule_params_of, ast_is_collection_node, rd_out_ty, ast_fold_texty_code]
+      calls : [scalar_map_bool_output, rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rule_is_texty, x86_stream_node, rule_params_of, ast_is_collection_node, rd_out_ty, ast_fold_texty_code]
     termination:
       bound : 8000
 
@@ -30118,7 +30118,7 @@ rule code_size_stream_node
       -- syscall clobbers only rcx/r11. Record elements (coll_elem_nfields > 0)
       -- are int3 (1 byte): filter would print ARENA INDICES; map keeps the same
       -- guard for ABI symmetry (the slice-6 load prefix is not free here).
-      AstMap(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then (if map_out_nf(StaticConceptState { node: body, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then code_size_map_record(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else 1) else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 197)
+      AstMap(coll, item_start, item_len, body) => if scalar_map_new(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) == 1 then scalar_map_size(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) else if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then (if map_out_nf(StaticConceptState { node: body, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then code_size_map_record(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else 1) else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 197)
       AstFilter(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then code_size_filter_record(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 213)
       AstMinFold(coll, item_start, item_len, body) => 1
       AstMaxFold(coll, item_start, item_len, body) => 1
@@ -30126,7 +30126,7 @@ rule code_size_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [arg_first, arg_list_len, arg_rest, arm_list_len, ast_call_args, ast_field_is_text, ast_span_text, ast_var_len, ast_var_start, bytelit_decoded_len, callee_is_texty, cd_name_len, cd_name_start, code_size_args, code_size_filter_record, code_size_map_record, code_size_node, code_size_stream_node, coll_elem_nfields, concept_at_index, connection_index_of, fold_size_cargs, fold_stream_ok, let_index, lets_append_binders, lets_append_elem_binders, map_out_nf, param_index, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_byte_at, span_is_concat, span_is_fetch, span_is_le32, span_is_le64, span_is_length, span_is_read, span_is_substring, static_concept_of, stream_size_arms, stream_size_cargs]
+      calls : [scalar_map_new, scalar_map_size, arg_first, arg_list_len, arg_rest, arm_list_len, ast_call_args, ast_field_is_text, ast_span_text, ast_var_len, ast_var_start, bytelit_decoded_len, callee_is_texty, cd_name_len, cd_name_start, code_size_args, code_size_filter_record, code_size_map_record, code_size_node, code_size_stream_node, coll_elem_nfields, concept_at_index, connection_index_of, fold_size_cargs, fold_stream_ok, let_index, lets_append_binders, lets_append_elem_binders, map_out_nf, param_index, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_byte_at, span_is_concat, span_is_fetch, span_is_le32, span_is_le64, span_is_length, span_is_read, span_is_substring, static_concept_of, stream_size_arms, stream_size_cargs]
     termination:
       bound : 8000
 
@@ -30641,7 +30641,7 @@ rule x86_stream_node
       -- 197 / 213 — the drift edge). Record elements -> int3 (see the size
       -- mirror's comment); the empty collection writes NOTHING (r8 = 0 exits
       -- before the first element — no stray newline).
-      AstMap(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then (if map_out_nf(StaticConceptState { node: body, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then x86_map_record(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else b"\xcc") else concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(120 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 143, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x41\x51\xe8", le32(0 - (bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 237)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59", b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (129 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})))))
+      AstMap(coll, item_start, item_len, body) => if scalar_map_new(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) == 1 then scalar_map_emit(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) else if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then (if map_out_nf(StaticConceptState { node: body, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then x86_map_record(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else b"\xcc") else concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(120 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 143, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x41\x51\xe8", le32(0 - (bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 237)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59", b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (129 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})))))
       AstFilter(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then x86_filter_record(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(136 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 143, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0\x0f\x84", le32(48), b"\x48\x8b\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), b"\x41\x51\xe8", le32(0 - (bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 253)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59", b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (145 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})))))
       AstMinFold(coll, item_start, item_len, body) => b"\xcc"
       AstMaxFold(coll, item_start, item_len, body) => b"\xcc"
@@ -30649,7 +30649,7 @@ rule x86_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [arg_first, arg_list_len, arg_rest, arm_list_len, ast_call_args, ast_field_is_text, ast_span_text, ast_var_len, ast_var_start, blob_end_off, bytelit_decoded_len, callee_is_texty, cd_fields, cd_name_len, cd_name_start, code_size_args, code_size_node, code_size_stream_node, coll_elem_nfields, concept_at_index, connection_index_of, count_binds, emit_bytes_data, fold_size_cargs, fold_stream_ok, let_index, lets_append_binders, lets_append_elem_binders, map_out_nf, max_payload_fields, param_index, proc_offset, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_byte_at, span_is_concat, span_is_fetch, span_is_le32, span_is_le64, span_is_length, span_is_read, span_is_substring, static_concept_of, stream_size_arms, x86_args, x86_elem_load, x86_filter_record, x86_fold_cargs, x86_map_record, x86_node, x86_stream_arms, x86_stream_cargs, x86_stream_dispatch, x86_stream_node]
+      calls : [scalar_map_new, scalar_map_emit, arg_first, arg_list_len, arg_rest, arm_list_len, ast_call_args, ast_field_is_text, ast_span_text, ast_var_len, ast_var_start, blob_end_off, bytelit_decoded_len, callee_is_texty, cd_fields, cd_name_len, cd_name_start, code_size_args, code_size_node, code_size_stream_node, coll_elem_nfields, concept_at_index, connection_index_of, count_binds, emit_bytes_data, fold_size_cargs, fold_stream_ok, let_index, lets_append_binders, lets_append_elem_binders, map_out_nf, max_payload_fields, param_index, proc_offset, resource_index_of, span_is_abort_if, span_is_arena_scope, span_is_byte_at, span_is_concat, span_is_fetch, span_is_le32, span_is_le64, span_is_length, span_is_read, span_is_substring, static_concept_of, stream_size_arms, x86_args, x86_elem_load, x86_filter_record, x86_fold_cargs, x86_map_record, x86_node, x86_stream_arms, x86_stream_cargs, x86_stream_dispatch, x86_stream_node]
     termination:
       bound : 8000
 
@@ -31492,11 +31492,11 @@ rule x86_program_src
     let concepts0 = if service_list_len(svcs) > 0 then concepts_append_http(HttpAppendState { concepts: parsed_concepts, req_start: fl_head_ty_start(rd_input(handler)), req_len: fl_head_ty_len(rd_input(handler)), resp_start: rd_out_ty_start(handler), resp_len: rd_out_ty_len(handler) }) else parsed_concepts
     let concepts = if program_uses_result(UsesTextRules { rules: prog, src: s.source }) == 1 then concepts_append_result(concepts0) else concepts0
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
-    out = concat(abort_if(arena_scope(collection_lowering_errors(LintCalleesState { iter: prog, full: prog, src: s.source })) + arena_scope(constructor_check_rules(TCheckListState { iter: prog, src: s.source, prog: prog, concepts: concepts0 })) + overflow_contract_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
+    out = concat(abort_if(arena_scope(scalar_map_errors(TCheckListState { iter: prog, src: s.source, prog: prog, concepts: concepts0 })) + arena_scope(collection_lowering_errors(LintCalleesState { iter: prog, full: prog, src: s.source })) + arena_scope(constructor_check_rules(TCheckListState { iter: prog, src: s.source, prog: prog, concepts: concepts0 })) + overflow_contract_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source })), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [collection_lowering_errors, find_rule, svc_handler_start, svc_head, svc_handler_len, service_list_len, concepts_append_http, fl_head_ty_start, rd_input, fl_head_ty_len, rd_out_ty_start, rd_out_ty_len, constructor_check_rules, overflow_contract_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
+      calls : [scalar_map_errors, collection_lowering_errors, find_rule, svc_handler_start, svc_head, svc_handler_len, service_list_len, concepts_append_http, fl_head_ty_start, rd_input, fl_head_ty_len, rd_out_ty_start, rd_out_ty_len, constructor_check_rules, overflow_contract_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, program_uses_result, concepts_append_result, proc_sizes, x86_program]
     termination:
       bound : 256
 
@@ -35260,7 +35260,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(collection_lowering_errors(LintCalleesState { iter: prog0, full: prog0, src: s.source })) + arena_scope(text_token_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(scalar_map_errors(TCheckListState { iter: prog0, src: s.source, prog: prog0, concepts: concepts0 })) + arena_scope(collection_lowering_errors(LintCalleesState { iter: prog0, full: prog0, src: s.source })) + arena_scope(text_token_errors(ProgramState { cell: toks, src: s.source }) + execution_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 1 }) + native_stack_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_text_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + http_io_errors(HttpIoCheck { cell: toks, src: s.source, depth: 0, active: 0 }) + bounded_result_errors(ProgramState { cell: toks, src: s.source }) + bad_entry + bytelit_operands(LintCalleesState { iter: prog, full: prog, src: s.source }) + toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + attr_pres_errors(ScanState { source: s.source, pos: 0 }) + hint_errors(ProgramState { cell: toks, src: s.source }) + proofs_errors(ProgramState { cell: toks, src: s.source }) + layer_list(LayerListState { iter: prog, full: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -35328,11 +35328,11 @@ rule elf_program_src
     -- trampoline REPLACES the entry_rule_* trampoline cascade (the trigger IS the
     -- head/entry proc, gated + open/write/close instead of itoa+print).
     let has_reaction = if reaction_list_len(rxs) > 0 then 1 else 0
-    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else if entryrec == 1 then concat(b"\xe8", le32(62 + entryrjfs + (if anytx == 1 then 86 else 0)), b"\x50", x86_json_record(JsonRecState { fields: entryrfields, esize: 8 * (max_payload_fields(concepts) + 1), off: 0 - (61 + entryrjfs + (if anytx == 1 then 86 else 0)), src: s.source, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns }), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrybool == 1 then concat(b"\xe8", le32(78 + (if anytx == 1 then 86 else 0)), b"\x31\xdb\x48\x85\xc0\x74\x14\x48\xb8\x74\x72\x75\x65\x0a\x00\x00\x00\x50\x48\xc7\xc2\x05\x00\x00\x00\xeb\x14\x48\xb8\x66\x61\x6c\x73\x65\x0a\x00\x00\x50\x48\xc7\xc2\x06\x00\x00\x00\xb3\x01\x48\x89\xe6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x89\xdf\x0f\x05") else if entrytextspan == 1 then concat(b"\xe8", le32(75 + (if anytx == 1 then 86 else 0)), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then text_blob(TextBlobState { src: s.source, cell: next_escaped_text(ProgramState { cell: toks, src: s.source }), pos: 0, cursor: 0, word: 0, used: 0 }) else b""))
+    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), (if scalar_map_bool_entry(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) == 1 then b"\x48\x89\xc7\x48\xc7\xc0\x3c\x00\x00\x00\x0f\x05" else b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")) else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else if entryrec == 1 then concat(b"\xe8", le32(62 + entryrjfs + (if anytx == 1 then 86 else 0)), b"\x50", x86_json_record(JsonRecState { fields: entryrfields, esize: 8 * (max_payload_fields(concepts) + 1), off: 0 - (61 + entryrjfs + (if anytx == 1 then 86 else 0)), src: s.source, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns }), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrybool == 1 then concat(b"\xe8", le32(78 + (if anytx == 1 then 86 else 0)), b"\x31\xdb\x48\x85\xc0\x74\x14\x48\xb8\x74\x72\x75\x65\x0a\x00\x00\x00\x50\x48\xc7\xc2\x05\x00\x00\x00\xeb\x14\x48\xb8\x66\x61\x6c\x73\x65\x0a\x00\x00\x50\x48\xc7\xc2\x06\x00\x00\x00\xb3\x01\x48\x89\xe6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x89\xdf\x0f\x05") else if entrytextspan == 1 then concat(b"\xe8", le32(75 + (if anytx == 1 then 86 else 0)), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then text_blob(TextBlobState { src: s.source, cell: next_escaped_text(ProgramState { cell: toks, src: s.source }), pos: 0, cursor: 0, word: 0, used: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [collection_lowering_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list, text_token_errors, text_blob, next_escaped_text]
+      calls : [scalar_map_errors, scalar_map_bool_entry, collection_lowering_errors, execution_errors, native_stack_errors, bounded_text_errors, http_io_errors, bounded_result_errors, begin_tokenize, parse_program, rules_select_entry, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, bytelit_operands, entry_freshtext, attr_errors, attr_pres_errors, hint_errors, proofs_errors, layer_list, text_token_errors, text_blob, next_escaped_text]
     termination:
       bound : 256
 
@@ -37381,15 +37381,699 @@ rule collection_lowering_check
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = collection_lowering_errors(LintCalleesState { iter: prog, full: prog, src: s.source })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    out = arena_scope(scalar_map_errors(TCheckListState { iter: prog, src: s.source, prog: prog, concepts: concepts })) + collection_lowering_errors(LintCalleesState { iter: prog, full: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, collection_lowering_errors]
+      calls : [parse_concepts, scalar_map_errors, begin_tokenize, parse_program, collection_lowering_errors]
     termination:
       bound : 256
 
 
+
+-- Scalar map output: strict kinds, bounded input reads and per-element arena reuse.
+
+rule scalar_map_tenv
+  @intention: "Resolve sequential map bindings without guessing unknown types"
+  @source: vexprparse.intent:1796
+  input:
+    bt : BuildTArg
+  output:
+    out : Env
+  logic:
+    out = match bt.binds:
+      BCons(name_start, name_len, value, rest) => scalar_map_tenv(BuildTArg { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: constructor_value_type(TypeArg { node: value, tenv: bt.tenv, src: bt.src, prog: bt.prog, concepts: bt.concepts }), rest: bt.tenv }, src: bt.src, prog: bt.prog, concepts: bt.concepts })
+      BNil => bt.tenv
+  proofs:
+    purity:
+      reads : [bt.binds, bt.tenv, bt.src, bt.prog, bt.concepts]
+      calls : [scalar_map_tenv, constructor_value_type]
+    termination:
+      bound : 4000
+
+
+rule scalar_map_input_type
+  @intention: "Find the established element type of a map source"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : number
+  logic:
+    let tenv = scalar_map_tenv(BuildTArg { binds: cr.lets, tenv: constructor_type_env(FieldConceptTenvState { fields: params_to_fields(cr.params), concepts: cr.concepts, src: cr.src }), src: cr.src, prog: cr.prog, concepts: cr.concepts })
+    out = constructor_element_type(ConstructorTypeCode { value: constructor_value_type(TypeArg { node: cr.coll, tenv: tenv, src: cr.src, prog: cr.prog, concepts: cr.concepts }) })
+  proofs:
+    purity:
+      reads : [cr.coll, cr.concepts, cr.lets, cr.params, cr.prog, cr.src]
+      calls : [constructor_element_type, constructor_type_env, constructor_value_type, params_to_fields, scalar_map_tenv]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_type
+  @intention: "Type the map body under its own item binder"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : number
+  logic:
+    let tenv = scalar_map_tenv(BuildTArg { binds: cr.lets, tenv: constructor_type_env(FieldConceptTenvState { fields: params_to_fields(cr.params), concepts: cr.concepts, src: cr.src }), src: cr.src, prog: cr.prog, concepts: cr.concepts })
+    let item = scalar_map_input_type(cr)
+    out = constructor_value_type(TypeArg { node: cr.body, tenv: Env::ECons { name_start: cr.item_start, name_len: cr.item_len, val: item, rest: tenv }, src: cr.src, prog: cr.prog, concepts: cr.concepts })
+  proofs:
+    purity:
+      reads : [cr, cr.body, cr.concepts, cr.item_len, cr.item_start, cr.lets, cr.params, cr.prog, cr.src]
+      calls : [constructor_type_env, constructor_value_type, params_to_fields, scalar_map_input_type, scalar_map_tenv]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_new
+  @intention: "Select scalar record projections and boolean numeric maps"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : number
+  logic:
+    let kind = scalar_map_type(cr)
+    let item = scalar_map_input_type(cr)
+    out = if kind == 1 or (kind == 0 and item >= 1000 and item < 1000000) then 1 else 0
+  proofs:
+    purity:
+      reads : [cr]
+      calls : [scalar_map_input_type, scalar_map_type]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_text_fields
+  @intention: "Count independent text slots in one input element"
+  @source: vexprparse.intent:1796
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then 1 else 0) + scalar_map_text_fields(rest)
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : [scalar_map_text_fields]
+    termination:
+      bound : 4000
+
+
+rule scalar_map_input_base
+  @intention: "Require the unshadowed rule input as collection base"
+  @source: vexprparse.intent:1796
+  input:
+    sc : StaticConceptState
+  output:
+    out : number
+  logic:
+    out = match sc.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => if param_list_len(sc.params) == 1 and param_index(ParamIndexState { params: sc.params, src: sc.src, q_start: start, q_len: len, idx: 0 }) == 0 and let_index(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0, found: 0 - 1 }) < 0 then 1 else 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [sc.lets, sc.node, sc.params, sc.src]
+      calls : [let_index, param_index, param_list_len]
+    termination:
+      bound : 8000
+
+
+concept ScalarMapInputFields
+  @intention: "The input field list and the selected trailing collection name"
+  @source: vexprparse.intent:1796
+  fields:
+    fields : FieldList
+    src : text
+    start : number
+    len : number
+
+
+rule scalar_map_input_fields
+  @intention: "Allow numeric fields followed by one selected trailing collection"
+  @source: vexprparse.intent:1796
+  input:
+    mf : ScalarMapInputFields
+  output:
+    out : number
+  logic:
+    out = match mf.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if ty == 3 then (if field_list_len(rest) == 0 and name_len == mf.len and name_eq(NameEqState { src: mf.src, a_start: name_start, b_start: mf.start, len: mf.len, off: 0 }) == 1 then 1 else 0) else if ty == 0 and type_code_of_span(SpanCheck { src: mf.src, start: ty_start, len: ty_len }) == 0 and resolve_type(ResolveTypeState { concepts: ConceptList::CNil, src: mf.src, ty_start: ty_start, ty_len: ty_len }) == 0 then scalar_map_input_fields(ScalarMapInputFields { fields: rest, src: mf.src, start: mf.start, len: mf.len }) else 0
+      FNil => 0
+  proofs:
+    purity:
+      reads : [mf.fields, mf.len, mf.src, mf.start]
+      calls : [field_list_len, name_eq, resolve_type, scalar_map_input_fields, type_code_of_span]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_layout
+  @intention: "Check the argv input layout before choosing the new scalar path"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : number
+  logic:
+    out = match cr.coll:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => if scalar_map_input_base(StaticConceptState { node: base, src: cr.src, params: cr.params, lets: cr.lets, concepts: cr.concepts }) == 1 and static_concept_of(StaticConceptState { node: base, src: cr.src, params: cr.params, lets: cr.lets, concepts: cr.concepts }) >= 0 then scalar_map_input_fields(ScalarMapInputFields { fields: cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: static_concept_of(StaticConceptState { node: base, src: cr.src, params: cr.params, lets: cr.lets, concepts: cr.concepts }) })), src: cr.src, start: fstart, len: flen }) else 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [cr.coll, cr.concepts, cr.lets, cr.params, cr.src]
+      calls : [cd_fields, concept_at_index, scalar_map_input_base, scalar_map_input_fields, static_concept_of]
+    termination:
+      bound : 8000
+
+
+concept ScalarMapCheck
+  @intention: "A map lowering and its declared output element type"
+  @source: vexprparse.intent:1796
+  fields:
+    coll : Ast
+    item_start : number
+    item_len : number
+    body : Ast
+    src : text [..256]
+    off : number
+    params : ParamList
+    lets : Binding
+    prog : RuleList
+    concepts : ConceptList
+    sizes : ProcSizeList
+    ress : ResourceList
+    conns : ConnectionList
+    declared : number
+
+
+rule scalar_map_check
+  @intention: "Refuse unknown or incompatible map output kinds and unsupported new layouts"
+  @source: vexprparse.intent:1796
+  input:
+    mc : ScalarMapCheck
+  output:
+    out : number
+  logic:
+    let kind = scalar_map_type(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns })
+    let item = scalar_map_input_type(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns })
+    let cidx = static_concept_of(StaticConceptState { node: mc.coll, src: mc.src, params: mc.params, lets: mc.lets, concepts: mc.concepts })
+    let fields = cd_fields(concept_at_index(ConceptAtState { concepts: mc.concepts, idx: cidx }))
+    out = if kind == 3 or kind != mc.declared then 1 else if kind >= 1000 and kind < 1000000 then 0 else if kind != 0 and kind != 1 then 1 else if scalar_map_new(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns }) == 0 then (if item == 0 then 0 else 1) else if scalar_map_layout(CollRecState { coll: mc.coll, item_start: mc.item_start, item_len: mc.item_len, body: mc.body, src: mc.src, off: mc.off, params: mc.params, lets: mc.lets, prog: mc.prog, concepts: mc.concepts, sizes: mc.sizes, ress: mc.ress, conns: mc.conns }) == 0 then 1 else if item == 0 then 0 else if item >= 1000 and item < 1000000 and field_list_len(fields) > 0 and field_list_number_or_text(fields) == 1 and scalar_map_plain_fields(FieldConceptTenvState { fields: fields, concepts: mc.concepts, src: mc.src }) == 1 and scalar_map_text_fields(fields) <= 16 then (if scalar_map_text_fields(fields) > 0 then scalar_map_text_ast(ScalarMapBody { node: mc.body, rules: mc.prog, src: mc.src, concepts: mc.concepts }) else 0) else 1
+  proofs:
+    purity:
+      reads : [mc.body, mc.coll, mc.concepts, mc.conns, mc.declared, mc.item_len, mc.item_start, mc.lets, mc.off, mc.params, mc.prog, mc.ress, mc.sizes, mc.src]
+      calls : [scalar_map_plain_fields, scalar_map_text_ast, cd_fields, concept_at_index, field_list_len, field_list_number_or_text, scalar_map_input_type, scalar_map_layout, scalar_map_new, scalar_map_text_fields, scalar_map_type, static_concept_of]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_rule_errors
+  @intention: "Check map output agreement and refuse unsupported boolean filters"
+  @source: vexprparse.intent:1796
+  input:
+    tr : TCheckRuleState
+  output:
+    out : number
+  logic:
+    out = match block_result(rd_body(tr.rd)):
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => scalar_map_check(ScalarMapCheck { coll: coll, item_start: item_start, item_len: item_len, body: body, src: tr.src, off: 0, params: rule_params_of(tr.rd), lets: block_binds(rd_body(tr.rd)), prog: tr.prog, concepts: tr.concepts, sizes: ProcSizeList::PSNil, ress: ResourceList::RsNil, conns: ConnectionList::CnNil, declared: resolve_type(ResolveTypeState { concepts: tr.concepts, src: tr.src, ty_start: rd_out_ty_start(tr.rd), ty_len: rd_out_ty_len(tr.rd) }) })
+      AstFilter(coll, item_start, item_len, body) => if resolve_type(ResolveTypeState { concepts: tr.concepts, src: tr.src, ty_start: rd_out_ty_start(tr.rd), ty_len: rd_out_ty_len(tr.rd) }) == 1 then 1 else 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [tr.concepts, tr.prog, tr.rd, tr.src]
+      calls : [block_binds, block_result, rd_body, rd_out_ty_len, rd_out_ty_start, resolve_type, rule_params_of, scalar_map_check]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_errors
+  @intention: "Check scalar map capabilities across every parsed rule"
+  @source: vexprparse.intent:1796
+  input:
+    tl : TCheckListState
+  output:
+    out : number
+  logic:
+    out = match tl.iter:
+      RCons(head, tail) => arena_scope(scalar_map_rule_errors(TCheckRuleState { rd: head, src: tl.src, prog: tl.prog, concepts: tl.concepts })) + scalar_map_errors(TCheckListState { iter: tail, src: tl.src, prog: tl.prog, concepts: tl.concepts })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [tl.concepts, tl.iter, tl.prog, tl.src]
+      calls : [scalar_map_errors, scalar_map_rule_errors]
+    termination:
+      bound : 8000
+
+
+concept ScalarMapDeclared
+  @intention: "A rule declaration and its source to identify boolean collection outputs"
+  @source: vexprparse.intent:1796
+  fields:
+    rd : RuleDecl
+    src : text
+
+
+rule scalar_map_bool_output
+  @intention: "Identify the declared boolean collection status convention"
+  @source: vexprparse.intent:1796
+  input:
+    md : ScalarMapDeclared
+  output:
+    out : number
+  logic:
+    out = if rd_out_ty(md.rd) == 3 and type_code_of_span(SpanCheck { src: md.src, start: rd_out_ty_start(md.rd), len: rd_out_ty_len(md.rd) }) == 1 then 1 else 0
+  proofs:
+    purity:
+      reads : [md.rd, md.src]
+      calls : [rd_out_ty, rd_out_ty_len, rd_out_ty_start, type_code_of_span]
+    termination:
+      bound : 64
+
+
+rule scalar_map_bool_entry
+  @intention: "Use the boolean collection procedure status at argv exit"
+  @source: vexprparse.intent:1796
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => scalar_map_bool_output(ScalarMapDeclared { rd: head, src: pg.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src]
+      calls : [scalar_map_bool_output]
+    termination:
+      bound : 64
+
+
+rule scalar_map_field_loads
+  @intention: "Load one element with a 64 KiB check before each text copy"
+  @source: vexprparse.intent:1796
+  input:
+    ef : ElemFieldLoads
+  output:
+    out : bytes
+  logic:
+    out = match ef.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat((if ty == 2 then concat(b"\x49\x8b\x31\x31\xc9\x80\x3c\x0e\x00\x74\x05\x48\xff\xc1\xeb\xf5\x48\x81\xf9\x00\x00\x01\x00\x76\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xbf", le32(536870912 + ef.text_off), b"\x51\xf3\xa4\x59\x48\xb8", le64((536870912 + ef.text_off - ef.src_base) * 4294967296), b"\x48\x09\xc8\x50\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90") else concat(b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x50")), (if field_list_len(rest) > 0 then b"\x49\x83\xc1\x08" else b""), scalar_map_field_loads(ElemFieldLoads { fields: rest, src_base: ef.src_base, text_off: (if ty == 2 then ef.text_off + 65536 else ef.text_off) }))
+      FNil => b""
+  proofs:
+    purity:
+      reads : [ef.fields, ef.src_base, ef.text_off]
+      calls : [field_list_len, scalar_map_field_loads]
+    termination:
+      bound : 512
+
+
+rule scalar_map_elem_load
+  @intention: "Build the current map element with bounded text loads"
+  @source: vexprparse.intent:1796
+  input:
+    el : ElemLoadState
+  output:
+    out : bytes
+  logic:
+    out = concat(scalar_map_field_loads(ElemFieldLoads { fields: el.efields, src_base: el.src_base, text_off: 0 }), b"\x4c\x89\xf0\x48\x69\xc0", le32(el.esize), b"\x4c\x01\xf8\x48\xc7\x00", le32(el.tag), x86_slot_pops(SlotPops { slot: el.nf - 1 }), b"\x4c\x89\xb5", le32(el.x_disp), b"\x49\xff\xc6")
+  proofs:
+    purity:
+      reads : [el.nf, el.tag, el.esize, el.x_disp, el.efields, el.src_base]
+      calls : [scalar_map_field_loads, x86_slot_pops]
+    termination:
+      bound : 64
+
+
+rule scalar_map_binders
+  @intention: "Share the item and reserved flag slots between sizing and emission"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : Binding
+  logic:
+    let cidx = static_concept_of(StaticConceptState { node: cr.coll, src: cr.src, params: cr.params, lets: cr.lets, concepts: cr.concepts })
+    out = if cidx >= 0 then lets_append_elem_binders(AppendElemBindersState { lets: cr.lets, item_start: cr.item_start, item_len: cr.item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })) }) else lets_append_binders(AppendBindersState { lets: cr.lets, bs: BinderList::BindCons { start: cr.item_start, len: cr.item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } })
+  proofs:
+    purity:
+      reads : [cr.coll, cr.concepts, cr.item_len, cr.item_start, cr.lets, cr.params, cr.src]
+      calls : [cd_name_len, cd_name_start, concept_at_index, lets_append_binders, lets_append_elem_binders, static_concept_of]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_load_size
+  @intention: "Size checked record loads or one numeric element"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : number
+  logic:
+    let cidx = static_concept_of(StaticConceptState { node: cr.coll, src: cr.src, params: cr.params, lets: cr.lets, concepts: cr.concepts })
+    out = if cidx >= 0 then 72 * field_list_len(cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx }))) + 26 + 21 * scalar_map_text_fields(cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx }))) else 66
+  proofs:
+    purity:
+      reads : [cr.coll, cr.concepts, cr.lets, cr.params, cr.src]
+      calls : [cd_fields, concept_at_index, field_list_len, scalar_map_text_fields, static_concept_of]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_bool_line
+  @intention: "Print a bool and remember any false without stopping the loop"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : bytes
+  logic:
+    out = concat(b"\x48\x85\xc0\x74\x12\x48\xb8\x74\x72\x75\x65\x0a\x00\x00\x00\x50\xba\x05\x00\x00\x00\xeb\x1b\x48\xc7\x85", le32(0 - 8 * (count_binds(cr.lets) + 2)), b"\x01\x00\x00\x00\x48\xb8\x66\x61\x6c\x73\x65\x0a\x00\x00\x50\xba\x06\x00\x00\x00\x48\x89\xe6\xbf\x01\x00\x00\x00\xb8\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08")
+  proofs:
+    purity:
+      reads : [cr.lets]
+      calls : [count_binds]
+    termination:
+      bound : 64
+
+
+rule scalar_map_print
+  @intention: "Print one scalar with the existing decimal routine or the boolean contract"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : bytes
+  logic:
+    out = if scalar_map_type(cr) == 1 then scalar_map_bool_line(cr) else concat(b"\x41\x51\xe8", le32(0 - (cr.off + 93)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59")
+  proofs:
+    purity:
+      reads : [cr, cr.off]
+      calls : [scalar_map_bool_line, scalar_map_type]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_size
+  @intention: "Size the bounded scalar map loop with the same binder context"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : number
+  logic:
+    let cidx = static_concept_of(StaticConceptState { node: cr.coll, src: cr.src, params: cr.params, lets: cr.lets, concepts: cr.concepts })
+    let nf = if cidx >= 0 then field_list_len(cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx }))) else 1
+    let eb = scalar_map_binders(cr)
+    let coll_sz = arena_scope(code_size_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }))
+    let body_sz = arena_scope(code_size_node(ByteGenState { node: cr.body, src: cr.src, off: 0, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }))
+    let load_sz = scalar_map_load_size(cr)
+    let print_sz = if scalar_map_type(cr) == 1 then 69 else 41
+    out = coll_sz + load_sz + body_sz + print_sz + 156
+  proofs:
+    purity:
+      reads : [cr, cr.body, cr.coll, cr.concepts, cr.conns, cr.lets, cr.off, cr.params, cr.prog, cr.ress, cr.sizes, cr.src]
+      calls : [cd_fields, code_size_node, concept_at_index, field_list_len, scalar_map_binders, scalar_map_load_size, scalar_map_type, static_concept_of]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_emit
+  @intention: "Stream scalar map results and restore each element arena mark"
+  @source: vexprparse.intent:1796
+  input:
+    cr : CollRecState
+  output:
+    out : bytes
+  logic:
+    let cidx = static_concept_of(StaticConceptState { node: cr.coll, src: cr.src, params: cr.params, lets: cr.lets, concepts: cr.concepts })
+    let nf = if cidx >= 0 then field_list_len(cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx }))) else 1
+    let eb = scalar_map_binders(cr)
+    let coll_sz = arena_scope(code_size_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }))
+    let body_sz = arena_scope(code_size_node(ByteGenState { node: cr.body, src: cr.src, off: 0, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }))
+    let load_sz = scalar_map_load_size(cr)
+    let print_sz = if scalar_map_type(cr) == 1 then 69 else 41
+    out = concat(x86_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }), b"\x41\x59\x49\x8b\x31\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8\x49\x89\xc0\x49\x83\xc1\x08", b"\x49\x8b\x04\x24\x49\x8d\x44\xc4\x08\x4c\x29\xc8\x48\xc1\xe8\x03\x31\xd2\xb9", le32(nf), b"\x48\xf7\xf1\x49\x39\xc0\x76\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05", b"\x48\xc7\x85", le32(0 - 8 * (count_binds(cr.lets) + 2)), b"\x00\x00\x00\x00", b"\x4d\x85\xc0\x0f\x84", le32(load_sz + body_sz + print_sz + 25), b"\x41\x56", (if cidx >= 0 then scalar_map_elem_load(ElemLoadState { nf: nf, tag: cidx * 256, esize: 8 * (max_payload_fields(cr.concepts) + 1), x_disp: 0 - 8 * (count_binds(cr.lets) + 1), efields: cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })), src_base: 4194304 + blob_end_off(ProgGenState { rules: cr.prog, src: cr.src, off: 0, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil }) }) else concat(b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(cr.lets) + 1)))), b"\x41\x50\x41\x51", x86_node(ByteGenState { node: cr.body, src: cr.src, off: cr.off + coll_sz + load_sz + 137, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }), b"\x58\x41\x59\x41\x58", scalar_map_print(CollRecState { coll: cr.coll, item_start: cr.item_start, item_len: cr.item_len, body: cr.body, src: cr.src, off: cr.off + coll_sz + load_sz + body_sz + 142, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, conns: cr.conns }), b"\x41\x5e\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (load_sz + body_sz + print_sz + 34)))
+  proofs:
+    purity:
+      reads : [cr, cr.body, cr.coll, cr.concepts, cr.conns, cr.item_len, cr.item_start, cr.lets, cr.off, cr.params, cr.prog, cr.ress, cr.sizes, cr.src]
+      calls : [blob_end_off, cd_fields, code_size_node, concept_at_index, count_binds, field_list_len, max_payload_fields, scalar_map_binders, scalar_map_elem_load, scalar_map_load_size, scalar_map_print, scalar_map_type, static_concept_of, x86_node]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_plain_fields
+  @intention: "Check that fields contain only established scalar values"
+  @source: vexprparse.intent:1796
+  input:
+    ft : FieldConceptTenvState
+  output:
+    out : number
+  logic:
+    out = match ft.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if constructor_head_type(ft) >= 0 and constructor_head_type(ft) <= 2 then scalar_map_plain_fields(FieldConceptTenvState { fields: rest, concepts: ft.concepts, src: ft.src }) else 0
+      FNil => 1
+  proofs:
+    purity:
+      reads : [ft, ft.fields, ft.concepts, ft.src]
+      calls : [constructor_head_type, scalar_map_plain_fields]
+    termination:
+      bound : 8000
+
+
+rule scalar_map_call_inputs
+  @intention: "Allow calls whose inputs cannot carry nested collection pointers"
+  @source: vexprparse.intent:1796
+  input:
+    ft : FieldConceptTenvState
+  output:
+    out : number
+  logic:
+    let kind = constructor_head_type(ft)
+    let cd = concept_at_index(ConceptAtState { concepts: ft.concepts, idx: kind - 1000 })
+    out = match ft.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if (kind >= 0 and kind <= 2) or (kind >= 1000 and kind < 1000000 and variant_list_len(cd_variants(cd)) == 0 and scalar_map_plain_fields(FieldConceptTenvState { fields: cd_fields(cd), concepts: ft.concepts, src: ft.src }) == 1) then scalar_map_call_inputs(FieldConceptTenvState { fields: rest, concepts: ft.concepts, src: ft.src }) else 0
+      FNil => 1
+  proofs:
+    purity:
+      reads : [ft, ft.fields, ft.concepts, ft.src]
+      calls : [constructor_head_type, concept_at_index, variant_list_len, cd_variants, cd_fields, scalar_map_plain_fields, scalar_map_call_inputs]
+    termination:
+      bound : 8000
+
+concept ScalarMapBody
+  @intention: "Scope for protecting an outer map's text slots"
+  @source: vexprparse.intent:1796
+  fields:
+    node : Ast
+    rules : RuleList
+    src : text
+    concepts : ConceptList
+
+concept ScalarMapBodyArgs
+  @intention: "Scope for protecting an outer map's text slots"
+  @source: vexprparse.intent:1796
+  fields:
+    args : ArgList
+    rules : RuleList
+    src : text
+    concepts : ConceptList
+
+concept ScalarMapBodyFields
+  @intention: "Scope for protecting an outer map's text slots"
+  @source: vexprparse.intent:1796
+  fields:
+    fields : VFieldList
+    rules : RuleList
+    src : text
+    concepts : ConceptList
+
+concept ScalarMapBodyArms
+  @intention: "Scope for protecting an outer map's text slots"
+  @source: vexprparse.intent:1796
+  fields:
+    arms : ArmList
+    rules : RuleList
+    src : text
+    concepts : ConceptList
+
+rule scalar_map_text_args
+  @intention: "Reject nested collection evaluation that could overwrite current text slots"
+  @source: vexprparse.intent:1796
+  input:
+    a : ScalarMapBodyArgs
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => scalar_map_text_ast(ScalarMapBody { node: head, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_args(ScalarMapBodyArgs { args: tail, rules: a.rules, src: a.src, concepts: a.concepts })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.concepts, a.args, a.rules, a.src]
+      calls : [scalar_map_text_ast, scalar_map_text_args]
+    termination:
+      bound : 4000
+
+rule scalar_map_text_vfields
+  @intention: "Reject nested collection evaluation that could overwrite current text slots"
+  @source: vexprparse.intent:1796
+  input:
+    a : ScalarMapBodyFields
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => scalar_map_text_ast(ScalarMapBody { node: val, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_vfields(ScalarMapBodyFields { fields: rest, rules: a.rules, src: a.src, concepts: a.concepts })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.concepts, a.fields, a.rules, a.src]
+      calls : [scalar_map_text_ast, scalar_map_text_vfields]
+    termination:
+      bound : 4000
+
+rule scalar_map_text_arms
+  @intention: "Reject nested collection evaluation that could overwrite current text slots"
+  @source: vexprparse.intent:1796
+  input:
+    a : ScalarMapBodyArms
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => scalar_map_text_ast(ScalarMapBody { node: body, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_arms(ScalarMapBodyArms { arms: rest, rules: a.rules, src: a.src, concepts: a.concepts })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.concepts, a.arms, a.rules, a.src]
+      calls : [scalar_map_text_ast, scalar_map_text_arms]
+    termination:
+      bound : 4000
+
+rule scalar_map_text_ast
+  @intention: "Reject nested collection evaluation that could overwrite current text slots"
+  @source: vexprparse.intent:1796
+  input:
+    a : ScalarMapBody
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => scalar_map_text_ast(ScalarMapBody { node: lhs, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_ast(ScalarMapBody { node: rhs, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstNeg(inner) => scalar_map_text_ast(ScalarMapBody { node: inner, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstNot(inner) => scalar_map_text_ast(ScalarMapBody { node: inner, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => scalar_map_text_ast(ScalarMapBody { node: base, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstCall(callee_start, callee_len, args) => (if scalar_map_call_inputs(FieldConceptTenvState { fields: params_to_fields(rule_params_of(find_rule(FindRuleState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len }))), concepts: a.concepts, src: a.src }) == 1 then 0 else 1) + scalar_map_text_args(ScalarMapBodyArgs { args: args, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstIf(cond, thn, els) => scalar_map_text_ast(ScalarMapBody { node: cond, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_ast(ScalarMapBody { node: thn, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_ast(ScalarMapBody { node: els, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => scalar_map_text_vfields(ScalarMapBodyFields { fields: fields, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstMatch(scrut, arms) => scalar_map_text_ast(ScalarMapBody { node: scrut, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_arms(ScalarMapBodyArms { arms: arms, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstOk(inner) => scalar_map_text_ast(ScalarMapBody { node: inner, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstResErr(inner) => scalar_map_text_ast(ScalarMapBody { node: inner, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => scalar_map_text_ast(ScalarMapBody { node: scrut, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_ast(ScalarMapBody { node: ok_body, rules: a.rules, src: a.src, concepts: a.concepts }) + scalar_map_text_ast(ScalarMapBody { node: err_body, rules: a.rules, src: a.src, concepts: a.concepts })
+      AstSum(coll, item_start, item_len, body) => 1
+      AstCount(coll, item_start, item_len, body) => 1
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
+      AstAll(coll, item_start, item_len, body) => 1
+      AstAny(coll, item_start, item_len, body) => 1
+      AstMap(coll, item_start, item_len, body) => 1
+      AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 1
+      AstMaxFold(coll, item_start, item_len, body) => 1
+  proofs:
+    purity:
+      reads : [a.concepts, a.node, a.rules, a.src]
+      calls : [scalar_map_text_ast, scalar_map_text_args, scalar_map_text_vfields, scalar_map_text_arms, scalar_map_call_inputs, params_to_fields, rule_params_of, find_rule]
+    termination:
+      bound : 4000
 
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8

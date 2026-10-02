@@ -305,6 +305,14 @@ ELF/raw emission. Every parsed rule and branch is checked; typing stays separate
 Supported direct reductions and streamed output retain their emitted code.
 See [collection lowering](docs/self-hosted-collection-lowering.md).
 
+Self-hosted scalar-map follow-up: number/bool projections from flat number/text
+records and bool maps over numbers now stream correctly, including `retirement`
+and its sticky false status. A per-element arena mark reclaims scalar body
+transients; checked argv tails and 16 checked 64 KiB text slots bound this new
+input path. Unknown output facts, unsupported layouts and nested traversals that
+could overwrite live text refuse before output. Existing numeric/record loops
+remain independent. See [scalar maps](docs/self-hosted-scalar-map.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

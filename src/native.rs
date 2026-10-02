@@ -57015,7 +57015,12 @@ rule pick
         // Constructor payload checking deliberately refuses tagged_bonuses:
         // read(resource) does not establish a field type in its strict subset.
         // Both ELF and raw emission refuse before producing bytes.
-        const EXPECTED_ACCEPTED: usize = 93;
+        // 93 -> 92: scalar-map capability checks refuse payroll's text-output
+        // `names` rule, including when another entry is selected. The parent
+        // emitted an int3 for it. Isolated record-output compute_bonuses and
+        // high_earners retain byte-identical code; the salaries projection now
+        // executes correctly. Retirement keeps its acceptance and now works.
+        const EXPECTED_ACCEPTED: usize = 92;
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.
@@ -58217,11 +58222,14 @@ rule pick
         // over every rule, and keeping the entry trivial stops an unrelated
         // emit-side refusal (e.g. entry_freshtext) from masquerading as a
         // purity verdict.
+        // Keep the collection last: scalar record maps now require the supported
+        // argv layout even in unselected rules. This leaves the purity obligation
+        // as the only difference between each accepted/rejected pair.
         const HEAD: &str = "@verbose 0.1.0\n\n\
             concept Item\n  @intention: \"i\"\n  @source: p.intent:1\n  \
             fields:\n    v : number [0, 100]\n\n\
             concept W\n  @intention: \"w\"\n  @source: p.intent:1\n  \
-            fields:\n    items : collection(Item)\n    secret : number [0, 100]\n    flag : number [0, 1]\n\n\
+            fields:\n    secret : number [0, 100]\n    flag : number [0, 1]\n    items : collection(Item)\n\n\
             rule main\n  @intention: \"m\"\n  @source: p.intent:1\n  \
             input:\n    w : W\n  output:\n    out : number\n  \
             logic:\n    out = w.flag\n  proofs:\n    purity:\n      reads : [w.flag]\n      \

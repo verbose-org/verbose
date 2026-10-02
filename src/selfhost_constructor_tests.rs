@@ -447,6 +447,9 @@ pub(crate) fn assert_emitted_drivers(compiler: &Path, base: &Path) {
         compiler, &base.join("constructor-x86_program_src"),
         &base.join("constructor-type_check"), &gate, base,
     );
+    crate::selfhost_scalar_map_tests::assert_scalar_maps(
+        compiler, &base.join("constructor-x86_program_src"), base,
+    );
 }
 
 #[test]
