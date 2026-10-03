@@ -57015,12 +57015,11 @@ rule pick
         // Constructor payload checking deliberately refuses tagged_bonuses:
         // read(resource) does not establish a field type in its strict subset.
         // Both ELF and raw emission refuse before producing bytes.
-        // 93 -> 92: scalar-map capability checks refuse payroll's text-output
-        // `names` rule, including when another entry is selected. The parent
-        // emitted an int3 for it. Isolated record-output compute_bonuses and
-        // high_earners retain byte-identical code; the salaries projection now
-        // executes correctly. Retirement keeps its acceptance and now works.
-        const EXPECTED_ACCEPTED: usize = 92;
+        // 92 -> 93: packed text-map output restores the complete payroll file,
+        // including `names`. The scalar-map parent refused that unselected rule.
+        // All six entries now match Rust native on empty and populated input;
+        // unsupported text values still refuse before ELF/raw bytes.
+        const EXPECTED_ACCEPTED: usize = 93;
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.

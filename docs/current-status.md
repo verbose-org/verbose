@@ -68,6 +68,13 @@ The new path checks argv tails and text-copy capacity, restores the arena after
 each scalar result and rejects unsupported layouts or text-slot lifetimes before
 emission. Existing numeric and record-output paths keep their lowering.
 
+The [text map follow-up](self-hosted-text-map.md) also streams packed text
+fields, literals, captured scalar lets, conditionals and checked byte slices.
+The full `payroll` example is supported again, including `names`. Text bytes
+are published before element storage is reused. The new text-map scope checks
+all eager lets and branches; fresh concat values, user-rule calls and other
+unsupported value forms refuse before output. No target buffer or GC is added.
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable

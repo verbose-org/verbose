@@ -134,9 +134,22 @@ stream their output and release element temporaries. It checks direct trailing
 collection inputs, number/text element layouts, copy capacities and text-slot
 lifetimes. Intermediate collection values and other legacy layout gaps remain
 outside that support; a successful capability check is not general backend parity.
-In particular, the full `payroll.verbose` file now refuses because its uncalled
-`names` rule has unsupported text collection output; isolating its supported
-record/scalar projections keeps those rules available.
+The [text map follow-up](self-hosted-text-map.md) restores the full
+`payroll.verbose` file, including `names`: supported packed spans are printed
+before element storage is reclaimed. Fresh concat values, user-rule calls,
+constructors, matches/Results and nested collections within the new text-map
+scope still refuse, including eager unused lets. Direct comparison of
+conditional text values also lacks packed-span comparison lowering and refuses.
+The legacy NUL-terminated source transport and interpreter's lossy conversion
+of partial UTF-8 slices remain separate limitations.
+
+The text-map differential also encountered an existing boolean evaluation
+difference: the Rust interpreter evaluates both operands of `and`/`or`, whereas
+native lowering short-circuits them. Thus `length(s) == 0 or byte_at(s, 0) > 0`
+fails in that interpreter for an empty string, although native takes the first
+operand. An explicit `if` agrees on selected-arm evaluation. This slice leaves
+those scalar implementations unchanged; interpreter short-circuit parity needs
+its own correction.
 
 ## WASM text-valued conditionals
 
