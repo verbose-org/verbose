@@ -73,11 +73,11 @@ The original-AST interpreter is the value oracle for valid UTF-8 spans. Its
 replacement characters. Native output preserves the selected bytes. Tests pin
 both outcomes instead of claiming parity on invalid UTF-8 fragments.
 
-The existing boolean evaluation difference also remains: native `and`/`or`
-short-circuit, while the Rust interpreter evaluates both operands. For a bounds
-check guarding a potentially failing expression, the differential fixtures use
-an explicit `if`, whose selected-arm evaluation agrees. The native scalar
-emitter is unchanged by this text-output slice.
+The subsequent [boolean evaluation correction](boolean-evaluation.md) makes
+the Rust interpreter short-circuit `and`/`or`, matching native evaluation. The
+shared gen0/gen1 text-map fixtures now use logical guards around potentially
+failing reads, including empty text and nested conditions. The native scalar
+emitter remains unchanged.
 
 Inspection also confirms the existing self-hosted stdin source transport stops
 at NUL, and ordinary text escapes have no NUL spelling. This slice does not

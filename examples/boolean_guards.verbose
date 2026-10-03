@@ -1,0 +1,24 @@
+@verbose 0.1.0
+
+concept Input
+  @intention: "Text and a candidate byte index"
+  @source: boolean_guards.intent:1
+  fields:
+    s : text
+    n : number
+
+rule guarded_byte
+  @intention: "Read only after both byte bounds have been checked"
+  @source: boolean_guards.intent:2
+  input:
+    i : Input
+  output:
+    out : number
+  logic:
+    out = if i.n >= 0 and i.n < length(i.s) and byte_at(i.s, i.n) > 0 then 1 else 0
+  proofs:
+    purity:
+      reads: [i.n, i.s]
+      calls: []
+    termination:
+      bound: 100

@@ -22,6 +22,15 @@ For example, `length(i.s) == 0 or byte_at(i.s, 0) > 0` succeeds on empty text
 without an invalid read. `length(i.s) > 0 and byte_at(i.s, 0) > 0` returns false
 on that input. Byte indexing and UTF-8 semantics are unchanged.
 
+The runnable [guarded-byte example](../examples/boolean_guards.verbose) checks
+both bounds before reading. For example:
+
+```sh
+printf '[{"s":"","n":0},{"s":"é","n":1}]' | \
+  cargo run -- examples/boolean_guards.verbose --run guarded_byte --stdin --json
+# [{"out":0},{"out":1}]
+```
+
 ## Implementation boundary
 
 The Rust interpreter handles logical operators before the general eager binary
@@ -48,6 +57,15 @@ Native and interpreter failure diagnostics/process conventions remain distinct.
 This does not claim complete parity for arithmetic overflow, partial UTF-8
 slices or unsupported backend shapes.
 
+One existing optimizer gap remains on artifact paths: constant folding visits
+both logical operands and can panic on signed division overflow in an unselected
+operand. For example, `1 == 1 or (-9223372036854775807 - 1) / -1 > 0` now
+interprets as true, while parent/current native CLI compilation both exit 2
+without an artifact during constant folding. Native runtime short-circuiting
+does not repair that earlier compiler step. Checked, evaluation-preserving
+constant folding is a separate follow-up; this slice leaves artifact lowering
+unchanged.
+
 ## Verification plan
 
 - Truth tables, empty/nonempty/NUL/Unicode text, nested guards, aliases,
@@ -61,3 +79,15 @@ slices or unsupported backend shapes.
 - Serialized normal Rust tests, Python tests and CIDX checks. The normal suite
   and bootstrap CI retain existing backend gates; compare native artifacts with
   the parent compiler to confirm that interpretation routing leaves them intact.
+
+The parent/current Rust CLI comparison covers all 194 top-level examples,
+including the new guarded-byte fixture: 190 emitted binaries are byte-identical
+and four refusal outcomes (status and stderr) are unchanged. This checks native
+artifact preservation, not a runtime performance measurement.
+
+Local validation passes the serialized normal suite (896 unit tests and six
+CLI integration tests), all 97 Python tool tests, and CIDX validate/doctor/security.
+The 28 existing ignored Rust tests retain their separate gates; two-generation
+bootstrap CI runs the updated shared gen0/gen1 fixtures. CIDX's configured
+security phase succeeds while reporting the existing Python dependency findings;
+this change does not update dependencies.
