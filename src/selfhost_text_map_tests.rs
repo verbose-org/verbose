@@ -18,6 +18,16 @@ fn text(body: &str) -> String {
 pub(crate) fn assert_text_maps(compiler: &Path, raw: &Path, base: &Path) {
     let bin = base.join("text-map");
     let rust = base.join("text-map-rust");
+    // Pin the new corpus entry's behavior, not only its acceptance count.
+    emitted(compiler, include_str!("../examples/boolean_guards.verbose"), &bin);
+    for (s, n, value) in [
+        ("", 0, 0), ("a", 0, 1), ("a", 1, 0), ("a", -1, 0),
+        ("é🦀", 1, 1), ("é🦀", 5, 1), ("é🦀", 6, 0),
+        ("x", i64::MIN, 0), ("x", i64::MAX, 0),
+    ] {
+        assert_run(&bin, &[s.into(), n.to_string()],
+            &(0, format!("{value}\n").into_bytes()), "boolean_guards");
+    }
     let mut cases = vec![
         (text("e.name"), true),
         (text("\"\""), true),
@@ -27,7 +37,9 @@ pub(crate) fn assert_text_maps(compiler: &Path, raw: &Path, base: &Path) {
         (text("if not (e.name == \"é🦀\") then \"other\" else e.name"), false),
         (text("substring(e.name, 0, length(e.name))"), false),
         (text("substring(if e.n > 0 then e.name else \"\", 0, 0)"), false),
-        (text("if e.n > 0 and (if length(e.name) == 0 then 1 else byte_at(e.name, 0)) > 0 then e.name else \"other\""), false),
+        (text("if length(e.name) == 0 or byte_at(e.name, 0) > 0 then e.name else \"other\""), false),
+        (text("if length(e.name) > 0 and byte_at(e.name, 0) > 0 then e.name else \"empty\""), false),
+        (text("if e.n > 0 and (length(e.name) == 0 or byte_at(e.name, 0) > 0) then e.name else \"other\""), false),
         (text("substring(\"hello\", max(0, min(e.n, 5)), 5)"), false),
         (text("if e.n >= 0 then substring(e.name, 0, length(e.name)) else substring(\"negative\", 0, 3)"), false),
         (program("if e.n >= 0 then captured else later", "text", FIELDS,

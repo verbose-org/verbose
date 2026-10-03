@@ -320,6 +320,15 @@ The new scope checks eager lets and every branch, refusing fresh concat values,
 user-rule calls and unsupported value shapes before ELF/raw bytes. It adds no
 target buffer, reservation or GC. See [text maps](docs/self-hosted-text-map.md).
 
+Interpreter boolean follow-up (2026-10-03): `and`/`or` now evaluate their right
+operand only when required by the left boolean. Errors on evaluated paths and
+eager lets retain their behavior; skipped operands still undergo full source
+verification. Ordinary CLI rule/reaction evaluation uses the original verified
+AST, avoiding numeric boolean encodings and evaluation removal in the shared
+optimizer. Native emission and storage are unchanged. Shared self-hosted map
+fixtures exercise the guards through gen0/gen1; WASM parity remains separate.
+See [boolean evaluation](docs/boolean-evaluation.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

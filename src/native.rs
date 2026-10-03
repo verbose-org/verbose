@@ -57019,7 +57019,10 @@ rule pick
         // including `names`. The scalar-map parent refused that unselected rule.
         // All six entries now match Rust native on empty and populated input;
         // unsupported text values still refuse before ELF/raw bytes.
-        const EXPECTED_ACCEPTED: usize = 93;
+        // 93 -> 94: boolean_guards adds a supported scalar entry. Its 1376-byte
+        // ELF skips invalid byte reads for empty text and extreme indices;
+        // the shared text-map driver pins its output through gen0 and gen1.
+        const EXPECTED_ACCEPTED: usize = 94;
         // try_byte_at adds one deliberately refused bounded-result example.
         // Bounded HTTP example is explicitly refused by the self-hosted transport.
         // http_capped adds an explicitly refused admission contract.
@@ -57052,7 +57055,7 @@ rule pick
         // constructor_order adds one accepted example at its subject rule #0.
         // Its reversed named fields now produce the interpreted value, pinned
         // separately by the constructor matrix and both bootstrap generations.
-        const EXPECTED_TOTAL: usize = 193;
+        const EXPECTED_TOTAL: usize = 194;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
             .expect("examples/vexprparse.verbose must exist");

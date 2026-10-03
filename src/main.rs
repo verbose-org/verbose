@@ -36,6 +36,8 @@ mod native;
 mod optimizer;
 #[cfg(test)]
 mod let_scope_tests;
+#[cfg(test)]
+mod boolean_evaluation_tests;
 mod parser;
 mod validate_x86;
 mod verifier;
@@ -356,9 +358,18 @@ fn real_main() {
             .and_then(|name| execution::find(&program, &name))
             .is_some_and(|e| matches!(e.mode, ast::ExecutionMode::Concurrent { .. }));
 
+    // Interpretation consumes the verified source AST, as source executions
+    // already do above. The shared lowering can encode bool constants as 0/1
+    // or erase evaluation; neither is valid for the typed source evaluator.
+    // Preserve the existing option priority for artifact/benchmark modes.
+    let source_interpretation = find_flag(&args, "--run").is_some()
+        && find_flag(&args, "--native").is_none()
+        && find_flag(&args, "--wasm").is_none()
+        && !args.iter().any(|a| a == "--benchmark" || a == "--disasm");
+
     // Optimize AST (platform-independent transformations)
     let show_stats = args.iter().any(|a| a == "--stats");
-    let (program, opt_stats) = if concurrent_native {
+    let (program, opt_stats) = if concurrent_native || source_interpretation {
         (program, optimizer::OptStats::default())
     } else {
         optimizer::optimize_program(&program)
@@ -381,7 +392,11 @@ fn real_main() {
         );
     }
     if show_stats {
-        println!("optimizations:\n{}", opt_stats);
+        if source_interpretation {
+            println!("optimizations: skipped for source interpretation");
+        } else {
+            println!("optimizations:\n{}", opt_stats);
+        }
     }
 
     let native_output = find_flag(&args, "--native");
