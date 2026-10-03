@@ -84,6 +84,9 @@ The parent/current Rust CLI comparison covers all 194 top-level examples,
 including the new guarded-byte fixture: 190 emitted binaries are byte-identical
 and four refusal outcomes (status and stderr) are unchanged. This checks native
 artifact preservation, not a runtime performance measurement.
+The self-hosted rule-0 corpus count is 94/194: the new guarded-byte entry emits
+a 1,376-byte ELF, with its empty/Unicode/extreme-index behavior pinned in the
+shared gen0/gen1 driver. The remaining 193 files keep their earlier acceptance.
 
 Local validation passes the serialized normal suite (896 unit tests and six
 CLI integration tests), all 97 Python tool tests, and CIDX validate/doctor/security.
