@@ -339,6 +339,14 @@ proofs remain unchanged; WASM logical lowering and interpreter arithmetic
 overflow parity remain separate. See
 [required evaluation](docs/constant-folding-evaluation.md).
 
+Signed division follow-up (2026-10-08): legacy native division by a positive
+literal power of two now truncates negative values toward zero. A proven
+nonnegative dividend keeps its logical shift; otherwise a 13-byte signed
+sequence uses the existing division scratch register, without a branch or new
+stack storage. Dividend evaluation remains eager and single; other divisor
+lowering and strict numeric contracts are unchanged. See
+[signed power-of-two division](docs/signed-power-of-two-division.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

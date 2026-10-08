@@ -160,13 +160,13 @@ WASM, nor change the strict numeric contract.
 
 ## Legacy native signed division by a power of two
 
-The constant-folding audit also found an older runtime strength-reduction bug:
-an unbounded numeric input `i.n / 2` with `i.n = -7` prints
-`9223372036854775804` instead of `-3`. Both parent `0e4e9d3` and the
-evaluation-preserving folding change reproduce it. The legacy scalar emitter
-uses a logical right shift without proving a nonnegative dividend; a signed
-division fix needs to preserve truncation toward zero. This is separate from
-literal constant folding and the dedicated strict numeric lowering path.
+Corrected by [signed power-of-two lowering](signed-power-of-two-division.md).
+The constant-folding audit found that an unbounded input `i.n / 2`, with
+`i.n = -7`, printed `9223372036854775804` instead of `-3` on parent `54f7a0f`.
+The legacy native emitter now preserves truncation toward zero with a signed
+bias-and-shift sequence; proven nonnegative dividends retain the logical shift.
+The dividend still executes once. This fix adds no allocation or stack storage;
+literal folding and the separate strict numeric lowering remain unchanged.
 
 ## WASM text-valued conditionals
 
