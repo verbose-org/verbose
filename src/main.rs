@@ -38,6 +38,8 @@ mod optimizer;
 mod let_scope_tests;
 #[cfg(test)]
 mod boolean_evaluation_tests;
+#[cfg(test)]
+mod constant_folding_tests;
 mod parser;
 mod validate_x86;
 mod verifier;

@@ -329,6 +329,16 @@ optimizer. Native emission and storage are unchanged. Shared self-hosted map
 fixtures exercise the guards through gen0/gen1; WASM parity remains separate.
 See [boolean evaluation](docs/boolean-evaluation.md).
 
+Artifact folding follow-up (2026-10-08): undefined constant signed division and
+remainder remain operations instead of panicking during compilation; literal
+negation uses native wrapping semantics in debug and release compilers. A shared
+conservative evaluation check protects zero products and range-based condition
+elimination, including native emission from an unoptimized AST. Ranges bound
+successful values, not the safety of evaluating every child. Strict source
+proofs remain unchanged; WASM logical lowering and interpreter arithmetic
+overflow parity remain separate. See
+[required evaluation](docs/constant-folding-evaluation.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

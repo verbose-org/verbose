@@ -596,7 +596,7 @@ pub fn optimize_expr(
             }
             // -(literal) → literal
             if let Expr::Number(n) = &inner {
-                return Expr::Number(-n);
+                return Expr::Number(n.wrapping_neg());
             }
             Expr::Neg(Box::new(inner))
         }
@@ -611,8 +611,8 @@ pub fn optimize_expr(
                     BinOp::Add => Some(l.wrapping_add(*r)),
                     BinOp::Sub => Some(l.wrapping_sub(*r)),
                     BinOp::Mul => Some(l.wrapping_mul(*r)),
-                    BinOp::Div if *r != 0 => Some(l / r),
-                    BinOp::Mod if *r != 0 => Some(l % r),
+                    BinOp::Div => l.checked_div(*r),
+                    BinOp::Mod => l.checked_rem(*r),
                     BinOp::Gt => return Expr::Number(if l > r { 1 } else { 0 }),
                     BinOp::Lt => return Expr::Number(if l < r { 1 } else { 0 }),
                     BinOp::GtEq => return Expr::Number(if l >= r { 1 } else { 0 }),
@@ -642,7 +642,11 @@ pub fn optimize_expr(
                     }
                 }
                 BinOp::Mul => {
-                    if matches!(&right, Expr::Number(0)) || matches!(&left, Expr::Number(0)) {
+                    if (matches!(&right, Expr::Number(0))
+                        && can_discard_scalar_eval(&left, input_name, field_ranges))
+                        || (matches!(&left, Expr::Number(0))
+                            && can_discard_scalar_eval(&right, input_name, field_ranges))
+                    {
                         return Expr::Number(0);
                     }
                     if matches!(&right, Expr::Number(1)) {
@@ -1061,12 +1065,43 @@ pub fn escape_json_string(s: &str) -> String {
     out
 }
 
-/// Try to statically determine a boolean expression's result.
+/// Whether removing scalar evaluation is safe after source verification.
+/// A range bounds successful values, but does not prove that a condition or
+/// operand cannot fail. Check every child as well, and retain unknown forms.
+pub(crate) fn can_discard_scalar_eval(
+    expr: &Expr,
+    input_name: &str,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> bool {
+    let safe = |e: &Expr| can_discard_scalar_eval(e, input_name, field_ranges);
+    match expr {
+        Expr::Number(_) | Expr::Ident(_) => true,
+        Expr::Field(base, _) => matches!(base.as_ref(), Expr::Ident(_)),
+        Expr::Binary(op, left, right) => {
+            safe(left) && safe(right) && match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod =>
+                    compute_range(expr, field_ranges, input_name).is_some(),
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq
+                | BinOp::Gt | BinOp::GtEq | BinOp::And | BinOp::Or => true,
+            }
+        }
+        Expr::Neg(inner) => safe(inner) && compute_range(expr, field_ranges, input_name).is_some(),
+        Expr::Not(inner) => safe(inner),
+        Expr::If(cond, yes, no) => safe(cond) && safe(yes) && safe(no),
+        _ => false,
+    }
+}
+
+/// Try to statically determine a boolean expression's result without losing
+/// required evaluation of its condition.
 fn try_static_eval(
     expr: &Expr,
     field_ranges: &HashMap<&str, (i64, i64)>,
     input_name: &str,
 ) -> Option<bool> {
+    if !can_discard_scalar_eval(expr, input_name, field_ranges) {
+        return None;
+    }
     match expr {
         Expr::Binary(op, left, right) => {
             let (l_min, l_max) = compute_range(left, field_ranges, input_name)?;

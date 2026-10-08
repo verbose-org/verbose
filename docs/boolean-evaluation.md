@@ -57,14 +57,14 @@ Native and interpreter failure diagnostics/process conventions remain distinct.
 This does not claim complete parity for arithmetic overflow, partial UTF-8
 slices or unsupported backend shapes.
 
-One existing optimizer gap remains on artifact paths: constant folding visits
-both logical operands and can panic on signed division overflow in an unselected
-operand. For example, `1 == 1 or (-9223372036854775807 - 1) / -1 > 0` now
-interprets as true, while parent/current native CLI compilation both exit 2
-without an artifact during constant folding. Native runtime short-circuiting
-does not repair that earlier compiler step. Checked, evaluation-preserving
-constant folding is a separate follow-up; this slice leaves artifact lowering
-unchanged.
+The artifact-path gap observed during this slice is now corrected by
+[evaluation-preserving constant folding](constant-folding-evaluation.md):
+`1 == 1 or (-9223372036854775807 - 1) / -1 > 0` both interprets as true and
+compiles natively without a compiler panic. Folding leaves an undefined division
+as an operation, which native control flow skips. Required failing computations
+also survive multiplication by zero and range-based condition elimination.
+WASM's eager logical lowering and interpreter arithmetic overflow conventions
+remain separate limits.
 
 ## Verification plan
 

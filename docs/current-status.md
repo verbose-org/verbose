@@ -79,7 +79,14 @@ The Rust interpreter now [short-circuits logical guards](boolean-evaluation.md),
 matching native `and`/`or`. Ordinary CLI rule/reaction interpretation uses the
 verified source AST, preserving boolean kinds and required evaluation. Lets
 remain eager and both operands remain subject to source verification. WASM
-logical lowering is still eager; native instructions and storage are unchanged.
+logical lowering is still eager.
+
+Artifact [constant folding](constant-folding-evaluation.md) now leaves undefined
+signed division/remainder for runtime control flow instead of panicking during
+compilation. Multiplication by zero and range-based branch elimination preserve
+potentially failing evaluation. Literal negation follows native wrapping
+semantics; strict source overflow proofs remain unchanged. The checks run only
+in the compiler, with no runtime analysis, allocation or GC.
 
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable

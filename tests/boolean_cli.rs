@@ -205,3 +205,82 @@ fn boolean_cli_artifact_modes_keep_optimization() {
     );
     assert_eq!(&fs::read(wasm).unwrap()[..4], b"\0asm");
 }
+
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn constant_folding_cli_compiles_guarded_traps_in_artifact_modes() {
+    let f = Fixture::new("folding-guards");
+    let native = f.0.join("native");
+    let wasm = f.0.join("module.wasm");
+    for failure in [
+        "1 / 0",
+        "1 % 0",
+        "(-9223372036854775807 - 1) / -1",
+        "(-9223372036854775807 - 1) % -1",
+    ] {
+        f.expression(
+            &format!("if 1 == 1 or ({failure}) > 0 then 7 else 9"),
+            "number",
+            "",
+        );
+        for flags in [
+            vec!["--native", native.to_str().unwrap()],
+            vec!["--wasm", wasm.to_str().unwrap()],
+            vec!["--disasm"],
+        ] {
+            let out = f.run(&flags, None);
+            assert!(out.status.success(), "{failure}, {flags:?}: {out:?}");
+            assert!(out.stderr.is_empty(), "{out:?}");
+        }
+        let out = Command::new(&native).args(["", "0"]).output().unwrap();
+        assert_eq!(
+            (out.status.code(), out.stdout, out.stderr),
+            (Some(0), b"7\n".to_vec(), vec![])
+        );
+        // Compilation only: WASM logical evaluation remains eager in this slice.
+        assert_eq!(&fs::read(&wasm).unwrap()[..4], b"\0asm");
+        let out = f.run(&["--stdin", "--json"], Some(r#"[{"s":"","n":0}]"#));
+        assert_eq!(
+            (out.status.code(), out.stdout, out.stderr),
+            (Some(0), b"[{\"out\":7}]\n".to_vec(), vec![])
+        );
+    }
+}
+
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn constant_folding_cli_keeps_required_evaluation_and_wrapping_negation() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new("folding-required");
+    let native = f.0.join("native");
+    for (expr, lets) in [
+        ("0 * (1 / 0)", ""),
+        ("(1 % 0) * 0", ""),
+        ("(-9223372036854775807 - 1) / -1", ""),
+        ("(-9223372036854775807 - 1) % -1", ""),
+        ("if (if 1 / i.n > 0 then 1 else 2) > 0 then 7 else 9", ""),
+        ("7", "    let unused = (1 / i.n) * 0\n"),
+    ] {
+        f.expression(expr, "number", lets);
+        let out = f.run(&["--native", native.to_str().unwrap()], None);
+        assert!(out.status.success(), "{expr}: {out:?}");
+        assert!(out.stderr.is_empty());
+        let out = Command::new(&native).args(["", "0"]).output().unwrap();
+        assert_eq!(
+            (out.status.signal(), out.stdout, out.stderr),
+            (Some(8), vec![], vec![]),
+            "{expr}"
+        );
+        // Do not rewrite an executable inode retained after the trap.
+        fs::remove_file(&native).unwrap();
+    }
+    f.expression("-(-9223372036854775807 - 1)", "number", "");
+    let out = f.run(&["--native", native.to_str().unwrap()], None);
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stderr.is_empty());
+    let out = Command::new(&native).args(["", "0"]).output().unwrap();
+    assert_eq!(
+        (out.status.code(), out.stdout, out.stderr),
+        (Some(0), b"-9223372036854775808\n".to_vec(), vec![])
+    );
+}

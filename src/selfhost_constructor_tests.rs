@@ -119,8 +119,13 @@ pub(crate) fn send(executable: &Path, src: &str, index: usize, unlimited: bool) 
 pub(crate) fn install(output: Output, path: &Path) {
     assert_eq!((output.status.code(), output.stderr), (Some(0), vec![]));
     assert!(output.stdout.starts_with(b"\x7fELF"));
-    fs::write(path, output.stdout).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    // Failure probes can leave the previous executable inode busy (for
+    // example while a core-dump handler still holds it). Publish a new inode
+    // instead of truncating the old executable and racing with that cleanup.
+    let staging = path.with_extension("installing");
+    fs::write(&staging, output.stdout).unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(staging, path).unwrap();
 }
 
 pub(crate) fn interpreted(p: &Program) -> Result<Value, interpreter::RuntimeError> {
