@@ -93,3 +93,10 @@ pass, as do CIDX validate/doctor and the three security tools. `cargo-audit`
 needed one retry after a transient container DNS failure; Trivy continues to
 report existing Python dependency findings. Two-generation bootstrap validation
 remains a required CI gate.
+
+The first CI run exposed `ETXTBSY` in the existing self-hosted constructor test
+installer while replacing a previously executed failure probe. The shared test
+helper now writes and chmods a staging file, then renames it into place, retaining
+all output/status assertions and avoiding mutation of an occupied executable
+inode. The affected self-hosted tests are rerun locally and in CI; production
+emission is unchanged by this test-harness correction.
