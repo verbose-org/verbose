@@ -75,6 +75,12 @@ are published before element storage is reused. The new text-map scope checks
 all eager lets and branches; fresh concat values, user-rule calls and other
 unsupported value forms refuse before output. No target buffer or GC is added.
 
+The Rust interpreter now [short-circuits logical guards](boolean-evaluation.md),
+matching native `and`/`or`. Ordinary CLI rule/reaction interpretation uses the
+verified source AST, preserving boolean kinds and required evaluation. Lets
+remain eager and both operands remain subject to source verification. WASM
+logical lowering is still eager; native instructions and storage are unchanged.
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable

@@ -143,13 +143,18 @@ conditional text values also lacks packed-span comparison lowering and refuses.
 The legacy NUL-terminated source transport and interpreter's lossy conversion
 of partial UTF-8 slices remain separate limitations.
 
-The text-map differential also encountered an existing boolean evaluation
-difference: the Rust interpreter evaluates both operands of `and`/`or`, whereas
-native lowering short-circuits them. Thus `length(s) == 0 or byte_at(s, 0) > 0`
-fails in that interpreter for an empty string, although native takes the first
-operand. An explicit `if` agrees on selected-arm evaluation. This slice leaves
-those scalar implementations unchanged; interpreter short-circuit parity needs
-its own correction.
+The text-map differential exposed a Rust interpreter `and`/`or` evaluation
+difference, now corrected by [source boolean evaluation](boolean-evaluation.md).
+Guarded reads short-circuit in the interpreter and native backends. Ordinary
+CLI interpretation also uses the verified source AST: the shared optimizer
+encodes some boolean constants as numbers and is not a typed interpreter IR.
+WASM still emits eager bitwise operations for `and`/`or`; its short-circuit
+correction remains separate. Guards still require complete source verification.
+The shared artifact optimizer also still visits unselected operands during
+constant folding: an overflowing constant division can panic before native
+emission. The [boolean contract](boolean-evaluation.md) records a parent/current
+reproducer. Source interpretation now avoids that lowering; fixing artifact
+constant folding remains separate from native runtime short-circuiting.
 
 ## WASM text-valued conditionals
 

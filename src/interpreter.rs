@@ -368,6 +368,25 @@ fn eval_expr(
         }
         Expr::Binary(op, left, right) => {
             let l = eval_expr(left, env, all_rules, concepts, entropies)?;
+            // Logical guards decide whether the right operand is evaluated.
+            // Keep booleans distinct from numbers, including at this defensive
+            // boundary for callers that bypass source verification.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                let Value::Bool(value) = l else {
+                    return Err(RuntimeError {
+                        message: format!("{:?} requires bool on the left, got {}", op, l),
+                    });
+                };
+                if (matches!(op, BinOp::And) && !value) || (matches!(op, BinOp::Or) && value) {
+                    return Ok(Value::Bool(value));
+                }
+                return match eval_expr(right, env, all_rules, concepts, entropies)? {
+                    Value::Bool(value) => Ok(Value::Bool(value)),
+                    other => Err(RuntimeError {
+                        message: format!("{:?} requires bool on the right, got {}", op, other),
+                    }),
+                };
+            }
             let r = eval_expr(right, env, all_rules, concepts, entropies)?;
             match (op, &l, &r) {
                 (BinOp::Eq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a == b)),
@@ -397,8 +416,6 @@ fn eval_expr(
                 (BinOp::Lt, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a < b)),
                 (BinOp::GtEq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a >= b)),
                 (BinOp::LtEq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a <= b)),
-                (BinOp::And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
-                (BinOp::Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
                 _ => Err(RuntimeError {
                     message: format!("cannot apply {:?} to {} and {}", op, l, r),
                 }),
