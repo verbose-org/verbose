@@ -7,6 +7,8 @@ mod http_log_stack;
 mod admission;
 mod pool;
 mod transport_asm;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod signed_division_tests;
 
 /// Native x86-64 code generation — produces ELF binaries directly.
 ///
@@ -16233,13 +16235,29 @@ fn emit_eval_expr(
                 }
             }
 
-            // Strength reduction: divide by power of 2 → shift right
+            // Signed division rounds toward zero. Keep the logical shift for
+            // proven nonnegative values; otherwise bias before an arithmetic
+            // shift. The dividend still executes exactly once.
             if *op == BinOp::Div {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
                         emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
-                        code.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
+                        if shift == 0 {
+                            return Ok(()); // x / 1, including i64::MIN
+                        }
+                        let nonnegative = compute_range(left, field_ranges, input_name)
+                            .map_or(false, |(min, _)| min >= 0);
+                        if nonnegative {
+                            code.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
+                        } else {
+                            // rdx is already scratch for ordinary division.
+                            // A negative x gets bias 2^shift - 1; others get 0.
+                            code.extend_from_slice(&[0x48, 0x99]); // cqo
+                            code.extend_from_slice(&[0x48, 0xC1, 0xEA, 64 - shift]); // shr rdx, 64-shift
+                            code.extend_from_slice(&[0x48, 0x01, 0xD0]); // add rax, rdx
+                            code.extend_from_slice(&[0x48, 0xC1, 0xF8, shift]); // sar rax, shift
+                        }
                         return Ok(());
                     }
                 }

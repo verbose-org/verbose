@@ -88,6 +88,11 @@ potentially failing evaluation. Literal negation follows native wrapping
 semantics; strict source overflow proofs remain unchanged. The checks run only
 in the compiler, with no runtime analysis, allocation or GC.
 
+Native [division by a positive literal power of two](signed-power-of-two-division.md)
+now rounds negative dividends toward zero correctly. Proven nonnegative values
+keep the compact logical shift; other values use a fixed signed sequence in
+registers. Dividend evaluation, strict numeric proofs and storage are preserved.
+
 Verbose's general-purpose direction covers command-line tools, data processing,
 compilers and long-running services within explicitly supported, verifiable
 subsets. Memory, resource, effect and concurrency contracts should be reusable
