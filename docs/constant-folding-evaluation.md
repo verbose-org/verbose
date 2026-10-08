@@ -64,3 +64,32 @@ example corpus against the parent compiler, explaining any artifact changes.
 Run the normal Rust suite serialized, Python tools, CIDX checks and the existing
 two-generation bootstrap CI. Reuse the existing guarded-byte example and avoid
 changing the bootstrap corpus denominator for test-only arithmetic fixtures.
+
+## Measured regression controls
+
+Real CLI comparison with parent `0e4e9d3`, using the guarded-byte example's input
+concept and temporary arithmetic bodies (argv `"" 0`):
+
+| Body | Parent | Corrected native |
+| --- | --- | --- |
+| `if 1 == 1 or (-9223372036854775807 - 1) / -1 > 0 then 7 else 9` | Compiler panic, status 2 | Prints `7`, status 0, 545 B |
+| `(1 / i.n) * 0` | Prints `0`, status 0, 470 B | SIGFPE, empty stdout/stderr, 482 B |
+| `if (if 1 / i.n > 0 then 1 else 2) > 0 then 7 else 9` | Prints `7`, status 0, 470 B | SIGFPE, empty stdout/stderr, 567 B |
+| `i.n * 0` | Prints `0`, status 0, 470 B | Same output/status and 470 B |
+
+The larger corrected failure cases retain operations that the old compiler
+incorrectly removed. They add neither allocation nor runtime proof bookkeeping.
+The audit also recorded an existing [legacy signed power-of-two division gap](known-gaps.md#legacy-native-signed-division-by-a-power-of-two),
+which is unchanged by this slice.
+
+The 194-file top-level example comparison preserves all 190 emitted native
+artifacts byte for byte and all four refusal outcomes (status and stderr).
+The self-hosted source and corpus membership are unchanged.
+
+Local validation passes 902 unit tests and eight CLI integration tests, serialized
+(28 existing ignored tests retain separate gates). The six new unit regressions
+and two new CLI regressions also pass in release mode. All 97 Python tool tests
+pass, as do CIDX validate/doctor and the three security tools. `cargo-audit`
+needed one retry after a transient container DNS failure; Trivy continues to
+report existing Python dependency findings. Two-generation bootstrap validation
+remains a required CI gate.

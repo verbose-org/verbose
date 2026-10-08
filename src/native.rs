@@ -15625,6 +15625,9 @@ fn try_static_condition(
     input_name: &str,
 ) -> Option<bool> {
     use crate::verifier::compute_range;
+    if !crate::optimizer::can_discard_scalar_eval(expr, input_name, field_ranges) {
+        return None;
+    }
     match expr {
         Expr::Binary(op, left, right) => {
             let (l_min, l_max) = compute_range(left, field_ranges, input_name)?;
@@ -16209,7 +16212,7 @@ fn emit_eval_expr(
                     BinOp::Add => Some(l.wrapping_add(*r)),
                     BinOp::Sub => Some(l.wrapping_sub(*r)),
                     BinOp::Mul => Some(l.wrapping_mul(*r)),
-                    BinOp::Div if *r != 0 => Some(l.wrapping_div(*r)),
+                    BinOp::Div => l.checked_div(*r),
                     _ => None,
                 };
                 if let Some(val) = result {
@@ -16272,9 +16275,20 @@ fn emit_eval_expr(
                 }
             }
 
-            // Strength reduction: multiply by 0 → 0
+            // Multiplication by zero still evaluates a potentially failing or
+            // effectful operand exactly once, before clearing the result.
             if *op == BinOp::Mul {
-                if matches!(right.as_ref(), Expr::Number(0)) || matches!(left.as_ref(), Expr::Number(0)) {
+                let retained = if matches!(right.as_ref(), Expr::Number(0)) {
+                    Some(left.as_ref())
+                } else if matches!(left.as_ref(), Expr::Number(0)) {
+                    Some(right.as_ref())
+                } else {
+                    None
+                };
+                if let Some(operand) = retained {
+                    if !crate::optimizer::can_discard_scalar_eval(operand, input_name, field_ranges) {
+                        emit_eval_expr(code, operand, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+                    }
                     code.extend_from_slice(&[0x48, 0x31, 0xC0]); // xor rax, rax
                     return Ok(());
                 }

@@ -150,11 +150,23 @@ CLI interpretation also uses the verified source AST: the shared optimizer
 encodes some boolean constants as numbers and is not a typed interpreter IR.
 WASM still emits eager bitwise operations for `and`/`or`; its short-circuit
 correction remains separate. Guards still require complete source verification.
-The shared artifact optimizer also still visits unselected operands during
-constant folding: an overflowing constant division can panic before native
-emission. The [boolean contract](boolean-evaluation.md) records a parent/current
-reproducer. Source interpretation now avoids that lowering; fixing artifact
-constant folding remains separate from native runtime short-circuiting.
+The artifact optimizer's constant division/remainder panic is now corrected by
+[evaluation-preserving folding](constant-folding-evaluation.md). Undefined
+literal division/remainder remains an operation; native guards can skip it,
+and evaluated native arithmetic failures retain their existing trap. Zero
+products and predictable conditions retain computations that can fail. This
+does not establish general arithmetic-overflow parity with the interpreter or
+WASM, nor change the strict numeric contract.
+
+## Legacy native signed division by a power of two
+
+The constant-folding audit also found an older runtime strength-reduction bug:
+an unbounded numeric input `i.n / 2` with `i.n = -7` prints
+`9223372036854775804` instead of `-3`. Both parent `0e4e9d3` and the
+evaluation-preserving folding change reproduce it. The legacy scalar emitter
+uses a logical right shift without proving a nonnegative dividend; a signed
+division fix needs to preserve truncation toward zero. This is separate from
+literal constant folding and the dedicated strict numeric lowering path.
 
 ## WASM text-valued conditionals
 
