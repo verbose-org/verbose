@@ -166,8 +166,10 @@ mod native {
                     .output()
                     .unwrap(),
             );
+            // A core-dump handler may still hold the old inode after SIGFPE.
+            // The next compilation must create a fresh executable.
+            fs::remove_file(&path).unwrap();
         }
-        fs::remove_file(path).unwrap();
     }
 
     fn succeeds(p: &Program, n: i64, value: i64) {

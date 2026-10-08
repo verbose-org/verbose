@@ -271,6 +271,8 @@ fn constant_folding_cli_keeps_required_evaluation_and_wrapping_negation() {
             (Some(8), vec![], vec![]),
             "{expr}"
         );
+        // Do not rewrite an executable inode retained after the trap.
+        fs::remove_file(&native).unwrap();
     }
     f.expression("-(-9223372036854775807 - 1)", "number", "");
     let out = f.run(&["--native", native.to_str().unwrap()], None);
