@@ -38,6 +38,9 @@
 use crate::ast::*;
 use std::collections::HashMap;
 
+#[cfg(test)]
+mod boolean_tests;
+
 /// First memory offset where text literals are placed. The 0..1024
 /// range is reserved for future runtime state (bump allocator
 /// metadata, scratch buffers) so adding it later doesn't shift
@@ -1642,6 +1645,25 @@ fn emit_wasm_expr(
                 None => Err(WasmError { message: format!("unresolved ident '{}'", name) }),
             }
         }
+        Expr::Binary(op @ (BinOp::And | BinOp::Or), left, right) => {
+            // Boolean expressions use i64 zero/one internally. Evaluate the
+            // left operand once and enter the RHS only when it is required.
+            emit_wasm_expr(code, left, ctx)?;
+            code.extend_from_slice(&[0x50, 0x04, 0x7E]); // i64.eqz; if (result i64)
+            if *op == BinOp::And {
+                code.extend_from_slice(&[0x42, 0x00]); // false and _ = false
+            } else {
+                emit_wasm_expr(code, right, ctx)?;
+            }
+            code.push(0x05); // else
+            if *op == BinOp::And {
+                emit_wasm_expr(code, right, ctx)?;
+            } else {
+                code.extend_from_slice(&[0x42, 0x01]); // true or _ = true
+            }
+            code.push(0x0B); // end
+            Ok(())
+        }
         Expr::Binary(op, left, right) => {
             emit_wasm_expr(code, left, ctx)?;
             emit_wasm_expr(code, right, ctx)?;
@@ -1658,8 +1680,7 @@ fn emit_wasm_expr(
                 BinOp::LtEq => { code.push(0x57); code.push(0xAD); }   // i64.le_s → i64.extend_i32_u
                 BinOp::Eq => { code.push(0x51); code.push(0xAD); }     // i64.eq → i64.extend_i32_u
                 BinOp::NotEq => { code.push(0x52); code.push(0xAD); }  // i64.ne → i64.extend_i32_u
-                BinOp::And => code.push(0x83),     // i64.and
-                BinOp::Or => code.push(0x84),      // i64.or
+                BinOp::And | BinOp::Or => unreachable!("logical operators use conditional lowering"),
             }
             Ok(())
         }
@@ -1677,6 +1698,7 @@ fn emit_wasm_expr(
         Expr::Not(inner) => {
             emit_wasm_expr(code, inner, ctx)?;
             code.push(0x50); // i64.eqz
+            code.push(0xAD); // i64.extend_i32_u, like other boolean expressions
             Ok(())
         }
         Expr::Neg(inner) => {
@@ -2108,11 +2130,9 @@ fn emit_wasm_result_body(
 ///
 /// Both share the same byte-compare loop; the only difference is the
 /// initial offset into the haystack (0 for starts_with,
-/// `h_len - n_len` for ends_with). The result is an i32 bool (0 or
-/// 1) — comparisons in WASM produce i32, no extension needed for the
-/// rule's internal bool path (the rule prologue handles widening to
-/// i64 if the rule output is `bool` via i64.extend, or wraps if
-/// output is bool — see compile_wasm's `is_bool` handling).
+/// `h_len - n_len` for ends_with). The loop produces an i32 zero/one,
+/// widened here to the uniform internal i64 boolean representation.
+/// Only an exported bool result is wrapped back to i32.
 ///
 /// Edge cases pinned:
 ///   - empty needle → always true (loop body never runs)
@@ -2210,15 +2230,7 @@ fn emit_starts_or_ends_with(
         code.push(0x00);                                  // unreachable
     code.push(0x0B);                                      // end block — i32 result on stack
 
-    // The result is i32 (0 or 1). The verifier's bool widening at
-    // the rule's TOP level handles extension; here we leave it as
-    // i32. But if this expression is NOT the rule's top output — it's
-    // a sub-expr of an arithmetic chain or a binding — we'd need
-    // i64 to type-match. Concretely: predicates only flow into
-    // bool-typed sinks today (rule output = bool, or bound to a
-    // bool-typed name), so i32 is what's wanted. If a number-typed
-    // context demands i64 later, this is the place to add
-    // i64.extend_i32_u.
+    // Compose with logical operators, conditions and boolean let bindings.
     code.push(0xAD);                                       // i64.extend_i32_u — uniform i64 in expression chains
     Ok(())
 }

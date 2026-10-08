@@ -78,8 +78,11 @@ unsupported value forms refuse before output. No target buffer or GC is added.
 The Rust interpreter now [short-circuits logical guards](boolean-evaluation.md),
 matching native `and`/`or`. Ordinary CLI rule/reaction interpretation uses the
 verified source AST, preserving boolean kinds and required evaluation. Lets
-remain eager and both operands remain subject to source verification. WASM
-logical lowering is still eager.
+remain eager and both operands remain subject to source verification.
+The [WASM follow-up](wasm-boolean-evaluation.md) now uses conditional evaluation
+for supported `and`/`or` expressions and keeps `not` in the same internal
+boolean representation. It adds no local, memory reservation or allocator;
+required failures retain the existing WebAssembly trap behavior.
 
 Artifact [constant folding](constant-folding-evaluation.md) now leaves undefined
 signed division/remainder for runtime control flow instead of panicking during

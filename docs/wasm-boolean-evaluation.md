@@ -74,3 +74,43 @@ separate.
 - Run serialized normal Rust tests, focused release tests, Python tools and
   CIDX checks. Require all six CI checks, including bootstrap, before marking
   the separate PR ready. Do not claim a speedup without a controlled benchmark.
+
+## Observed regression controls
+
+Using the guarded-byte example's `(s: text, n: number)` input schema, with
+empty text and `n = 0`, the actual optimized CLI artifacts behave as follows:
+
+| Boolean body | Parent module | Corrected module |
+| --- | --- | --- |
+| `i.n != 0 and 10 / i.n > 0` | 77 B, division-by-zero trap | 83 B, returns i32 `0` |
+| `i.n == 0 or 10 / i.n > 0` | 77 B, division-by-zero trap | 83 B, returns i32 `1` |
+| `not (i.n > 0)` | 68 B, invalid i32/i64 stack types | 69 B, valid, returns i32 `1` |
+
+The tests validate each module before invoking it, distinguishing a malformed
+module from a required runtime trap. Scalar-only probes have no locals,
+imports, linear memory, globals or data section. Tests with text operands also
+observe the existing concat allocator's output bytes and result pointer: traces
+show the left operand exactly once, followed by the right operand exactly once
+only when required, for source and optimized ASTs. No instrumentation or host
+imports are added to those modules.
+
+The 194-file WASM corpus comparison repeats the parent compilation as a
+determinism control. It preserves 174 refusal outcomes (status and stderr) and
+16 modules byte for byte. Four modules change: `app` (73 to 79 B), `business`
+(76 to 82 B), `config` (199 to 205 B) and `layers` (92 to 98 B). Each differs by
+exactly one logical `and` lowering and its code-section length fields; all
+other sections are identical.
+
+Node validates 19 of the 20 emitted modules on both compilers. The remaining
+`layers` module has the same pre-existing [text equality type mismatch](known-gaps.md#wasm-text-equality)
+on parent and current: this is not evidence of complete WASM acceptance parity.
+For the other three changed modules, 24 parent/current executions over their
+bundled JSON inputs agree with source interpretation, including propagated
+Result errors. Twelve representative native examples remain byte-identical,
+including `layers`, guarded booleans, strict numeric rules and SHA-256.
+
+Local validation passes 914 unit tests and 11 CLI tests, serialized; the 28
+existing ignored tests retain their dedicated gates. All eight new focused tests
+and the existing guarded-constant CLI test pass in release mode as well. The 97
+Python tool tests and CIDX validate, doctor and security pass. The security phase
+retains the existing Python environment findings; no dependency is added.
