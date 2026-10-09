@@ -50,7 +50,7 @@ There is no new AST kind or implicit numeric-to-boolean conversion.
 | Rust interpreter, rules/reactions and source executions | Short-circuit logical operators on the verified source AST |
 | Rust native | Existing short-circuit lowering retained |
 | Self-hosted native / evaluator compiled natively | Existing short-circuit lowering retained |
-| WASM | Existing eager logical lowering remains a separate gap |
+| WASM | [Short-circuit lowering](wasm-boolean-evaluation.md) for supported expressions; internal boolean values are i64 zero/one, exported bool is i32 |
 
 No native emitter, target frame, arena, allocator or GC changes are required.
 Native and interpreter failure diagnostics/process conventions remain distinct.
@@ -63,8 +63,9 @@ The artifact-path gap observed during this slice is now corrected by
 compiles natively without a compiler panic. Folding leaves an undefined division
 as an operation, which native control flow skips. Required failing computations
 also survive multiplication by zero and range-based condition elimination.
-WASM's eager logical lowering and interpreter arithmetic overflow conventions
-remain separate limits.
+The [WASM follow-up](wasm-boolean-evaluation.md) now skips those unrequired
+computations as well and makes `not` compose with other boolean expressions.
+Interpreter arithmetic overflow conventions remain a separate limit.
 
 ## Verification plan
 

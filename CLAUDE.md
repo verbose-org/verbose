@@ -347,6 +347,13 @@ stack storage. Dividend evaluation remains eager and single; other divisor
 lowering and strict numeric contracts are unchanged. See
 [signed power-of-two division](docs/signed-power-of-two-division.md).
 
+WASM boolean follow-up (2026-10-08): supported `and`/`or` expressions now use
+conditional evaluation, retaining eager lets and required traps. `not` widens
+its result to the same internal i64 zero/one representation as comparisons;
+exported bool still uses i32. The lowering adds no locals, memory reservation,
+allocation or imports. Node execution is required in the normal CI job. See
+[WASM boolean evaluation](docs/wasm-boolean-evaluation.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

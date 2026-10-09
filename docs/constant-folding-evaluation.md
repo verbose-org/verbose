@@ -23,8 +23,9 @@ predictable must likewise retain any required computation that can fail.
 
 This slice covers the shared Rust optimizer and legacy native scalar lowering.
 The checked numeric/text/Result paths retain their separate verified contracts.
-WASM receives safe shared constant folding, but its eager `and`/`or` remains a
-separate follow-up. Self-hosted source and its arithmetic conventions are unchanged.
+WASM receives safe shared constant folding; the later
+[WASM boolean follow-up](wasm-boolean-evaluation.md) also corrects its eager
+`and`/`or`. Self-hosted source and its arithmetic conventions are unchanged.
 
 ## Implementation
 

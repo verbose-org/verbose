@@ -148,8 +148,10 @@ difference, now corrected by [source boolean evaluation](boolean-evaluation.md).
 Guarded reads short-circuit in the interpreter and native backends. Ordinary
 CLI interpretation also uses the verified source AST: the shared optimizer
 encodes some boolean constants as numbers and is not a typed interpreter IR.
-WASM still emits eager bitwise operations for `and`/`or`; its short-circuit
-correction remains separate. Guards still require complete source verification.
+The [WASM correction](wasm-boolean-evaluation.md) now uses short-circuit control
+flow for supported `and`/`or` expressions and widens `not` to the internal i64
+boolean representation. Guards still require complete source verification and
+do not make unsupported WASM operations available.
 The artifact optimizer's constant division/remainder panic is now corrected by
 [evaluation-preserving folding](constant-folding-evaluation.md). Undefined
 literal division/remainder remains an operation; native guards can skip it,
@@ -179,6 +181,16 @@ optimizer correction leaves this defect unchanged; it needs a text multi-value
 block signature or an explicit refusal. The cross-backend let-scope branch probe
 therefore uses numeric arm results. Successful module emission alone is not
 evidence that a WASM program can run.
+
+## WASM text equality
+
+The boolean-lowering corpus comparison confirms a pre-existing type mismatch in
+`layers.verbose --run is_priority --wasm`: parent `bed8c98` emits a 92-byte module
+that Node rejects because `o.tier == "gold"` supplies text's i32 pointer/length
+pairs to `i64.eq`. The short-circuit correction grows that module by six bytes
+but leaves the same validation failure. A runtime guard cannot hide malformed
+WASM instructions. This needs text-aware equality lowering or an explicit
+backend refusal, independently of logical evaluation order.
 
 ## Legacy Rust native dynamic text rebinding
 

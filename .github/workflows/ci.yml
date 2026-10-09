@@ -35,6 +35,11 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
+      - name: Check WASM runtime
+        # Runtime assertions may skip on minimal local/container setups.
+        # Require the host engine in this job so module execution is mandatory.
+        run: node --version
+
       - name: Run tests
         # --test-threads=1: native tests compile a binary to a shared temp path
         # then exec it; in parallel they race (Text-file-busy, or a

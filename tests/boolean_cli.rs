@@ -69,6 +69,29 @@ impl Drop for Fixture {
     }
 }
 
+fn check_wasm(path: &std::path::Path, cases: &str) {
+    match Command::new("node").arg("--version").output() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("node unavailable: skipping WASM runtime assertions (required by normal CI)");
+            return;
+        }
+        Ok(out) => assert!(out.status.success(), "{out:?}"),
+        Err(e) => panic!("cannot start node: {e}"),
+    }
+    let script = format!(
+        "{}\nconst path = {path:?};\n{cases}\nconsole.log('ok');",
+        include_str!("support/wasm_boolean.js")
+    );
+    let out = Command::new("node")
+        .args(["-e", &script, "guarded_byte"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        (out.status.code(), out.stdout, out.stderr),
+        (Some(0), b"ok\n".to_vec(), vec![])
+    );
+}
+
 #[test]
 fn boolean_cli_guards_empty_text_and_extreme_indices() {
     let f = Fixture::new("guards");
@@ -237,13 +260,78 @@ fn constant_folding_cli_compiles_guarded_traps_in_artifact_modes() {
             (out.status.code(), out.stdout, out.stderr),
             (Some(0), b"7\n".to_vec(), vec![])
         );
-        // Compilation only: WASM logical evaluation remains eager in this slice.
-        assert_eq!(&fs::read(&wasm).unwrap()[..4], b"\0asm");
+        check_wasm(&wasm, "check(path, '', 0n, 7n);");
         let out = f.run(&["--stdin", "--json"], Some(r#"[{"s":"","n":0}]"#));
         assert_eq!(
             (out.status.code(), out.stdout, out.stderr),
             (Some(0), b"[{\"out\":7}]\n".to_vec(), vec![])
         );
+    }
+}
+
+#[test]
+fn wasm_boolean_cli_executes_guards_and_nested_negation() {
+    let f = Fixture::new("wasm-runtime");
+    let wasm = f.0.join("module.wasm");
+    for (expr, lets, cases) in [
+        (
+            "i.n == 0 or 10 / i.n > 0",
+            "",
+            "check(path, '', 0n, 1); check(path, '', 1n, 1); check(path, '', -1n, 0);",
+        ),
+        (
+            "not (i.n != 0 and 10 % i.n > 0)",
+            "",
+            "check(path, '', 0n, 1); check(path, '', 3n, 0); check(path, '', -1n, 1);",
+        ),
+        (
+            "length(i.s) == 0 or parse_int(i.s) > 0",
+            "",
+            "check(path, '', 0n, 1); check(path, '2', 0n, 1); check(path, '-2', 0n, 0); check(path, 'é', 0n, 'trap');",
+        ),
+        (
+            "not (i.n > 0) and not (i.n == 0)",
+            "",
+            "check(path, '', -9223372036854775808n, 1); check(path, '', 9223372036854775807n, 0); check(path, '', 0n, 0);",
+        ),
+        (
+            "i.n == 0 or eager",
+            "    let eager = 10 / i.n > 0\n",
+            "check(path, '', 0n, 'trap'); check(path, '', 1n, 1);",
+        ),
+    ] {
+        f.expression(expr, "bool", lets);
+        let out = f.run(&["--wasm", wasm.to_str().unwrap()], None);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        check_wasm(&wasm, cases);
+    }
+}
+
+#[test]
+fn wasm_boolean_cli_refusals_preserve_existing_artifacts() {
+    let f = Fixture::new("wasm-refusals");
+    let wasm = f.0.join("module.wasm");
+    for (expr, remove_reads) in [
+        ("1 == 1 or i.s", false),
+        ("1 == 2 and i.n", false),
+        ("not i.n", false),
+        ("i.n == 0 or parse_int(i.s) > 0", true),
+        ("i.n == 0 or byte_at(i.s, 0) > 0", false),
+    ] {
+        f.expression(expr, "bool", "");
+        if remove_reads {
+            let source = f.0.join("case.verbose");
+            let text = fs::read_to_string(&source)
+                .unwrap()
+                .replace("reads: [i.n, i.s]", "reads: [i.n]");
+            fs::write(source, text).unwrap();
+        }
+        fs::write(&wasm, b"existing artifact").unwrap();
+        let out = f.run(&["--wasm", wasm.to_str().unwrap()], None);
+        assert_eq!(out.status.code(), Some(1), "{expr}: {out:?}");
+        assert!(!out.stderr.is_empty());
+        assert_eq!(fs::read(&wasm).unwrap(), b"existing artifact");
     }
 }
 
