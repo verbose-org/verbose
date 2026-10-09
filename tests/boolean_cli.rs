@@ -372,3 +372,74 @@ fn constant_folding_cli_keeps_required_evaluation_and_wrapping_negation() {
         (Some(0), b"-9223372036854775808\n".to_vec(), vec![])
     );
 }
+
+#[test]
+fn wasm_cli_text_equality_counts_nul_and_utf8_and_preserves_refusals() {
+    let f = Fixture::new("text-equality");
+    let path = f.0.join("equality.wasm");
+    f.expression("i.s == \"aé\"", "bool", "");
+    let out = f.run(
+        &["--stdin", "--json"],
+        Some(r#"[{"s":"aé","n":0},{"s":"aè","n":0},{"s":"a","n":0}]"#),
+    );
+    assert_eq!(
+        (out.status.code(), out.stdout, out.stderr),
+        (
+            Some(0),
+            b"[{\"out\":true},{\"out\":false},{\"out\":false}]\n".to_vec(),
+            vec![]
+        )
+    );
+    // Ordinary CLI JSON input does not yet decode Unicode escapes. NUL
+    // comparison is exercised through the actual host ABI and typed AST tests.
+    f.expression("i.s == \"a\0é\"", "bool", "");
+    let out = f.run(&["--wasm", path.to_str().unwrap()], None);
+    assert!(out.status.success(), "{out:?}");
+    check_wasm(
+        &path,
+        "check(path, 'a\\0é', 0n, 1); check(path, 'a\\0è', 0n, 0); check(path, 'a', 0n, 0);",
+    );
+    for (expr, diagnostic) in [
+        ("i.s == i.n", "type"),
+        (
+            "(if i.n > 0 then i.s else \"other\") == i.s",
+            "text-valued conditionals",
+        ),
+    ] {
+        f.expression(expr, "bool", "");
+        fs::write(&path, b"preserve").unwrap();
+        let out = f.run(&["--wasm", path.to_str().unwrap()], None);
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(diagnostic),
+            "{out:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"preserve");
+    }
+}
+
+#[test]
+fn wasm_cli_layers_text_comparison_is_valid_and_runs() {
+    let f = Fixture::new("layers-text-equality");
+    let path = f.0.join("layers.wasm");
+    let out = Command::new(env!("CARGO_BIN_EXE_verbosec"))
+        .args(["examples/layers.verbose", "--run", "is_priority", "--wasm"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    check_wasm(
+        &path,
+        r#"
+const e = load(path);
+for (const [amount, tier, expected] of [
+    [0n, 'gold', 0], [1000n, 'gold', 0], [1001n, 'gold', 1],
+    [1001n, 'silver', 0], [1001n, '', 0], [1001n, 'gold\0', 0], [1001n, '🦀', 0]
+]) {
+    const bytes = encoder.encode(tier);
+    new Uint8Array(e.memory.buffer).set(bytes, 60000);
+    assert.equal(e.is_priority(amount, 60000, bytes.length), expected);
+}
+"#,
+    );
+}

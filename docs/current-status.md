@@ -84,6 +84,13 @@ for supported `and`/`or` expressions and keeps `not` in the same internal
 boolean representation. It adds no local, memory reservation or allocator;
 required failures retain the existing WebAssembly trap behavior.
 
+WASM [text equality](wasm-text-equality.md) compares counted bytes, including
+UTF-8 and embedded NUL, with eager single evaluation of both operands. It reuses
+one fixed text-primitive scratch group and adds no comparison allocation. Text
+aliases, lexical shadowing, supported Result binders and acyclic same-input calls
+share preparation with emission. General text-valued conditionals now refuse
+explicitly until their multi-value block signature is supported.
+
 Artifact [constant folding](constant-folding-evaluation.md) now leaves undefined
 signed division/remainder for runtime control flow instead of panicking during
 compilation. Multiplication by zero and range-based branch elimination preserve
