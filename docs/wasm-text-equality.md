@@ -62,3 +62,46 @@ RSS or machine-stack bound. Host-provided spans retain the existing ABI contract
   native artifacts. Run serialized Rust tests, focused release tests, Python
   tool tests and CIDX checks; require all six CI checks before marking the PR ready.
   This correctness slice makes no benchmark or general performance claim.
+
+## Observed regression controls
+
+The 194-file example comparison repeats parent emission as a determinism control;
+the two parent runs agree completely. Current emission preserves 18 modules byte
+for byte, corrects `layers`, removes an unused formatter from `enrich`, and adds
+three modules whose callee text literals were previously missing from preparation.
+
+| Example (default last rule) | Parent | Corrected |
+| --- | --- | --- |
+| `layers` | 98 B, invalid text/scalar comparison | 175 B, validates and executes |
+| `enrich` | 430 B | 300 B, unused numeric formatter omitted after binder classification |
+| `alert` | Missing callee literal refusal | 283 B, validates and executes |
+| `clients` | Missing callee literal refusal | 179 B, validates and executes |
+| `priv_failure` | Missing callee literal refusal | 634 B, validates and executes |
+
+All 23 emitted modules validate in Node. Of the remaining 171 outcomes, 137
+preserve the parent refusal exactly and 34 receive an earlier, explicit backend
+diagnostic. This includes five parent compiler stack overflows on unsupported
+recursive call shapes; these now return a compilation error before emission.
+No previously emitted example becomes a refusal.
+
+Across the five examples above, 77 module executions agree with original-source
+interpretation, including both parent/current `enrich` and its selected Result
+payload. These CLI comparisons use ASCII and actual UTF-8 JSON characters;
+embedded NUL uses direct typed interpretation in the regression suite because the
+[ordinary JSON input reader](known-gaps.md#ordinary-rule-cli-json-unicode-escapes)
+does not decode Unicode escapes. Twelve representative native artifacts remain
+byte-identical, including guarded booleans, strict numeric rules and SHA-256.
+
+Tests execute source and optimized AST modules. They also inspect field-comparison-only
+modules: one rule function, no imports/globals/data segment, the existing single
+memory page, and a shared group of six i32 locals regardless of comparison count.
+Numeric comparisons reserve no such group. Producer traces show both operands
+exactly once, in source order, even when their lengths differ. Invalid host spans
+are used only as probes of skipped versus required reads, not as a new validated
+host-input contract.
+
+The final serialized normal suite passes 921 unit tests and 13 CLI tests (934
+in total); 28 existing ignored tests retain their dedicated gates. All 97 Python
+tool tests and local CIDX validate, doctor and security checks pass. Node execution
+is required by normal CI; the dedicated bootstrap job checks the existing
+self-hosted corpus without changing its source or acceptance matrix.

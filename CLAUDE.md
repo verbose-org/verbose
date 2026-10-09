@@ -354,6 +354,14 @@ exported bool still uses i32. The lowering adds no locals, memory reservation,
 allocation or imports. Node execution is required in the normal CI job. See
 [WASM boolean evaluation](docs/wasm-boolean-evaluation.md).
 
+WASM counted equality follow-up (2026-10-09): text `==` / `!=` now compare
+lengths and bytes, preserving UTF-8, embedded NUL and eager operand evaluation.
+The existing byte loop reuses a fixed group of six i32 locals across comparisons,
+with no comparison allocation. Source-order binding views and a checked acyclic
+same-input call walk prepare shapes, constants and helpers before emission.
+Unsupported text-valued general conditionals now refuse before artifact output.
+See [WASM text equality](docs/wasm-text-equality.md).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

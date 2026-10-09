@@ -40,6 +40,9 @@ use std::collections::HashMap;
 
 #[cfg(test)]
 mod boolean_tests;
+#[cfg(test)]
+mod text_equality_tests;
+mod preparation;
 
 /// First memory offset where text literals are placed. The 0..1024
 /// range is reserved for future runtime state (bump allocator
@@ -81,7 +84,7 @@ struct ConcatLocals {
     arg_len: u32,
 }
 
-/// The five i32 locals reserved when a rule uses any of the W3c text
+/// The six i32 locals reserved when a rule uses text equality or the W3c text
 /// primitives that need 2-arg compare loops (`starts_with`, `ends_with`,
 /// `contains`). `length` reuses the first slot to drop the unwanted
 /// `ptr` half of a text value off the stack. `parse_int` and
@@ -290,9 +293,9 @@ pub fn compile_wasm(
         let mut offender: Option<(&str, &str)> = is_record(&rule.output_ty)
             .map(|c| (rule.name.as_str(), c));
         if offender.is_none() {
-            // Direct callees only — WASM inlines one level and refuses the
-            // rest already, so a deeper walk would report a shape the
-            // backend never reaches.
+            // Give entry/direct record callees the established aggregate
+            // diagnostic. Unsupported expressions deeper in expanded calls
+            // still refuse during emission.
             let mut names: Vec<String> = Vec::new();
             for (_, e) in &rule.logic.bindings {
                 crate::native::collect_callee_names(e, &mut names);
@@ -492,6 +495,9 @@ pub fn compile_wasm(
         }
     }
 
+    // Follow exactly the supported expansion graph before assigning storage.
+    let callees = preparation::inline_callees(rule, &rules)?;
+
     // --- Text literal collection + offset assignment ---------------
     // Walk the rule body and let-binding RHSes for every Expr::Text
     // occurrence; assign each unique literal an offset starting at
@@ -509,12 +515,11 @@ pub fn compile_wasm(
             walk_text_literals(rhs, &mut collect);
         }
         walk_text_literals(&rule.logic.value, &mut collect);
-        // W4-MatchResult: the inlined callee's body lives outside the
-        // rule's own AST; reach it explicitly so any text literals it
-        // uses (e.g. an Err("...") in the callee) get their offsets
-        // assigned alongside the outer rule's literals.
-        if let Some(plan) = match_result_plan {
-            walk_text_literals(&plan.callee.logic.value, &mut collect);
+        // Expanded callees live outside the entry AST. Visit in deterministic
+        // source order, after entry literals, preserving the original layout
+        // for the existing single-callee match_result path.
+        for callee in &callees {
+            walk_text_literals(&callee.logic.value, &mut collect);
         }
     }
 
@@ -544,34 +549,35 @@ pub fn compile_wasm(
     // concat to its own let first (which is now legal in W3b).
     let mut binding_shapes: HashMap<&str, BindingShape> = HashMap::new();
     let mut binding_assignments: Vec<(usize, BindingShape)> = Vec::new();
-    let mut next_binding_i64 = total_param_slots;       // first i64 binding slot
     let mut n_i64_bindings: u32 = 0;
     let mut n_text_bindings: u32 = 0;
-    // First pass: only count slots so we know where the i32 group
-    // starts. We can't classify Ident-typed RHSes accurately without
-    // the binding_shapes map being partially populated, but for now
-    // the only "yields text" Idents would reference an earlier text
-    // binding. We rely on source order during the actual classify
-    // pass below.
-    for (_, expr) in &rule.logic.bindings {
-        if expr_yields_text(expr, &field_shapes, &binding_shapes) {
+    // Classify each RHS against preceding bindings. Placeholder indices only
+    // carry widths in this pass; the second pass assigns real local indices.
+    let mut needs_text_equality = false;
+    let mut needs_itoa = false;
+    for (name, expr) in &rule.logic.bindings {
+        needs_text_equality |= preparation::uses_text_equality(expr, &field_shapes, &binding_shapes, &rules);
+        needs_itoa |= expr_concat_has_number_arg(expr, &field_shapes, &binding_shapes, &rules);
+        let shape = if expr_yields_text(expr, &field_shapes, &binding_shapes, &rules) {
             n_text_bindings += 1;
+            BindingShape::Text { ptr: 0, len: 0 }
         } else {
             n_i64_bindings += 1;
-        }
-        // Speculatively register the shape so subsequent ident
-        // lookups during the same pass behave consistently. The
-        // local indices are filler — they get overwritten in the
-        // actual emit pass below.
-        if expr_yields_text(expr, &field_shapes, &binding_shapes) {
-            // unused at this point; populated below
-        }
+            BindingShape::Number(0)
+        };
+        binding_shapes.insert(name.as_str(), shape);
     }
+    needs_text_equality |= preparation::uses_text_equality(&rule.logic.value, &field_shapes, &binding_shapes, &rules);
+    needs_itoa |= expr_concat_has_number_arg(&rule.logic.value, &field_shapes, &binding_shapes, &rules);
+    for callee in &callees {
+        needs_text_equality |= preparation::uses_text_equality(&callee.logic.value, &field_shapes, &HashMap::new(), &rules);
+        needs_itoa |= expr_concat_has_number_arg(&callee.logic.value, &field_shapes, &HashMap::new(), &rules);
+    }
+    binding_shapes.clear();
 
     let needs_scratch = expr_uses_scratch(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_scratch(e))
-        || match_result_plan
-            .map_or(false, |p| expr_uses_scratch(&p.callee.logic.value));
+        || callees.iter().any(|r| expr_uses_scratch(&r.logic.value));
     let n_scratch_i64 = if needs_scratch { 2 } else { 0 };
 
     // n_match_i64: how many i64 locals W4-MatchResult adds. Depends on
@@ -600,16 +606,18 @@ pub fn compile_wasm(
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_concat(e))
         || expr_uses_json_escape(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_json_escape(e))
-        || match_result_plan.map_or(false, |p| {
-            expr_uses_concat(&p.callee.logic.value) || expr_uses_json_escape(&p.callee.logic.value)
+        || callees.iter().any(|r| {
+            expr_uses_concat(&r.logic.value) || expr_uses_json_escape(&r.logic.value)
         });
+
+    // Producers can need memory even with numeric-only input and bool output.
+    let needs_memory = needs_memory || needs_concat;
 
     // Refuse nested concat upfront with a clear pointer to the
     // workaround.
-    if expr_has_nested_concat(&rule.logic.value)
-        || rule.logic.bindings.iter().any(|(_, e)| expr_has_nested_concat(e))
-        || match_result_plan
-            .map_or(false, |p| expr_has_nested_concat(&p.callee.logic.value))
+    if expr_has_nested_concat(&rule.logic.value, &rules)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_has_nested_concat(e, &rules))
+        || callees.iter().any(|r| expr_has_nested_concat(&r.logic.value, &rules))
     {
         return Err(WasmError {
             message: "nested concat(...) is not supported in the WASM backend; bind the inner concat to a `let` first".into(),
@@ -617,13 +625,12 @@ pub fn compile_wasm(
     }
 
     // i32 group total: text-binding ptr/len pairs + concat scratches
-    //                  + W3c text-primitive scratches (5 i32 if any of
+    //                  + text-primitive scratches (6 i32 if equality or any of
     //                  length/parse_int/json_escape/starts_with/ends_with
     //                  /contains appears in the rule).
-    let needs_text_prim = expr_uses_text_primitive(&rule.logic.value)
+    let needs_text_prim = needs_text_equality || expr_uses_text_primitive(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_text_primitive(e))
-        || match_result_plan
-            .map_or(false, |p| expr_uses_text_primitive(&p.callee.logic.value));
+        || callees.iter().any(|r| expr_uses_text_primitive(&r.logic.value));
     let n_concat_locals: u32 = if needs_concat { 5 } else { 0 };
     let n_text_prim_locals: u32 = if needs_text_prim { 6 } else { 0 };
 
@@ -743,7 +750,7 @@ pub fn compile_wasm(
     let mut i64_cursor = total_param_slots;
     let mut i32_cursor = i32_base;
     for (i, (name, expr)) in rule.logic.bindings.iter().enumerate() {
-        if expr_yields_text(expr, &field_shapes, &binding_shapes) {
+        if expr_yields_text(expr, &field_shapes, &binding_shapes, &rules) {
             let shape = BindingShape::Text { ptr: i32_cursor, len: i32_cursor + 1 };
             binding_shapes.insert(name.as_str(), shape);
             binding_assignments.push((i, shape));
@@ -760,21 +767,14 @@ pub fn compile_wasm(
     debug_assert_eq!(i64_cursor, scratch_base_i64);
 
     // --- Detect helper-function needs -----------------------------
-    // Each detection ALSO walks the W4-MatchResult callee body so its
-    // helper needs flow into the outer rule's reservations.
-    let needs_itoa = expr_concat_has_number_arg(&rule.logic.value, &field_shapes, &binding_shapes)
-        || rule.logic.bindings.iter().any(|(_, e)| {
-            expr_concat_has_number_arg(e, &field_shapes, &binding_shapes)
-        })
-        || match_result_plan.map_or(false, |p| {
-            expr_concat_has_number_arg(&p.callee.logic.value, &field_shapes, &binding_shapes)
-        });
+    // Include all supported expanded callees in the entry reservations.
+    // The shape-dependent itoa check ran with lexical binding views above.
     let needs_parse_int = expr_uses_parse_int(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_parse_int(e))
-        || match_result_plan.map_or(false, |p| expr_uses_parse_int(&p.callee.logic.value));
+        || callees.iter().any(|r| expr_uses_parse_int(&r.logic.value));
     let needs_json_escape = expr_uses_json_escape(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_json_escape(e))
-        || match_result_plan.map_or(false, |p| expr_uses_json_escape(&p.callee.logic.value));
+        || callees.iter().any(|r| expr_uses_json_escape(&r.logic.value));
 
     // Helper-function indices. Func 0 is always the rule. Helpers
     // are appended in a fixed order (itoa, parse_int, json_escape)
@@ -940,8 +940,10 @@ pub fn compile_wasm(
     // Emit let binding computations. Text bindings leave (ptr, len)
     // on the stack — pop into the two i32 slots in reverse order
     // (len first, then ptr). Number bindings store one i64.
-    for (i, (_, expr)) in rule.logic.bindings.iter().enumerate() {
-        emit_wasm_expr(&mut body, expr, &ctx)?;
+    let mut preceding_bindings = HashMap::new();
+    for (i, (name, expr)) in rule.logic.bindings.iter().enumerate() {
+        let rhs_ctx = WasmCtx { binding_shapes: &preceding_bindings, ..ctx };
+        emit_wasm_expr(&mut body, expr, &rhs_ctx)?;
         match binding_assignments[i].1 {
             BindingShape::Number(idx) => {
                 body.push(0x21);
@@ -952,6 +954,7 @@ pub fn compile_wasm(
                 body.push(0x21); emit_leb128(&mut body, ptr as u64);   // pop ptr
             }
         }
+        preceding_bindings.insert(name.as_str(), binding_assignments[i].1);
     }
 
     // Emit main expression. For Result-typed rules we route through
@@ -1433,6 +1436,8 @@ fn expr_uses_json_escape(expr: &Expr) -> bool {
 /// expression leave a text `(ptr, len)` pair on the stack (true) or
 /// a single i64 / i32 value (false)?
 ///
+/// Recognises text-valued calls/conditionals as text even when a later
+/// emission check refuses their specific form.
 /// Source of truth for:
 ///   - choosing the binding slot shape (i64 vs i32 ptr+len)
 ///   - dispatching concat-arg emission (text path vs number path)
@@ -1445,6 +1450,7 @@ fn expr_yields_text(
     expr: &Expr,
     field_shapes: &HashMap<&str, FieldShape>,
     binding_shapes: &HashMap<&str, BindingShape>,
+    rules: &HashMap<&str, &Rule>,
 ) -> bool {
     match expr {
         Expr::Text(_) => true,
@@ -1460,10 +1466,10 @@ fn expr_yields_text(
         Expr::Ident(name) => {
             matches!(binding_shapes.get(name.as_str()), Some(BindingShape::Text { .. }))
         }
-        // Conservative defaults below: treat unknown shapes as non-text.
-        // If/Else with text branches isn't allowed in W3b (the type
-        // system would forbid mixed branches) — refuse upstream if it
-        // ever appears.
+        Expr::Call(name, _) => rules.get(name.as_str()).is_some_and(|r| r.output_ty == Type::Text),
+        // Recognise the shape even though emission refuses text-valued blocks.
+        Expr::If(_, yes, no) => expr_yields_text(yes, field_shapes, binding_shapes, rules)
+            || expr_yields_text(no, field_shapes, binding_shapes, rules),
         _ => false,
     }
 }
@@ -1502,40 +1508,46 @@ fn expr_concat_has_number_arg(
     expr: &Expr,
     field_shapes: &HashMap<&str, FieldShape>,
     binding_shapes: &HashMap<&str, BindingShape>,
+    rules: &HashMap<&str, &Rule>,
 ) -> bool {
     match expr {
-        Expr::Concat(args) => args.iter().any(|a| !expr_yields_text(a, field_shapes, binding_shapes)),
+        Expr::Concat(args) => args.iter().any(|a| !expr_yields_text(a, field_shapes, binding_shapes, rules)),
         Expr::Binary(_, l, r) => {
-            expr_concat_has_number_arg(l, field_shapes, binding_shapes)
-                || expr_concat_has_number_arg(r, field_shapes, binding_shapes)
+            expr_concat_has_number_arg(l, field_shapes, binding_shapes, rules)
+                || expr_concat_has_number_arg(r, field_shapes, binding_shapes, rules)
         }
         Expr::If(c, t, e) => {
-            expr_concat_has_number_arg(c, field_shapes, binding_shapes)
-                || expr_concat_has_number_arg(t, field_shapes, binding_shapes)
-                || expr_concat_has_number_arg(e, field_shapes, binding_shapes)
+            expr_concat_has_number_arg(c, field_shapes, binding_shapes, rules)
+                || expr_concat_has_number_arg(t, field_shapes, binding_shapes, rules)
+                || expr_concat_has_number_arg(e, field_shapes, binding_shapes, rules)
         }
         Expr::Not(inner) | Expr::Neg(inner) | Expr::Abs(inner) => {
-            expr_concat_has_number_arg(inner, field_shapes, binding_shapes)
+            expr_concat_has_number_arg(inner, field_shapes, binding_shapes, rules)
         }
         Expr::Min(a, b) | Expr::Max(a, b) => {
-            expr_concat_has_number_arg(a, field_shapes, binding_shapes)
-                || expr_concat_has_number_arg(b, field_shapes, binding_shapes)
+            expr_concat_has_number_arg(a, field_shapes, binding_shapes, rules)
+                || expr_concat_has_number_arg(b, field_shapes, binding_shapes, rules)
         }
-        Expr::Call(_, args) => args.iter().any(|a| expr_concat_has_number_arg(a, field_shapes, binding_shapes)),
+        Expr::Call(_, args) => args.iter().any(|a| expr_concat_has_number_arg(a, field_shapes, binding_shapes, rules)),
         Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
-            expr_concat_has_number_arg(i, field_shapes, binding_shapes)
+            expr_concat_has_number_arg(i, field_shapes, binding_shapes, rules)
         }
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
-            expr_concat_has_number_arg(h, field_shapes, binding_shapes)
-                || expr_concat_has_number_arg(n, field_shapes, binding_shapes)
+            expr_concat_has_number_arg(h, field_shapes, binding_shapes, rules)
+                || expr_concat_has_number_arg(n, field_shapes, binding_shapes, rules)
         }
         Expr::Ok(inner) | Expr::Err(inner) => {
-            expr_concat_has_number_arg(inner, field_shapes, binding_shapes)
+            expr_concat_has_number_arg(inner, field_shapes, binding_shapes, rules)
         }
-        Expr::MatchResult(t, _, ok_b, _, err_b) => {
-            expr_concat_has_number_arg(t, field_shapes, binding_shapes)
-                || expr_concat_has_number_arg(ok_b, field_shapes, binding_shapes)
-                || expr_concat_has_number_arg(err_b, field_shapes, binding_shapes)
+        Expr::MatchResult(t, ok, ok_b, err, err_b) => {
+            if let Some((yes, no)) = preparation::result_branch_bindings(t, ok, err, binding_shapes, rules) {
+                expr_concat_has_number_arg(ok_b, field_shapes, &yes, rules)
+                    || expr_concat_has_number_arg(err_b, field_shapes, &no, rules)
+            } else {
+                expr_concat_has_number_arg(t, field_shapes, binding_shapes, rules)
+                    || expr_concat_has_number_arg(ok_b, field_shapes, binding_shapes, rules)
+                    || expr_concat_has_number_arg(err_b, field_shapes, binding_shapes, rules)
+            }
         }
         _ => false,
     }
@@ -1547,45 +1559,22 @@ fn expr_concat_has_number_arg(
 /// across nesting would clobber. Workaround: bind the inner concat
 /// to a `let` and reference the binding (which is now allowed since
 /// W3b lifts the text-let-RHS refusal).
-fn expr_has_nested_concat(expr: &Expr) -> bool {
-    fn inside_concat(e: &Expr) -> bool {
-        match e {
-            Expr::Concat(_) => true,
-            Expr::Binary(_, l, r) => inside_concat(l) || inside_concat(r),
-            Expr::If(c, t, ee) => inside_concat(c) || inside_concat(t) || inside_concat(ee),
-            Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => inside_concat(i),
-            Expr::Min(a, b) | Expr::Max(a, b) => inside_concat(a) || inside_concat(b),
-            Expr::Call(_, args) => args.iter().any(inside_concat),
-            Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => inside_concat(i),
-            Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
-                inside_concat(h) || inside_concat(n)
-            }
-            Expr::Ok(inner) | Expr::Err(inner) => inside_concat(inner),
-            Expr::MatchResult(t, _, ok_b, _, err_b) => {
-                inside_concat(t) || inside_concat(ok_b) || inside_concat(err_b)
-            }
-            _ => false,
+fn expr_has_nested_concat(expr: &Expr, rules: &HashMap<&str, &Rule>) -> bool {
+    fn contains_concat(expr: &Expr, rules: &HashMap<&str, &Rule>) -> bool {
+        if matches!(expr, Expr::Concat(_)) { return true; }
+        if let Expr::Call(name, _) = expr {
+            return rules.get(name.as_str()).is_some_and(|r| contains_concat(&r.logic.value, rules));
         }
+        let mut found = false;
+        crate::verifier::walk_expr_children(expr, &mut |e| found |= contains_concat(e, rules));
+        found
     }
-    match expr {
-        Expr::Concat(args) => args.iter().any(inside_concat),
-        Expr::Binary(_, l, r) => expr_has_nested_concat(l) || expr_has_nested_concat(r),
-        Expr::If(c, t, e) => expr_has_nested_concat(c) || expr_has_nested_concat(t) || expr_has_nested_concat(e),
-        Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => expr_has_nested_concat(i),
-        Expr::Min(a, b) | Expr::Max(a, b) => expr_has_nested_concat(a) || expr_has_nested_concat(b),
-        Expr::Call(_, args) => args.iter().any(expr_has_nested_concat),
-        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => expr_has_nested_concat(i),
-        Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
-            expr_has_nested_concat(h) || expr_has_nested_concat(n)
-        }
-        Expr::Ok(inner) | Expr::Err(inner) => expr_has_nested_concat(inner),
-        Expr::MatchResult(t, _, ok_b, _, err_b) => {
-            expr_has_nested_concat(t)
-                || expr_has_nested_concat(ok_b)
-                || expr_has_nested_concat(err_b)
-        }
-        _ => false,
+    if let Expr::Concat(args) = expr {
+        if args.iter().any(|a| contains_concat(a, rules)) { return true; }
     }
+    let mut found = false;
+    crate::verifier::walk_expr_children(expr, &mut |e| found |= expr_has_nested_concat(e, rules));
+    found
 }
 
 fn emit_wasm_expr(
@@ -1664,6 +1653,19 @@ fn emit_wasm_expr(
             code.push(0x0B); // end
             Ok(())
         }
+        Expr::Binary(op @ (BinOp::Eq | BinOp::NotEq), left, right)
+            if expr_yields_text(left, ctx.field_shapes, ctx.binding_shapes, ctx.all_rules)
+                || expr_yields_text(right, ctx.field_shapes, ctx.binding_shapes, ctx.all_rules) => {
+            if !expr_yields_text(left, ctx.field_shapes, ctx.binding_shapes, ctx.all_rules)
+                || !expr_yields_text(right, ctx.field_shapes, ctx.binding_shapes, ctx.all_rules) {
+                return Err(WasmError { message: "WASM text equality requires two supported text expressions".into() });
+            }
+            emit_text_compare(code, left, right, ctx, TextCompare::Equal)?;
+            if *op == BinOp::NotEq {
+                code.extend_from_slice(&[0x50, 0xAD]); // i64.eqz; i64.extend_i32_u
+            }
+            Ok(())
+        }
         Expr::Binary(op, left, right) => {
             emit_wasm_expr(code, left, ctx)?;
             emit_wasm_expr(code, right, ctx)?;
@@ -1685,6 +1687,9 @@ fn emit_wasm_expr(
             Ok(())
         }
         Expr::If(cond, then_e, else_e) => {
+            if expr_yields_text(expr, ctx.field_shapes, ctx.binding_shapes, ctx.all_rules) {
+                return Err(WasmError { message: "WASM text-valued conditionals are not yet supported (pointer/length block result)".into() });
+            }
             emit_wasm_expr(code, cond, ctx)?;
             code.push(0xA7); // i32.wrap_i64 (condition must be i32)
             code.push(0x04); // if
@@ -1783,7 +1788,7 @@ fn emit_wasm_expr(
             code.push(0x21); emit_leb128(code, cl.cursor as u64);     // [], $cursor = bump
 
             for arg in args {
-                let yields_text = expr_yields_text(arg, ctx.field_shapes, ctx.binding_shapes);
+                let yields_text = expr_yields_text(arg, ctx.field_shapes, ctx.binding_shapes, ctx.all_rules);
                 if yields_text {
                     // Eval arg → [..., arg_ptr, arg_len]
                     emit_wasm_expr(code, arg, ctx)?;
@@ -1908,10 +1913,10 @@ fn emit_wasm_expr(
             Ok(())
         }
         Expr::StartsWith(haystack, needle) => {
-            emit_starts_or_ends_with(code, haystack, needle, ctx, /* from_end */ false)
+            emit_text_compare(code, haystack, needle, ctx, TextCompare::Prefix)
         }
         Expr::EndsWith(haystack, needle) => {
-            emit_starts_or_ends_with(code, haystack, needle, ctx, /* from_end */ true)
+            emit_text_compare(code, haystack, needle, ctx, TextCompare::Suffix)
         }
         Expr::Contains(haystack, needle) => {
             emit_contains(code, haystack, needle, ctx)
@@ -2126,27 +2131,31 @@ fn emit_wasm_result_body(
     }
 }
 
-/// Inline emission for `starts_with(h, n)` and `ends_with(h, n)`.
+#[derive(Clone, Copy, PartialEq)]
+enum TextCompare { Prefix, Suffix, Equal }
+
+/// Inline byte comparison for prefix, suffix and full text equality.
 ///
-/// Both share the same byte-compare loop; the only difference is the
-/// initial offset into the haystack (0 for starts_with,
-/// `h_len - n_len` for ends_with). The loop produces an i32 zero/one,
+/// Full equality requires equal lengths; prefix/suffix require the needle to
+/// fit the haystack, with an initial offset of `h_len - n_len` for suffix.
+/// The shared byte loop produces an i32 zero/one,
 /// widened here to the uniform internal i64 boolean representation.
 /// Only an exported bool result is wrapped back to i32.
 ///
 /// Edge cases pinned:
-///   - empty needle → always true (loop body never runs)
-///   - needle longer than haystack → false (length check before loop)
-///   - exact-length match → true (loop runs n_len iterations)
-fn emit_starts_or_ends_with(
+///   - two empty texts → true (loop body never runs)
+///   - empty prefix/suffix → true, even for a nonempty haystack
+///   - incompatible lengths → false before the loop
+///   - equal lengths/content → true after n_len iterations
+fn emit_text_compare(
     code: &mut Vec<u8>,
     haystack: &Expr,
     needle: &Expr,
     ctx: &WasmCtx,
-    from_end: bool,
+    mode: TextCompare,
 ) -> Result<(), WasmError> {
     let tp = ctx.text_prim.ok_or_else(|| WasmError {
-        message: "internal: starts_with/ends_with reached emit without text-prim scratches".into(),
+        message: "internal: text comparison reached emit without text-prim scratches".into(),
     })?;
 
     // Eval BOTH args first, then park. Mirror of the W1 discipline
@@ -2161,13 +2170,13 @@ fn emit_starts_or_ends_with(
     code.push(0x21); emit_leb128(code, tp.h_len as u64);
     code.push(0x21); emit_leb128(code, tp.h_ptr as u64);
 
-    // Length pre-check: if n_len > h_len, push 0 and return early.
-    // We use a block with br to skip the compare loop in that case.
+    // Reject unequal lengths for equality, or an oversized prefix/suffix,
+    // before any byte read. Both operands have already executed once.
     code.extend_from_slice(&[0x02, 0x7F]);              // block (i32 result)
-        // First check: if n_len > h_len, push 0 and br out.
+        // Push false and leave the block when the length check fails.
         code.push(0x20); emit_leb128(code, tp.n_len as u64);
         code.push(0x20); emit_leb128(code, tp.h_len as u64);
-        code.push(0x4B);                                 // i32.gt_u (n_len > h_len, unsigned)
+        code.push(if mode == TextCompare::Equal { 0x47 } else { 0x4B }); // ne / gt_u
         code.extend_from_slice(&[0x04, 0x40,             // if (no result)
             0x41, 0x00,                                  //   i32.const 0
             0x0C, 0x01,                                  //   br 1 (out of block)
@@ -2179,7 +2188,7 @@ fn emit_starts_or_ends_with(
 
         // For ends_with: shift h_ptr forward by (h_len - n_len) so the
         // following loop compares the suffix of haystack against needle.
-        if from_end {
+        if mode == TextCompare::Suffix {
             code.push(0x20); emit_leb128(code, tp.h_ptr as u64);
             code.push(0x20); emit_leb128(code, tp.h_len as u64);
             code.push(0x20); emit_leb128(code, tp.n_len as u64);
@@ -2193,7 +2202,7 @@ fn emit_starts_or_ends_with(
             // exit condition: $i >= n_len → push 1 and br out
             code.push(0x20); emit_leb128(code, tp.i as u64);
             code.push(0x20); emit_leb128(code, tp.n_len as u64);
-            code.push(0x4E);                              // i32.ge_s
+            code.push(if mode == TextCompare::Equal { 0x4F } else { 0x4E }); // ge_u / ge_s
             code.extend_from_slice(&[0x04, 0x40,
                 0x41, 0x01,                               // push 1 (matched)
                 0x0C, 0x02,                               // br 2 (out of block)
