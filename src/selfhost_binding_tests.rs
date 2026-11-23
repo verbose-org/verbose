@@ -75,9 +75,6 @@ fn emit(compiler: &Path, src: &str) -> std::process::Output {
 enum NativeReference {
     Compare,
     Refuses(&'static str),
-    // The parent Rust native emitter reuses the old BoundText classification.
-    // See known-gaps.md; the original interpreter remains the value oracle.
-    DynamicRebindingGap,
 }
 
 fn cases() -> Vec<(&'static str, &'static str, Value, NativeReference)> {
@@ -90,7 +87,7 @@ fn cases() -> Vec<(&'static str, &'static str, Value, NativeReference)> {
         ("    let x = \"abc\"\n    let a = x\n    let x = 7\n    out = concat(a, x)", "text", Value::Text("abc7".into()), NativeReference::Refuses("concat argument type not yet supported")),
         ("    let x = 7\n    let a = x\n    let x = \"abc\"\n    out = concat(a, x)", "text", Value::Text("7abc".into()), NativeReference::Refuses("concat argument type not yet supported")),
         ("    let x = \"old\"\n    let a = x\n    let x = i.s\n    let b = x\n    let x = \"new\"\n    out = concat(a, b, x)", "text", Value::Text("oldé\nnew".into()), NativeReference::Compare),
-        ("    let x = i.s\n    let a = x\n    let x = i.n\n    out = concat(a, x)", "text", Value::Text("é\n7".into()), NativeReference::DynamicRebindingGap),
+        ("    let x = i.s\n    let a = x\n    let x = i.n\n    out = concat(a, x)", "text", Value::Text("é\n7".into()), NativeReference::Refuses("concat argument type not yet supported")),
         ("    let x = \"same\"\n    let a = x\n    let x = \"else\"\n    out = if a == \"same\" then byte_at(x, 0) else 0", "number", Value::Number(101), NativeReference::Refuses("text literals not supported in native backend")),
         ("    let x = \"same\"\n    let a = x\n    let x = \"else\"\n    out = if a == x then 0 else length(a)", "number", Value::Number(4), NativeReference::Refuses("text literals not supported in native backend")),
         ("    let e = \"outer\"\n    let value = match_result(Err(\"x\"), ok => ok, e => length(e))\n    let e = \"new\"\n    out = value + length(e)", "number", Value::Number(4), NativeReference::Refuses("match_result target must be a rule call")),
@@ -140,7 +137,6 @@ pub(crate) fn assert_selfhost_bindings(compiler: &Path, base: &Path, evaluator: 
             );
         }
         match native_refusal {
-            NativeReference::DynamicRebindingGap => {}
             mode => {
                 let compiled = native::compile_native(
                     &optimizer::optimize_program(&p).0,

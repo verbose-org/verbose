@@ -5086,23 +5086,34 @@ fn check_call_arity(rule: &Rule, errors: &mut Vec<VerifyError>) {
 
 fn collect_logic_facts(logic: &LogicStmt) -> LogicFacts {
     let mut facts = LogicFacts::default();
-    let binding_names: HashSet<String> = logic.bindings.iter().map(|(n, _)| n.clone()).collect();
-    for (_, expr) in &logic.bindings {
-        collect_expr_facts(expr, &mut facts.reads, &mut facts.calls);
-    }
-    collect_expr_facts(&logic.value, &mut facts.reads, &mut facts.calls);
     // Reads that reference let-bound names are local, not field reads — they
-    // must not reach the purity proof. They are MOVED to `local_reads` rather
-    // than dropped, so `verify_rule` can still check the field they name.
-    let local: Vec<Vec<String>> = facts
-        .reads
+    // must not reach the purity proof. They go to `local_reads` rather than
+    // being dropped, so `verify_rule` can still check the field they name.
+    //
+    // SOURCE ORDER matters: a path is local only if its root was bound by an
+    // EARLIER let. Partitioning against the set of ALL let names let
+    // `let x = helper(i); let i = 7` verify with `reads: []` — a concealed
+    // read of the input, since the later `let i` retroactively hid the
+    // earlier use.
+    let mut bound: HashSet<&str> = HashSet::new();
+    let exprs = logic
+        .bindings
         .iter()
-        .filter(|path| path.first().map_or(false, |name| binding_names.contains(name)))
-        .cloned()
-        .collect();
-    for path in local {
-        facts.reads.remove(&path);
-        facts.local_reads.insert(path);
+        .map(|(n, e)| (Some(n.as_str()), e))
+        .chain(std::iter::once((None, &logic.value)));
+    for (name, expr) in exprs {
+        let mut reads = HashSet::new();
+        collect_expr_facts(expr, &mut reads, &mut facts.calls);
+        for path in reads {
+            if path.first().map_or(false, |n| bound.contains(n.as_str())) {
+                facts.local_reads.insert(path);
+            } else {
+                facts.reads.insert(path);
+            }
+        }
+        if let Some(n) = name {
+            bound.insert(n);
+        }
     }
     facts
 }
@@ -7304,6 +7315,67 @@ rule bad
     /// twin proves the error came from the arity and not from some unrelated
     /// defect in the fixture. Without it this test would still pass against a
     /// verifier that rejected the program for the wrong reason.
+    #[test]
+    fn input_read_before_a_shadowing_let_must_be_declared() {
+        let program = |reads: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept In
+  @intention: "doc"
+  @source: invoices.intent:1
+  fields:
+    n : number [0, 100]
+
+rule helper
+  @intention: "doc"
+  @source: invoices.intent:1
+  input:
+    i : In
+  output:
+    out : number
+  logic:
+    out = i.n * 2
+  proofs:
+    purity:
+      reads   : [i.n]
+      calls   : []
+    termination:
+      bound : 1
+
+rule caller
+  @intention: "doc"
+  @source: invoices.intent:1
+  input:
+    i : In
+  output:
+    out : number
+  logic:
+    let x = helper(i)
+    let i = 7
+    out = x
+  proofs:
+    purity:
+      reads   : {reads}
+      calls   : [helper]
+    termination:
+      bound : 3
+"#
+            )
+        };
+        // The input is consumed BEFORE `let i` shadows it: hiding that read
+        // is a concealed read.
+        let errs = verify_str(&program("[]"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("purity.reads") && e.message.contains("missing")),
+            "a read of the input before a shadowing let must be declared; got {:#?}",
+            errs
+        );
+        // Twin: declared.
+        let errs = verify_str(&program("[i]"));
+        assert!(errs.is_empty(), "declared twin must verify; got {:#?}", errs);
+    }
+
     #[test]
     fn wrong_arity_rule_call_rejected_at_verify_time() {
         // `{CALL}` is the only thing that differs between the two programs.
