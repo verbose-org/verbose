@@ -362,6 +362,13 @@ same-input call walk prepare shapes, constants and helpers before emission.
 Unsupported text-valued general conditionals now refuse before artifact output.
 See [WASM text equality](docs/wasm-text-equality.md).
 
+Let-shadowing follow-up (2026-11-23): purity facts are now collected in source
+order, so an input read BEFORE a let that shadows the input name must be
+declared (`let x = helper(i); let i = 7` no longer verifies with `reads: []`).
+The legacy native rule prologue drops a text binding when a numeric let rebinds
+its name; the dynamic rebinding shape now refuses instead of printing the old
+text twice. See [known gaps](docs/known-gaps.md#purity-reads-before-input-name-shadowing).
+
 ## Dev workflow (cidx + branch-protected main)
 
 Both the canonical compiler repo and POC repos use **[cidx](https://github.com/cidx-org/cidx)** as the CI driver. `cidx.toml` declares the pipeline phases (security / code / test / build) and the same containers + commands run locally and in CI — no drift between developer machine and GitHub Actions runner.

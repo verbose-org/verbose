@@ -231,6 +231,17 @@ binding. Fixing this needs source-order lexical resolution in the dependency
 walk, including branch binders, independently of WASM slot preparation. The
 counted-equality correction does not change source proof acceptance.
 
+Fixed 2026-11-23: `collect_logic_facts` now partitions each let RHS's reads
+against the names bound by EARLIER lets only, so the read above must be
+declared (`reads: []` is refused as missing `[i]`). Lambda and match binders
+were already scoped per body. All 194 examples keep their verification verdict.
+Pinned by `input_read_before_a_shadowing_let_must_be_declared`.
+
+Still open, found while writing that test: the TYPE checker does not honour a
+scalar let that shadows the input name — after `let i = 7`, `out = x + i` is
+refused with `expression has type 'In' but context expects 'number'`. It
+refuses a valid program (the safe direction); the interpreter accepts it.
+
 ## Legacy Rust native dynamic text rebinding
 
 The self-hosted binding probes expose a separate parent Rust-native defect
@@ -241,6 +252,14 @@ the earlier `BoundText` classification for this dynamic rebinding. The original
 interpreter is correct. The self-hosted binding regression therefore uses that
 interpreter and explicit expected bytes for this form, not the Rust-native
 output as an oracle. This is outside the self-hosted emitter correction.
+
+Fixed 2026-11-23 in the safe direction: a numeric let now un-registers an
+earlier text let of the same name in the main rule prologue (classifier and
+emit loop), so the stale `BoundText` no longer answers. The program is REFUSED
+(`concat argument type not yet supported`) like its two neighbours below,
+instead of printing `abab` at rc 0. A numeric let as a `concat` argument is
+still unbuilt in the legacy native path; the callable and service let
+prologues were not audited for the same shape.
 
 Two nearby legacy Rust-native shapes explicitly refuse instead: rebinding a
 literal text to a numeric let, or capturing a numeric alias before a text let,

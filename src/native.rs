@@ -4990,8 +4990,12 @@ fn emit_record_loop_prologue<'a>(
         .iter()
         .map(|(name, expr)| {
             let is_text = let_rhs_is_text(expr, input_concept, context_concept, all_rules, &prior_text);
+            // A rebinding takes the NEW kind: a number let must un-register
+            // an earlier text let of the same name, here and in the emit loop.
             if is_text {
                 prior_text.insert(name.as_str());
+            } else {
+                prior_text.remove(name.as_str());
             }
             is_text
         })
@@ -5668,6 +5672,7 @@ fn emit_record_loop_prologue<'a>(
             next_slot -= 16;
         } else {
             emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges, &text_bindings, None, None)?;
+            text_bindings.remove(name.as_str());
             if next_slot >= -128 {
                 code.extend_from_slice(&[0x48, 0x89, 0x45]);
                 code.push(next_slot as u8);
