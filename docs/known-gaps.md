@@ -182,6 +182,11 @@ block signature or an explicit refusal. The cross-backend let-scope branch probe
 therefore uses numeric arm results. Successful module emission alone is not
 evidence that a WASM program can run.
 
+The [counted equality correction](wasm-text-equality.md) (2026-10-09) now
+recognises these text-valued blocks and refuses them explicitly before writing
+an artifact. Executing such blocks remains unsupported; selected branches that
+optimization reduces to a supported expression retain their existing behavior.
+
 ## WASM text equality
 
 The boolean-lowering corpus comparison confirms a pre-existing type mismatch in
@@ -191,6 +196,40 @@ pairs to `i64.eq`. The short-circuit correction grows that module by six bytes
 but leaves the same validation failure. A runtime guard cannot hide malformed
 WASM instructions. This needs text-aware equality lowering or an explicit
 backend refusal, independently of logical evaluation order.
+
+Resolved for the supported [counted text subset](wasm-text-equality.md),
+2026-10-09: `==` / `!=` compare lengths and bytes and produce canonical booleans.
+Lexical aliases and supported acyclic calls prepare their storage before
+emission. General text-valued conditionals receive a named refusal. Native and
+self-hosted equality paths are unchanged by this WASM correction.
+
+## Ordinary rule CLI JSON Unicode escapes
+
+The WASM text-equality comparison reproduced this older input limitation on
+parent `271c2d5`: ordinary rule `--input` / `--stdin` uses
+`interpreter::unescape_json_string`, which decodes common ASCII escapes but
+preserves unknown escapes, including `\u00e9`, `\u0000` and surrogate pairs,
+as literal backslash text. Actual UTF-8 characters are preserved. For example,
+`enrich.verbose --run enriched --json` with `user: "\u00e9"` and `amount: 1001`
+reports the literal escape in the enriched error instead of `é`.
+
+The [source-execution reader](source-executions.md#interpreter-reference)
+already handles Unicode escapes strictly within its separate flat-input scope.
+Migrating ordinary rule input needs its own compatibility decision, including
+nested records/collections and rejection of malformed input. Counted comparison
+tests use direct typed interpreter values and host memory for embedded NUL;
+they do not treat this legacy JSON reader as a Unicode-decoding oracle.
+
+## Purity reads before input-name shadowing
+
+A separate source-proof gap is reproducible on parent `271c2d5`: with
+`let x = helper(i); let i = 7; out = x`, `reads: [i]` is refused as an extra
+read, while `reads: []` verifies. The earlier call still consumes the input.
+`collect_logic_facts` first gathers all reads, then moves every path rooted in
+any let name to `local_reads`, irrespective of its position relative to that
+binding. Fixing this needs source-order lexical resolution in the dependency
+walk, including branch binders, independently of WASM slot preparation. The
+counted-equality correction does not change source proof acceptance.
 
 ## Legacy Rust native dynamic text rebinding
 
